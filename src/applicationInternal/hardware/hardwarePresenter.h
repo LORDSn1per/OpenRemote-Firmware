@@ -2,7 +2,6 @@
 
 #include <list>
 #include <string>
-#include "applicationInternal/hardware/IRremoteProtocols.h"
 #include "applicationInternal/hardware/arduinoLayer.h"
 
 // --- hardware general -------------------------------------------------------
@@ -37,38 +36,32 @@ uint32_t get_sleepTimeout();
 void set_sleepTimeout(uint32_t aSleepTimeout);
 bool get_wakeupByIMUEnabled();
 void set_wakeupByIMUEnabled(bool aWakeupByIMUEnabled);
-uint8_t get_motionThreshold();
-void set_motionThreshold(uint8_t aMotionThreshold);
 
 // --- keypad -----------------------------------------------------------------
 void init_keys(void);
-const char NO_KEY = '\0';
-// -- has to be exactly the same structure as in the hardware implementations, because only a pointer is passed
-const uint8_t keypadROWS = 5; //five rows
-const uint8_t keypadCOLS = 5; //five columns
-enum keypad_rawKeyStates {IDLE_RAW, PRESSED_RAW,       RELEASED_RAW};
-struct rawKey {
-  unsigned long timestampReceived;
-  char keyChar;
-  keypad_rawKeyStates rawKeyState;
+enum keypad_keyStates {IDLE, PRESSED, HOLD, RELEASED};
+struct keypad_key {
+	char kchar;
+	int kcode;
+	keypad_keyStates kstate;
+	bool stateChanged;
 };
-// --
-extern rawKey rawKeys[][keypadCOLS];
-void getKeys(rawKey (*rawKeys)[keypadCOLS], unsigned long currentMillis);
-#if(OMOTE_HARDWARE_REV >= 5)
-void update_keyboardBrightness(void);
-uint8_t get_keyboardBrightness();
-void set_keyboardBrightness(uint8_t aKeyboardBrightness);
-#endif
-
-// --- SD card ----------------------------------------------------------------
-#if(OMOTE_HARDWARE_REV >= 5)
-void init_SD_card(void);
-#endif
+const uint8_t keypad_maxkeys = 10;
+extern keypad_key keypad_keys[keypad_maxkeys];
+void getKeys(keypad_key *keypad_keys);
 
 // --- IR sender --------------------------------------------------------------
 void init_infraredSender(void);
-void sendIRcode(int protocol, std::list<std::string> commandPayloads, std::string additionalPayload);
+enum IRprotocols {
+  IR_PROTOCOL_GC = 0,
+  IR_PROTOCOL_NEC = 1,
+  IR_PROTOCOL_SAMSUNG = 2,
+  IR_PROTOCOL_SONY = 3,
+  IR_PROTOCOL_RC5 = 4,
+  IR_PROTOCOL_DENON = 5,
+  IR_PROTOCOL_SAMSUNG36 = 6
+};
+void sendIRcode(IRprotocols protocol, std::list<std::string> commandPayloads, std::string additionalPayload);
 
 // --- IR receiver ------------------------------------------------------------
 void start_infraredReceiver(void);
@@ -109,7 +102,7 @@ void keyboardBLE_deleteBonds();
 bool keyboardBLE_forceConnectionToAddress(std::string peerAddress);
 bool keyboardBLE_isAdvertising();
 bool keyboardBLE_isConnected();
-void keyboardBLE_shutdown();
+void keyboardBLE_end();
 void keyboardBLE_write(uint8_t c);
 void keyboardBLE_longpress(uint8_t c);
 void keyboardBLE_home();
@@ -119,7 +112,7 @@ void consumerControlBLE_longpress(const MediaKeyReport value);
 #endif
 
 // --- tft --------------------------------------------------------------------
-void update_backlightBrightness(void);
+void update_backligthBrighness(void);
 uint8_t get_backlightBrightness();
 void set_backlightBrightness(uint8_t aBacklightBrightness);
 
@@ -133,7 +126,7 @@ void init_mqtt(void);
 bool getIsWifiConnected();
 void mqtt_loop();
 bool publishMQTTMessage(const char *topic, const char *payload);
-void wifi_shutdown();
+void wifiStop();
 #endif
 
 // --- memory usage -----------------------------------------------------------

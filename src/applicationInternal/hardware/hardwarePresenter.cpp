@@ -59,13 +59,6 @@ void update_userled() {
   update_userled_HAL();
 }
 
-// --- SD card ----------------------------------------------------------------
-#if(OMOTE_HARDWARE_REV >= 5)
-void init_SD_card(void) {
-  init_SD_HAL();
-}
-#endif
-
 // --- battery ----------------------------------------------------------------
 void init_battery(void) {
   init_battery_HAL();
@@ -99,48 +92,21 @@ bool get_wakeupByIMUEnabled() {
 void set_wakeupByIMUEnabled(bool aWakeupByIMUEnabled) {
   set_wakeupByIMUEnabled_HAL(aWakeupByIMUEnabled);
 }
-uint8_t get_motionThreshold() {
-  return get_motionThreshold_HAL();
-}
-void set_motionThreshold(uint8_t aMotionThreshold) {
-  set_motionThreshold_HAL(aMotionThreshold);
-}
 
 // --- keypad -----------------------------------------------------------------
 void init_keys(void) {
   init_keys_HAL();  
 }
-// Used in keypad_getRawKeys to save the raw key states.
-// Holds the raw keystates as received from the keypad (OMOTE_HARDWARE_REV <= 4), the TCA8418 (OMOTE_HARDWARE_REV >= 5) or the simulator.
-// We expect only IDLE_PRESSED and IDLE_RELEASED, because this is what all three sources can deliver (only the keypad could also deliver IDLE and HOLD)
-// The whole array is passed as a pointer to the hardware implementation, which fills it with the raw key states.
-rawKey rawKeys[][keypadCOLS] = {
-  {{0, NO_KEY, IDLE_RAW},{0, NO_KEY, IDLE_RAW},{0, NO_KEY, IDLE_RAW},{0, NO_KEY, IDLE_RAW},{0, NO_KEY, IDLE_RAW}},
-  {{0, NO_KEY, IDLE_RAW},{0, NO_KEY, IDLE_RAW},{0, NO_KEY, IDLE_RAW},{0, NO_KEY, IDLE_RAW},{0, NO_KEY, IDLE_RAW}},
-  {{0, NO_KEY, IDLE_RAW},{0, NO_KEY, IDLE_RAW},{0, NO_KEY, IDLE_RAW},{0, NO_KEY, IDLE_RAW},{0, NO_KEY, IDLE_RAW}},
-  {{0, NO_KEY, IDLE_RAW},{0, NO_KEY, IDLE_RAW},{0, NO_KEY, IDLE_RAW},{0, NO_KEY, IDLE_RAW},{0, NO_KEY, IDLE_RAW}},
-  {{0, NO_KEY, IDLE_RAW},{0, NO_KEY, IDLE_RAW},{0, NO_KEY, IDLE_RAW},{0, NO_KEY, IDLE_RAW},{0, NO_KEY, IDLE_RAW}},
-};
-void getKeys(rawKey rawKeys[keypadROWS][keypadCOLS], unsigned long currentMillis) {
-  // we need to provide currentMillis to the hardware, because at least in case of the simulator there is no way to access millis()
-  keys_getKeys_HAL(rawKeys, currentMillis);
+keypad_key keypad_keys[keypad_maxkeys];
+void getKeys(keypad_key *keys) {
+  keys_getKeys_HAL(keys);
 }
-#if(OMOTE_HARDWARE_REV >= 5)
-void update_keyboardBrightness(void) {
-  update_keyboardBrightness_HAL();
-}
-uint8_t get_keyboardBrightness() {
-  return get_keyboardBrightness_HAL();
-}
-void set_keyboardBrightness(uint8_t aKeyboardBrightness){
-  set_keyboardBrightness_HAL(aKeyboardBrightness);
-}
-#endif
+
 // --- IR sender --------------------------------------------------------------
 void init_infraredSender(void) {
   init_infraredSender_HAL();  
 }
-void sendIRcode(int protocol, std::list<std::string> commandPayloads, std::string additionalPayload) {
+void sendIRcode(IRprotocols protocol, std::list<std::string> commandPayloads, std::string additionalPayload) {
   sendIRcode_HAL(protocol, commandPayloads, additionalPayload);
 }
 
@@ -210,8 +176,8 @@ bool keyboardBLE_isAdvertising() {
 bool keyboardBLE_isConnected() {
   return keyboardBLE_isConnected_HAL();
 }
-void keyboardBLE_shutdown() {
-  keyboardBLE_shutdown_HAL();
+void keyboardBLE_end() {
+  keyboardBLE_end_HAL();
 }
 void keyboardBLE_write(uint8_t c) {
   keyboardBLE_write_HAL(c);
@@ -234,9 +200,9 @@ void consumerControlBLE_longpress(const MediaKeyReport value) {
 #endif
 
 // --- tft --------------------------------------------------------------------
-void update_backlightBrightness(void) {
-  update_backlightBrightness_HAL();
-}
+void update_backligthBrighness(void) {
+  update_backligthBrighness_HAL();
+};
 uint8_t get_backlightBrightness() {
   return get_backlightBrightness_HAL();
 }
@@ -266,8 +232,8 @@ void mqtt_loop() {
 bool publishMQTTMessage(const char *topic, const char *payload) {
   return publishMQTTMessage_HAL(topic, payload);
 }
-void wifi_shutdown() {
-  wifi_shutdown_HAL();
+void wifiStop() {
+  wifiStop_HAL();
 }
 #endif
 

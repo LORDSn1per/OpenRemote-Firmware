@@ -238,8 +238,8 @@ void init_gui_memoryUsage_bar() {
 
   MemoryUsageLabel = lv_label_create(memoryUsageBar);
   lv_label_set_text(MemoryUsageLabel, "");
-  lv_obj_align(MemoryUsageLabel, LV_ALIGN_TOP_LEFT, 0 +2, labelsPositionTop +2);
-  lv_obj_set_style_text_font(MemoryUsageLabel, &lv_font_montserrat_10, LV_PART_MAIN);
+  lv_obj_align(MemoryUsageLabel, LV_ALIGN_TOP_LEFT, 0, labelsPositionTop);
+  lv_obj_set_style_text_font(MemoryUsageLabel, &lv_font_montserrat_12, LV_PART_MAIN);
   lv_label_set_recolor(MemoryUsageLabel, true);
 }
 
@@ -350,18 +350,6 @@ void guis_doTabCreationForNavigateToLastActiveGUIofPreviousGUIlist() {
 // ------------------------------------------------------------------------------------------------------------
 
 void setActiveTab(uint32_t index, lv_anim_enable_t anim_en, bool send_tab_changed_event) {
-  // Check if tabview is initialized before using it
-  if (tabview == NULL) {
-    omote_log_w("setActiveTab: tabview is NULL, cannot set active tab\n");
-    return;
-  }
-  
-  // Check if the tabview object is still valid
-  if (!lv_obj_is_valid(tabview)) {
-    omote_log_w("setActiveTab: tabview object is invalid, cannot set active tab\n");
-    return;
-  }
-  
   // unsigned long startTime = millis();
   if (anim_en == LV_ANIM_ON) {
     lv_tabview_set_act(tabview, index, LV_ANIM_ON);

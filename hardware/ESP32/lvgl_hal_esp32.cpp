@@ -26,20 +26,34 @@ void my_disp_flush( lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *colo
 }
 
 // Read the touchpad
-void my_touchpad_read(lv_indev_drv_t * indev_driver, lv_indev_data_t * data) {
-    uint16_t x, y;
-    if (tft.getTouch(&x, &y)) {
-        data->state = LV_INDEV_STATE_PR;
-        data->point.x = x;
-        data->point.y = y;
-        setLastActivityTimestamp_HAL();    
-        
-        // Uncomment this to show the touchpoint
-        //tft.drawFastHLine(0, y, SCR_WIDTH, TFT_RED);
-        //tft.drawFastVLine(x, 0, SCR_HEIGHT, TFT_RED);
-    } else {
-        data->state = LV_INDEV_STATE_REL;
-    }
+void my_touchpad_read(lv_indev_drv_t * indev_driver, lv_indev_data_t * data){
+  int16_t touchX;
+  int16_t touchY;
+  get_touchpoint(&touchX, &touchY);
+  
+  bool touched = false;
+  if ((touchX > 0) || (touchY > 0)) {
+    touched = true;
+    setLastActivityTimestamp_HAL();
+  }
+
+  if( !touched ){
+    data->state = LV_INDEV_STATE_REL;
+  }
+  else{
+    data->state = LV_INDEV_STATE_PR;
+
+    // Set the coordinates
+    data->point.x = SCR_WIDTH - touchX;
+    data->point.y = SCR_HEIGHT - touchY;
+
+    //Serial.print( "touchpoint: x" );
+    //Serial.print( touchX );
+    //Serial.print( " y" );
+    //Serial.println( touchY );
+    //tft.drawFastHLine(0, SCR_HEIGHT - touchY, SCR_WIDTH, TFT_RED);
+    //tft.drawFastVLine(SCR_WIDTH - touchX, 0, SCR_HEIGHT, TFT_RED);
+  }
 }
 
 static lv_disp_draw_buf_t draw_buf;
@@ -48,13 +62,24 @@ void init_lvgl_HAL() {
   // first init TFT
   init_tft();
 
-  #ifdef useTwoBuffersForlvgl
-  lv_color_t * bufA = (lv_color_t *) malloc(sizeof(lv_color_t) * SCR_WIDTH * SCR_HEIGHT / 10);
-  lv_color_t * bufB = (lv_color_t *) malloc(sizeof(lv_color_t) * SCR_WIDTH * SCR_HEIGHT / 10);
-  lv_disp_draw_buf_init(&draw_buf, bufA, bufB, SCR_WIDTH * SCR_HEIGHT / 10);
+  #if !defined(BOARD_HAS_PSRAM)
+    #ifdef useTwoBuffersForlvgl
+    lv_color_t * bufA = (lv_color_t *) malloc(sizeof(lv_color_t) * SCR_WIDTH * SCR_HEIGHT / 10);
+    lv_color_t * bufB = (lv_color_t *) malloc(sizeof(lv_color_t) * SCR_WIDTH * SCR_HEIGHT / 10);
+    lv_disp_draw_buf_init(&draw_buf, bufA, bufB, SCR_WIDTH * SCR_HEIGHT / 10);
+    #else
+    lv_color_t * bufA = (lv_color_t *) malloc(sizeof(lv_color_t) * SCR_WIDTH * SCR_HEIGHT / 10);
+    lv_disp_draw_buf_init(&draw_buf, bufA, NULL, SCR_WIDTH * SCR_HEIGHT / 10);
+    #endif
   #else
-  lv_color_t * bufA = (lv_color_t *) malloc(sizeof(lv_color_t) * SCR_WIDTH * SCR_HEIGHT / 10);
-  lv_disp_draw_buf_init(&draw_buf, bufA, NULL, SCR_WIDTH * SCR_HEIGHT / 10);
+    #ifdef useTwoBuffersForlvgl
+    lv_color_t * bufA = (lv_color_t *) ps_malloc(sizeof(lv_color_t) * SCR_WIDTH * SCR_HEIGHT / 10);
+    lv_color_t * bufB = (lv_color_t *) ps_malloc(sizeof(lv_color_t) * SCR_WIDTH * SCR_HEIGHT / 10);
+    lv_disp_draw_buf_init(&draw_buf, bufA, bufB, SCR_WIDTH * SCR_HEIGHT / 10);
+    #else
+    lv_color_t * bufA = (lv_color_t *) ps_malloc(sizeof(lv_color_t) * SCR_WIDTH * SCR_HEIGHT / 10);
+    lv_disp_draw_buf_init(&draw_buf, bufA, NULL, SCR_WIDTH * SCR_HEIGHT / 10);
+    #endif
   #endif
 
   // Initialize the display driver --------------------------------------------------------------------------

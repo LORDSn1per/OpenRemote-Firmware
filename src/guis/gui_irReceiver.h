@@ -6,10 +6,6 @@
 const char * const tabName_irReceiver = "IR Receiver";
 void register_gui_irReceiver(void);
 
-// used by commandHandler to show IR messages
-void showNewIRmessage(std::string);
-
-#if (ENABLE_WIFI_AND_MQTT == 1)
 // used by commandHandler to show WiFi status
+void showNewIRmessage(std::string);
 void showMQTTmessage(std::string topic, std::string payload);
-#endif // ENABLE_WIFI_AND_MQTT

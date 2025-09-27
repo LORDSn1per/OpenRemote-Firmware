@@ -1,16 +1,19 @@
 #include <SDL2/SDL.h>
-#include <queue>
 
-enum guiKeyStates {IDLE_SIMULATOR, PRESSED_SIMULATOR, RELEASED_SIMULATOR};
+enum guiKeyStates {GUI_KEY_IDLE, GUI_KEY_PRESSED, GUI_KEY_HOLD, GUI_KEY_RELEASED};
 
-const char NO_KEY = '\0';
-struct KeyEvent {
-  char keyChar;
+struct ActiveKey {
+  char key;
   int keyCode;
-  guiKeyStates keyState;
+  guiKeyStates state;
+  bool changed;
+};
+
+struct KeyState {
+  ActiveKey key;
+  bool stateChanged;
 };
 
 SDL_Window* keypad_gui_setup();
 
-// A queue for all mouse events between two loops
-extern std::queue<KeyEvent> keyEventsQueue;
+KeyState pumpKeys();

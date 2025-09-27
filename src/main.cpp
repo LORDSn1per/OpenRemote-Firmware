@@ -1,5 +1,5 @@
 // OMOTE firmware for ESP32
-// 2023-2025 Maximilian Kern, Klaus Musch
+// 2023-2024 Maximilian Kern / Klaus Musch
 
 #include "applicationInternal/omote_log.h"
 // init hardware and hardware loop
@@ -9,12 +9,8 @@
 #include "devices/misc/device_specialCommands.h"
 #include "applicationInternal/commandHandler.h"
 //   keyboards
-#if (ENABLE_KEYBOARD_MQTT == 1)
 #include "devices/keyboard/device_keyboard_mqtt/device_keyboard_mqtt.h"
-#endif // ENABLE_KEYBOARD_MQTT
-#if (ENABLE_KEYBOARD_BLE == 1)
 #include "devices/keyboard/device_keyboard_ble/device_keyboard_ble.h"
-#endif // ENABLE_KEYBOARD_BLE
 //   TV
 #include "devices/TV/device_samsungTV/device_samsungTV.h"
 //#include "devices/TV/device_lgTV/device_lgTV.h"
@@ -69,26 +65,32 @@ int main(int argc, char *argv[]) {
   Serial.begin(115200);
   // do some general hardware setup, like powering the TFT, I2C, ...
   init_hardware_general();
+  #if (CHEAP_YELLOW_DISPLAY == 0)
   // get wakeup reason
   init_sleep();
+  #endif
   // Restore settings from internal flash memory
   init_preferences();
+  #if (CHEAP_YELLOW_DISPLAY == 0)
   // blinking led
   init_userled();
-  // startup SD card
-  #if(OMOTE_HARDWARE_REV >= 5)
-  // SD card is currently not used, so save some time on startup and don't init the SD card
-  // init_SD_card();
-  #endif
+  // Power Pin definition
+  init_battery();
 
+  // button Pin definition for hardware keys
+  init_keys();
   // setup IR sender
   init_infraredSender();
+  #endif
+  #if (ENABLE_KEYBOARD_BLE == 1)
+  init_keyboardBLE();
+  #endif
 
   // register commands for the devices
   register_specialCommands();
   //   TV
   register_device_samsungTV();
-  //register_device_lgTV();
+//  register_device_lgTV();
   //   AV receiver
   register_device_yamahaAmp();
   //register_device_denonAvr();
@@ -143,23 +145,14 @@ int main(int argc, char *argv[]) {
   set_scenes_on_sceneSelectionGUI({scene_name_TV, scene_name_fireTV, scene_name_chromecast, scene_name_appleTV});
 
   // init GUI - will initialize tft, touch and lvgl
-  init_gui(); // This has to come before any other i2c devices are initialized, otherwise the i2c bus will not be powered
+  init_gui();
   setLabelActiveScene();
   gui_loop(); // Run the LVGL UI once before the loop takes over
-  
-  // Power Pin and battery monitor definition
-  init_battery();
-
-  // init BLE keyboard. Has to be after init_gui (because of powered I2C) and after init_battery (because of fuel gauge init)
-  #if (ENABLE_KEYBOARD_BLE == 1)
-  init_keyboardBLE();
-  #endif
-
-  // setup keyboard matrix driver
-  init_keys();
 
   // setup the Inertial Measurement Unit (IMU) for motion detection. Has to be after init_gui(), otherwise I2C will not work
+  #if (CHEAP_YELLOW_DISPLAY == 0)
   init_IMU();
+  #endif
 
   // init WiFi - needs to be after init_gui() because WifiLabel must be available
   #if (ENABLE_WIFI_AND_MQTT == 1)
@@ -190,17 +183,16 @@ void loop(unsigned long *pIMUTaskTimer, unsigned long *pUpdateStatusTimer) {
 #endif
 
   // --- do as often as possible --------------------------------------------------------
-  // update backlight and keyboard brightness. Fade in on startup, dim before going to sleep
-  update_backlightBrightness();
-  #if(OMOTE_HARDWARE_REV >= 5)
-    update_keyboardBrightness();
-  #endif
+  // update backlight brightness. Fade in on startup, dim before going to sleep
+  update_backligthBrighness();
+  #if (CHEAP_YELLOW_DISPLAY == 0)
   // keypad handling: get key states from hardware and process them
   keypad_loop();
   // process IR receiver, if activated
   if (get_irReceiverEnabled()) {
     infraredReceiver_loop();
   }
+  #endif
   // update LVGL UI
   gui_loop();
   // call mqtt loop to receive mqtt messages, if you are subscribed to some topics
@@ -208,6 +200,7 @@ void loop(unsigned long *pIMUTaskTimer, unsigned long *pUpdateStatusTimer) {
   mqtt_loop();
   #endif
 
+  #if (CHEAP_YELLOW_DISPLAY == 0)
   // --- every 100 ms -------------------------------------------------------------------
   // Refresh IMU data (motion detection) every 100 ms
   // If no action (key, TFT or motion), then go to sleep
@@ -217,6 +210,7 @@ void loop(unsigned long *pIMUTaskTimer, unsigned long *pUpdateStatusTimer) {
     check_activity();
 
   }
+  #endif
 
   // --- every 1000 ms ------------------------------------------------------------------
   if(millis() - *pUpdateStatusTimer >= 1000) {

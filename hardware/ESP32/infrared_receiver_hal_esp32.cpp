@@ -41,13 +41,8 @@
 
 #include "infrared_receiver_hal_esp32.h"
 
-#if(OMOTE_HARDWARE_REV >= 5)
-const uint8_t IR_RX_GPIO  = 4; // IR receiver input
-const uint8_t IR_VCC_GPIO = 6; // IR receiver power
-#else
-const uint8_t IR_RX_GPIO  = 15; // IR receiver input
-const uint8_t IR_VCC_GPIO = 25; // IR receiver power
-#endif
+uint8_t IR_RX_GPIO  = 15; // IR receiver input
+uint8_t IR_VCC_GPIO = 25; // IR receiver power
 
 bool irReceiverEnabled = false;
 

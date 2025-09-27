@@ -12,7 +12,7 @@ void updateBatteryStatusOnGUI() {
   get_battery_status(&battery_voltage, &battery_percentage, &battery_ischarging);
 
   char buffer1[20];
-  snprintf(buffer1, sizeof(buffer1), "Voltage: %.2f V", (float)battery_voltage / 1000);
+  sprintf(buffer1, "Voltage: %.2f V", (float)battery_voltage / 1000);
 
   // GUI settings
   if (objBattSettingsVoltage    != NULL) {lv_label_set_text_fmt(objBattSettingsVoltage, "%s", buffer1);}
@@ -22,9 +22,9 @@ void updateBatteryStatusOnGUI() {
   // GUI status bar at the top
   char buffer2[12];
   // Voltage and percentage
-  // snprintf(buffer2, sizeof(buffer2), "%.1fV, %d%%", (float)getBatteryVoltage() / 1000, battery_percentage);
+  // sprintf(buffer2, "%.1fV, %d%%", (float)getBatteryVoltage() / 1000, battery_percentage);
   // only percentage
-  snprintf(buffer2, sizeof(buffer2), "%d%%", battery_percentage);
+  sprintf(buffer2, "%d%%", battery_percentage);
   for (int i=0; i<strlen(buffer2); i++) {
     if (buffer2[i] == '.') {
       buffer2[i] = ',';
@@ -83,9 +83,11 @@ void updateKeyboardBLEstatusOnGUI() {
 // update user_led, battery, BLE, memoryUsage on GUI
 void updateHardwareStatusAndShowOnGUI(void) {
 
+#if (CHEAP_YELLOW_DISPLAY == 0)
   update_userled();
 
   updateBatteryStatusOnGUI();
+#endif
   #if (ENABLE_BLUETOOTH == 1)
     // adjust this if you implement other bluetooth devices than the BLE keyboard
     #if (ENABLE_KEYBOARD_BLE == 1)

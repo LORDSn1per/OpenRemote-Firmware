@@ -1,10 +1,6 @@
 #include <Arduino.h>
 
-#if(OMOTE_HARDWARE_REV >= 5)
-const uint8_t USER_LED_GPIO = 45;
-#else
-const uint8_t USER_LED_GPIO = 2;
-#endif
+uint8_t USER_LED_GPIO = 2;
 
 void init_userled_HAL(void) {
   pinMode(USER_LED_GPIO, OUTPUT);
