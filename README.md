@@ -1,3 +1,12 @@
+# Branch cheap_yellow_display
+This is a proof of concept for running OMOTE on the "Cheap Yellow Display 2432S028R".
+
+Please also see this [this post on Discord](https://discord.com/channels/1138116475559882852/1139589736772665414/1222655421425258607)
+
+This branch does not contain the latest features from the main branch and was only maintained until approximately September 2025.
+
+Some features are mssing, e.g. IR or hardware keys.
+
 # OMOTE - Open Universal Remote - Firmware
 
 ![Ubuntu build](https://github.com/OMOTE-Community/OMOTE-Firmware/actions/workflows/build-platformio-ubuntu.yml/badge.svg)
