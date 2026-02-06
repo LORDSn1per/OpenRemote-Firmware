@@ -62,16 +62,13 @@ jobs:
         run: pip install --upgrade platformio
 
       - name: Build PlatformIO env:ESP32-Rev1toRev4
-        run: pio run -e esp32-Rev1toRev4
+        run: pio run -e esp32
 
       - name: Build PlatformIO env:ESP32_testboard-Rev1toRev4
-        run: pio run -e esp32_testboard-Rev1toRev4
+        run: pio run -e esp32_testboard
 
       - name: Build PlatformIO env:ESP32-S3-Rev5andHigher
-        run: pio run -e esp32-s3-Rev5andHigher
-
-      - name: Build PlatformIO env:ESP32-S3_testboard-Rev5andHigher
-        run: pio run -e esp32-s3_testboard-Rev5andHigher
+        run: pio run -e esp32-cheap_yellow_display
 
       - name: Build PlatformIO env:linux_64bit
         run: pio run -e linux_64bit
