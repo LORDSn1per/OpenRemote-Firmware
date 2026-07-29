@@ -1,0 +1,19 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <SPI.h>
+#include <SD.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <ESPmDNS.h>
+#include <Preferences.h>
+#include <Update.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+#include <BLEHIDDevice.h>
+#include <BLESecurity.h>
+
+#include "../OpenRemote_1.0.ino"
