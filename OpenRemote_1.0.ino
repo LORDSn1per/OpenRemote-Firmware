@@ -1833,6 +1833,9 @@ uint16_t touchStartX = 0;
 uint16_t touchStartY = 0;
 uint16_t touchLastX = 0;
 uint16_t touchLastY = 0;
+uint8_t touchPendingConfirmCount = 0;
+uint16_t touchPendingX = 0;
+uint16_t touchPendingY = 0;
 ActivitySliderUi *activitySliderUi = nullptr;
 SPIClass sdSpi(FSPI);
 static lv_fs_drv_t sdLvglFsDriver;
@@ -2796,6 +2799,7 @@ void sleepTouchController() {
   if (touchInputDevice) lv_indev_reset(touchInputDevice, nullptr);
   lvTouchDown = false;
   touchWasDown = false;
+  touchPendingConfirmCount = 0;
   touchQuarantineActive = true;
   touchQuarantineStartedMs = millis();
   touchAcceptAfterMs = millis() + 80UL;
@@ -2806,6 +2810,7 @@ void wakeTouchController(uint32_t settleMs = 80) {
   if (touchInputDevice) lv_indev_reset(touchInputDevice, nullptr);
   lvTouchDown = false;
   touchWasDown = false;
+  touchPendingConfirmCount = 0;
   touchQuarantineActive = true;
   touchQuarantineStartedMs = millis();
   touchAcceptAfterMs = millis() + settleMs;
@@ -9592,6 +9597,7 @@ void lvTouchRead(lv_indev_drv_t *drv, lv_indev_data_t *data) {
     data->state = LV_INDEV_STATE_REL;
     lvTouchDown = false;
     touchWasDown = false;
+    touchPendingConfirmCount = 0;
     return;
   }
 
@@ -9627,10 +9633,29 @@ void lvTouchRead(lv_indev_drv_t *drv, lv_indev_data_t *data) {
     data->state = LV_INDEV_STATE_REL;
     lvTouchDown = false;
     touchWasDown = false;
+    touchPendingConfirmCount = 0;
     return;
   }
 
   if (touchFound && readTouch(x, y)) {
+    if (!touchWasDown) {
+      // A single spurious sample with otherwise-valid, in-range coordinates
+      // is the signature of electrical/capacitive noise (worst right after a
+      // sleep/wake power transition), not a real finger, which stays down for
+      // many consecutive poll cycles. Require one confirming read at a
+      // similar position before treating this as a genuine new touch-down.
+      if (touchPendingConfirmCount == 0 ||
+          abs((int)x - (int)touchPendingX) > 12 ||
+          abs((int)y - (int)touchPendingY) > 12) {
+        touchPendingConfirmCount = 1;
+        touchPendingX = x;
+        touchPendingY = y;
+        data->state = LV_INDEV_STATE_REL;
+        lvTouchDown = false;
+        return;
+      }
+      touchPendingConfirmCount = 0;
+    }
     data->state = LV_INDEV_STATE_PR;
     lvTouchDown = true;
     data->point.x = x;
@@ -9650,6 +9675,7 @@ void lvTouchRead(lv_indev_drv_t *drv, lv_indev_data_t *data) {
     showLiveTouchDiagnostic(x, y, now);
     if (touchMoved) lastWakeMs = millis();
   } else {
+    touchPendingConfirmCount = 0;
     data->state = LV_INDEV_STATE_REL;
     lvTouchDown = false;
     if (touchWasDown) {
@@ -12279,6 +12305,7 @@ void beginUiMutation() {
   if (touchInputDevice) lv_indev_reset(touchInputDevice, nullptr);
   lvTouchDown = false;
   touchWasDown = false;
+  touchPendingConfirmCount = 0;
   activityDragActive = false;
   touchQuarantineActive = true;
   touchQuarantineStartedMs = millis();
@@ -12291,6 +12318,7 @@ void endUiMutation() {
   if (touchInputDevice) lv_indev_reset(touchInputDevice, nullptr);
   lvTouchDown = false;
   touchWasDown = false;
+  touchPendingConfirmCount = 0;
   activityDragActive = false;
   touchQuarantineActive = true;
   touchQuarantineStartedMs = millis();
