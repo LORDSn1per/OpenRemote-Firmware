@@ -8,6 +8,24 @@
     - Restores firmware 2.09's passive touch-controller startup exactly: the
       FT5x06 is detected but no operating-mode or threshold registers are
       rewritten during boot.
+    - Actually fixes the blank-center display: lv_obj_remove_style_all() on
+      each page-strip tile was wiping the x-position lv_tileview_add_tile()
+      had just assigned, leaving every tile stacked at (0,0) so the strip
+      never really scrolled regardless of which page was "active." Tile
+      position is now restored immediately after the style reset.
+    - Fixes touch going permanently dead after light/deep sleep: the
+      touch-quarantine latch had no timeout and could wait forever for a
+      clean release that a noisy post-wake I2C bus might never deliver. It
+      now force-clears after 2s and runs the existing (previously unused)
+      touch-rail recovery routine.
+    - Fixes activity sliders being hijacked into a page swipe after 2-3px of
+      drag: their card containers are now scrollable (chaining disabled) so
+      LVGL picks the card, not the page strip, as the drag target, letting
+      the thumb's own drag handler keep the whole gesture.
+    - Reduces random phantom touches, especially right after sleep/wake: a
+      new touch-down now requires two consecutive matching samples instead
+      of accepting a single sample, filtering out single-frame electrical/
+      capacitive noise from the shared LCD/touch rail settling.
 
   2.36 - 2026-08-01
     - Restores the colour-corrected LCD staging band to internal DMA-capable
