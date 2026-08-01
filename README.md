@@ -1,3 +1,58 @@
+# OpenRemote 2.36 - DMA Display Bands and Active Touch
+
+Firmware 2.36 keeps the persistent, finger-following LVGL page strip and its
+two 240x32 DMA buffers. It makes the destination tile visible before building
+its controls, preventing LVGL from clipping every invalidation generated for
+an off-screen tile and leaving only the wallpaper bands visible. Touch uses the
+proven firmware 2.09 single-frame FT5x06 read again, while retaining the clean
+release quarantine after wake and UI rebuilds.
+
+# OpenRemote 2.34 - Persistent LVGL Page Strip
+
+Firmware 2.34 keeps the 2.32 replacement of screenshot-driven swipe transitions
+with persistent
+native LVGL tiles. Page content is never deleted or rebuilt while a touch or
+scroll animation is active. The display uses two proven 240x32 RGB565 DMA
+buffers, so it remains double-buffered without asking the Rev 5 parallel bus to
+accept one unsupported full-screen transfer. Calibrated bands finish their DMA
+transfer before the shared colour buffer is reused, so every row reaches the
+LCD reliably. Touch input requires matching
+valid FT5x06 frames, resets LVGL's input state before every page-tree mutation,
+and quarantines stale samples after wake or navigation. Ordinary display sleep
+keeps the FT5x06 awake instead of using its unreliable I2C hibernate sequence.
+WebConfig also pauses BLE and performs a cold, retryable Wi-Fi controller
+recovery, preventing Chromecast use from leaving Wi-Fi dead until a hardware
+reset.
+
+The UI object tree is allocated in PSRAM so the persistent page strip does not
+consume the internal DMA heap.
+
+Firmware 2.31 applies the focused page-lifecycle fix from firmware 2.10 to the
+2.30 branch. Device selection is deferred until LVGL finishes its picker event,
+temporary device pages are excluded from adjacent-page snapshot generation,
+and closing a device returns to the exact page that opened it.
+
+# OpenRemote 2.30 - Stable 2.09 Foundation
+
+Firmware 2.30 is deliberately rebuilt from firmware 2.09. It preserves the
+2.09 display, raw touch, BLE, Wi-Fi and page-navigation implementation instead
+of carrying those subsystems forward from rejected firmware 2.29.
+
+Only the requested later features have been added:
+
+- Complete LCD Debug menu with saved split-line calibration, touch diagnostics,
+  CPU/RAM, accelerometer and FPS overlays
+- Real I2S microphone or embedded test-audio selection for Chromecast ATVV
+  Voice Search, including the blue physical-button microphone overlay
+- One-minute deep-sleep selection in addition to the existing 5-30 minute range
+- Current charger-aware battery history and time-to-full/time-to-empty metrics
+- Runtime and API compatibility required by WebConfig 2.16, including default
+  theme-file status checks
+- Firmware version and running INO change log updated to 2.30
+
+Firmware 2.29 is rejected because BLE discovery/connection and Wi-Fi operation
+could fail after starting a Bluetooth activity. Do not use it as a base.
+
 # OpenRemote 2.06 - Reliable Deep Sleep
 
 Firmware 2.06 fixes the five-minute power transition on Rev 5. Timer wakeups
