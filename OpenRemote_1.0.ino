@@ -1875,6 +1875,7 @@ bool pageStripRendering = false;
 uint8_t uiMutationDepth = 0;
 unsigned long touchAcceptAfterMs = 0;
 unsigned long touchReleasedSinceMs = 0;
+unsigned long touchQuarantineStartedMs = 0;
 bool touchQuarantineActive = true;
 uint16_t *displayColourLut = nullptr;
 uint16_t *displayFlush565 = nullptr;
@@ -2796,6 +2797,7 @@ void sleepTouchController() {
   lvTouchDown = false;
   touchWasDown = false;
   touchQuarantineActive = true;
+  touchQuarantineStartedMs = millis();
   touchAcceptAfterMs = millis() + 80UL;
   touchReleasedSinceMs = 0;
 }
@@ -2805,6 +2807,7 @@ void wakeTouchController(uint32_t settleMs = 80) {
   lvTouchDown = false;
   touchWasDown = false;
   touchQuarantineActive = true;
+  touchQuarantineStartedMs = millis();
   touchAcceptAfterMs = millis() + settleMs;
   touchReleasedSinceMs = 0;
 }
@@ -9608,6 +9611,19 @@ void lvTouchRead(lv_indev_drv_t *drv, lv_indev_data_t *data) {
     } else {
       touchReleasedSinceMs = 0;
     }
+    // A PRESSED or INVALID read above resets the wait indefinitely, which can
+    // leave the quarantine stuck forever if the bus is noisy (e.g. right after
+    // a light-sleep wake) or a finger is already down when it starts. Force a
+    // clear after a bounded wait and, since that most likely means the I2C
+    // bus itself is wedged, run the existing (previously unused) rail-cycle
+    // recovery instead of just resuming with a possibly-dead controller.
+    if (touchQuarantineActive &&
+        (uint32_t)(now - touchQuarantineStartedMs) >= 2000UL) {
+      Serial.println("Touch: quarantine timeout, forcing recovery");
+      touchQuarantineActive = false;
+      touchReleasedSinceMs = 0;
+      if (touchFound) recoverTouchControllerPower();
+    }
     data->state = LV_INDEV_STATE_REL;
     lvTouchDown = false;
     touchWasDown = false;
@@ -12248,6 +12264,7 @@ void beginUiMutation() {
   touchWasDown = false;
   activityDragActive = false;
   touchQuarantineActive = true;
+  touchQuarantineStartedMs = millis();
   touchAcceptAfterMs = millis() + 80UL;
   touchReleasedSinceMs = 0;
 }
@@ -12259,6 +12276,7 @@ void endUiMutation() {
   touchWasDown = false;
   activityDragActive = false;
   touchQuarantineActive = true;
+  touchQuarantineStartedMs = millis();
   touchAcceptAfterMs = millis() + 80UL;
   touchReleasedSinceMs = 0;
   pageStripRendering = false;
