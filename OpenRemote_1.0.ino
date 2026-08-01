@@ -1,6 +1,22 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  2.42 - 2026-08-01
+    - Ghost-touch diagnostics: user testing confirmed LovyanGFX's DMA
+      parallel bus causes phantom touches (worse at 40MHz, reduced but not
+      gone at 16MHz) while Arduino_GFX (no DMA) has none. Investigation
+      found any DMA-capable parallel driver on the ESP32-S3 has to go
+      through the same LCD_CAM peripheral LovyanGFX already uses - there is
+      no second one to swap to, so a from-scratch replacement driver was
+      very unlikely to help. Adds a lower-risk, more targeted experiment
+      instead: a Debug > Display driver "Drive Strength" option
+      (Weakest/Weak/Default/Strongest) that sets GPIO pad drive capability
+      on the parallel bus WR strobe and 8 data lines. Lower drive strength
+      slows edge rates on those pins, which can reduce high-frequency noise
+      coupling into the neighbouring I2C touch bus without changing the bus
+      clock or giving up DMA. Defaults to "Default" (unchanged prior
+      behaviour); LovyanGFX only.
+
   2.41 - 2026-08-01
     - Battery life: runs the LIS3DH accelerometer in low-power mode (8-bit,
       LPen=1) instead of normal mode for every idle/wake-detect
@@ -929,8 +945,8 @@
   1.00 - Initial LVGL cinematic runtime prototype.
 */
 
-static constexpr float OPENREMOTE_VERSION = 2.41f;
-static constexpr char OPENREMOTE_VERSION_TEXT[] = "2.41";
+static constexpr float OPENREMOTE_VERSION = 2.42f;
+static constexpr char OPENREMOTE_VERSION_TEXT[] = "2.42";
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
   "OPENREMOTE_FIRMWARE_VERSION=2.37";
 
@@ -1313,6 +1329,27 @@ uint32_t lcdFreqHz = 40000000;
 // LovyanGFX only: 0 = single draw buffer, 1 = double draw buffer. Arduino_GFX
 // is synchronous and always effectively single-buffered regardless of this.
 uint8_t lcdBufferMode = 1;
+// LovyanGFX only: GPIO pad drive strength (0=weakest/5mA .. 3=strongest/40mA,
+// matching gpio_drive_cap_t) for the parallel bus WR strobe and 8 data
+// lines. Lower drive strength slows edge rates on those pins, which can
+// reduce high-frequency noise coupling into the neighbouring I2C touch bus
+// without changing the bus clock or giving up DMA. Default (2) matches the
+// ESP32's own default pad drive strength, i.e. unchanged prior behaviour.
+uint8_t lcdDriveStrength = 2;
+
+// Called from setup() after tft.init(), once LovyanGFX has configured the
+// parallel bus pins. Drive capability is a pad-level property independent
+// of the GPIO matrix routing LCD_CAM uses, so this can be set after init
+// without conflicting with it.
+void applyLcdDriveStrength() {
+  if (displayDriverChoice != 0) return;
+  gpio_drive_cap_t cap = (gpio_drive_cap_t)constrain((int)lcdDriveStrength, 0, 3);
+  static const int busPins[] = {
+    PIN_LCD_WR, PIN_LCD_D0, PIN_LCD_D1, PIN_LCD_D2, PIN_LCD_D3,
+    PIN_LCD_D4, PIN_LCD_D5, PIN_LCD_D6, PIN_LCD_D7
+  };
+  for (int pin : busPins) gpio_set_drive_capability((gpio_num_t)pin, cap);
+}
 
 // Persistent native LVGL tiles are transferred through two DMA-safe 32-row
 // buffers. This remains true double buffering, while keeping each parallel-bus
@@ -3576,6 +3613,7 @@ void loadSettings() {
   displayDriverChoice = preferences.getUChar("dispDrv", 0);
   lcdFreqHz = preferences.getULong("lcdFreqHz", 40000000UL);
   lcdBufferMode = preferences.getUChar("lcdBufMode", 1);
+  lcdDriveStrength = constrain((int)preferences.getUChar("lcdDriveStr", 2), 0, 3);
   physicalRepeatEnabled = preferences.getBool("btnRpt", true);
   physicalRepeatDelayMs = constrain(
     (int)preferences.getUShort("btnDelay", 400),
@@ -11804,6 +11842,17 @@ void lcdBufferDropdownEvent(lv_event_t *e) {
   showDebugRebootConfirmation(true);
 }
 
+void lcdDriveStrengthDropdownEvent(lv_event_t *e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  uint16_t selected = lv_dropdown_get_selected(lv_event_get_target(e));
+  if (selected > 3) return;
+  preferences.begin(PREFERENCES_NAMESPACE, false);
+  preferences.putUChar("lcdDriveStr", (uint8_t)selected);
+  preferences.end();
+  lastWakeMs = millis();
+  showDebugRebootConfirmation(true);
+}
+
 void makeDisplayDriverRow(int y) {
   lv_obj_t *panel = lv_obj_create(content);
   lv_obj_set_pos(panel, 8, y);
@@ -11860,6 +11909,23 @@ void makeLcdBufferRow(int y) {
   lv_obj_add_event_cb(dropdown, lcdBufferDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
 }
 
+void makeLcdDriveStrengthRow(int y) {
+  lv_obj_t *panel = lv_obj_create(content);
+  lv_obj_set_pos(panel, 8, y);
+  lv_obj_set_size(panel, 224, 44);
+  lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(panel, LV_OBJ_FLAG_CLICKABLE);
+  stylePanel(panel, lvRgb(34, 35, 39), lvRgb(54, 56, 62));
+  makeLabel(panel, "Drive Strength", 8, 8, &lv_font_montserrat_14, textPrimary());
+  lv_obj_t *dropdown = lv_dropdown_create(panel);
+  lv_obj_set_pos(dropdown, 104, 1);
+  lv_obj_set_size(dropdown, 112, 32);
+  styleDebugDropdown(dropdown);
+  lv_dropdown_set_options(dropdown, "Weakest\nWeak\nDefault\nStrongest");
+  lv_dropdown_set_selected(dropdown, lcdDriveStrength);
+  lv_obj_add_event_cb(dropdown, lcdDriveStrengthDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
+}
+
 void renderDebugPage() {
   setCinematicBackground(false);
   configureContent(42, 278, false);
@@ -11895,6 +11961,8 @@ void renderDebugPage() {
     makeLcdFrequencyRow(driverSectionY);
     driverSectionY += 50;
     makeLcdBufferRow(driverSectionY);
+    driverSectionY += 50;
+    makeLcdDriveStrengthRow(driverSectionY);
     driverSectionY += 50;
   }
   int rebootButtonY = driverSectionY + 8;
@@ -13812,6 +13880,7 @@ void setup() {
   } else {
     tft.setBusFrequency(lcdFreqHz);
     tft.init();
+    applyLcdDriveStrength();
     tft.initDMA();
     tft.setSwapBytes(true);
     tft.fillScreen(TFT_BLACK);
@@ -13821,7 +13890,8 @@ void setup() {
                 displayDriverChoice == 1 ? "Arduino_GFX (synchronous)" : "LovyanGFX (DMA)",
                 displayDriverChoice == 1 ? "" :
                   (String(", ") + String(lcdFreqHz / 1000000UL) + "MHz, " +
-                   (lcdBufferMode ? "double buffer" : "single buffer")).c_str());
+                   (lcdBufferMode ? "double buffer" : "single buffer") +
+                   ", drive=" + String(lcdDriveStrength)).c_str());
   ensureDisplayFlushBuffers();
   rebuildDisplayColourLut();
   applyDisplayControllerSettings();
