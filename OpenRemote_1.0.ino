@@ -11802,7 +11802,16 @@ void renderActivitiesPage() {
     lv_obj_set_style_border_width(card, showCard ? 1 : 0, 0);
     lv_obj_set_style_radius(card, 9, 0);
     lv_obj_set_style_pad_all(card, 0, 0);
-    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    // Keep the card scrollable (with no chaining) so it, not the page strip,
+    // is the ancestor LVGL picks up as the drag target when the thumb below
+    // is dragged. The card has no overflowing content so nothing actually
+    // scrolls, but its presence stops the gesture from bubbling up and being
+    // read as a horizontal page swipe after only a couple of pixels of drag.
+    lv_obj_add_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(card, LV_DIR_HOR);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLL_CHAIN_HOR);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLL_CHAIN_VER);
+    lv_obj_set_scrollbar_mode(card, LV_SCROLLBAR_MODE_OFF);
 
     lv_obj_t *thumb = lv_obj_create(card);
     lv_obj_remove_style_all(thumb);
@@ -11919,7 +11928,15 @@ void makeNestedActivitySlider(const Tile &tile, uint8_t targetActivityIndex,
   lv_obj_set_style_border_width(card, showCard ? 1 : 0, 0);
   lv_obj_set_style_radius(card, 9, 0);
   lv_obj_set_style_pad_all(card, 0, 0);
-  lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+  // See makeNestedActivitySlider's sibling in renderActivitiesPage: keep the
+  // card scrollable (with no chaining) so LVGL picks it, not the page strip,
+  // as the drag target for the thumb below, preventing the drag from
+  // bubbling up into a horizontal page swipe.
+  lv_obj_add_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_scroll_dir(card, LV_DIR_HOR);
+  lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLL_CHAIN_HOR);
+  lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLL_CHAIN_VER);
+  lv_obj_set_scrollbar_mode(card, LV_SCROLLBAR_MODE_OFF);
 
   lv_obj_t *thumb = lv_obj_create(card);
   lv_obj_remove_style_all(thumb);
