@@ -10471,6 +10471,18 @@ void renderSettingsBackButton() {
   lv_obj_add_event_cb(back, backToSettings, LV_EVENT_CLICKED, nullptr);
 }
 
+// Attached once to every page-slot's persistent content container (see
+// setupUiRoot) rather than per-render, since content survives lv_obj_clean
+// across renders. A left-to-right swipe anywhere in a nested Settings view
+// does exactly what the back button does - it does not "pop one level",
+// because backToSettings() itself always jumps straight to SETTINGS_HOME.
+void settingsBackGestureEvent(lv_event_t *e) {
+  if (pages[currentPage].kind != PAGE_REMOTE_SETTINGS || settingsView == SETTINGS_HOME) return;
+  lv_indev_t *indev = lv_indev_get_act();
+  if (!indev) return;
+  if (lv_indev_get_gesture_dir(indev) == LV_DIR_RIGHT) backToSettings(nullptr);
+}
+
 void renderSettingsHome() {
   setCinematicBackground(false);
   configureContent(42, 250, false);
@@ -13319,6 +13331,7 @@ void setupUiRoot() {
     lv_obj_set_style_bg_color(slot.content, lv_color_black(), 0);
     lv_obj_set_style_bg_opa(slot.content, LV_OPA_COVER, 0);
     lv_obj_add_flag(slot.content, LV_OBJ_FLAG_SCROLL_CHAIN_HOR);
+    lv_obj_add_event_cb(slot.content, settingsBackGestureEvent, LV_EVENT_GESTURE, nullptr);
 
     slot.topBar = lv_obj_create(slot.root);
     lv_obj_remove_style_all(slot.topBar);
