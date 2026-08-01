@@ -9773,6 +9773,37 @@ void stylePanel(lv_obj_t *obj, lv_color_t bg, lv_color_t border, lv_opa_t opa = 
   lv_obj_set_style_pad_all(obj, 8, 0);
 }
 
+// Shared dark-track / blue-fill / plain-white-knob look for every switch and
+// slider in the Settings menu, replacing LVGL's stock default theme (which
+// is where the previous blue-tinted knob came from - nothing had styled
+// these parts at all before).
+void styleModernSwitch(lv_obj_t *sw) {
+  lv_obj_set_style_radius(sw, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(sw, lvRgb(60, 63, 70), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(sw, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_radius(sw, LV_RADIUS_CIRCLE, LV_PART_INDICATOR);
+  lv_obj_set_style_bg_color(sw, lvRgb(60, 63, 70), LV_PART_INDICATOR);
+  lv_obj_set_style_bg_color(sw, lvRgb(45, 143, 255), LV_PART_INDICATOR | LV_STATE_CHECKED);
+  lv_obj_set_style_bg_opa(sw, LV_OPA_COVER, LV_PART_INDICATOR);
+  lv_obj_set_style_bg_color(sw, lv_color_white(), LV_PART_KNOB);
+  lv_obj_set_style_bg_opa(sw, LV_OPA_COVER, LV_PART_KNOB);
+  lv_obj_set_style_pad_all(sw, 2, LV_PART_KNOB);
+}
+
+void styleModernSlider(lv_obj_t *sl, int knobPad = 6) {
+  lv_obj_set_style_radius(sl, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(sl, lvRgb(60, 63, 70), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(sl, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_radius(sl, LV_RADIUS_CIRCLE, LV_PART_INDICATOR);
+  lv_obj_set_style_bg_color(sl, lvRgb(45, 143, 255), LV_PART_INDICATOR);
+  lv_obj_set_style_bg_opa(sl, LV_OPA_COVER, LV_PART_INDICATOR);
+  lv_obj_set_style_radius(sl, LV_RADIUS_CIRCLE, LV_PART_KNOB);
+  lv_obj_set_style_bg_color(sl, lv_color_white(), LV_PART_KNOB);
+  lv_obj_set_style_bg_opa(sl, LV_OPA_COVER, LV_PART_KNOB);
+  lv_obj_set_style_border_width(sl, 0, LV_PART_KNOB);
+  lv_obj_set_style_pad_all(sl, knobPad, LV_PART_KNOB);
+}
+
 lv_obj_t *makeLabel(lv_obj_t *parent, const char *text, int x, int y, const lv_font_t *font, lv_color_t colour) {
   lv_obj_t *label = lv_label_create(parent);
   lv_label_set_text(label, text);
@@ -10396,6 +10427,7 @@ lv_obj_t *makeSettingRow(const char *name, const char *sub, int y, bool *switchT
     lv_obj_t *sw = lv_switch_create(row);
     lv_obj_set_size(sw, 38, 22);
     lv_obj_align(sw, LV_ALIGN_RIGHT_MID, -4, 0);
+    styleModernSwitch(sw);
     if (*switchTarget) lv_obj_add_state(sw, LV_STATE_CHECKED);
     lv_obj_add_event_cb(sw, switchEvent, LV_EVENT_VALUE_CHANGED, switchTarget);
   }
@@ -11311,6 +11343,7 @@ void makeDisplaySlider(const char *label, int y, int minValue, int maxValue, int
   lv_obj_t *slider = lv_slider_create(content);
   lv_obj_set_pos(slider, 10, y + 23);
   lv_obj_set_size(slider, 220, 12);
+  styleModernSlider(slider);
   if (setting == 2) {
     uint8_t index = deepSleepSliderIndex(value);
     lv_slider_set_range(slider, 0, 6);
@@ -11384,6 +11417,7 @@ void makeButtonTimingSlider(const char *label, int y, int minValue,
   lv_obj_t *slider = lv_slider_create(content);
   lv_obj_set_pos(slider, 10, y + 23);
   lv_obj_set_size(slider, 220, 12);
+  styleModernSlider(slider);
   int sliderValue = value;
   if (setting == 0) {
     lv_slider_set_range(slider, minValue / 50, maxValue / 50);
@@ -12343,13 +12377,12 @@ void renderUnlockPage() {
   lv_obj_set_size(slider, 200, 42);
   lv_slider_set_range(slider, 0, 100);
   lv_slider_set_value(slider, 0, LV_ANIM_OFF);
-  lv_obj_set_style_radius(slider, 21, LV_PART_MAIN);
+  styleModernSlider(slider, 13);
+  // Track/indicator stay translucent black/blue over the wallpaper behind the
+  // lock overlay, unlike the opaque dark track used on plain Settings pages.
   lv_obj_set_style_bg_color(slider, lv_color_black(), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(slider, LV_OPA_60, LV_PART_MAIN);
-  lv_obj_set_style_bg_color(slider, lvRgb(65, 145, 230), LV_PART_INDICATOR);
   lv_obj_set_style_bg_opa(slider, LV_OPA_70, LV_PART_INDICATOR);
-  lv_obj_set_style_bg_color(slider, lv_color_white(), LV_PART_KNOB);
-  lv_obj_set_style_pad_all(slider, 13, LV_PART_KNOB);
   lv_obj_add_event_cb(slider, unlockSliderEvent, LV_EVENT_ALL, nullptr);
   lv_obj_t *hint = makeLabel(lockOverlay, "slide to unlock", 0, 260, &lv_font_montserrat_12, textPrimary());
   lv_obj_set_width(hint, LCD_W);
@@ -12707,10 +12740,7 @@ void toggleBrightnessPanel() {
   lv_obj_align(slider, LV_ALIGN_CENTER, 0, 8);
   lv_slider_set_range(slider, 0, 100);
   lv_slider_set_value(slider, brightness, LV_ANIM_OFF);
-  lv_obj_set_style_bg_color(slider, lvRgb(75, 78, 86), LV_PART_MAIN);
-  lv_obj_set_style_bg_color(slider, lv_color_white(), LV_PART_INDICATOR);
-  lv_obj_set_style_bg_color(slider, lv_color_white(), LV_PART_KNOB);
-  lv_obj_set_style_pad_all(slider, 5, LV_PART_KNOB);
+  styleModernSlider(slider, 5);
   lv_obj_add_event_cb(slider, brightnessEvent, LV_EVENT_VALUE_CHANGED, nullptr);
   lv_obj_add_event_cb(slider, brightnessEvent, LV_EVENT_RELEASED, nullptr);
 
