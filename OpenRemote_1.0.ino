@@ -9698,15 +9698,24 @@ void lvTouchRead(lv_indev_drv_t *drv, lv_indev_data_t *data) {
     // A PRESSED or INVALID read above resets the wait indefinitely, which can
     // leave the quarantine stuck forever if the bus is noisy (e.g. right after
     // a light-sleep wake) or a finger is already down when it starts. Force a
-    // clear after a bounded wait and, since that most likely means the I2C
-    // bus itself is wedged, run the existing (previously unused) rail-cycle
-    // recovery instead of just resuming with a possibly-dead controller.
+    // clear after a bounded wait.
+    //
+    // This deliberately does NOT call recoverTouchControllerPower() any more.
+    // That function reconfigures the FT5x06's power-mode/scan-timeout
+    // registers (0xA5/0xA4) - firmware 1.98, which never wrote a single
+    // register to this chip at any point in its life (boot, sleep, wake, or
+    // otherwise), had no phantom-touch problem at all, while every version
+    // that actively configures those registers has had some degree of it -
+    // including a documented case of the wrong power mode causing stale
+    // coordinate replay. Leaving the chip's own register state alone,
+    // exactly as 1.98 did, is the experiment: if phantom touches persist
+    // unchanged, the cause is elsewhere (electrical noise, redraw-triggered
+    // interference) rather than this chip's configured mode.
     if (touchQuarantineActive &&
         (uint32_t)(now - touchQuarantineStartedMs) >= 2000UL) {
-      Serial.println("Touch: quarantine timeout, forcing recovery");
+      Serial.println("Touch: quarantine timeout, forcing clear (no chip reset)");
       touchQuarantineActive = false;
       touchReleasedSinceMs = 0;
-      if (touchFound) recoverTouchControllerPower();
     }
     data->state = LV_INDEV_STATE_REL;
     lvTouchDown = false;
