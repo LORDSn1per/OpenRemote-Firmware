@@ -1,16 +1,17 @@
 /*
   OpenRemote firmware change log (newest first)
 
-  2.39 - 2026-08-01
-    - Fixes hesitant/dropped swipes (e.g. into Settings) that needed an
-      unnatural pause-then-slide to register. 2.38's ghost-touch debounce
-      required two consecutive touch samples to land within 12px of each
-      other before accepting a new touch-down, but at LVGL's ~30ms poll
-      period any swipe faster than roughly 400px/s moves further than that
-      between polls, so the pending sample kept resetting and never
-      confirmed. Drops the position check - two consecutive PRESSED samples
-      are enough regardless of how far they moved - which still filters an
-      isolated single-frame glitch without penalising normal swipe speed.
+  2.40 - 2026-08-01
+    - Reverts 2.39: dropping the ghost-touch debounce's 12px proximity check
+      to fix hesitant swipes let ghost touches back in almost immediately.
+      Restores the exact 2.38 debounce behaviour. The swipe hesitation is
+      the lesser problem until the actual noise source is pinned down (see
+      2.38's LCD driver/clock/buffer diagnostics).
+
+  2.39 - 2026-08-01 - REJECTED / DO NOT USE
+    - Dropped the ghost-touch debounce's 12px position check to fix hesitant
+      swipes into Settings, but ghost touches returned almost immediately on
+      hardware. Reverted by 2.40.
 
   2.38 - 2026-08-01
     - Fixes the Wi-Fi password keyboard's backspace key overlapping the "m"
@@ -909,8 +910,8 @@
   1.00 - Initial LVGL cinematic runtime prototype.
 */
 
-static constexpr float OPENREMOTE_VERSION = 2.39f;
-static constexpr char OPENREMOTE_VERSION_TEXT[] = "2.39";
+static constexpr float OPENREMOTE_VERSION = 2.40f;
+static constexpr char OPENREMOTE_VERSION_TEXT[] = "2.40";
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
   "OPENREMOTE_FIRMWARE_VERSION=2.37";
 
@@ -1934,6 +1935,8 @@ uint16_t touchStartY = 0;
 uint16_t touchLastX = 0;
 uint16_t touchLastY = 0;
 uint8_t touchPendingConfirmCount = 0;
+uint16_t touchPendingX = 0;
+uint16_t touchPendingY = 0;
 ActivitySliderUi *activitySliderUi = nullptr;
 SPIClass sdSpi(FSPI);
 static lv_fs_drv_t sdLvglFsDriver;
@@ -9837,14 +9840,14 @@ void lvTouchRead(lv_indev_drv_t *drv, lv_indev_data_t *data) {
       // A single spurious sample with otherwise-valid, in-range coordinates
       // is the signature of electrical/capacitive noise (worst right after a
       // sleep/wake power transition), not a real finger, which stays down for
-      // at least two consecutive ~30ms poll cycles. Require one confirming
-      // PRESSED read before accepting a genuine new touch-down - but don't
-      // also require it to land within a few pixels of the first sample: a
-      // normal swipe easily moves more than that between two polls (well
-      // under 400px/s), and requiring close-together samples meant a quick
-      // swipe needed an unnatural pause-then-slide to ever be recognised.
-      if (touchPendingConfirmCount == 0) {
+      // many consecutive poll cycles. Require one confirming read at a
+      // similar position before treating this as a genuine new touch-down.
+      if (touchPendingConfirmCount == 0 ||
+          abs((int)x - (int)touchPendingX) > 12 ||
+          abs((int)y - (int)touchPendingY) > 12) {
         touchPendingConfirmCount = 1;
+        touchPendingX = x;
+        touchPendingY = y;
         data->state = LV_INDEV_STATE_REL;
         lvTouchDown = false;
         return;
