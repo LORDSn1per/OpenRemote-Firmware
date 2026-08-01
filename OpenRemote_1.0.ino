@@ -10908,6 +10908,9 @@ lv_obj_t *makeKeyboardKey(const char *label, const char *key, int x, int y, int 
   lv_obj_set_style_border_color(button, lvRgb(120, 154, 180), 0);
   lv_obj_set_style_shadow_width(button, 0, 0);
   lv_obj_set_style_pad_all(button, 0, 0);
+  // Give every key an obvious pressed state so a tap has visible feedback -
+  // previously a key gave no visual confirmation that a touch registered.
+  lv_obj_set_style_bg_color(button, lv_color_darken(bg, LV_OPA_40), LV_STATE_PRESSED);
   lv_obj_add_event_cb(button, wifiKeyboardEvent, LV_EVENT_CLICKED, (void *)key);
   lv_obj_t *text = lv_label_create(button);
   lv_label_set_text(text, label);
@@ -10946,9 +10949,13 @@ void renderCompactWifiKeyboard() {
   addKeyboardTextRow("1234567890", 10, 4, 4, 21, false);
   addKeyboardTextRow(customKeyboardSymbols ? "!@#$%^&*()" : "qwertyuiop", 10, 4, 35, 21, !customKeyboardSymbols);
   addKeyboardTextRow(customKeyboardSymbols ? "-_=+[]{};" : "asdfghjkl", 9, 15, 66, 21, !customKeyboardSymbols);
-  makeKeyboardKey(customKeyboardCaps ? "abc" : "ABC", "<CAPS>", 4, 97, 34, 27, lvRgb(182, 215, 238));
-  addKeyboardTextRow(customKeyboardSymbols ? ".,:?/\\'" : "zxcvbnm", 7, 42, 97, 20, !customKeyboardSymbols);
-  makeKeyboardKey(LV_SYMBOL_BACKSPACE, "<DEL>", 188, 97, 46, 27, lvRgb(182, 215, 238));
+  // CAPS (x4-42) + 7 letter keys at pitch 21 (x46-191) + backspace (x195-236)
+  // fit the 240px width with no overlap. The previous fixed backspace x=188
+  // ate into the last letter key's own x174-194 span, hiding ~30% of "m"
+  // under the backspace button drawn on top of it.
+  makeKeyboardKey(customKeyboardCaps ? "abc" : "ABC", "<CAPS>", 4, 97, 38, 27, lvRgb(182, 215, 238));
+  addKeyboardTextRow(customKeyboardSymbols ? ".,:?/\\'" : "zxcvbnm", 7, 46, 97, 19, !customKeyboardSymbols);
+  makeKeyboardKey(LV_SYMBOL_BACKSPACE, "<DEL>", 195, 97, 41, 27, lvRgb(182, 215, 238));
   makeKeyboardKey("@#", "<SYM>", 4, 128, 36, 27, lvRgb(182, 215, 238));
   makeKeyboardKey("Cancel", "<CANCEL>", 43, 128, 54, 27, lvRgb(80, 96, 118));
   makeKeyboardKey("space", "<SPACE>", 100, 128, 58, 27, lvRgb(182, 215, 238));
