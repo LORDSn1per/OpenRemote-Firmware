@@ -14,6 +14,29 @@
     - Button Test mode already suppressed real IR/BLE transmission, but its
       pulse reused the same red flash as a genuine send, making the two
       indistinguishable. It now flashes the status pill green instead.
+    - Fixes swipe-back never firing on Settings pages with a scrollable
+      content (e.g. Display): LVGL claims any scrollable ancestor as a
+      touch's scroll target as soon as one exists, regardless of drag
+      direction, which starves gesture detection. Detects the swipe from
+      the raw touch-down/up points in lvTouchRead instead.
+    - Fixes dragging a Settings slider (Brightness, etc.) refusing to
+      scroll the page: the existing scroll-safe-slider logic stopped the
+      slider's value from drifting during a vertical drag but never
+      actually scrolled the list itself. It now drives the scroll directly
+      once vertical intent is detected.
+    - Ghost-touch experiment: stops the touch-quarantine timeout from
+      power-cycling the LCD/touch rail and rewriting the FT5x06's
+      power-mode/scan-timeout registers. Firmware 1.98 never touched those
+      registers at any point (boot, sleep, or wake) and had no phantom-
+      touch problem; every version since that configures them has had some
+      degree of it.
+    - Adds a runtime-selectable LCD driver (Debug > Display driver): the
+      current LovyanGFX 40MHz parallel-DMA path, or the exact synchronous
+      Arduino_GFX path firmware used before 2.07, to test whether the DMA
+      transfers are an electrical contributor to phantom touches. Also adds
+      an LCD write-clock choice (40/27/20/16/10MHz) and a single/double
+      draw-buffer choice, both LovyanGFX-only. All three require a reboot
+      to take effect.
 
   2.37 - 2026-08-01
     - Fixes persistent tile selection before the first LVGL layout pass. The
@@ -942,6 +965,7 @@ static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
 #define RAW_BUFFER_LENGTH 750
 #include <IRremote.hpp>
 #include <LovyanGFX.hpp>
+#include <Arduino_GFX_Library.h>
 #include <lvgl.h>
 #include "cinema_wallpaper_rgb565.h"
 #include "atvv_test_audio.h"
@@ -1224,9 +1248,40 @@ class OpenRemoteDisplay : public lgfx::LGFX_Device {
     panel.config(panelConfig);
     setPanel(&panel);
   }
+
+  // Called from setup() after Preferences has been read, before init(), so
+  // the stored LCD write-clock choice can be applied before the bus starts.
+  void setBusFrequency(uint32_t hz) {
+    auto busConfig = bus.config();
+    busConfig.freq_write = hz;
+    bus.config(busConfig);
+  }
 };
 
 OpenRemoteDisplay tft;
+
+// Diagnostic alternative to the LovyanGFX driver above: the exact synchronous,
+// non-DMA Arduino_GFX path firmware used before 2.07 (see changelog), offered
+// as a runtime-selectable fallback to test whether LovyanGFX's 40MHz parallel
+// DMA transfers are an electrical contributor to phantom touches on the
+// shared I2C bus. Selected via Debug > Display Driver; takes effect on reboot.
+Arduino_DataBus *agfxBus = new Arduino_ESP32PAR8(
+  PIN_LCD_DC, PIN_LCD_CS, PIN_LCD_WR, PIN_LCD_RD,
+  PIN_LCD_D0, PIN_LCD_D1, PIN_LCD_D2, PIN_LCD_D3,
+  PIN_LCD_D4, PIN_LCD_D5, PIN_LCD_D6, PIN_LCD_D7
+);
+Arduino_ILI9341 *agfxLcd = new Arduino_ILI9341(agfxBus, PIN_LCD_RST, 0, false, LCD_W, LCD_H);
+Arduino_GFX *agfx = agfxLcd;
+
+// 0 = LovyanGFX (DMA), 1 = Arduino_GFX (synchronous, no DMA). Loaded from
+// Preferences at boot; changing it requires a reboot to take effect.
+uint8_t displayDriverChoice = 0;
+// LovyanGFX parallel-bus write clock in Hz. Arduino_GFX has no equivalent
+// setting (its ESP32 8-bit parallel bus runs at a fixed rate).
+uint32_t lcdFreqHz = 40000000;
+// LovyanGFX only: 0 = single draw buffer, 1 = double draw buffer. Arduino_GFX
+// is synchronous and always effectively single-buffered regardless of this.
+uint8_t lcdBufferMode = 1;
 
 // Persistent native LVGL tiles are transferred through two DMA-safe 32-row
 // buffers. This remains true double buffering, while keeping each parallel-bus
@@ -3475,6 +3530,9 @@ void loadSettings() {
   displaySaturation = constrain((int)preferences.getUShort("saturation", 100), 0, 200);
   displayRgb666 = preferences.getBool("rgb666", false);
   displayInverted = preferences.getBool("invert", false);
+  displayDriverChoice = preferences.getUChar("dispDrv", 0);
+  lcdFreqHz = preferences.getULong("lcdFreqHz", 40000000UL);
+  lcdBufferMode = preferences.getUChar("lcdBufMode", 1);
   physicalRepeatEnabled = preferences.getBool("btnRpt", true);
   physicalRepeatDelayMs = constrain(
     (int)preferences.getUShort("btnDelay", 400),
@@ -9392,6 +9450,14 @@ void rebuildDisplayColourLut() {
 void applyDisplayControllerSettings() {
   if (!lcdControllerReady) return;
   ensureDisplayFlushBuffers();
+  if (displayDriverChoice == 1) {
+    // Arduino_GFX's draw16bitRGBBitmap() is always RGB565 with no runtime
+    // pixel-format switch; RGB666 is LovyanGFX-only in this build.
+    agfx->invertDisplay(displayInverted);
+    Serial.printf("LCD transfer: RGB565 (Arduino_GFX), inversion: %s\n",
+                  displayInverted ? "on" : "off");
+    return;
+  }
   tft.waitDMA();
   tft.setColorDepth(displayRgb666 ? 18 : 16);
   tft.invertDisplay(displayInverted);
@@ -9401,6 +9467,29 @@ void applyDisplayControllerSettings() {
 
 void setLcdControllerSleeping(bool sleeping) {
   if (!lcdControllerReady) return;
+  if (displayDriverChoice == 1) {
+    // Arduino_GFX has no sleep()/wakeup() of its own; send the same ILI9341
+    // sleep-in/out + display off/on commands firmware 2.06 used directly.
+    if (sleeping) {
+      agfxBus->beginWrite();
+      agfxBus->writeCommand(0x28);  // Display off.
+      agfxBus->endWrite();
+      delay(20);
+      agfxBus->beginWrite();
+      agfxBus->writeCommand(0x10);  // Sleep in.
+      agfxBus->endWrite();
+    } else {
+      agfxBus->beginWrite();
+      agfxBus->writeCommand(0x11);  // Sleep out.
+      agfxBus->endWrite();
+      delay(120);
+      agfxBus->beginWrite();
+      agfxBus->writeCommand(0x29);  // Display on.
+      agfxBus->endWrite();
+      applyDisplayControllerSettings();
+    }
+    return;
+  }
   tft.waitDMA();
   if (sleeping) {
     tft.sleep();
@@ -9415,6 +9504,16 @@ void lvFlush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *colour) {
   int32_t h = area->y2 - area->y1 + 1;
   const uint32_t pixelCount = (uint32_t)w * h;
   uint16_t *source = reinterpret_cast<uint16_t *>(colour);
+
+  if (displayDriverChoice == 1) {
+    if (displayColourLutActive && ensureDisplayFlushBuffers(pixelCount)) {
+      for (uint32_t i = 0; i < pixelCount; i++) displayFlush565[i] = displayColourLut[source[i]];
+      source = displayFlush565;
+    }
+    agfx->draw16bitRGBBitmap(area->x1, area->y1, source, w, h);
+    lv_disp_flush_ready(disp);
+    return;
+  }
 
   // Colour calibration uses one shared staging buffer. Keep it owned by the
   // display bus until each band has fully transferred before reusing it.
@@ -11620,6 +11719,98 @@ void debugRebootButtonEvent(lv_event_t *e) {
   showDebugRebootConfirmation((bool)(uintptr_t)lv_event_get_user_data(e));
 }
 
+// LCD driver, clock and buffering choices only take effect at boot (the
+// display bus is configured once in setup()), so each of the three writes
+// its choice to Preferences immediately and then prompts for the same hard-
+// reboot confirmation used by the existing reboot buttons below.
+void displayDriverDropdownEvent(lv_event_t *e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  uint16_t selected = lv_dropdown_get_selected(lv_event_get_target(e));
+  preferences.begin(PREFERENCES_NAMESPACE, false);
+  preferences.putUChar("dispDrv", (uint8_t)selected);
+  preferences.end();
+  lastWakeMs = millis();
+  showDebugRebootConfirmation(true);
+}
+
+void lcdFreqDropdownEvent(lv_event_t *e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  static const uint32_t options[] = {40000000UL, 27000000UL, 20000000UL, 16000000UL, 10000000UL};
+  uint16_t selected = lv_dropdown_get_selected(lv_event_get_target(e));
+  if (selected >= 5) return;
+  preferences.begin(PREFERENCES_NAMESPACE, false);
+  preferences.putULong("lcdFreqHz", options[selected]);
+  preferences.end();
+  lastWakeMs = millis();
+  showDebugRebootConfirmation(true);
+}
+
+void lcdBufferDropdownEvent(lv_event_t *e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  uint16_t selected = lv_dropdown_get_selected(lv_event_get_target(e));
+  preferences.begin(PREFERENCES_NAMESPACE, false);
+  preferences.putUChar("lcdBufMode", (uint8_t)selected);
+  preferences.end();
+  lastWakeMs = millis();
+  showDebugRebootConfirmation(true);
+}
+
+void makeDisplayDriverRow(int y) {
+  lv_obj_t *panel = lv_obj_create(content);
+  lv_obj_set_pos(panel, 8, y);
+  lv_obj_set_size(panel, 224, 44);
+  lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(panel, LV_OBJ_FLAG_CLICKABLE);
+  stylePanel(panel, lvRgb(34, 35, 39), lvRgb(54, 56, 62));
+  makeLabel(panel, "LCD Driver", 8, 8, &lv_font_montserrat_14, textPrimary());
+  lv_obj_t *dropdown = lv_dropdown_create(panel);
+  lv_obj_set_pos(dropdown, 104, 1);
+  lv_obj_set_size(dropdown, 112, 32);
+  styleDebugDropdown(dropdown);
+  lv_dropdown_set_options(dropdown, "LovyanGFX\nArduino_GFX");
+  lv_dropdown_set_selected(dropdown, displayDriverChoice);
+  lv_obj_add_event_cb(dropdown, displayDriverDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
+}
+
+void makeLcdFrequencyRow(int y) {
+  lv_obj_t *panel = lv_obj_create(content);
+  lv_obj_set_pos(panel, 8, y);
+  lv_obj_set_size(panel, 224, 44);
+  lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(panel, LV_OBJ_FLAG_CLICKABLE);
+  stylePanel(panel, lvRgb(34, 35, 39), lvRgb(54, 56, 62));
+  makeLabel(panel, "LCD Clock", 8, 8, &lv_font_montserrat_14, textPrimary());
+  lv_obj_t *dropdown = lv_dropdown_create(panel);
+  lv_obj_set_pos(dropdown, 104, 1);
+  lv_obj_set_size(dropdown, 112, 32);
+  styleDebugDropdown(dropdown);
+  lv_dropdown_set_options(dropdown, "40 MHz\n27 MHz\n20 MHz\n16 MHz\n10 MHz");
+  static const uint32_t options[] = {40000000UL, 27000000UL, 20000000UL, 16000000UL, 10000000UL};
+  uint16_t selectedIndex = 0;
+  for (uint16_t i = 0; i < 5; i++) {
+    if (options[i] == lcdFreqHz) { selectedIndex = i; break; }
+  }
+  lv_dropdown_set_selected(dropdown, selectedIndex);
+  lv_obj_add_event_cb(dropdown, lcdFreqDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
+}
+
+void makeLcdBufferRow(int y) {
+  lv_obj_t *panel = lv_obj_create(content);
+  lv_obj_set_pos(panel, 8, y);
+  lv_obj_set_size(panel, 224, 44);
+  lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(panel, LV_OBJ_FLAG_CLICKABLE);
+  stylePanel(panel, lvRgb(34, 35, 39), lvRgb(54, 56, 62));
+  makeLabel(panel, "Buffering", 8, 8, &lv_font_montserrat_14, textPrimary());
+  lv_obj_t *dropdown = lv_dropdown_create(panel);
+  lv_obj_set_pos(dropdown, 104, 1);
+  lv_obj_set_size(dropdown, 112, 32);
+  styleDebugDropdown(dropdown);
+  lv_dropdown_set_options(dropdown, "Single\nDouble");
+  lv_dropdown_set_selected(dropdown, lcdBufferMode ? 1 : 0);
+  lv_obj_add_event_cb(dropdown, lcdBufferDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
+}
+
 void renderDebugPage() {
   setCinematicBackground(false);
   configureContent(42, 278, false);
@@ -11645,9 +11836,23 @@ void renderDebugPage() {
                  &debugAccelerometerEnabled);
   makeSettingRow("FPS", "Display frames per second", 502, &debugFpsEnabled);
   makeMicrophoneSourceRow(552);
-  lv_obj_t *softButton = makeButton(content, "Soft reboot", 8, 606, 108, 42,
+
+  makeLabel(content, "Display driver (reboot required)", 10, 604,
+            &lv_font_montserrat_12, lvRgb(170, 178, 190));
+  int driverSectionY = 626;
+  makeDisplayDriverRow(driverSectionY);
+  driverSectionY += 50;
+  if (displayDriverChoice == 0) {
+    makeLcdFrequencyRow(driverSectionY);
+    driverSectionY += 50;
+    makeLcdBufferRow(driverSectionY);
+    driverSectionY += 50;
+  }
+  int rebootButtonY = driverSectionY + 8;
+
+  lv_obj_t *softButton = makeButton(content, "Soft reboot", 8, rebootButtonY, 108, 42,
                                     lvRgb(28, 91, 150));
-  lv_obj_t *hardButton = makeButton(content, "Hard reboot", 124, 606, 108, 42,
+  lv_obj_t *hardButton = makeButton(content, "Hard reboot", 124, rebootButtonY, 108, 42,
                                     lvRgb(132, 43, 48));
   lv_obj_add_event_cb(softButton, debugRebootButtonEvent, LV_EVENT_CLICKED,
                       (void *)(uintptr_t)false);
@@ -13245,7 +13450,7 @@ void enterDisplaySleep() {
   sleepTouchController();
   lv_obj_add_flag(uiRoot, LV_OBJ_FLAG_HIDDEN);
   lv_refr_now(nullptr);
-  tft.fillScreen(TFT_BLACK);
+  if (displayDriverChoice == 1) agfx->fillScreen(0x0000); else tft.fillScreen(TFT_BLACK);
   setLcdControllerSleeping(true);
   IrReceiver.stop();
   digitalWrite(PIN_IR_VCC, LOW);
@@ -13317,7 +13522,11 @@ void setupLvgl() {
   lv_fs_drv_register(&sdLvglFsDriver);
 
   lvBuf1 = lvFallbackBuf1;
-  lvBuf2 = lvFallbackBuf2;
+  // Arduino_GFX's flush is synchronous (no DMA in flight when it returns), so
+  // there is nothing for a second buffer to overlap with - it is always
+  // effectively single-buffered there regardless of lcdBufferMode.
+  bool useDoubleBuffer = displayDriverChoice == 0 && lcdBufferMode != 0;
+  lvBuf2 = useDoubleBuffer ? lvFallbackBuf2 : nullptr;
   lvDrawBufferPixels = LCD_W * 32;
   lvFullFrameDoubleBuffer = false;
   if (displayColourLutActive) ensureDisplayFlushBuffers(lvDrawBufferPixels);
@@ -13545,11 +13754,26 @@ void setup() {
   applyClockMode();
   applyBluetoothState();
 
-  tft.init();
-  tft.initDMA();
-  tft.setSwapBytes(true);
-  tft.fillScreen(TFT_BLACK);
-  lcdControllerReady = true;
+  if (displayDriverChoice == 1) {
+    if (!agfx->begin()) {
+      Serial.println("LCD init failed (Arduino_GFX)");
+    } else {
+      lcdControllerReady = true;
+    }
+    agfx->fillScreen(0x0000);
+  } else {
+    tft.setBusFrequency(lcdFreqHz);
+    tft.init();
+    tft.initDMA();
+    tft.setSwapBytes(true);
+    tft.fillScreen(TFT_BLACK);
+    lcdControllerReady = true;
+  }
+  Serial.printf("LCD driver: %s%s\n",
+                displayDriverChoice == 1 ? "Arduino_GFX (synchronous)" : "LovyanGFX (DMA)",
+                displayDriverChoice == 1 ? "" :
+                  (String(", ") + String(lcdFreqHz / 1000000UL) + "MHz, " +
+                   (lcdBufferMode ? "double buffer" : "single buffer")).c_str());
   ensureDisplayFlushBuffers();
   rebuildDisplayColourLut();
   applyDisplayControllerSettings();
@@ -13734,7 +13958,7 @@ void loop() {
     ESP.restart();
   }
   if (hardRestartPending) {
-    tft.waitDMA();
+    if (displayDriverChoice == 0) tft.waitDMA();
     delay(100);
     esp_rom_software_reset_system();
     while (true) delay(1000);
