@@ -4,8 +4,11 @@
 #define LV_COLOR_DEPTH 16
 #define LV_COLOR_16_SWAP 0
 
-#define LV_MEM_CUSTOM 0
-#define LV_MEM_SIZE (64U * 1024U)
+#define LV_MEM_CUSTOM 1
+#define LV_MEM_CUSTOM_INCLUDE "esp32-hal-psram.h"
+#define LV_MEM_CUSTOM_ALLOC ps_malloc
+#define LV_MEM_CUSTOM_FREE free
+#define LV_MEM_CUSTOM_REALLOC ps_realloc
 
 #define LV_TICK_CUSTOM 0
 #define LV_USE_LOG 0
@@ -29,6 +32,7 @@
 #define LV_USE_KEYBOARD 1
 #define LV_USE_QRCODE 1
 #define LV_USE_PNG 1
+#define LV_USE_SNAPSHOT 1
 #define LV_IMG_CACHE_DEF_SIZE 1
 
 #define LV_FONT_MONTSERRAT_10 1

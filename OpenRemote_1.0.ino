@@ -1,6 +1,110 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  2.37 - 2026-08-01
+    - Fixes persistent tile selection before the first LVGL layout pass. The
+      visible tile is now positioned, selected and laid out before its controls
+      are built, followed by one complete screen invalidation after mutation.
+    - Restores firmware 2.09's passive touch-controller startup exactly: the
+      FT5x06 is detected but no operating-mode or threshold registers are
+      rewritten during boot.
+
+  2.36 - 2026-08-01
+    - Restores the colour-corrected LCD staging band to internal DMA-capable
+      memory. The accidental PSRAM staging introduced with the persistent page
+      strip could transfer only the first and final invalidated bands reliably.
+    - Keeps the FT5x06-compatible touch controller in active polling mode.
+      Firmware 2.35 incorrectly selected monitor mode during initialisation,
+      causing delayed, stale and phantom coordinates on this Rev 5 panel.
+
+  2.35 - 2026-08-01
+    - Keeps the persistent native LVGL page strip, but makes the destination
+      tile visible before rendering its controls so LVGL does not discard the
+      off-screen invalidation and leave only the slot wallpaper shell visible.
+    - Restores firmware 2.09's proven single-frame FT5x06 sampling while keeping
+      the clean-release quarantine used after UI rebuilds and display wake.
+
+  2.34 - 2026-08-01
+    - Keeps the persistent native LVGL page strip and its finger-following
+      navigation introduced in 2.32.
+    - Serialises each calibrated 32-row DMA transfer before reusing the shared
+      colour-correction buffer, preventing all but the first LCD band from
+      being overwritten while the parallel display bus is still transmitting.
+
+  2.33 - 2026-08-01
+    - Keeps the new persistent, finger-following LVGL tile strip from 2.32.
+    - Replaces the unsupported single 153600-byte LCD DMA transfer with the
+      proven pair of 32-row LVGL DMA buffers; rendering remains double-buffered
+      and native LVGL, with no screenshot or pixel-push navigation fallback.
+    - Keeps the FT5x06 awake during ordinary display/light sleep because its
+      deep-hibernate register cannot reliably be released over I2C on Rev 5.
+      LVGL gesture state is reset and touch is quarantined until a clean release.
+
+  2.32 - 2026-08-01
+    - Replaced PSRAM screenshots and delete/rebuild swipe transitions with a
+      persistent native LVGL tile strip modelled on OMOTE's stable navigation.
+    - Parks Wi-Fi safely during Chromecast BLE idle, then pauses BLE and fully
+      recovers the Wi-Fi controller with retries whenever WebConfig is opened.
+    - Hardened FT5x06 input with matching-frame validation, invalid-coordinate
+      rejection, controller sleep/wake commands and a clean-release quarantine.
+    - Moved LVGL object allocation to PSRAM and added OMOTE-style full-frame
+      double buffering, with a safe partial-buffer fallback if PSRAM is absent.
+    - Resets and quarantines LVGL input whenever a page tree is replaced so a
+      stale swipe or release can never be delivered to newly-created controls.
+    - Restored the proven 2.15 BLE/Wi-Fi handoff: Wi-Fi is fully stopped during
+      BLE idle and cold-recovered before station scans or WebConfig startup.
+
+  2.31 - 2026-08-01
+    - Ported the focused device-page stability fix from firmware 2.10 onto the
+      2.30 branch without changing its 2.09 BLE, Wi-Fi, touch or display core.
+    - Defers device opening until the LVGL picker callback has returned, avoids
+      unsafe snapshot rebuilding for large transient device pages, and reliably
+      returns to the exact Home or activity page that opened the device.
+
+  2.30 - 2026-08-01
+    - Rebuilt from the proven 2.09 firmware base so its responsive DMA display,
+      direct touch path and known-good Chromecast BLE/Wi-Fi coexistence remain
+      unchanged.
+    - Added the complete persistent Debug menu: split-line calibration, touch
+      reticle/trail, CPU/RAM, accelerometer and FPS diagnostics, microphone
+      source selection, and confirmed soft/full-system reboot controls.
+    - Added live I2S microphone capture for Chromecast Voice Search while
+      retaining the embedded Test Only phrase and blue hold-to-talk overlay.
+    - Added the one-minute deep-sleep choice and current WebConfig theme-asset
+      status/configuration fields. Retained 2.09's charger-aware battery history,
+      two-decimal statistics and time-to-full/time-to-empty calculations.
+
+  2.29 - 2026-08-01 - REJECTED / DO NOT USE
+    - BLE reconnection and Wi-Fi availability could fail after starting a BLE
+      activity. Firmware 2.30 replaces it with the 2.09 radio foundation.
+
+  2.09 - 2026-07-30
+    - Replaced release-triggered horizontal page changes with a direct-manipulation
+      page strip that follows the user's finger throughout the swipe.
+    - Added PSRAM-backed previous/current/next page previews with natural snap-back
+      and snap-forward behavior, including reversing direction before release.
+    - Cancels the underlying tile or button press as soon as page dragging begins,
+      preventing accidental commands while changing pages.
+
+  2.08 - 2026-07-30
+    - Fixed forgotten Wi-Fi networks remaining selected as automatic connection
+      targets and delaying the WebConfig setup AP with an empty password.
+    - QR setup now attempts station mode only for a real saved profile and
+      immediately starts the open OpenRemote setup AP when none is available.
+    - Forgetting the active network now disables station auto-reconnect and
+      cleanly changes the live QR/WebConfig transport back to setup AP mode.
+
+  2.07 - 2026-07-30
+    - Replaced the synchronous Arduino_GFX LCD transfer path with the official
+      OMOTE Rev 5 LovyanGFX 40 MHz parallel DMA driver and double buffering.
+    - Restored anti-aliased LVGL Montserrat text for substantially cleaner
+      labels while retaining all existing sizes, layouts and symbols.
+    - Moved awake LVGL input/render servicing to the start of every loop and
+      restored OMOTE's standard scroll threshold and momentum for smoother,
+      more immediate page movement.
+    - Preserved RGB565/RGB666 output, gamma/saturation calibration, inversion,
+      display sleep, deep sleep and the existing OpenRemote feature set.
+
   2.06 - 2026-07-29
     - Fixed the deep-sleep deadline timer being treated as movement whenever a
       Rev 5 wake input briefly deferred entry into deep sleep.
@@ -739,10 +843,10 @@
   1.00 - Initial LVGL cinematic runtime prototype.
 */
 
-static constexpr float OPENREMOTE_VERSION = 2.06f;
-static constexpr char OPENREMOTE_VERSION_TEXT[] = "2.06";
+static constexpr float OPENREMOTE_VERSION = 2.37f;
+static constexpr char OPENREMOTE_VERSION_TEXT[] = "2.37";
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
-  "OPENREMOTE_FIRMWARE_VERSION=2.06";
+  "OPENREMOTE_FIRMWARE_VERSION=2.37";
 
 /*
   OpenRemote / OMOTE Rev 5 - LVGL cinematic runtime prototype
@@ -759,7 +863,7 @@ static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
     - MAX17048 fuel gauge at 0x36 for battery percentage
 
   Libraries:
-    - Arduino_GFX_Library by moononournation
+    - LovyanGFX by lovyan03
     - lvgl, preferably v8.x for this sketch
 */
 
@@ -789,8 +893,10 @@ static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
 #include <strings.h>
 #include <sys/time.h>
 #include <driver/gpio.h>
+#include <driver/i2s_std.h>
 #include <driver/uart.h>
 #include <esp_pm.h>
+#include <esp_rom_sys.h>
 #include <esp_sleep.h>
 #include <esp_sntp.h>
 #include <freertos/FreeRTOS.h>
@@ -803,7 +909,7 @@ static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
 #define IR_RECEIVE_PIN 4
 #define RAW_BUFFER_LENGTH 750
 #include <IRremote.hpp>
-#include <Arduino_GFX_Library.h>
+#include <LovyanGFX.hpp>
 #include <lvgl.h>
 #include "cinema_wallpaper_rgb565.h"
 #include "atvv_test_audio.h"
@@ -823,13 +929,12 @@ class PsramJsonAllocator : public ArduinoJson::Allocator {
 
 PsramJsonAllocator psramJsonAllocator;
 
-// These thresholded 1-bpp Montserrat fonts use one solid colour for every
-// illuminated glyph pixel. That avoids the pale antialiasing pixels visible
-// around LVGL's standard 4-bpp fonts on the physical 240x320 LCD.
-LV_FONT_DECLARE(lv_font_openremote_10);
-LV_FONT_DECLARE(lv_font_openremote_12);
-LV_FONT_DECLARE(lv_font_openremote_16);
-LV_FONT_DECLARE(lv_font_openremote_20);
+// Retained for compatibility with older saved layouts. The live UI now uses
+// LVGL's anti-aliased Montserrat fonts, matching the official OMOTE firmware.
+LV_FONT_DECLARE(lv_font_montserrat_10);
+LV_FONT_DECLARE(lv_font_montserrat_12);
+LV_FONT_DECLARE(lv_font_montserrat_16);
+LV_FONT_DECLARE(lv_font_montserrat_20);
 
 // ---------------------------------------------------------------------------
 // Rev 5 pin map
@@ -945,6 +1050,9 @@ static const uint16_t CHARGE_STATE_DEBOUNCE_MS = 300;
 static const uint16_t CHARGE_ANIMATION_FILL_MS = 2200;
 static const uint8_t MAX_PAGE_ICON_CACHE = 12;
 static const int16_t PAGE_SWIPE_THRESHOLD = 42;
+static const int16_t PAGE_DRAG_START_PIXELS = 9;
+static const int16_t PAGE_DRAG_COMMIT_PIXELS = 60;
+static const uint16_t PAGE_DRAG_SETTLE_MS = 150;
 static const uint16_t DNS_PORT = 53;
 static const char *PREFERENCES_NAMESPACE = "openremote";
 static const char *WEB_CONFIG_PATH = "/www/index.html";
@@ -1049,26 +1157,55 @@ static const uint8_t BLE_HID_REPORT_MAP[] = {
 };
 static const uint8_t BLE_HID_INPUT_BYTES = 10;
 
-Arduino_DataBus *bus = new Arduino_ESP32PAR8(
-  PIN_LCD_DC, PIN_LCD_CS, PIN_LCD_WR, PIN_LCD_RD,
-  PIN_LCD_D0, PIN_LCD_D1, PIN_LCD_D2, PIN_LCD_D3,
-  PIN_LCD_D4, PIN_LCD_D5, PIN_LCD_D6, PIN_LCD_D7
-);
+class OpenRemoteDisplay : public lgfx::LGFX_Device {
+ private:
+  lgfx::Panel_ILI9341 panel;
+  lgfx::Bus_Parallel8 bus;
 
-Arduino_ILI9341 *lcd = new Arduino_ILI9341(
-  bus,
-  PIN_LCD_RST,
-  0,      // Normal orientation with the LCD installed in the remote
-  false,
-  LCD_W,
-  LCD_H
-);
-Arduino_GFX *gfx = lcd;
+ public:
+  OpenRemoteDisplay() {
+    auto busConfig = bus.config();
+    busConfig.freq_write = 40000000;
+    busConfig.pin_wr = PIN_LCD_WR;
+    busConfig.pin_rd = PIN_LCD_RD;
+    busConfig.pin_rs = PIN_LCD_DC;
+    busConfig.pin_d0 = PIN_LCD_D0;
+    busConfig.pin_d1 = PIN_LCD_D1;
+    busConfig.pin_d2 = PIN_LCD_D2;
+    busConfig.pin_d3 = PIN_LCD_D3;
+    busConfig.pin_d4 = PIN_LCD_D4;
+    busConfig.pin_d5 = PIN_LCD_D5;
+    busConfig.pin_d6 = PIN_LCD_D6;
+    busConfig.pin_d7 = PIN_LCD_D7;
+    bus.config(busConfig);
+    panel.setBus(&bus);
 
-// LVGL draw buffers. Two partial buffers are enough and avoid full-screen RAM use.
+    auto panelConfig = panel.config();
+    panelConfig.pin_cs = PIN_LCD_CS;
+    panelConfig.pin_rst = PIN_LCD_RST;
+    panelConfig.pin_busy = -1;
+    panelConfig.memory_width = LCD_W;
+    panelConfig.memory_height = LCD_H;
+    panelConfig.panel_width = LCD_W;
+    panelConfig.panel_height = LCD_H;
+    panelConfig.offset_rotation = 2;
+    panel.config(panelConfig);
+    setPanel(&panel);
+  }
+};
+
+OpenRemoteDisplay tft;
+
+// Persistent native LVGL tiles are transferred through two DMA-safe 32-row
+// buffers. This remains true double buffering, while keeping each parallel-bus
+// transaction within the proven transfer size used by firmware 2.09/2.15.
 static lv_disp_draw_buf_t drawBuf;
-static lv_color_t lvBuf1[LCD_W * 32];
-static lv_color_t lvBuf2[LCD_W * 32];
+static lv_color_t lvFallbackBuf1[LCD_W * 32];
+static lv_color_t lvFallbackBuf2[LCD_W * 32];
+static lv_color_t *lvBuf1 = lvFallbackBuf1;
+static lv_color_t *lvBuf2 = lvFallbackBuf2;
+static uint32_t lvDrawBufferPixels = LCD_W * 32;
+static bool lvFullFrameDoubleBuffer = false;
 static lv_disp_drv_t dispDrv;
 static lv_indev_drv_t touchDrv;
 
@@ -1089,6 +1226,7 @@ struct RuntimeThemeStyle {
   char path[72];
   uint32_t glassColour;
   uint16_t split;
+  uint8_t rowCount;
   uint8_t glassOpacity;
   bool glassEnabled;
 };
@@ -1206,7 +1344,7 @@ uint8_t *activityTileCounts = nullptr;
 uint8_t DEVICE_COUNT = 0;
 uint8_t ACTIVITY_COUNT = 0;
 uint8_t MACRO_COUNT = 0;
-UiCommandBinding uiCommandBindings[MAX_DEVICE_COMMANDS] = {};
+UiCommandBinding *uiCommandBindings = nullptr;
 uint8_t uiCommandBindingCount = 0;
 DeviceCommand *heldRepeatCommand = nullptr;
 const DeviceCommand *heldVoiceSearchCommand = nullptr;
@@ -1306,9 +1444,12 @@ struct RuntimePage {
 RuntimePage pages[4];
 uint8_t pageCount = 2;
 uint8_t currentPage = 1;
+uint8_t deviceReturnPage = 1;
 int8_t pendingPageTransition = 0;
 int activeActivity = -1;
 int activeDevice = -1;
+int8_t pendingDeviceOpen = -1;
+int8_t pendingActivityOpen = -1;
 
 bool wifiOn = true;
 bool bluetoothOn = true;
@@ -1319,6 +1460,13 @@ bool raiseToWake = true;
 bool physicalRepeatEnabled = true;
 uint16_t physicalRepeatDelayMs = 400;
 uint8_t physicalRepeatRateHz = 9;
+bool debugSplitEnabled = true;
+bool debugTouchEnabled = false;
+bool debugCpuRamEnabled = false;
+bool debugAccelerometerEnabled = false;
+bool debugFpsEnabled = false;
+bool microphoneTestAudioEnabled = false;
+uint16_t debugRowPixels[5] = {246, 195, 144, 93, 42};
 bool sdReady = false;
 uint8_t brightness = 72;  // User-facing percentage: 0 to 100.
 uint8_t timeoutSeconds = 25;
@@ -1351,6 +1499,7 @@ enum SettingsView {
   SETTINGS_CLOCK_CITY,
   SETTINGS_DISPLAY,
   SETTINGS_BUTTONS,
+  SETTINGS_DEBUG,
   SETTINGS_BATTERY,
   SETTINGS_BACKUP,
   SETTINGS_ABOUT,
@@ -1369,6 +1518,13 @@ volatile bool webServerStopRequested = false;
 TaskHandle_t webServerTaskHandle = nullptr;
 TaskHandle_t atvvAudioTaskHandle = nullptr;
 SemaphoreHandle_t atvvNotifyMutex = nullptr;
+SemaphoreHandle_t microphoneMutex = nullptr;
+i2s_chan_handle_t microphoneRxChannel = nullptr;
+bool realMicrophoneActive = false;
+bool atvvStreamUsesTestAudio = false;
+volatile bool microphoneStopPending = false;
+int16_t microphoneAdpcmPredictor = 0;
+int8_t microphoneAdpcmStepIndex = 0;
 bool dnsServerStarted = false;
 bool networkStackActive = false;
 bool setupApActive = false;
@@ -1379,7 +1535,9 @@ bool bleShutdownInProgress = false;
 volatile bool bleSuspended = false;
 bool scheduledNtpWake = false;
 bool setupApPausedBle = false;
+bool webConfigPausedBle = false;
 volatile bool restartPending = false;
+volatile bool hardRestartPending = false;
 bool firmwareUploadOk = false;
 bool firmwareStageOk = false;
 bool webConfigUploadOk = false;
@@ -1598,6 +1756,14 @@ lv_obj_t *wallpaper = nullptr;
 lv_obj_t *topBar = nullptr;
 lv_obj_t *content = nullptr;
 lv_obj_t *dots = nullptr;
+lv_obj_t *splitDiagnosticLabel = nullptr;
+lv_obj_t *touchDiagnosticLabel = nullptr;
+lv_obj_t *cpuRamDiagnosticLabel = nullptr;
+lv_obj_t *accelerometerDiagnosticLabel = nullptr;
+lv_obj_t *fpsDiagnosticLabel = nullptr;
+lv_obj_t *splitDiagnosticAnchor = nullptr;
+int16_t splitDiagnosticAnchorY = INT16_MAX;
+int16_t splitDiagnosticLastY = INT16_MIN;
 lv_obj_t *deviceModal = nullptr;
 lv_obj_t *brightnessOverlay = nullptr;
 lv_obj_t *lockOverlay = nullptr;
@@ -1607,6 +1773,17 @@ bool physicalVoiceOverlayVisible = false;
 unsigned long physicalVoiceOverlayShowAfterMs = 0;
 lv_obj_t *brightnessPanel = nullptr;
 lv_obj_t *touchDot = nullptr;
+lv_obj_t *touchReticleTicks[4] = {nullptr, nullptr, nullptr, nullptr};
+static const uint8_t TOUCH_TRAIL_POINT_COUNT = 8;
+struct TouchTrailPoint {
+  lv_obj_t *dot;
+  unsigned long createdMs;
+  bool active;
+};
+TouchTrailPoint touchTrail[TOUCH_TRAIL_POINT_COUNT] = {};
+uint8_t nextTouchTrailPoint = 0;
+unsigned long lastTouchTrailPointMs = 0;
+unsigned long touchDiagnosticHoldUntilMs = 0;
 lv_obj_t *clockLabel = nullptr;
 lv_obj_t *batteryFill = nullptr;
 lv_obj_t *statusPill = nullptr;
@@ -1618,12 +1795,22 @@ lv_obj_t *wifiKeyboard = nullptr;
 lv_obj_t *setupApStatusLabel = nullptr;
 lv_obj_t *buttonTestPanel = nullptr;
 lv_obj_t *buttonTestLabel = nullptr;
+lv_obj_t *lcdRebootConfirmBox = nullptr;
+bool lcdRebootConfirmHard = false;
 lv_obj_t *clockRollers[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
 lv_obj_t *displayValueLabels[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
 lv_obj_t *buttonValueLabels[2] = {nullptr, nullptr};
+lv_obj_t *debugRowDropdowns[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
+int16_t debugRowDropdownMinimums[5] = {0, 0, 0, 0, 0};
 lv_obj_t *batteryMetricNameLabels[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
 lv_obj_t *batteryMetricValueLabels[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
 unsigned long nextStatusRefreshMs = 0;
+unsigned long nextDebugCpuRamRefreshMs = 0;
+unsigned long nextDebugAccelerometerRefreshMs = 0;
+unsigned long nextDebugFpsRefreshMs = 0;
+volatile uint32_t debugDisplayFrameCount = 0;
+uint32_t debugLastDisplayFrameCount = 0;
+unsigned long debugLastFpsSampleMs = 0;
 unsigned long nextBatteryPageRefreshMs = 0;
 unsigned long nextSetupApStatusRefreshMs = 0;
 unsigned long brightnessLastActivityMs = 0;
@@ -1640,28 +1827,58 @@ unsigned long chargingCandidateSinceMs = 0;
 unsigned long chargingAnimationStartMs = 0;
 bool touchWasDown = false;
 bool lvTouchDown = false;
+lv_indev_t *touchInputDevice = nullptr;
 bool activityDragActive = false;
 uint16_t touchStartX = 0;
 uint16_t touchStartY = 0;
 uint16_t touchLastX = 0;
 uint16_t touchLastY = 0;
-int8_t pendingPageDelta = 0;
-ActivitySliderUi activitySliderUi[MAX_ACTIVITY_TILES];
+ActivitySliderUi *activitySliderUi = nullptr;
 SPIClass sdSpi(FSPI);
 static lv_fs_drv_t sdLvglFsDriver;
-uint16_t *runtimeWallpaperPixels = nullptr;
-lv_img_dsc_t runtimeWallpaperDescriptor = {};
 struct CachedPageIcon {
   char path[96];
   uint8_t *pixels;
   lv_img_dsc_t descriptor;
 };
-CachedPageIcon pageIconCache[MAX_PAGE_ICON_CACHE] = {};
-uint8_t pageIconCacheCount = 0;
-char activeRuntimeThemePath[72] = "";
+
+struct PageUi {
+  lv_obj_t *tile = nullptr;
+  lv_obj_t *root = nullptr;
+  lv_obj_t *wallpaper = nullptr;
+  lv_obj_t *topBar = nullptr;
+  lv_obj_t *content = nullptr;
+  lv_obj_t *dots = nullptr;
+  lv_obj_t *clockLabel = nullptr;
+  lv_obj_t *statusPill = nullptr;
+  lv_obj_t *statusBattery = nullptr;
+  lv_obj_t *statusBatteryTerminal = nullptr;
+  lv_obj_t *batteryFill = nullptr;
+  uint16_t *wallpaperPixels = nullptr;
+  lv_img_dsc_t wallpaperDescriptor = {};
+  char themePath[72] = "";
+  CachedPageIcon iconCache[MAX_PAGE_ICON_CACHE] = {};
+  uint8_t iconCacheCount = 0;
+  UiCommandBinding commandBindings[MAX_DEVICE_COMMANDS] = {};
+  ActivitySliderUi sliderUi[MAX_ACTIVITY_TILES] = {};
+};
+
+static const uint8_t PAGE_SLOT_COUNT = 4;
+PageUi pageUi[PAGE_SLOT_COUNT];
+PageUi *boundPageUi = nullptr;
+lv_obj_t *uiRoot = nullptr;
+lv_obj_t *pageStrip = nullptr;
+bool pageStripChangePending = false;
+uint8_t pageStripPendingPage = 1;
+bool pageStripRebuildPending = false;
+bool pageStripRendering = false;
+uint8_t uiMutationDepth = 0;
+unsigned long touchAcceptAfterMs = 0;
+unsigned long touchReleasedSinceMs = 0;
+bool touchQuarantineActive = true;
 uint16_t *displayColourLut = nullptr;
 uint16_t *displayFlush565 = nullptr;
-uint8_t *displayFlush666 = nullptr;
+size_t displayFlushPixelCapacity = 0;
 bool displayColourLutActive = false;
 
 struct ScrollSafeSliderState {
@@ -1704,6 +1921,10 @@ static const uint8_t SD_FOLDER_COUNT = sizeof(sdFolders) / sizeof(sdFolders[0]);
 void renderCurrentPage();
 void rebuildPages();
 void changePage(int delta);
+void renderAllPageSlots();
+void configurePageStripDirections();
+void bindPageUi(uint8_t index);
+void requestPageStripRebuild();
 void createPhysicalVoiceOverlay();
 void servicePhysicalVoiceOverlay();
 void showPhysicalVoiceOverlay();
@@ -1727,6 +1948,7 @@ bool persistSettingsToRuntimeConfig();
 void rebuildDisplayColourLut();
 void applyDisplayControllerSettings();
 bool bluetoothRuntimeRequired();
+bool bluetoothActivitySessionRequired();
 void applyBluetoothState();
 void startBluetoothPairing();
 void forgetBluetoothPairing();
@@ -1735,11 +1957,14 @@ bool ensureBluetoothRuntimeDevice();
 void applyClockMode();
 void startNetworkStack();
 void stopNetworkStack();
+void parkNetworkStackForBle();
 void startSetupAccessPoint();
 void stopSetupAccessPoint(bool resumeStation = true);
 void configureWebServer();
 void requestWebServerListen(bool rebind = false);
 void requestWebServerStop();
+bool requestWebServerStopAndWait(uint32_t timeoutMs = 1800UL);
+bool recoverWifiRadio(wifi_mode_t targetMode, const char *reason);
 void renderSettingsHome();
 void renderWifiPage();
 void renderWifiPasswordPage();
@@ -1749,6 +1974,7 @@ void renderClockPage();
 void renderClockCityPage();
 void renderDisplayPage();
 void renderButtonsPage();
+void renderDebugPage();
 void renderBatteryPage();
 void renderBackupRestorePage();
 void renderAboutPage();
@@ -1776,6 +2002,10 @@ void serviceInternetTime(unsigned long now);
 void serviceWebControlRequests(unsigned long now);
 void serviceAtvvVoice(unsigned long now);
 void ensureAtvvAudioTask();
+void refreshDebugOverlayVisibility();
+void serviceDebugOverlay(unsigned long now);
+bool startRealMicrophoneCapture();
+void stopRealMicrophoneCapture();
 void serviceNetworkPower(unsigned long now);
 bool enterDeepPowerSleep(bool allowQrPage = false);
 void releaseDeepSleepPinHolds();
@@ -1813,11 +2043,17 @@ void lcdPowerOn() {
   buttonBacklight(false);
   digitalWrite(PIN_MIC_POWER, LOW);
   digitalWrite(PIN_SD_EN, HIGH);
-  digitalWrite(PIN_LCD_EN, LOW);
+  // Match OMOTE's Rev 5 startup sequence: place the LCD/touch rail in its
+  // inactive state before releasing any retained deep-sleep pin holds, then
+  // give it a clean off-to-on edge before the I2C master is started. Merely
+  // asserting ON here can leave the FT5x06 hibernating across an ESP_EN reset.
+  digitalWrite(PIN_LCD_EN, HIGH);
   // Deep sleep holds these pins at their off levels. Program every output
   // before releasing the holds so no pin can briefly float or reveal the
   // uninitialised white panel during the ESP32 restart.
   releaseDeepSleepPinHolds();
+  delay(40);
+  digitalWrite(PIN_LCD_EN, LOW);
   delay(120);
 }
 
@@ -2220,7 +2456,7 @@ void recordButtonDiagnostic(uint8_t key, uint8_t row, uint8_t col,
   Serial.printf("Button diagnostic %s: key=%u row=%u col=%u switch=S%u INT=GPIO%d\n",
                 PHYSICAL_BUTTON_NAMES[target], key, row, col, switchNumber, PIN_TCA_INT);
   pendingPageTransition = 0;
-  renderCurrentPage();
+  pendingUiRefresh = true;
   lastWakeMs = millis();
 }
 
@@ -2353,6 +2589,8 @@ void handleHardwareAllOff() {
 
   activeActivity = -1;
   activeDevice = -1;
+  pendingDeviceOpen = -1;
+  deviceReturnPage = 1;
   buttonDiagnosticActive = false;
   if (deviceModal) {
     lv_obj_del(deviceModal);
@@ -2361,7 +2599,7 @@ void handleHardwareAllOff() {
   rebuildPages();
   currentPage = pageCount > 1 ? 1 : 0;
   pendingPageTransition = -1;
-  renderCurrentPage();
+  renderAllPageSlots();
   applyBluetoothState();
   lastWakeMs = millis();
 }
@@ -2517,23 +2755,122 @@ bool readReg16BE(uint8_t address, uint8_t reg, uint16_t &value) {
   return true;
 }
 
-bool readTouch(uint16_t &x, uint16_t &y) {
+enum TouchSampleStatus : int8_t {
+  TOUCH_SAMPLE_INVALID = -1,
+  TOUCH_SAMPLE_RELEASED = 0,
+  TOUCH_SAMPLE_PRESSED = 1
+};
+
+TouchSampleStatus readTouchSample(uint16_t &x, uint16_t &y) {
   uint8_t data[5];
-  if (!readBytes(ADDR_TOUCH, 0x02, data, 5)) return false;
-  if ((data[0] & 0x0F) == 0) return false;
+  if (!readBytes(ADDR_TOUCH, 0x02, data, 5)) return TOUCH_SAMPLE_INVALID;
+  uint8_t pointCount = data[0] & 0x0F;
+  if (pointCount == 0) return TOUCH_SAMPLE_RELEASED;
+  if (pointCount != 1) return TOUCH_SAMPLE_INVALID;
 
   uint16_t rawX = ((uint16_t)(data[1] & 0x0F) << 8) | data[2];
   uint16_t rawY = ((uint16_t)(data[3] & 0x0F) << 8) | data[4];
-
-  if (rawX >= LCD_W) rawX = LCD_W - 1;
-  if (rawY >= LCD_H) rawY = LCD_H - 1;
+  if (rawX >= LCD_W || rawY >= LCD_H) return TOUCH_SAMPLE_INVALID;
 
   // The LCD now uses its normal rotation (0). The touch controller's native
   // coordinates run in the opposite direction, so rotate both axes by 180
   // degrees to keep touches aligned with the displayed controls.
   x = (LCD_W - 1) - rawX;
   y = (LCD_H - 1) - rawY;
-  return true;
+  return TOUCH_SAMPLE_PRESSED;
+}
+
+bool readTouch(uint16_t &x, uint16_t &y) {
+  // Firmware 2.09's direct one-frame read was the proven stable path on this
+  // Rev 5 board. Extra matching reads multiply traffic on the shared I2C bus
+  // and can push the ESP32 Arduino driver into ESP_ERR_INVALID_STATE.
+  return readTouchSample(x, y) == TOUCH_SAMPLE_PRESSED;
+}
+
+void sleepTouchController() {
+  // Do not put the FT5x06 into register-level hibernate here. On Rev 5 the
+  // touch controller shares the LCD rail and does not reliably accept the I2C
+  // wake sequence afterwards. Keep the low-current controller awake and reset
+  // only LVGL's gesture state before the display sleeps.
+  if (touchInputDevice) lv_indev_reset(touchInputDevice, nullptr);
+  lvTouchDown = false;
+  touchWasDown = false;
+  touchQuarantineActive = true;
+  touchAcceptAfterMs = millis() + 80UL;
+  touchReleasedSinceMs = 0;
+}
+
+void wakeTouchController(uint32_t settleMs = 80) {
+  if (touchInputDevice) lv_indev_reset(touchInputDevice, nullptr);
+  lvTouchDown = false;
+  touchWasDown = false;
+  touchQuarantineActive = true;
+  touchAcceptAfterMs = millis() + settleMs;
+  touchReleasedSinceMs = 0;
+}
+
+bool initialiseTouchController() {
+  // lcdPowerOn() already gave the shared display/touch rail a clean reset
+  // before Wire began. Wait for the controller's real address ACK without
+  // dismantling or power-cycling an active I2C bus.
+  bool addressReady = false;
+  for (uint8_t retry = 0; retry < 12 && !addressReady; retry++) {
+    addressReady = i2cDevicePresent(ADDR_TOUCH);
+    if (!addressReady) delay(20);
+  }
+  if (!addressReady) {
+    touchFound = false;
+    return false;
+  }
+
+  for (uint8_t attempt = 0; attempt < 3; attempt++) {
+    writeReg8(ADDR_TOUCH, 0x00, 0x00);
+    // PWR_MODE 0 is the stable continuously-scanned mode used by 2.09.
+    // Monitor mode (1) can defer scans and replay stale coordinates.
+    writeReg8(ADDR_TOUCH, 0xA5, 0x00);
+    delay(12);
+    uint8_t chipId = 0;
+    if (readReg8(ADDR_TOUCH, 0xA3, chipId) && chipId != 0x00 && chipId != 0xFF) {
+      writeReg8(ADDR_TOUCH, 0xA4, 0x00);
+      touchFound = true;
+      wakeTouchController(120);
+      Serial.printf("Touch: controller ready, id=0x%02X attempt=%u\n",
+                    chipId, (unsigned)(attempt + 1));
+      return true;
+    }
+    delay(25);
+  }
+  touchFound = false;
+  return false;
+}
+
+bool recoverTouchControllerPower() {
+  Serial.println("Touch: no ACK, retrying a full display/touch rail cycle");
+  Wire.end();
+  pinMode(PIN_I2C_SDA, INPUT_PULLUP);
+  pinMode(PIN_I2C_SCL, INPUT_PULLUP);
+  digitalWrite(PIN_LCD_EN, HIGH);
+  delay(180);
+  digitalWrite(PIN_LCD_EN, LOW);
+  delay(240);
+  Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
+  Wire.setClock(400000);
+  return initialiseTouchController();
+}
+
+uint8_t normaliseDeepSleepMinutes(int minutes) {
+  if (minutes <= 1) return 1;
+  minutes = constrain(minutes, 5, 30);
+  return (uint8_t)(((minutes + 2) / 5) * 5);
+}
+
+uint8_t deepSleepSliderIndex(uint8_t minutes) {
+  if (minutes <= 1) return 0;
+  return (uint8_t)constrain((minutes / 5), 1, 6);
+}
+
+uint8_t deepSleepMinutesForIndex(int index) {
+  return index <= 0 ? 1 : (uint8_t)(constrain(index, 1, 6) * 5);
 }
 
 bool configureLis3dhAwake() {
@@ -3015,6 +3352,10 @@ int findWifiProfile(const String &ssid) {
   return -1;
 }
 
+bool hasSelectedWifiProfile() {
+  return selectedWifiSsid.length() && findWifiProfile(selectedWifiSsid) >= 0;
+}
+
 void saveWifiProfiles() {
   preferences.begin(PREFERENCES_NAMESPACE, false);
   preferences.putUChar("wifiCnt", wifiProfileCount);
@@ -3029,8 +3370,8 @@ void saveWifiProfiles() {
       preferences.remove(passKey.c_str());
     }
   }
-  preferences.putString("ssid", selectedWifiSsid);
   int selected = findWifiProfile(selectedWifiSsid);
+  preferences.putString("ssid", selected >= 0 ? selectedWifiSsid : "");
   preferences.putString("pass", selected >= 0 ? wifiProfiles[selected].password : "");
   preferences.end();
 }
@@ -3057,12 +3398,14 @@ void saveWifiCredentials(const String &ssid, const String &password) {
 void forgetWifiCredentials(const String &ssid) {
   int index = findWifiProfile(ssid);
   if (index < 0) return;
+  bool wasSelected = selectedWifiSsid == ssid;
   for (uint8_t i = index + 1; i < wifiProfileCount; i++) {
     wifiProfiles[i - 1] = wifiProfiles[i];
   }
   if (wifiProfileCount) wifiProfileCount--;
   wifiProfiles[wifiProfileCount].ssid = "";
   wifiProfiles[wifiProfileCount].password = "";
+  if (wasSelected) selectedWifiSsid = "";
   saveWifiProfiles();
 }
 
@@ -3081,8 +3424,8 @@ void loadSettings() {
   slideToUnlock = preferences.getBool("lock", true);
   brightness = preferences.getUChar("bright", 72);
   timeoutSeconds = preferences.getUChar("sleep", 25);
-  deepSleepMinutes = constrain((int)preferences.getUChar("deepMin", 10), 5, 30);
-  deepSleepMinutes = ((deepSleepMinutes + 2) / 5) * 5;
+  deepSleepMinutes = normaliseDeepSleepMinutes(
+    preferences.getUChar("deepMin", 10));
   wakeSensitivity = constrain((int)preferences.getUChar("wake", 58), 1, 100);
   displayGamma = constrain((int)preferences.getUShort("gamma", 100), 50, 250);
   displaySaturation = constrain((int)preferences.getUShort("saturation", 100), 0, 200);
@@ -3096,6 +3439,19 @@ void loadSettings() {
   physicalRepeatRateHz = constrain(
     (int)preferences.getUChar("btnRate", 9),
     (int)BUTTON_REPEAT_RATE_MIN_HZ, (int)BUTTON_REPEAT_RATE_MAX_HZ);
+  debugSplitEnabled = preferences.getBool("dbgSplit", true);
+  debugTouchEnabled = preferences.getBool("dbgTouch", false);
+  debugCpuRamEnabled = preferences.getBool("dbgCpu", false);
+  debugAccelerometerEnabled = preferences.getBool("dbgAccel", false);
+  debugFpsEnabled = preferences.getBool("dbgFps", false);
+  microphoneTestAudioEnabled = preferences.getBool("micTest", false);
+  static const uint16_t defaultRows[5] = {246, 195, 144, 93, 42};
+  for (uint8_t i = 0; i < 5; i++) {
+    char key[8];
+    snprintf(key, sizeof(key), "dbgRow%u", i + 1);
+    debugRowPixels[i] = constrain(
+      (int)preferences.getUShort(key, defaultRows[i]), 0, LCD_H - 1);
+  }
   manualClockEpoch = preferences.getULong64("manualTs", 0);
   clockCityName = preferences.getString("city", "Canberra");
   clockUtcOffsetMinutes = constrain(
@@ -3169,6 +3525,17 @@ void saveSettings() {
   preferences.putBool("btnRpt", physicalRepeatEnabled);
   preferences.putUShort("btnDelay", physicalRepeatDelayMs);
   preferences.putUChar("btnRate", physicalRepeatRateHz);
+  preferences.putBool("dbgSplit", debugSplitEnabled);
+  preferences.putBool("dbgTouch", debugTouchEnabled);
+  preferences.putBool("dbgCpu", debugCpuRamEnabled);
+  preferences.putBool("dbgAccel", debugAccelerometerEnabled);
+  preferences.putBool("dbgFps", debugFpsEnabled);
+  preferences.putBool("micTest", microphoneTestAudioEnabled);
+  for (uint8_t i = 0; i < 5; i++) {
+    char key[8];
+    snprintf(key, sizeof(key), "dbgRow%u", i + 1);
+    preferences.putUShort(key, debugRowPixels[i]);
+  }
   preferences.putULong64("manualTs", manualClockEpoch);
   preferences.putString("city", clockCityName);
   preferences.putShort("utcOffset", clockUtcOffsetMinutes);
@@ -3191,7 +3558,7 @@ void scheduleNetworkShutdown(uint32_t delayMs = NETWORK_IDLE_SHUTDOWN_MS) {
 
 bool ensureStationConnected(uint32_t timeoutMs = 15000UL) {
   if (WiFi.status() == WL_CONNECTED) return true;
-  if (!wifiOn || !selectedWifiSsid.length()) return false;
+  if (!wifiOn || !hasSelectedWifiProfile()) return false;
   startNetworkStack();
   unsigned long started = millis();
   while (WiFi.status() != WL_CONNECTED &&
@@ -3229,7 +3596,7 @@ void applyClockMode() {
 }
 
 void requestInternetTimeSync() {
-  if (!clockUseInternetTime || !wifiOn || !selectedWifiSsid.length()) return;
+  if (!clockUseInternetTime || !wifiOn || !hasSelectedWifiProfile()) return;
   ntpSyncPending = true;
   ntpConfigured = false;
   ntpSyncStartedMs = millis();
@@ -3282,7 +3649,8 @@ void serviceNetworkPower(unsigned long now) {
     (settingsView == SETTINGS_WIFI || settingsView == SETTINGS_WIFI_PASSWORD ||
      settingsView == SETTINGS_WIFI_QR);
   if (!wifiUiActive && !ntpSyncPending && !wifiScanPending && !wifiConnectPending) {
-    stopNetworkStack();
+    if (bluetoothActivitySessionRequired()) parkNetworkStackForBle();
+    else stopNetworkStack();
   }
 }
 
@@ -3427,15 +3795,178 @@ bool atvvSendCapabilities() {
   return true;
 }
 
+static const int16_t MICROPHONE_ADPCM_STEP_TABLE[89] = {
+  7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31,
+  34, 37, 41, 45, 50, 55, 60, 66, 73, 80, 88, 97, 107, 118, 130,
+  143, 157, 173, 190, 209, 230, 253, 279, 307, 337, 371, 408, 449,
+  494, 544, 598, 658, 724, 796, 876, 963, 1060, 1166, 1282, 1411,
+  1552, 1707, 1878, 2066, 2272, 2499, 2749, 3024, 3327, 3660, 4026,
+  4428, 4871, 5358, 5894, 6484, 7132, 7845, 8630, 9493, 10442,
+  11487, 12635, 13899, 15289, 16818, 18500, 20350, 22385, 24623,
+  27086, 29794, 32767
+};
+
+static const int8_t MICROPHONE_ADPCM_INDEX_TABLE[16] = {
+  -1, -1, -1, -1, 2, 4, 6, 8,
+  -1, -1, -1, -1, 2, 4, 6, 8
+};
+
+uint8_t encodeMicrophoneAdpcmSample(int16_t sample) {
+  int step = MICROPHONE_ADPCM_STEP_TABLE[microphoneAdpcmStepIndex];
+  int difference = (int)sample - microphoneAdpcmPredictor;
+  uint8_t code = 0;
+  if (difference < 0) {
+    code = 8;
+    difference = -difference;
+  }
+
+  int delta = step >> 3;
+  if (difference >= step) {
+    code |= 4;
+    difference -= step;
+    delta += step;
+  }
+  step >>= 1;
+  if (difference >= step) {
+    code |= 2;
+    difference -= step;
+    delta += step;
+  }
+  step >>= 1;
+  if (difference >= step) {
+    code |= 1;
+    delta += step;
+  }
+
+  if (code & 8) microphoneAdpcmPredictor -= delta;
+  else microphoneAdpcmPredictor += delta;
+  microphoneAdpcmPredictor = constrain((int)microphoneAdpcmPredictor, -32768, 32767);
+  microphoneAdpcmStepIndex = constrain(
+    (int)microphoneAdpcmStepIndex + MICROPHONE_ADPCM_INDEX_TABLE[code], 0, 88);
+  return code;
+}
+
+bool startRealMicrophoneCapture() {
+  if (realMicrophoneActive) return true;
+  if (webConfigTransferActive || usbSdTransferActive() || setupApActive) {
+    Serial.println("I2S microphone: shared SD pins are busy");
+    return false;
+  }
+  if (!microphoneMutex) microphoneMutex = xSemaphoreCreateMutex();
+  if (!microphoneMutex) return false;
+
+  if (sdReady) {
+    sdReady = false;
+    SD.end();
+    sdSpi.end();
+  }
+  pinMode(PIN_SD_CS, OUTPUT);
+  digitalWrite(PIN_SD_CS, HIGH);
+  digitalWrite(PIN_SD_EN, HIGH);
+  pinMode(PIN_MIC_POWER, OUTPUT);
+  digitalWrite(PIN_MIC_POWER, HIGH);
+  delay(20);
+
+  i2s_chan_config_t channelConfig = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
+  channelConfig.dma_desc_num = 4;
+  channelConfig.dma_frame_num = 80;
+  esp_err_t error = i2s_new_channel(&channelConfig, nullptr, &microphoneRxChannel);
+  if (error == ESP_OK) {
+    i2s_std_config_t config = {
+      .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(16000),
+      .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
+        I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO),
+      .gpio_cfg = {
+        .mclk = I2S_GPIO_UNUSED,
+        .bclk = (gpio_num_t)PIN_MIC_BCLK,
+        .ws = (gpio_num_t)PIN_MIC_WS,
+        .dout = I2S_GPIO_UNUSED,
+        .din = (gpio_num_t)PIN_MIC_DATA,
+        .invert_flags = {
+          .mclk_inv = false,
+          .bclk_inv = false,
+          .ws_inv = false,
+        },
+      },
+    };
+    config.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
+    error = i2s_channel_init_std_mode(microphoneRxChannel, &config);
+    if (error == ESP_OK) error = i2s_channel_enable(microphoneRxChannel);
+  }
+  if (error != ESP_OK) {
+    Serial.printf("I2S microphone: initialise failed (%d)\n", (int)error);
+    if (microphoneRxChannel) {
+      i2s_del_channel(microphoneRxChannel);
+      microphoneRxChannel = nullptr;
+    }
+    digitalWrite(PIN_MIC_POWER, LOW);
+    sdReady = initSdStorage();
+    return false;
+  }
+
+  microphoneAdpcmPredictor = 0;
+  microphoneAdpcmStepIndex = 0;
+  realMicrophoneActive = true;
+  Serial.println("I2S microphone: live capture ready");
+  return true;
+}
+
+void stopRealMicrophoneCapture() {
+  if (!realMicrophoneActive && !microphoneRxChannel) return;
+  if (microphoneMutex) xSemaphoreTake(microphoneMutex, portMAX_DELAY);
+  if (microphoneRxChannel) {
+    i2s_channel_disable(microphoneRxChannel);
+    i2s_del_channel(microphoneRxChannel);
+    microphoneRxChannel = nullptr;
+  }
+  realMicrophoneActive = false;
+  digitalWrite(PIN_MIC_POWER, LOW);
+  if (microphoneMutex) xSemaphoreGive(microphoneMutex);
+  delay(2);
+  sdReady = initSdStorage();
+  Serial.printf("I2S microphone: stopped; SD %s\n",
+                sdReady ? "restored" : "unavailable");
+}
+
+bool readRealMicrophoneAdpcmFrame(uint8_t *frame) {
+  if (!frame || !realMicrophoneActive || !microphoneRxChannel || !microphoneMutex) return false;
+  int32_t samples[80] = {};
+  size_t bytesRead = 0;
+  if (xSemaphoreTake(microphoneMutex, pdMS_TO_TICKS(20)) != pdTRUE) return false;
+  esp_err_t error = i2s_channel_read(microphoneRxChannel, samples, sizeof(samples),
+                                     &bytesRead, pdMS_TO_TICKS(12));
+  if (error == ESP_OK && bytesRead >= sizeof(samples)) {
+    for (uint8_t i = 0; i < ATVV_AUDIO_FRAME_BYTES; i++) {
+      int32_t first = samples[i * 4] >> 14;
+      int32_t second = samples[i * 4 + 2] >> 14;
+      uint8_t low = encodeMicrophoneAdpcmSample(
+        (int16_t)constrain(first, (int32_t)-32768, (int32_t)32767));
+      uint8_t high = encodeMicrophoneAdpcmSample(
+        (int16_t)constrain(second, (int32_t)-32768, (int32_t)32767));
+      frame[i] = low | (high << 4);
+    }
+  }
+  xSemaphoreGive(microphoneMutex);
+  return error == ESP_OK && bytesRead >= sizeof(samples);
+}
+
 bool atvvStartAudio(uint8_t reason, uint8_t streamId) {
   if (!atvvRx || !atvvRxCccd || !atvvRxCccd->getNotifications()) {
     Serial.println("ATVV AUDIO_START not sent: Chromecast audio notifications are off");
     return false;
   }
+  atvvStreamUsesTestAudio = microphoneTestAudioEnabled;
+  if (!atvvStreamUsesTestAudio && !startRealMicrophoneCapture()) {
+    Serial.println("ATVV AUDIO_START not sent: real I2S microphone unavailable");
+    return false;
+  }
   uint8_t packet[] = {
     ATVV_AUDIO_START, reason, ATVV_CODEC_ADPCM_8KHZ, streamId
   };
-  if (!atvvNotifyControlPacket(packet, sizeof(packet))) return false;
+  if (!atvvNotifyControlPacket(packet, sizeof(packet))) {
+    if (!atvvStreamUsesTestAudio) stopRealMicrophoneCapture();
+    return false;
+  }
   atvvStreamId = streamId;
   atvvAudioFrameNumber = 0;
   atvvTestAudioOffset = 0;
@@ -3444,15 +3975,22 @@ bool atvvStartAudio(uint8_t reason, uint8_t streamId) {
   atvvNextAudioFrameMs = atvvAudioStartedMs;
   atvvAudioStarted = true;
   atvvVoiceState = ATVV_VOICE_STREAMING;
-  if (!atvvSendAudioSync(0, OPENREMOTE_ATVV_TEST_INITIAL_PREDICTOR,
-                         OPENREMOTE_ATVV_TEST_INITIAL_STEP_INDEX)) {
-    Serial.println("ATVV test phrase: initial AUDIO_SYNC failed");
+  int16_t initialPredictor = atvvStreamUsesTestAudio
+    ? OPENREMOTE_ATVV_TEST_INITIAL_PREDICTOR : microphoneAdpcmPredictor;
+  uint8_t initialStep = atvvStreamUsesTestAudio
+    ? OPENREMOTE_ATVV_TEST_INITIAL_STEP_INDEX : microphoneAdpcmStepIndex;
+  if (!atvvSendAudioSync(0, initialPredictor, initialStep)) {
+    Serial.println("ATVV audio: initial AUDIO_SYNC failed");
   }
-  Serial.printf("ATVV test phrase: streaming %u bytes (%u frames, %.2f s)\n",
-                (unsigned)OPENREMOTE_ATVV_TEST_AUDIO_BYTES,
-                (unsigned)(OPENREMOTE_ATVV_TEST_AUDIO_BYTES /
-                           ATVV_AUDIO_FRAME_BYTES),
-                OPENREMOTE_ATVV_TEST_PCM_SAMPLES / 8000.0f);
+  if (atvvStreamUsesTestAudio) {
+    Serial.printf("ATVV test phrase: streaming %u bytes (%u frames, %.2f s)\n",
+                  (unsigned)OPENREMOTE_ATVV_TEST_AUDIO_BYTES,
+                  (unsigned)(OPENREMOTE_ATVV_TEST_AUDIO_BYTES /
+                             ATVV_AUDIO_FRAME_BYTES),
+                  OPENREMOTE_ATVV_TEST_PCM_SAMPLES / 8000.0f);
+  } else {
+    Serial.println("ATVV microphone: streaming live 8 kHz IMA ADPCM");
+  }
   ensureAtvvAudioTask();
   if (atvvAudioTaskHandle) xTaskNotifyGive(atvvAudioTaskHandle);
   return true;
@@ -3463,6 +4001,7 @@ bool atvvStopAudio(uint8_t reason) {
   atvvAudioStarted = false;
   uint8_t packet[] = {ATVV_AUDIO_STOP, reason};
   bool sent = atvvNotifyControlPacket(packet, sizeof(packet));
+  if (!atvvStreamUsesTestAudio) stopRealMicrophoneCapture();
   return sent;
 }
 
@@ -3471,12 +4010,20 @@ void atvvSendAudioFrame() {
       !atvvRxCccd->getNotifications()) return;
   uint8_t frame[ATVV_AUDIO_FRAME_BYTES] = {0};
   bool switchToSilence = false;
-  if (!atvvTestAudioFinished &&
-      atvvTestAudioOffset < OPENREMOTE_ATVV_TEST_AUDIO_BYTES) {
-    memcpy_P(frame, OPENREMOTE_ATVV_TEST_AUDIO + atvvTestAudioOffset,
-             sizeof(frame));
-  } else if (!atvvTestAudioFinished) {
-    switchToSilence = true;
+  if (atvvStreamUsesTestAudio) {
+    if (!atvvTestAudioFinished &&
+        atvvTestAudioOffset < OPENREMOTE_ATVV_TEST_AUDIO_BYTES) {
+      memcpy_P(frame, OPENREMOTE_ATVV_TEST_AUDIO + atvvTestAudioOffset,
+               sizeof(frame));
+    } else if (!atvvTestAudioFinished) {
+      switchToSilence = true;
+    }
+  } else if (!readRealMicrophoneAdpcmFrame(frame)) {
+    for (uint8_t i = 0; i < sizeof(frame); i++) {
+      uint8_t low = encodeMicrophoneAdpcmSample(0);
+      uint8_t high = encodeMicrophoneAdpcmSample(0);
+      frame[i] = low | (high << 4);
+    }
   }
   if (switchToSilence) {
     if (!atvvSendAudioSync(static_cast<uint16_t>(atvvAudioFrameNumber), 0, 0)) {
@@ -3494,7 +4041,9 @@ void atvvSendAudioFrame() {
   atvvRx->setValue(frame, sizeof(frame));
   atvvRx->notify();
   if (atvvNotifyMutex) xSemaphoreGive(atvvNotifyMutex);
-  if (!atvvTestAudioFinished) atvvTestAudioOffset += sizeof(frame);
+  if (atvvStreamUsesTestAudio && !atvvTestAudioFinished) {
+    atvvTestAudioOffset += sizeof(frame);
+  }
   atvvAudioFrameNumber++;
 }
 
@@ -3728,6 +4277,7 @@ class OpenRemoteBleServerCallbacks : public BLEServerCallbacks {
 
   void onDisconnect(BLEServer *server) override {
     bleConnected = false;
+    if (realMicrophoneActive) microphoneStopPending = true;
     heldVoiceSearchCommand = nullptr;
     heldVoiceSearchFromTouch = false;
     heldVoiceSearchPhysicalKey = 0;
@@ -3826,7 +4376,8 @@ bool bluetoothRuntimeRequired() {
 void applyBluetoothState() {
   bool shouldRun = bluetoothOn && (blePairingMode || bleBonded) &&
                    bluetoothRuntimeRequired() && !scheduledNtpWake &&
-                   !setupApActive && !setupApPausedBle;
+                   !setupApActive && !setupApPausedBle &&
+                   !webConfigPausedBle;
   if (shouldRun && !bleReady && !setupApActive && !setupApPausedBle) {
     if (!BLEDevice::init(BLE_HID_NAME)) {
       Serial.println("BLE HID: init failed");
@@ -3871,7 +4422,7 @@ void applyBluetoothState() {
     if (blePairingMode || bleBonded) advertiseBluetoothHid();
     Serial.printf("BLE HID: ready, bonded=%s ATVV=%s\n",
                   bleBonded ? "yes" : "no", atvvReady ? "ready" : "failed");
-  } else if (shouldRun && bleReady) {
+  } else if (shouldRun && bleReady && !webConfigPausedBle) {
     if (bleSuspended) {
       bleSuspended = false;
       Serial.println("BLE HID: resumed");
@@ -4212,6 +4763,77 @@ void handleWifiNetworksApi() {
   sendJson(200, body);
 }
 
+bool validDefaultThemeWallpaper(const char *path) {
+  if (!sdReady || !SD.exists(path)) return false;
+  File file = SD.open(path, FILE_READ);
+  const size_t expected = LCD_W * LCD_H * sizeof(uint16_t);
+  if (!file || file.size() != expected) {
+    if (file) file.close();
+    return false;
+  }
+  uint8_t buffer[256];
+  bool havePixel = false;
+  uint16_t firstPixel = 0;
+  uint32_t visiblePixels = 0;
+  uint32_t changedPixels = 0;
+  while (file.available()) {
+    size_t count = file.read(buffer, sizeof(buffer));
+    for (size_t i = 0; i + 1 < count; i += 2) {
+      uint16_t pixel = (uint16_t)buffer[i] | ((uint16_t)buffer[i + 1] << 8);
+      if (!havePixel) {
+        firstPixel = pixel;
+        havePixel = true;
+      }
+      if (pixel != 0) visiblePixels++;
+      if (pixel != firstPixel) changedPixels++;
+    }
+  }
+  file.close();
+  return havePixel && visiblePixels > 256 && changedPixels > 256;
+}
+
+bool validDefaultThemePreview(const char *path) {
+  if (!sdReady || !SD.exists(path)) return false;
+  File file = SD.open(path, FILE_READ);
+  if (!file || file.size() < 128) {
+    if (file) file.close();
+    return false;
+  }
+  uint8_t signature[8] = {};
+  bool valid = file.read(signature, sizeof(signature)) == sizeof(signature) &&
+    signature[0] == 0x89 && signature[1] == 'P' && signature[2] == 'N' &&
+    signature[3] == 'G' && signature[4] == 0x0D && signature[5] == 0x0A &&
+    signature[6] == 0x1A && signature[7] == 0x0A;
+  file.close();
+  return valid;
+}
+
+bool defaultThemeAssetsReady(const char *id) {
+  String base = String("/themes/Default/") + id;
+  return validDefaultThemeWallpaper((base + ".rgb565").c_str()) &&
+         validDefaultThemePreview((base + ".png").c_str());
+}
+
+void handleThemeStatusApi() {
+  if (!requestAuthorized()) {
+    sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
+    return;
+  }
+  JsonDocument doc;
+  doc["ok"] = true;
+  JsonObject assets = doc["assets"].to<JsonObject>();
+  assets["smooth_blue"] = defaultThemeAssetsReady("smooth_blue");
+  assets["obsidian_silk"] = defaultThemeAssetsReady("obsidian_silk");
+  assets["aurora_glass"] = defaultThemeAssetsReady("aurora_glass");
+  assets["champagne_noir"] = defaultThemeAssetsReady("champagne_noir");
+  assets["grand_cinema"] = defaultThemeAssetsReady("grand_cinema");
+  assets["alpine_ember"] = defaultThemeAssetsReady("alpine_ember");
+  assets["midnight_penthouse"] = defaultThemeAssetsReady("midnight_penthouse");
+  String body;
+  serializeJson(doc, body);
+  sendJson(200, body);
+}
+
 void handleWifiScanApi() {
   if (!requestAuthorized()) {
     sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
@@ -4298,8 +4920,8 @@ void applySettingsJson(JsonVariantConst settings) {
   slideToUnlock = settings["slideToUnlock"] | slideToUnlock;
   brightness = constrain((int)(settings["brightness"] | brightness), 5, 100);
   timeoutSeconds = constrain((int)(settings["sleepSeconds"] | timeoutSeconds), 5, 120);
-  deepSleepMinutes = constrain((int)(settings["deepSleepMinutes"] | deepSleepMinutes), 5, 30);
-  deepSleepMinutes = ((deepSleepMinutes + 2) / 5) * 5;
+  deepSleepMinutes = normaliseDeepSleepMinutes(
+    settings["deepSleepMinutes"] | deepSleepMinutes);
   wakeSensitivity = constrain((int)(settings["wakeSensitivity"] | wakeSensitivity), 1, 100);
   displayGamma = constrain((int)(settings["displayGamma"] | displayGamma), 50, 250);
   displaySaturation = constrain((int)(settings["displaySaturation"] | displaySaturation), 0, 200);
@@ -4313,6 +4935,21 @@ void applySettingsJson(JsonVariantConst settings) {
   physicalRepeatRateHz = constrain(
     (int)(settings["physicalRepeatRateHz"] | physicalRepeatRateHz),
     (int)BUTTON_REPEAT_RATE_MIN_HZ, (int)BUTTON_REPEAT_RATE_MAX_HZ);
+  debugSplitEnabled = settings["debugSplit"] | debugSplitEnabled;
+  debugTouchEnabled = settings["debugTouch"] | debugTouchEnabled;
+  debugCpuRamEnabled = settings["debugCpuRam"] | debugCpuRamEnabled;
+  debugAccelerometerEnabled =
+    settings["debugAccelerometer"] | debugAccelerometerEnabled;
+  debugFpsEnabled = settings["debugFps"] | debugFpsEnabled;
+  microphoneTestAudioEnabled =
+    settings["microphoneTestAudio"] | microphoneTestAudioEnabled;
+  JsonArrayConst debugRows = settings["debugRowPixels"].as<JsonArrayConst>();
+  if (!debugRows.isNull()) {
+    for (uint8_t i = 0; i < 5 && i < debugRows.size(); i++) {
+      debugRowPixels[i] = constrain(
+        (int)(debugRows[i] | debugRowPixels[i]), 0, LCD_H - 1);
+    }
+  }
   buttonIconSize = constrain((int)(settings["buttonIconSize"] | buttonIconSize), 20, 64);
   buttonTextSize = constrain((int)(settings["buttonTextSize"] | buttonTextSize), 10, 24);
   activityIconSize = constrain((int)(settings["activityIconSize"] | activityIconSize), 20, 64);
@@ -5307,6 +5944,30 @@ uint32_t parseThemeColour(const char *value, uint32_t fallback) {
   return end && *end == '\0' ? colour : fallback;
 }
 
+uint8_t themeRowCountForSplit(int split) {
+  static const uint16_t canonicalSplits[5] = {246, 195, 144, 93, 42};
+  uint8_t bestRow = 1;
+  int bestDistance = abs(split - (int)canonicalSplits[0]);
+  for (uint8_t index = 1; index < 5; index++) {
+    int distance = abs(split - (int)canonicalSplits[index]);
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      bestRow = index + 1;
+    }
+  }
+  return bestRow;
+}
+
+void applyRuntimeThemeRowCalibration() {
+  for (uint8_t index = 0; index < runtimeThemeCount; index++) {
+    RuntimeThemeStyle &theme = runtimeThemes[index];
+    if (theme.rowCount < 1 || theme.rowCount > 5) {
+      theme.rowCount = themeRowCountForSplit(theme.split);
+    }
+    theme.split = debugRowPixels[theme.rowCount - 1];
+  }
+}
+
 RuntimeThemeStyle *findRuntimeThemeStyle(const char *path) {
   if (!path || !path[0]) return nullptr;
   for (uint8_t i = 0; i < runtimeThemeCount; i++) {
@@ -5370,6 +6031,8 @@ void loadRuntimeModel(JsonDocument &doc) {
   // indexes from being rendered after a WebConfig sync removes or reorders data.
   activeActivity = -1;
   activeDevice = -1;
+  pendingDeviceOpen = -1;
+  deviceReturnPage = 1;
   if (currentPage > 1) currentPage = 1;
   bool smartBindingsApplied[MAX_RUNTIME_DEVICES] = {};
   clearRuntimeCommands();
@@ -5408,7 +6071,9 @@ void loadRuntimeModel(JsonDocument &doc) {
     if (!path[0]) continue;
     RuntimeThemeStyle &theme = runtimeThemes[runtimeThemeCount++];
     strlcpy(theme.path, path, sizeof(theme.path));
-    theme.split = constrain((int)(source["split"] | 62), 42, 292);
+    int configuredSplit = constrain((int)(source["split"] | 144), 0, LCD_H - 1);
+    theme.rowCount = themeRowCountForSplit(configuredSplit);
+    theme.split = debugRowPixels[theme.rowCount - 1];
     theme.glassEnabled = source["glassEnabled"] | true;
     theme.glassColour = parseThemeColour(source["glassColour"] | "#24384d", 0x24384D);
     int opacityPercent = constrain((int)(source["glassTransparency"] | 25), 0, 100);
@@ -5715,8 +6380,9 @@ void loadRuntimeModel(JsonDocument &doc) {
   }
 
   applySettingsJson(doc["settings"]);
+  applyRuntimeThemeRowCalibration();
   rebuildPages();
-  pendingUiRefresh = true;
+  requestPageStripRebuild();
   Serial.printf("Runtime model: %u devices, %u activities\n", DEVICE_COUNT, ACTIVITY_COUNT);
 }
 
@@ -5794,6 +6460,14 @@ bool persistSettingsToRuntimeConfig() {
   settings["physicalRepeatEnabled"] = physicalRepeatEnabled;
   settings["physicalRepeatDelayMs"] = physicalRepeatDelayMs;
   settings["physicalRepeatRateHz"] = physicalRepeatRateHz;
+  settings["debugSplit"] = debugSplitEnabled;
+  settings["debugTouch"] = debugTouchEnabled;
+  settings["debugCpuRam"] = debugCpuRamEnabled;
+  settings["debugAccelerometer"] = debugAccelerometerEnabled;
+  settings["debugFps"] = debugFpsEnabled;
+  settings["microphoneTestAudio"] = microphoneTestAudioEnabled;
+  JsonArray debugRows = settings["debugRowPixels"].to<JsonArray>();
+  for (uint8_t i = 0; i < 5; i++) debugRows.add(debugRowPixels[i]);
   settings["buttonIconSize"] = buttonIconSize;
   settings["buttonTextSize"] = buttonTextSize;
   settings["activityIconSize"] = activityIconSize;
@@ -8238,6 +8912,7 @@ void configureWebServer() {
   webServer.on("/api/status", HTTP_GET, handleStatusApi);
   webServer.on("/api/clock", HTTP_POST, handleClockSettingsApi);
   webServer.on("/api/wifi/networks", HTTP_GET, handleWifiNetworksApi);
+  webServer.on("/api/themes/status", HTTP_GET, handleThemeStatusApi);
   webServer.on("/api/wifi/scan", HTTP_POST, handleWifiScanApi);
   webServer.on("/api/wifi/connect", HTTP_POST, handleWifiConnectApi);
   webServer.on("/api/wifi/forget", HTTP_POST, handleWifiForgetApi);
@@ -8385,6 +9060,16 @@ void requestWebServerStop() {
   if (webServerTaskHandle) xTaskNotifyGive(webServerTaskHandle);
 }
 
+bool requestWebServerStopAndWait(uint32_t timeoutMs) {
+  requestWebServerStop();
+  unsigned long started = millis();
+  while ((webServerStarted || webServerStopRequested) &&
+         (uint32_t)(millis() - started) < timeoutMs) {
+    delay(2);
+  }
+  return !webServerStarted && !webServerStopRequested;
+}
+
 void ensureSetupIdentity() {
   if (setupApSsid.length() && setupToken.length()) return;
   uint64_t chipId = ESP.getEfuseMac();
@@ -8394,17 +9079,66 @@ void ensureSetupIdentity() {
   setupToken = String((uint32_t)(chipId >> 16), HEX) + String((uint32_t)chipId, HEX);
 }
 
+bool recoverWifiRadio(wifi_mode_t targetMode, const char *reason) {
+  if (webServerStarted && !requestWebServerStopAndWait()) {
+    Serial.printf("Wi-Fi: HTTP worker blocked recovery for %s\n",
+                  reason ? reason : "operation");
+    return false;
+  }
+  if (wifiScanPending) WiFi.scanDelete();
+  wifiScanPending = false;
+  wifiScanStartPending = false;
+  MDNS.end();
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(false);
+  // Always perform a cold radio transition. Leaving STA partially alive while
+  // BLE owns the shared RF hardware is what made scans/AP startup remain dead
+  // until a physical ESP32 reset.
+  WiFi.disconnect(false, false);
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_OFF);
+  networkStackActive = false;
+  delay(180);
+
+  for (uint8_t attempt = 1; attempt <= 3; attempt++) {
+    if (WiFi.mode(targetMode)) {
+      delay(120);
+      if (WiFi.getMode() == targetMode) {
+        WiFi.setSleep(false);
+        Serial.printf("Wi-Fi: radio recovered for %s on attempt %u\n",
+                      reason ? reason : "operation", (unsigned)attempt);
+        return true;
+      }
+    }
+    WiFi.mode(WIFI_OFF);
+    delay(180);
+  }
+  Serial.printf("Wi-Fi: radio recovery failed for %s\n",
+                reason ? reason : "operation");
+  return false;
+}
+
 void startNetworkStack() {
-  if (!wifiOn || networkStackActive) return;
+  if (!wifiOn) return;
   ensureSetupIdentity();
 
   networkShutdownAtMs = 0;
   WiFi.persistent(false);
   WiFi.setSleep(false);
   WiFi.setAutoReconnect(true);
-  WiFi.mode(WIFI_STA);
 
-  if (selectedWifiSsid.length()) {
+  wifi_mode_t actualMode = WiFi.getMode();
+  bool stationMode = actualMode == WIFI_STA || actualMode == WIFI_AP_STA;
+  if (!stationMode) networkStackActive = false;
+  if (WiFi.status() == WL_CONNECTED && stationMode) {
+    networkStackActive = true;
+    if (MDNS.begin("openremote")) MDNS.addService("http", "tcp", 80);
+    return;
+  }
+  if (!recoverWifiRadio(WIFI_STA, "station startup")) return;
+  WiFi.setAutoReconnect(true);
+
+  if (hasSelectedWifiProfile()) {
     String password = savedWifiPassword(selectedWifiSsid);
     WiFi.begin(selectedWifiSsid.c_str(), password.c_str());
     wifiConnectStartedMs = millis();
@@ -8414,10 +9148,15 @@ void startNetworkStack() {
   Serial.println("Wi-Fi: station mode ready");
 }
 
+void parkNetworkStackForBle() {
+  stopNetworkStack();
+  Serial.println("Wi-Fi: fully stopped for BLE coexistence");
+}
+
 void startSetupAccessPoint() {
-  if (!wifiOn || setupApActive) return;
+  if (setupApActive) return;
   ensureSetupIdentity();
-  requestWebServerStop();
+  if (!requestWebServerStopAndWait()) return;
 
   if (wifiScanPending) {
     WiFi.scanDelete();
@@ -8432,18 +9171,15 @@ void startSetupAccessPoint() {
 
   // Keep this as close as possible to the stock Arduino ESP32 open-AP example.
   // Phones must associate first; DNS/WebServer captive routing happens after.
-  MDNS.end();
-  WiFi.persistent(false);
-  WiFi.setSleep(false);
-  WiFi.setAutoReconnect(false);
-  WiFi.disconnect(false, false);
-  WiFi.softAPdisconnect(true);
-  WiFi.mode(WIFI_OFF);
-  networkStackActive = false;
-  delay(250);
-  WiFi.mode(WIFI_AP);
-  delay(150);
-  bool apStarted = WiFi.softAP(setupApSsid.c_str());
+  bool apStarted = false;
+  for (uint8_t attempt = 1; attempt <= 3 && !apStarted; attempt++) {
+    if (!recoverWifiRadio(WIFI_AP, "setup AP")) continue;
+    apStarted = WiFi.softAP(setupApSsid.c_str());
+    if (!apStarted) {
+      WiFi.mode(WIFI_OFF);
+      delay(220);
+    }
+  }
   if (!apStarted) {
     Serial.println("Setup AP: failed to start");
     if (setupApPausedBle && bluetoothOn) {
@@ -8485,14 +9221,16 @@ void stopSetupAccessPoint(bool resumeStation) {
 }
 
 void stopNetworkStack() {
-  requestWebServerStop();
+  requestWebServerStopAndWait(800UL);
   stopSetupAccessPoint(false);
   if (wifiScanPending) WiFi.scanDelete();
   wifiScanPending = false;
   wifiScanStartPending = false;
   MDNS.end();
-  WiFi.disconnect(true, false);
-  WiFi.mode(WIFI_OFF);
+  if (WiFi.getMode() != WIFI_OFF) {
+    WiFi.disconnect(false, false);
+    WiFi.mode(WIFI_OFF);
+  }
   networkStackActive = false;
   Serial.println("Wi-Fi: off");
 }
@@ -8506,14 +9244,29 @@ void *allocateDisplayMemory(size_t bytes) {
   return memory ? memory : malloc(bytes);
 }
 
-void ensureDisplayFlushBuffers() {
-  const size_t pixelCount = LCD_W * 32;
-  if (!displayFlush565) {
-    displayFlush565 = static_cast<uint16_t *>(allocateDisplayMemory(pixelCount * sizeof(uint16_t)));
+bool ensureDisplayFlushBuffers(size_t pixelCount = LCD_W * 32) {
+  if (displayFlush565 && displayFlushPixelCapacity >= pixelCount) return true;
+
+  if (displayFlush565) {
+    free(displayFlush565);
+    displayFlush565 = nullptr;
+    displayFlushPixelCapacity = 0;
   }
-  if (!displayFlush666) {
-    displayFlush666 = static_cast<uint8_t *>(allocateDisplayMemory(pixelCount * 3));
-  }
+
+  // LVGL never emits more than one 32-row band with this partial draw buffer.
+  // The calibrated source is passed directly to pushPixelsDMA(), so it must
+  // live in internal DMA-capable memory rather than PSRAM.
+  const size_t allocationPixels = max(pixelCount, (size_t)(LCD_W * 32));
+  displayFlush565 = static_cast<uint16_t *>(
+    heap_caps_malloc(allocationPixels * sizeof(uint16_t),
+                     MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
+  if (!displayFlush565) return false;
+  displayFlushPixelCapacity = allocationPixels;
+  Serial.printf("LCD DMA staging: %lu pixels, DMA=%s, internal=%s\n",
+                (unsigned long)displayFlushPixelCapacity,
+                esp_ptr_dma_capable(displayFlush565) ? "yes" : "no",
+                esp_ptr_internal(displayFlush565) ? "yes" : "no");
+  return true;
 }
 
 void rebuildDisplayColourLut() {
@@ -8553,33 +9306,20 @@ void rebuildDisplayColourLut() {
 void applyDisplayControllerSettings() {
   if (!lcdControllerReady) return;
   ensureDisplayFlushBuffers();
-  bool useRgb666 = displayRgb666 && displayFlush666;
-  bus->beginWrite();
-  bus->writeC8D8(ILI9341_PIXFMT, useRgb666 ? 0x66 : 0x55);
-  bus->endWrite();
-  lcd->invertDisplay(displayInverted);
+  tft.waitDMA();
+  tft.setColorDepth(displayRgb666 ? 18 : 16);
+  tft.invertDisplay(displayInverted);
   Serial.printf("LCD transfer: %s, inversion: %s\n",
-                useRgb666 ? "RGB666" : "RGB565", displayInverted ? "on" : "off");
+                displayRgb666 ? "RGB666" : "RGB565", displayInverted ? "on" : "off");
 }
 
 void setLcdControllerSleeping(bool sleeping) {
   if (!lcdControllerReady) return;
+  tft.waitDMA();
   if (sleeping) {
-    bus->beginWrite();
-    bus->writeCommand(0x28);  // Display off.
-    bus->endWrite();
-    delay(20);
-    bus->beginWrite();
-    bus->writeCommand(0x10);  // Sleep in.
-    bus->endWrite();
+    tft.sleep();
   } else {
-    bus->beginWrite();
-    bus->writeCommand(0x11);  // Sleep out.
-    bus->endWrite();
-    delay(120);
-    bus->beginWrite();
-    bus->writeCommand(0x29);  // Display on.
-    bus->endWrite();
+    tft.wakeup();
     applyDisplayControllerSettings();
   }
 }
@@ -8590,24 +9330,27 @@ void lvFlush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *colour) {
   const uint32_t pixelCount = (uint32_t)w * h;
   uint16_t *source = reinterpret_cast<uint16_t *>(colour);
 
-  if (displayRgb666 && displayFlush666) {
-    for (uint32_t i = 0; i < pixelCount; i++) {
-      uint16_t value = displayColourLutActive ? displayColourLut[source[i]] : source[i];
-      displayFlush666[i * 3] = (value & 0xF800) >> 8;
-      displayFlush666[i * 3 + 1] = (value & 0x07E0) >> 3;
-      displayFlush666[i * 3 + 2] = value << 3;
-    }
-    bus->beginWrite();
-    lcd->writeAddrWindow(area->x1, area->y1, w, h);
-    bus->writeBytes(displayFlush666, pixelCount * 3);
-    bus->endWrite();
-  } else if (displayColourLutActive && displayFlush565) {
+  // Colour calibration uses one shared staging buffer. Keep it owned by the
+  // display bus until each band has fully transferred before reusing it.
+  tft.waitDMA();
+  if (displayColourLutActive && ensureDisplayFlushBuffers(pixelCount)) {
     for (uint32_t i = 0; i < pixelCount; i++) displayFlush565[i] = displayColourLut[source[i]];
-    gfx->draw16bitRGBBitmap(area->x1, area->y1, displayFlush565, w, h);
-  } else {
-    gfx->draw16bitRGBBitmap(area->x1, area->y1, source, w, h);
+    source = displayFlush565;
   }
+
+  tft.startWrite();
+  tft.setAddrWindow(area->x1, area->y1, w, h);
+  tft.pushPixelsDMA(source, pixelCount);
+  tft.waitDMA();
+  tft.endWrite();
   lv_disp_flush_ready(disp);
+}
+
+void lvMonitor(lv_disp_drv_t *disp, uint32_t time, uint32_t pixels) {
+  (void)disp;
+  (void)time;
+  (void)pixels;
+  debugDisplayFrameCount++;
 }
 
 bool lvSdReady(lv_fs_drv_t *drv) {
@@ -8661,22 +9404,25 @@ lv_fs_res_t lvSdTell(lv_fs_drv_t *drv, void *filePointer, uint32_t *position) {
 }
 
 void clearPageIconCache() {
+  if (!boundPageUi) return;
   lv_img_cache_invalidate_src(nullptr);
-  for (uint8_t i = 0; i < pageIconCacheCount; i++) {
-    free(pageIconCache[i].pixels);
-    pageIconCache[i] = {};
+  for (uint8_t i = 0; i < boundPageUi->iconCacheCount; i++) {
+    free(boundPageUi->iconCache[i].pixels);
+    boundPageUi->iconCache[i] = {};
   }
-  pageIconCacheCount = 0;
+  boundPageUi->iconCacheCount = 0;
 }
 
 const void *cachedPageIconSource(const char *path) {
-  if (!path || !path[0]) return path;
-  for (uint8_t i = 0; i < pageIconCacheCount; i++) {
-    if (strcmp(pageIconCache[i].path, path) == 0) return &pageIconCache[i].descriptor;
+  if (!boundPageUi || !path || !path[0]) return path;
+  for (uint8_t i = 0; i < boundPageUi->iconCacheCount; i++) {
+    if (strcmp(boundPageUi->iconCache[i].path, path) == 0) {
+      return &boundPageUi->iconCache[i].descriptor;
+    }
   }
   const char *extension = strrchr(path, '.');
   if (!extension || strcasecmp(extension, ".png") != 0 ||
-      pageIconCacheCount >= MAX_PAGE_ICON_CACHE) return path;
+      boundPageUi->iconCacheCount >= MAX_PAGE_ICON_CACHE) return path;
 
   lv_img_decoder_dsc_t decoded;
   if (lv_img_decoder_open(&decoded, path, lv_color_black(), 0) != LV_RES_OK ||
@@ -8693,7 +9439,7 @@ const void *cachedPageIconSource(const char *path) {
   }
   memcpy(pixels, decoded.img_data, bytes);
 
-  CachedPageIcon &entry = pageIconCache[pageIconCacheCount++];
+  CachedPageIcon &entry = boundPageUi->iconCache[boundPageUi->iconCacheCount++];
   strlcpy(entry.path, path, sizeof(entry.path));
   entry.pixels = pixels;
   entry.descriptor.header = decoded.header;
@@ -8715,36 +9461,38 @@ const lv_font_t *fontForSize(uint8_t size) {
 }
 
 bool applyRuntimeTheme(const char *path) {
-  if (!wallpaper) return false;
+  if (!boundPageUi || !wallpaper) return false;
   activeRuntimeThemeStyle = findRuntimeThemeStyle(path);
   if (path && strcmp(path, "builtin:burnt-orange") == 0) {
-    if (runtimeWallpaperPixels) {
+    if (boundPageUi->wallpaperPixels) {
       lv_img_set_src(wallpaper, nullptr);
-      lv_img_cache_invalidate_src(&runtimeWallpaperDescriptor);
-      free(runtimeWallpaperPixels);
-      runtimeWallpaperPixels = nullptr;
-      memset(&runtimeWallpaperDescriptor, 0, sizeof(runtimeWallpaperDescriptor));
+      lv_img_cache_invalidate_src(&boundPageUi->wallpaperDescriptor);
+      free(boundPageUi->wallpaperPixels);
+      boundPageUi->wallpaperPixels = nullptr;
+      memset(&boundPageUi->wallpaperDescriptor, 0,
+             sizeof(boundPageUi->wallpaperDescriptor));
     }
-    strlcpy(activeRuntimeThemePath, path, sizeof(activeRuntimeThemePath));
+    strlcpy(boundPageUi->themePath, path, sizeof(boundPageUi->themePath));
     lv_img_set_src(wallpaper, &cinemaWallpaper);
     lv_obj_clear_flag(wallpaper, LV_OBJ_FLAG_HIDDEN);
     return true;
   }
-  if (path && path[0] && runtimeWallpaperPixels &&
-      strcmp(path, activeRuntimeThemePath) == 0) {
-    lv_img_set_src(wallpaper, &runtimeWallpaperDescriptor);
+  if (path && path[0] && boundPageUi->wallpaperPixels &&
+      strcmp(path, boundPageUi->themePath) == 0) {
+    lv_img_set_src(wallpaper, &boundPageUi->wallpaperDescriptor);
     lv_obj_clear_flag(wallpaper, LV_OBJ_FLAG_HIDDEN);
     return true;
   }
   if (!path || !path[0] || !sdReady || !SD.exists(path)) {
-    if (runtimeWallpaperPixels) {
+    if (boundPageUi->wallpaperPixels) {
       lv_img_set_src(wallpaper, nullptr);
-      lv_img_cache_invalidate_src(&runtimeWallpaperDescriptor);
-      free(runtimeWallpaperPixels);
-      runtimeWallpaperPixels = nullptr;
-      memset(&runtimeWallpaperDescriptor, 0, sizeof(runtimeWallpaperDescriptor));
+      lv_img_cache_invalidate_src(&boundPageUi->wallpaperDescriptor);
+      free(boundPageUi->wallpaperPixels);
+      boundPageUi->wallpaperPixels = nullptr;
+      memset(&boundPageUi->wallpaperDescriptor, 0,
+             sizeof(boundPageUi->wallpaperDescriptor));
     }
-    activeRuntimeThemePath[0] = '\0';
+    boundPageUi->themePath[0] = '\0';
     lv_obj_add_flag(wallpaper, LV_OBJ_FLAG_HIDDEN);
     return false;
   }
@@ -8763,26 +9511,109 @@ bool applyRuntimeTheme(const char *path) {
     return false;
   }
   file.close();
-  if (runtimeWallpaperPixels) {
+  if (boundPageUi->wallpaperPixels) {
     lv_img_set_src(wallpaper, nullptr);
-    lv_img_cache_invalidate_src(&runtimeWallpaperDescriptor);
-    free(runtimeWallpaperPixels);
+    lv_img_cache_invalidate_src(&boundPageUi->wallpaperDescriptor);
+    free(boundPageUi->wallpaperPixels);
   }
-  runtimeWallpaperPixels = pixels;
-  runtimeWallpaperDescriptor.header.always_zero = 0;
-  runtimeWallpaperDescriptor.header.w = LCD_W;
-  runtimeWallpaperDescriptor.header.h = LCD_H;
-  runtimeWallpaperDescriptor.header.cf = LV_IMG_CF_TRUE_COLOR;
-  runtimeWallpaperDescriptor.data_size = expected;
-  runtimeWallpaperDescriptor.data = reinterpret_cast<const uint8_t *>(runtimeWallpaperPixels);
-  strlcpy(activeRuntimeThemePath, path, sizeof(activeRuntimeThemePath));
-  lv_img_set_src(wallpaper, &runtimeWallpaperDescriptor);
+  boundPageUi->wallpaperPixels = pixels;
+  boundPageUi->wallpaperDescriptor.header.always_zero = 0;
+  boundPageUi->wallpaperDescriptor.header.w = LCD_W;
+  boundPageUi->wallpaperDescriptor.header.h = LCD_H;
+  boundPageUi->wallpaperDescriptor.header.cf = LV_IMG_CF_TRUE_COLOR;
+  boundPageUi->wallpaperDescriptor.data_size = expected;
+  boundPageUi->wallpaperDescriptor.data =
+    reinterpret_cast<const uint8_t *>(boundPageUi->wallpaperPixels);
+  strlcpy(boundPageUi->themePath, path, sizeof(boundPageUi->themePath));
+  lv_img_set_src(wallpaper, &boundPageUi->wallpaperDescriptor);
   lv_obj_clear_flag(wallpaper, LV_OBJ_FLAG_HIDDEN);
   return true;
 }
 
+void addTouchTrailPoint(uint16_t x, uint16_t y, unsigned long now, bool force = false) {
+  if (!debugTouchEnabled || (!force && now - lastTouchTrailPointMs < 70UL)) return;
+  TouchTrailPoint &point = touchTrail[nextTouchTrailPoint];
+  nextTouchTrailPoint = (nextTouchTrailPoint + 1) % TOUCH_TRAIL_POINT_COUNT;
+  if (!point.dot || !lv_obj_is_valid(point.dot)) return;
+  point.createdMs = now;
+  point.active = true;
+  lastTouchTrailPointMs = now;
+  lv_obj_set_pos(point.dot, constrain((int)x - 3, 0, LCD_W - 6),
+                 constrain((int)y - 3, 0, LCD_H - 6));
+  lv_obj_set_style_bg_opa(point.dot, LV_OPA_COVER, 0);
+  lv_obj_clear_flag(point.dot, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_move_foreground(point.dot);
+}
+
+void showLiveTouchDiagnostic(uint16_t x, uint16_t y, unsigned long now) {
+  if (!debugTouchEnabled) return;
+  if (touchDot) {
+    lv_obj_clear_flag(touchDot, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_pos(touchDot, constrain((int)x - 22, 0, LCD_W - 44),
+                   constrain((int)y - 22, 0, LCD_H - 44));
+    lv_obj_move_foreground(touchDot);
+  }
+  if (touchDiagnosticLabel) {
+    char coordinates[18];
+    snprintf(coordinates, sizeof(coordinates), "T %u,%u", x, y);
+    lv_label_set_text(touchDiagnosticLabel, coordinates);
+    lv_obj_set_style_text_color(touchDiagnosticLabel, lv_color_hex(0xFF3C45), 0);
+    lv_obj_clear_flag(touchDiagnosticLabel, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(touchDiagnosticLabel);
+  }
+  touchDiagnosticHoldUntilMs = 0;
+  addTouchTrailPoint(x, y, now);
+}
+
+void holdReleasedTouchDiagnostic(uint16_t x, uint16_t y, unsigned long now) {
+  if (!debugTouchEnabled) return;
+  if (touchDot) lv_obj_add_flag(touchDot, LV_OBJ_FLAG_HIDDEN);
+  addTouchTrailPoint(x, y, now, true);
+  if (touchDiagnosticLabel) {
+    char coordinates[18];
+    snprintf(coordinates, sizeof(coordinates), "T %u,%u", x, y);
+    lv_label_set_text(touchDiagnosticLabel, coordinates);
+    lv_obj_set_style_text_color(touchDiagnosticLabel, lv_color_hex(0xFF9D2E), 0);
+    lv_obj_clear_flag(touchDiagnosticLabel, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(touchDiagnosticLabel);
+  }
+  touchDiagnosticHoldUntilMs = now + 5000UL;
+}
+
 void lvTouchRead(lv_indev_drv_t *drv, lv_indev_data_t *data) {
-  uint16_t x, y;
+  uint16_t x = 0;
+  uint16_t y = 0;
+  unsigned long now = millis();
+
+  if (pageStripRendering) {
+    data->state = LV_INDEV_STATE_REL;
+    lvTouchDown = false;
+    touchWasDown = false;
+    return;
+  }
+
+  if (touchQuarantineActive) {
+    uint16_t ignoredX = 0;
+    uint16_t ignoredY = 0;
+    TouchSampleStatus status = touchFound
+      ? readTouchSample(ignoredX, ignoredY) : TOUCH_SAMPLE_RELEASED;
+    if (status == TOUCH_SAMPLE_RELEASED) {
+      if (!touchReleasedSinceMs) touchReleasedSinceMs = now;
+      if ((int32_t)(now - touchAcceptAfterMs) >= 0 &&
+          (uint32_t)(now - touchReleasedSinceMs) >= 120UL) {
+        touchQuarantineActive = false;
+        touchReleasedSinceMs = 0;
+        Serial.println("Touch: stable release accepted");
+      }
+    } else {
+      touchReleasedSinceMs = 0;
+    }
+    data->state = LV_INDEV_STATE_REL;
+    lvTouchDown = false;
+    touchWasDown = false;
+    return;
+  }
+
   if (touchFound && readTouch(x, y)) {
     data->state = LV_INDEV_STATE_PR;
     lvTouchDown = true;
@@ -8798,37 +9629,18 @@ void lvTouchRead(lv_indev_drv_t *drv, lv_indev_data_t *data) {
     }
     touchLastX = x;
     touchLastY = y;
+
     if (brightnessOverlay) brightnessLastActivityMs = millis();
-    if (touchDot) {
-      lv_obj_clear_flag(touchDot, LV_OBJ_FLAG_HIDDEN);
-      lv_obj_set_pos(touchDot, constrain((int)x - 5, 0, LCD_W - 10), constrain((int)y - 5, 0, LCD_H - 10));
-      lv_obj_move_foreground(touchDot);
-    }
+    showLiveTouchDiagnostic(x, y, now);
     if (touchMoved) lastWakeMs = millis();
   } else {
     data->state = LV_INDEV_STATE_REL;
     lvTouchDown = false;
     if (touchWasDown) {
-      int16_t dx = (int16_t)touchLastX - (int16_t)touchStartX;
-      int16_t dy = (int16_t)touchLastY - (int16_t)touchStartY;
-
-      // Queue page movement for loop(), outside LVGL's input callback. This
-      // works even when the swipe begins over a card or tile.
-      bool devicePageSwipe = pages[currentPage].kind == PAGE_DEVICE;
-      bool settingsChildPage = pages[currentPage].kind == PAGE_REMOTE_SETTINGS &&
-                               settingsView != SETTINGS_HOME;
-      bool pageNavigationAvailable = !settingsChildPage;
-      bool activityDragBlocksSwipe = activityDragActive && !devicePageSwipe;
-      if (!activityDragBlocksSwipe && !brightnessOverlay && !deviceModal && !lockActive &&
-          pageNavigationAvailable &&
-          abs(dx) >= PAGE_SWIPE_THRESHOLD && abs(dx) > abs(dy)) {
-        pendingPageDelta = (dx < 0) ? 1 : -1;
-      }
+      holdReleasedTouchDiagnostic(touchLastX, touchLastY, now);
       touchWasDown = false;
     }
-    if (touchDot) {
-      lv_obj_add_flag(touchDot, LV_OBJ_FLAG_HIDDEN);
-    }
+    if (touchDot && !debugTouchEnabled) lv_obj_add_flag(touchDot, LV_OBJ_FLAG_HIDDEN);
   }
 }
 
@@ -8875,7 +9687,7 @@ lv_obj_t *makeButton(lv_obj_t *parent, const char *text, int x, int y, int w, in
   stylePanel(btn, bg, lvRgb(70, 95, 130), LV_OPA_COVER);
   lv_obj_t *label = lv_label_create(btn);
   lv_label_set_text(label, text);
-  lv_obj_set_style_text_font(label, &lv_font_openremote_12, 0);
+  lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
   lv_obj_set_style_text_color(label, textPrimary(), 0);
   lv_obj_clear_flag(label, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_clear_flag(label, LV_OBJ_FLAG_SCROLLABLE);
@@ -8952,10 +9764,10 @@ void createPhysicalVoiceOverlay() {
   lv_obj_set_style_pad_all(micBase, 0, 0);
 
   lv_obj_t *title = makeLabel(physicalVoiceOverlay, "LISTENING", 0, 0,
-                              &lv_font_openremote_20, textPrimary());
+                              &lv_font_montserrat_20, textPrimary());
   lv_obj_align(title, LV_ALIGN_CENTER, 0, 78);
   lv_obj_t *hint = makeLabel(physicalVoiceOverlay, "Release button to search", 0, 0,
-                             &lv_font_openremote_10, lvRgb(135, 195, 255));
+                             &lv_font_montserrat_10, lvRgb(135, 195, 255));
   lv_obj_align(hint, LV_ALIGN_CENTER, 0, 105);
   lv_obj_add_flag(physicalVoiceOverlay, LV_OBJ_FLAG_HIDDEN);
 }
@@ -9021,6 +9833,7 @@ void rebuildPages() {
   }
 
   if (currentPage >= pageCount) currentPage = pageCount - 1;
+  configurePageStripDirections();
 }
 
 void drawDots() {
@@ -9047,7 +9860,8 @@ void drawDots() {
 
 void setCinematicBackground(bool enabled) {
   if (!wallpaper) return;
-  if (enabled && (runtimeWallpaperPixels || activeRuntimeThemePath[0])) {
+  if (enabled && boundPageUi &&
+      (boundPageUi->wallpaperPixels || boundPageUi->themePath[0])) {
     lv_obj_clear_flag(wallpaper, LV_OBJ_FLAG_HIDDEN);
   } else {
     lv_obj_add_flag(wallpaper, LV_OBJ_FLAG_HIDDEN);
@@ -9063,6 +9877,155 @@ void configureContent(int y, int height, bool transparent) {
   lv_obj_set_size(content, LCD_W, height);
   lv_obj_set_style_bg_color(content, lv_color_black(), 0);
   lv_obj_set_style_bg_opa(content, transparent ? LV_OPA_TRANSP : LV_OPA_COVER, 0);
+}
+
+void resetSplitDiagnosticAnchor() {
+  splitDiagnosticAnchor = nullptr;
+  splitDiagnosticAnchorY = INT16_MAX;
+  splitDiagnosticLastY = INT16_MIN;
+}
+
+void registerSplitDiagnosticAnchor(lv_obj_t *obj) {
+  if (!obj) return;
+  int16_t localY = lv_obj_get_y(obj);
+  if (!splitDiagnosticAnchor || localY < splitDiagnosticAnchorY) {
+    splitDiagnosticAnchor = obj;
+    splitDiagnosticAnchorY = localY;
+  }
+}
+
+void updateSplitDiagnostic() {
+  if (!splitDiagnosticLabel || !lv_obj_is_valid(splitDiagnosticLabel)) return;
+  if (!debugSplitEnabled) {
+    lv_obj_add_flag(splitDiagnosticLabel, LV_OBJ_FLAG_HIDDEN);
+    return;
+  }
+  lv_obj_clear_flag(splitDiagnosticLabel, LV_OBJ_FLAG_HIDDEN);
+  int16_t y = content ? lv_obj_get_y(content) - lv_obj_get_scroll_y(content) : 0;
+  if (splitDiagnosticAnchor && lv_obj_is_valid(splitDiagnosticAnchor)) {
+    lv_area_t coordinates;
+    lv_obj_get_coords(splitDiagnosticAnchor, &coordinates);
+    y = coordinates.y1;
+  }
+  y -= 4;
+  if (y == splitDiagnosticLastY) return;
+  splitDiagnosticLastY = y;
+  char text[14];
+  snprintf(text, sizeof(text), "S %d", y);
+  lv_label_set_text(splitDiagnosticLabel, text);
+}
+
+void setDebugObjectVisible(lv_obj_t *obj, bool visible) {
+  if (!obj || !lv_obj_is_valid(obj)) return;
+  if (visible) lv_obj_clear_flag(obj, LV_OBJ_FLAG_HIDDEN);
+  else lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
+}
+
+void refreshDebugOverlayVisibility() {
+  setDebugObjectVisible(splitDiagnosticLabel, debugSplitEnabled);
+  setDebugObjectVisible(cpuRamDiagnosticLabel, debugCpuRamEnabled);
+  setDebugObjectVisible(accelerometerDiagnosticLabel, debugAccelerometerEnabled);
+  setDebugObjectVisible(fpsDiagnosticLabel, debugFpsEnabled);
+  setDebugObjectVisible(touchDiagnosticLabel, debugTouchEnabled &&
+                        (lvTouchDown || (int32_t)(touchDiagnosticHoldUntilMs - millis()) > 0));
+  setDebugObjectVisible(touchDot, debugTouchEnabled && lvTouchDown);
+  if (!debugTouchEnabled) {
+    touchDiagnosticHoldUntilMs = 0;
+    for (TouchTrailPoint &point : touchTrail) {
+      point.active = false;
+      setDebugObjectVisible(point.dot, false);
+    }
+  }
+  if (debugSplitEnabled) updateSplitDiagnostic();
+}
+
+uint8_t debugCpuUsagePercent() {
+  static uint32_t previousTotal = 0;
+  static uint64_t previousIdle = 0;
+  TaskStatus_t states[40];
+  uint32_t total = 0;
+  UBaseType_t count = uxTaskGetSystemState(states, 40, &total);
+  uint64_t idle = 0;
+  for (UBaseType_t i = 0; i < count; i++) {
+    if (strncmp(states[i].pcTaskName, "IDLE", 4) == 0) idle += states[i].ulRunTimeCounter;
+  }
+  uint8_t usage = 0;
+  if (previousTotal && total > previousTotal && idle >= previousIdle) {
+    uint64_t available = (uint64_t)(total - previousTotal) * portNUM_PROCESSORS;
+    uint64_t idleDelta = idle - previousIdle;
+    usage = available ? (uint8_t)constrain(
+      100 - (int)(idleDelta * 100ULL / available), 0, 100) : 0;
+  }
+  previousTotal = total;
+  previousIdle = idle;
+  return usage;
+}
+
+void serviceDebugOverlay(unsigned long now) {
+  if (displaySleeping || !screenRoot) return;
+  if (debugTouchEnabled) {
+    for (TouchTrailPoint &point : touchTrail) {
+      if (!point.active || !point.dot || !lv_obj_is_valid(point.dot)) continue;
+      uint32_t age = now - point.createdMs;
+      if (age >= 3000UL) {
+        point.active = false;
+        lv_obj_add_flag(point.dot, LV_OBJ_FLAG_HIDDEN);
+        continue;
+      }
+      lv_opa_t opacity = (lv_opa_t)map(age, 0, 3000, LV_OPA_COVER, LV_OPA_10);
+      lv_obj_set_style_bg_opa(point.dot, opacity, 0);
+      lv_obj_move_foreground(point.dot);
+    }
+    if (!lvTouchDown && touchDiagnosticHoldUntilMs &&
+        (int32_t)(now - touchDiagnosticHoldUntilMs) >= 0) {
+      touchDiagnosticHoldUntilMs = 0;
+      setDebugObjectVisible(touchDiagnosticLabel, false);
+    }
+  }
+  if (debugCpuRamEnabled && (int32_t)(now - nextDebugCpuRamRefreshMs) >= 0) {
+    nextDebugCpuRamRefreshMs = now + 1000UL;
+    uint32_t total = ESP.getHeapSize();
+    uint32_t freeBytes = ESP.getFreeHeap();
+    uint32_t used = total > freeBytes ? total - freeBytes : 0;
+    char text[36];
+    snprintf(text, sizeof(text), "CPU %u%% RAM %lu/%luK",
+             debugCpuUsagePercent(), (unsigned long)(used / 1024UL),
+             (unsigned long)(freeBytes / 1024UL));
+    lv_label_set_text(cpuRamDiagnosticLabel, text);
+  }
+  if (debugAccelerometerEnabled &&
+      (int32_t)(now - nextDebugAccelerometerRefreshMs) >= 0) {
+    nextDebugAccelerometerRefreshMs = now + 100UL;
+    int16_t x = 0, y = 0, z = 0;
+    char text[38];
+    if (lis3dhReady && readLIS3DH(x, y, z)) {
+      snprintf(text, sizeof(text), "ACC X%d Y%d Z%d", x, y, z);
+    } else {
+      strlcpy(text, "ACC unavailable", sizeof(text));
+    }
+    lv_label_set_text(accelerometerDiagnosticLabel, text);
+  }
+  if (debugFpsEnabled && (int32_t)(now - nextDebugFpsRefreshMs) >= 0) {
+    if (!debugLastFpsSampleMs) debugLastFpsSampleMs = now;
+    uint32_t elapsed = max(1UL, now - debugLastFpsSampleMs);
+    uint32_t frames = debugDisplayFrameCount;
+    uint32_t fps = (frames - debugLastDisplayFrameCount) * 1000UL / elapsed;
+    char text[14];
+    snprintf(text, sizeof(text), "FPS %lu", (unsigned long)fps);
+    lv_label_set_text(fpsDiagnosticLabel, text);
+    debugLastDisplayFrameCount = frames;
+    debugLastFpsSampleMs = now;
+    nextDebugFpsRefreshMs = now + 1000UL;
+  }
+  if (debugCpuRamEnabled) lv_obj_move_foreground(cpuRamDiagnosticLabel);
+  if (debugAccelerometerEnabled) lv_obj_move_foreground(accelerometerDiagnosticLabel);
+  if (debugFpsEnabled) lv_obj_move_foreground(fpsDiagnosticLabel);
+  if (debugSplitEnabled) lv_obj_move_foreground(splitDiagnosticLabel);
+  if (debugTouchEnabled &&
+      (lvTouchDown || (int32_t)(touchDiagnosticHoldUntilMs - now) > 0)) {
+    lv_obj_move_foreground(touchDiagnosticLabel);
+  }
+  if (debugTouchEnabled && lvTouchDown) lv_obj_move_foreground(touchDot);
 }
 
 bool updateChargingState() {
@@ -9178,7 +10141,7 @@ void renderTopBar(const char *title, bool allowDevices) {
   lv_obj_set_pos(titleLabel, titleX, 9);
   lv_obj_set_width(titleLabel, titleWidth);
   lv_obj_set_style_text_align(titleLabel, LV_TEXT_ALIGN_LEFT, 0);
-  lv_obj_set_style_text_font(titleLabel, allowDevices ? &lv_font_openremote_16 : &lv_font_openremote_20, 0);
+  lv_obj_set_style_text_font(titleLabel, allowDevices ? &lv_font_montserrat_16 : &lv_font_montserrat_20, 0);
   lv_obj_set_style_text_color(titleLabel, textPrimary(), 0);
   if (allowDevices) {
     lv_obj_add_flag(titleLabel, LV_OBJ_FLAG_CLICKABLE);
@@ -9188,7 +10151,7 @@ void renderTopBar(const char *title, bool allowDevices) {
   }
 
   if (!allowDevices) {
-    lv_obj_t *hint = makeLabel(topBar, LV_SYMBOL_DOWN, 119, 13, &lv_font_openremote_10, textPrimary());
+    lv_obj_t *hint = makeLabel(topBar, LV_SYMBOL_DOWN, 119, 13, &lv_font_montserrat_10, textPrimary());
     lv_obj_set_style_text_opa(hint, LV_OPA_60, 0);
   }
 
@@ -9210,7 +10173,7 @@ void renderTopBar(const char *title, bool allowDevices) {
 
   clockLabel = nullptr;
   if (clockEnabled) {
-    clockLabel = makeLabel(pill, "--:--", 4, 8, &lv_font_openremote_12, textPrimary());
+    clockLabel = makeLabel(pill, "--:--", 4, 8, &lv_font_montserrat_12, textPrimary());
     lv_obj_set_width(clockLabel, 54);
     lv_obj_set_style_text_align(clockLabel, LV_TEXT_ALIGN_RIGHT, 0);
   }
@@ -9243,6 +10206,13 @@ void renderTopBar(const char *title, bool allowDevices) {
   lv_obj_set_style_bg_opa(terminal, LV_OPA_80, 0);
 
   refreshStatusPill();
+  if (boundPageUi) {
+    boundPageUi->clockLabel = clockLabel;
+    boundPageUi->statusPill = statusPill;
+    boundPageUi->statusBattery = statusBattery;
+    boundPageUi->statusBatteryTerminal = statusBatteryTerminal;
+    boundPageUi->batteryFill = batteryFill;
+  }
   lv_obj_move_foreground(topBar);
 }
 
@@ -9269,7 +10239,7 @@ void switchEvent(lv_event_t *e) {
   } else if (target == &clockEnabled) {
     pendingUiRefresh = true;
   } else if (target == &clockUseInternetTime) {
-    if (clockUseInternetTime && (!wifiOn || !selectedWifiSsid.length())) {
+    if (clockUseInternetTime && (!wifiOn || !hasSelectedWifiProfile())) {
       clockUseInternetTime = false;
     }
     applyClockMode();
@@ -9280,6 +10250,11 @@ void switchEvent(lv_event_t *e) {
   } else if (target == &physicalRepeatEnabled) {
     endHeldIrCommand();
     pendingUiRefresh = settingsView == SETTINGS_BUTTONS;
+  } else if (target == &debugSplitEnabled || target == &debugTouchEnabled ||
+             target == &debugCpuRamEnabled ||
+             target == &debugAccelerometerEnabled ||
+             target == &debugFpsEnabled) {
+    refreshDebugOverlayVisibility();
   } else if (target == &displayRgb666 || target == &displayInverted) {
     applyDisplayControllerSettings();
     lv_obj_invalidate(lv_scr_act());
@@ -9305,8 +10280,8 @@ lv_obj_t *makeSettingRow(const char *name, const char *sub, int y, bool *switchT
     lv_obj_clear_flag(row, LV_OBJ_FLAG_CLICKABLE);
   }
   stylePanel(row, lvRgb(34, 35, 39), lvRgb(54, 56, 62));
-  lv_obj_t *nameLabel = makeLabel(row, name, 8, 2, &lv_font_openremote_16, textPrimary());
-  lv_obj_t *subLabel = makeLabel(row, sub, 8, 24, &lv_font_openremote_10, lvRgb(150, 150, 160));
+  lv_obj_t *nameLabel = makeLabel(row, name, 8, 2, &lv_font_montserrat_16, textPrimary());
+  lv_obj_t *subLabel = makeLabel(row, sub, 8, 24, &lv_font_montserrat_10, lvRgb(150, 150, 160));
   if (nameLabelOut) *nameLabelOut = nameLabel;
   if (subLabelOut) *subLabelOut = subLabel;
 
@@ -9333,11 +10308,13 @@ void openSettingsView(SettingsView view) {
   if (leavingQrPage) {
     stationFallbackToSetupAp = false;
     wifiConnectPending = false;
+    webConfigPausedBle = false;
     requestWebServerStop();
   }
   settingsView = view;
   if (leavingQrPage && !keepingStationForWifi) scheduleNetworkShutdown(50UL);
-  if (enteringWifiPage && wifiOn && selectedWifiSsid.length()) {
+  if (leavingQrPage) applyBluetoothState();
+  if (enteringWifiPage && wifiOn && hasSelectedWifiProfile()) {
     networkShutdownAtMs = 0;
     startNetworkStack();
     if (WiFi.status() != WL_CONNECTED && !wifiConnectPending) {
@@ -9347,10 +10324,18 @@ void openSettingsView(SettingsView view) {
   }
   if (enteringQrPage) {
     networkShutdownAtMs = 0;
-    if (wifiOn && selectedWifiSsid.length()) {
+    wifiConnectPending = false;
+    stationFallbackToSetupAp = false;
+    webConfigPausedBle = true;
+    if (bleReady && !bleSuspended) {
+      stopBluetoothRadio("WebConfig session");
+      delay(120);
+    }
+    if (wifiOn && hasSelectedWifiProfile()) {
       startNetworkStack();
-      requestWebServerListen(true);
-      if (WiFi.status() != WL_CONNECTED) {
+      if (WiFi.status() == WL_CONNECTED) {
+        requestWebServerListen(true);
+      } else {
         wifiConnectPending = true;
         stationFallbackToSetupAp = true;
         wifiConnectStartedMs = millis();
@@ -9412,9 +10397,11 @@ void renderSettingsHome() {
     [](lv_event_t *e) { openSettingsView(SETTINGS_DISPLAY); });
   makeSettingRow("Buttons", "Repeat timing and button test", 258, nullptr,
     [](lv_event_t *e) { openSettingsView(SETTINGS_BUTTONS); });
-  makeSettingRow("Backup / Restore", "Full configuration backups", 308, nullptr,
+  makeSettingRow("Debug", "Touch, display, sensors and microphone", 308, nullptr,
+    [](lv_event_t *e) { openSettingsView(SETTINGS_DEBUG); });
+  makeSettingRow("Backup / Restore", "Full configuration backups", 358, nullptr,
     [](lv_event_t *e) { openSettingsView(SETTINGS_BACKUP); });
-  makeSettingRow("About", "Version, device and battery information", 358, nullptr,
+  makeSettingRow("About", "Version, device and battery information", 408, nullptr,
     [](lv_event_t *e) { openSettingsView(SETTINGS_ABOUT); });
 }
 
@@ -9436,15 +10423,15 @@ void renderBluetoothPage() {
 
   const char *state = bleConnected ? "Connected to streamer" :
     (blePairingMode ? "Ready to pair" : (bleBonded ? "Paired - waiting to reconnect" : "Not paired"));
-  makeLabel(content, state, 58, 10, &lv_font_openremote_16,
+  makeLabel(content, state, 58, 10, &lv_font_montserrat_16,
             bleConnected ? lvRgb(120, 255, 155) : textPrimary());
-  makeLabel(content, BLE_HID_NAME, 12, 52, &lv_font_openremote_12, lvRgb(150, 190, 240));
+  makeLabel(content, BLE_HID_NAME, 12, 52, &lv_font_montserrat_12, lvRgb(150, 190, 240));
   makeLabel(content, "On Chromecast open Settings >", 12, 76,
-            &lv_font_openremote_10, lvRgb(175, 175, 185));
+            &lv_font_montserrat_10, lvRgb(175, 175, 185));
   makeLabel(content, "Remotes & Accessories > Pair", 12, 92,
-            &lv_font_openremote_10, lvRgb(175, 175, 185));
+            &lv_font_montserrat_10, lvRgb(175, 175, 185));
   makeLabel(content, "remote, then choose OpenRemote HID.", 12, 108,
-            &lv_font_openremote_10, lvRgb(175, 175, 185));
+            &lv_font_montserrat_10, lvRgb(175, 175, 185));
 
   lv_obj_t *pair = makeButton(content, bleBonded ? "Pair another" : "Start pairing",
                               12, 138, 216, 42, lvRgb(24, 105, 220));
@@ -9456,7 +10443,7 @@ void renderBluetoothPage() {
     lv_obj_add_event_cb(forget, bluetoothForgetEvent, LV_EVENT_CLICKED, nullptr);
   }
   makeLabel(content, "Keyboard and media controls only. No voice.", 12, 238,
-            &lv_font_openremote_10, lvRgb(145, 145, 155));
+            &lv_font_montserrat_10, lvRgb(145, 145, 155));
 }
 
 void beginWifiScan(lv_event_t *e) {
@@ -9590,7 +10577,7 @@ void renderWifiPage() {
   } else {
     snprintf(status, sizeof(status), "Not connected");
   }
-  makeLabel(content, status, 58, 13, &lv_font_openremote_10,
+  makeLabel(content, status, 58, 13, &lv_font_montserrat_10,
             WiFi.status() == WL_CONNECTED ? lvRgb(166, 255, 184) : lvRgb(170, 175, 185));
 
   lv_obj_t *scan = makeButton(content, wifiScanPending ? "Scanning..." : "Scan networks", 8, 45, 224, 34, lvRgb(35, 86, 140));
@@ -9598,7 +10585,7 @@ void renderWifiPage() {
   if (wifiScanPending) lv_obj_add_state(scan, LV_STATE_DISABLED);
 
   int visible = max(0, min(wifiScanCount, 10));
-  if (wifiScanCount == 0) makeLabel(content, "No Wi-Fi networks found", 12, 94, &lv_font_openremote_12, lvRgb(170, 175, 185));
+  if (wifiScanCount == 0) makeLabel(content, "No Wi-Fi networks found", 12, 94, &lv_font_montserrat_12, lvRgb(170, 175, 185));
   for (int i = 0; i < visible; i++) {
     String label = wifiScanResults[i].ssid;
     if (findWifiProfile(label) >= 0) label += "  Saved";
@@ -9700,10 +10687,18 @@ void serviceWebControlRequests(unsigned long now) {
   String ssid = wifiRequest.ssid;
   if (wifiRequest.action == WEB_WIFI_FORGET) {
     bool wasConnected = WiFi.status() == WL_CONNECTED && WiFi.SSID() == ssid;
+    bool wasSelected = selectedWifiSsid == ssid;
     forgetWifiCredentials(ssid);
-    if (selectedWifiSsid == ssid) selectedWifiSsid = "";
-    if (wasConnected) WiFi.disconnect(false, false);
+    if (wasConnected || wasSelected) {
+      WiFi.setAutoReconnect(false);
+      WiFi.disconnect(false, true);
+      wifiConnectPending = false;
+      stationFallbackToSetupAp = false;
+    }
     snprintf(webWifiStatusText, sizeof(webWifiStatusText), "Forgot %s", ssid.c_str());
+    if (webConfigQrPageActive() && (wasConnected || wasSelected)) {
+      startSetupAccessPoint();
+    }
     pendingUiRefresh = settingsView == SETTINGS_WIFI;
     return;
   }
@@ -9753,9 +10748,18 @@ void useSavedWifiEvent(lv_event_t *e) {
 }
 
 void forgetSavedWifiEvent(lv_event_t *e) {
-  forgetWifiCredentials(selectedWifiSsid);
-  WiFi.disconnect(false, false);
+  String forgottenSsid = selectedWifiSsid;
+  bool wasConnected = WiFi.status() == WL_CONNECTED && WiFi.SSID() == forgottenSsid;
+  forgetWifiCredentials(forgottenSsid);
+  if (wasConnected) {
+    WiFi.setAutoReconnect(false);
+    WiFi.disconnect(false, true);
+  }
+  // Keep the unsaved SSID only as the password-entry target. Automatic station
+  // connection paths require a saved profile and will ignore this value.
+  selectedWifiSsid = forgottenSsid;
   wifiConnectPending = false;
+  stationFallbackToSetupAp = false;
   wifiPasswordArea = nullptr;
   pendingUiRefresh = true;
 }
@@ -9800,7 +10804,7 @@ lv_obj_t *makeKeyboardKey(const char *label, const char *key, int x, int y, int 
   lv_obj_add_event_cb(button, wifiKeyboardEvent, LV_EVENT_CLICKED, (void *)key);
   lv_obj_t *text = lv_label_create(button);
   lv_label_set_text(text, label);
-  lv_obj_set_style_text_font(text, &lv_font_openremote_12, 0);
+  lv_obj_set_style_text_font(text, &lv_font_montserrat_12, 0);
   lv_obj_set_style_text_color(text, lvRgb(20, 40, 58), 0);
   lv_obj_clear_flag(text, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_center(text);
@@ -9849,12 +10853,12 @@ void renderWifiPasswordPage() {
   configureContent(42, 278, false);
   renderTopBar("Password", false);
   renderSettingsBackButton();
-  makeLabel(content, selectedWifiSsid.c_str(), 58, 13, &lv_font_openremote_12, textPrimary());
+  makeLabel(content, selectedWifiSsid.c_str(), 58, 13, &lv_font_montserrat_12, textPrimary());
 
   wifiPasswordArea = nullptr;
   if (findWifiProfile(selectedWifiSsid) >= 0) {
     makeLabel(content, "A password is saved for this network.", 10, 50,
-              &lv_font_openremote_10, lvRgb(165, 180, 200));
+              &lv_font_montserrat_10, lvRgb(165, 180, 200));
     lv_obj_t *useSaved = makeButton(content, "Use saved password", 8, 78, 224, 42,
                                     lvRgb(24, 105, 220));
     lv_obj_add_event_cb(useSaved, useSavedWifiEvent, LV_EVENT_CLICKED, nullptr);
@@ -9899,11 +10903,11 @@ void renderWifiQrPage() {
   bool connectionReady = stationConnected || setupApActive;
   if (!connectionReady) {
     makeLabel(content, "Connecting to saved Wi-Fi...", 18, 112,
-              &lv_font_openremote_12, textPrimary());
+              &lv_font_montserrat_12, textPrimary());
     makeLabel(content, "Setup AP starts automatically if needed", 15, 140,
-              &lv_font_openremote_10, lvRgb(155, 165, 180));
+              &lv_font_montserrat_10, lvRgb(155, 165, 180));
     setupApStatusLabel = makeLabel(content, "", 18, 172,
-                                  &lv_font_openremote_10, lvRgb(155, 165, 180));
+                                  &lv_font_montserrat_10, lvRgb(155, 165, 180));
     refreshSetupApStatusLabel();
     nextSetupApStatusRefreshMs = millis() + 1000UL;
     return;
@@ -9915,11 +10919,11 @@ void renderWifiQrPage() {
   lv_obj_set_pos(qr, 37, 43);
   lv_qrcode_update(qr, payload.c_str(), payload.length());
   makeLabel(content, stationConnected ? "Scan to open WebConfig" : "Open network - no password", 35, 220,
-            &lv_font_openremote_12, textPrimary());
+            &lv_font_montserrat_12, textPrimary());
   makeLabel(content, stationConnected ? "Connected Wi-Fi" :
             (setupApActive ? setupApSsid.c_str() : "Turn Wi-Fi on to start setup"), 24, 240,
-            &lv_font_openremote_10, lvRgb(155, 165, 180));
-  setupApStatusLabel = makeLabel(content, "", 24, 255, &lv_font_openremote_10, lvRgb(155, 165, 180));
+            &lv_font_montserrat_10, lvRgb(155, 165, 180));
+  setupApStatusLabel = makeLabel(content, "", 24, 255, &lv_font_montserrat_10, lvRgb(155, 165, 180));
   refreshSetupApStatusLabel();
   nextSetupApStatusRefreshMs = millis() + 1000UL;
 }
@@ -9937,7 +10941,7 @@ void buildNumberOptions(char *buffer, size_t size, int start, int end, uint8_t w
 
 lv_obj_t *makeClockRoller(int index, const char *label, int x, int y, int w,
                           const char *options, int selected) {
-  makeLabel(content, label, x, y - 16, &lv_font_openremote_10, lvRgb(150, 160, 176));
+  makeLabel(content, label, x, y - 16, &lv_font_montserrat_10, lvRgb(150, 160, 176));
   lv_obj_t *roller = lv_roller_create(content);
   lv_obj_set_pos(roller, x, y);
   lv_obj_set_size(roller, w, 64);
@@ -9949,7 +10953,7 @@ lv_obj_t *makeClockRoller(int index, const char *label, int x, int y, int w,
   lv_obj_set_style_border_color(roller, lvRgb(58, 72, 92), 0);
   lv_obj_set_style_border_width(roller, 1, 0);
   lv_obj_set_style_radius(roller, 8, 0);
-  lv_obj_set_style_text_font(roller, &lv_font_openremote_12, 0);
+  lv_obj_set_style_text_font(roller, &lv_font_montserrat_12, 0);
   lv_obj_set_style_text_color(roller, textPrimary(), 0);
   lv_obj_set_style_bg_color(roller, lvRgb(44, 92, 140), LV_PART_SELECTED);
   lv_obj_set_style_text_color(roller, lv_color_white(), LV_PART_SELECTED);
@@ -9982,7 +10986,7 @@ void setManualClockEvent(lv_event_t *e) {
 
 void chooseClockCity(lv_event_t *e) {
   const char *city = (const char *)lv_event_get_user_data(e);
-  if (!city || !wifiOn || !selectedWifiSsid.length()) return;
+  if (!city || !wifiOn || !hasSelectedWifiProfile()) return;
   clockCityName = city;
   clockUseInternetTime = true;
   saveSettings();
@@ -10001,9 +11005,9 @@ void renderClockCityPage() {
   renderTopBar("Search City", false);
   renderSettingsBackButton();
 
-  if (!wifiOn || !selectedWifiSsid.length()) {
+  if (!wifiOn || !hasSelectedWifiProfile()) {
     makeLabel(content, "Connect Wi-Fi before selecting\nan Internet time city.", 12, 70,
-              &lv_font_openremote_12, textPrimary());
+              &lv_font_montserrat_12, textPrimary());
     return;
   }
 
@@ -10011,7 +11015,7 @@ void renderClockCityPage() {
     "Canberra", "Sydney", "Melbourne", "Brisbane", "Perth",
     "Adelaide", "Darwin", "Hobart", "UTC"
   };
-  makeLabel(content, "Select nearest city", 58, 13, &lv_font_openremote_12, textPrimary());
+  makeLabel(content, "Select nearest city", 58, 13, &lv_font_montserrat_12, textPrimary());
   for (uint8_t i = 0; i < sizeof(cities) / sizeof(cities[0]); i++) {
     lv_obj_t *city = makeButton(content, cities[i], 8, 48 + i * 38, 224, 34, lvRgb(32, 35, 42));
     lv_obj_add_event_cb(city, chooseClockCity, LV_EVENT_CLICKED, (void *)cities[i]);
@@ -10025,7 +11029,7 @@ void renderClockPage() {
   renderSettingsBackButton();
 
   makeSettingRow("Status bar", clockEnabled ? "Show time in top right" : "Battery only", 42, &clockEnabled);
-  makeSettingRow("Internet time", wifiOn && selectedWifiSsid.length()
+  makeSettingRow("Internet time", wifiOn && hasSelectedWifiProfile()
     ? "Boot and daily 3am sync" : "Needs a saved Wi-Fi network", 92,
     &clockUseInternetTime);
 
@@ -10033,11 +11037,11 @@ void renderClockPage() {
     makeSettingRow("City", clockCityName.c_str(), 142, nullptr,
       [](lv_event_t *e) { openSettingsView(SETTINGS_CLOCK_CITY); });
     makeLabel(content, "Wi-Fi turns on only while time syncs.", 12, 200,
-              &lv_font_openremote_12, lvRgb(170, 175, 185));
+              &lv_font_montserrat_12, lvRgb(170, 175, 185));
     return;
   }
 
-  makeLabel(content, "Set manually", 10, 148, &lv_font_openremote_12, textPrimary());
+  makeLabel(content, "Set manually", 10, 148, &lv_font_montserrat_12, textPrimary());
   static char yearOptions[72];
   static char monthOptions[36];
   static char dayOptions[96];
@@ -10135,7 +11139,7 @@ void displaySliderEvent(lv_event_t *e) {
   } else if (setting == 1) {
     timeoutSeconds = value;
   } else if (setting == 2) {
-    deepSleepMinutes = constrain(value * 5, 5, 30);
+    deepSleepMinutes = deepSleepMinutesForIndex(value);
     value = deepSleepMinutes;
   } else if (setting == 3) {
     wakeSensitivity = constrain(value, 1, 100);
@@ -10168,13 +11172,13 @@ void displaySliderEvent(lv_event_t *e) {
 }
 
 void makeDisplaySlider(const char *label, int y, int minValue, int maxValue, int value, int setting) {
-  makeLabel(content, label, 10, y, &lv_font_openremote_12, textPrimary());
+  makeLabel(content, label, 10, y, &lv_font_montserrat_12, textPrimary());
   char valueText[12];
   if (setting == 4) snprintf(valueText, sizeof(valueText), "%.2f", value / 100.0f);
   else if (setting == 2) snprintf(valueText, sizeof(valueText), "%dmin", value);
   else if (setting == 3) snprintf(valueText, sizeof(valueText), "%udeg", motionWakeAngleDegrees());
   else snprintf(valueText, sizeof(valueText), "%d%s", value, setting == 1 ? "s" : "%");
-  lv_obj_t *number = makeLabel(content, valueText, 190, y, &lv_font_openremote_12, lvRgb(95, 180, 255));
+  lv_obj_t *number = makeLabel(content, valueText, 190, y, &lv_font_montserrat_12, lvRgb(95, 180, 255));
   displayValueLabels[setting] = number;
   lv_obj_set_width(number, 38);
   lv_obj_set_style_text_align(number, LV_TEXT_ALIGN_RIGHT, 0);
@@ -10182,9 +11186,10 @@ void makeDisplaySlider(const char *label, int y, int minValue, int maxValue, int
   lv_obj_set_pos(slider, 10, y + 23);
   lv_obj_set_size(slider, 220, 12);
   if (setting == 2) {
-    lv_slider_set_range(slider, minValue / 5, maxValue / 5);
-    lv_slider_set_value(slider, value / 5, LV_ANIM_OFF);
-    attachScrollSafeSlider(slider, value / 5);
+    uint8_t index = deepSleepSliderIndex(value);
+    lv_slider_set_range(slider, 0, 6);
+    lv_slider_set_value(slider, index, LV_ANIM_OFF);
+    attachScrollSafeSlider(slider, index);
   } else {
     lv_slider_set_range(slider, minValue, maxValue);
     lv_slider_set_value(slider, value, LV_ANIM_OFF);
@@ -10205,7 +11210,7 @@ void renderDisplayPage() {
   renderSettingsBackButton();
   makeDisplaySlider("Brightness", 46, 5, 100, brightness, 0);
   makeDisplaySlider("Sleep timer", 100, 5, 120, timeoutSeconds, 1);
-  makeDisplaySlider("Deep Sleep", 154, 5, 30, deepSleepMinutes, 2);
+  makeDisplaySlider("Deep Sleep", 154, 1, 30, deepSleepMinutes, 2);
   makeDisplaySlider("Motion sensitivity", 208, 1, 100, wakeSensitivity, 3);
   makeDisplaySlider("Gamma", 262, 50, 250, displayGamma, 4);
   makeDisplaySlider("Saturation", 316, 0, 200, displaySaturation, 5);
@@ -10241,12 +11246,12 @@ void buttonSliderEvent(lv_event_t *e) {
 
 void makeButtonTimingSlider(const char *label, int y, int minValue,
                             int maxValue, int value, int setting) {
-  makeLabel(content, label, 10, y, &lv_font_openremote_12, textPrimary());
+  makeLabel(content, label, 10, y, &lv_font_montserrat_12, textPrimary());
   char text[16];
   if (setting == 0) snprintf(text, sizeof(text), "%dms", value);
   else snprintf(text, sizeof(text), "%d/s", value);
   lv_obj_t *number = makeLabel(content, text, 184, y,
-                               &lv_font_openremote_12, lvRgb(95, 180, 255));
+                               &lv_font_montserrat_12, lvRgb(95, 180, 255));
   buttonValueLabels[setting] = number;
   lv_obj_set_width(number, 44);
   lv_obj_set_style_text_align(number, LV_TEXT_ALIGN_RIGHT, 0);
@@ -10303,10 +11308,156 @@ void renderButtonsPage() {
   lv_obj_set_style_radius(buttonTestPanel, 6, 0);
   lv_obj_set_style_border_width(buttonTestPanel, 1, 0);
   buttonTestLabel = makeLabel(buttonTestPanel, "No button pressed", 8, 13,
-                              &lv_font_openremote_16, lvRgb(150, 150, 160));
+                              &lv_font_montserrat_16, lvRgb(150, 150, 160));
   lv_obj_set_width(buttonTestLabel, 206);
   lv_obj_set_style_text_align(buttonTestLabel, LV_TEXT_ALIGN_CENTER, 0);
   setButtonTestVisual(false);
+}
+
+void debugRowDropdownEvent(lv_event_t *e) {
+  uint8_t row = (uint8_t)(uintptr_t)lv_event_get_user_data(e);
+  if (row >= 5) return;
+  uint16_t selected = lv_dropdown_get_selected(lv_event_get_target(e));
+  debugRowPixels[row] = constrain(debugRowDropdownMinimums[row] + (int)selected,
+                                  0, LCD_H - 1);
+  applyRuntimeThemeRowCalibration();
+  saveSettings();
+  scheduleRuntimeSettingsSave();
+  pendingUiRefresh = true;
+  lastWakeMs = millis();
+}
+
+void styleDebugDropdown(lv_obj_t *dropdown) {
+  lv_obj_set_style_text_font(dropdown, &lv_font_montserrat_12, 0);
+  lv_obj_set_style_text_color(dropdown, textPrimary(), 0);
+  lv_obj_set_style_bg_color(dropdown, lvRgb(25, 42, 62), 0);
+  lv_obj_set_style_bg_opa(dropdown, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_color(dropdown, lvRgb(55, 132, 205), 0);
+  lv_obj_set_style_border_width(dropdown, 1, 0);
+  lv_obj_set_style_radius(dropdown, 6, 0);
+  lv_obj_set_style_pad_left(dropdown, 8, 0);
+  lv_obj_add_flag(dropdown, LV_OBJ_FLAG_GESTURE_BUBBLE);
+}
+
+void makeDebugRowDropdown(uint8_t row, int y) {
+  char title[10];
+  snprintf(title, sizeof(title), "Row %u", row + 1);
+  lv_obj_t *panel = lv_obj_create(content);
+  lv_obj_set_pos(panel, 8, y);
+  lv_obj_set_size(panel, 224, 42);
+  lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(panel, LV_OBJ_FLAG_CLICKABLE);
+  stylePanel(panel, lvRgb(34, 35, 39), lvRgb(54, 56, 62));
+  makeLabel(panel, title, 8, 7, &lv_font_montserrat_14, textPrimary());
+
+  int minimum = max(0, (int)debugRowPixels[row] - 10);
+  int maximum = min(LCD_H - 1, (int)debugRowPixels[row] + 10);
+  debugRowDropdownMinimums[row] = minimum;
+  String options;
+  for (int value = minimum; value <= maximum; value++) {
+    if (options.length()) options += '\n';
+    options += String(value) + " px";
+  }
+  lv_obj_t *dropdown = lv_dropdown_create(panel);
+  debugRowDropdowns[row] = dropdown;
+  lv_obj_set_pos(dropdown, 116, 1);
+  lv_obj_set_size(dropdown, 92, 32);
+  styleDebugDropdown(dropdown);
+  lv_dropdown_set_options(dropdown, options.c_str());
+  lv_dropdown_set_selected(dropdown, debugRowPixels[row] - minimum);
+  lv_obj_add_event_cb(dropdown, debugRowDropdownEvent, LV_EVENT_VALUE_CHANGED,
+                      (void *)(uintptr_t)row);
+}
+
+void microphoneSourceDropdownEvent(lv_event_t *e) {
+  microphoneTestAudioEnabled = lv_dropdown_get_selected(lv_event_get_target(e)) == 1;
+  saveSettings();
+  scheduleRuntimeSettingsSave();
+  lastWakeMs = millis();
+}
+
+void makeMicrophoneSourceRow(int y) {
+  lv_obj_t *panel = lv_obj_create(content);
+  lv_obj_set_pos(panel, 8, y);
+  lv_obj_set_size(panel, 224, 44);
+  lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(panel, LV_OBJ_FLAG_CLICKABLE);
+  stylePanel(panel, lvRgb(34, 35, 39), lvRgb(54, 56, 62));
+  makeLabel(panel, "Microphone", 8, 8, &lv_font_montserrat_14, textPrimary());
+  lv_obj_t *dropdown = lv_dropdown_create(panel);
+  lv_obj_set_pos(dropdown, 104, 1);
+  lv_obj_set_size(dropdown, 104, 32);
+  styleDebugDropdown(dropdown);
+  lv_dropdown_set_options(dropdown, "I2S Mic\nTest Only");
+  lv_dropdown_set_selected(dropdown, microphoneTestAudioEnabled ? 1 : 0);
+  lv_obj_add_event_cb(dropdown, microphoneSourceDropdownEvent,
+                      LV_EVENT_VALUE_CHANGED, nullptr);
+}
+
+void confirmDebugReboot(lv_event_t *e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED || !lcdRebootConfirmBox) return;
+  const char *choice = lv_msgbox_get_active_btn_text(lcdRebootConfirmBox);
+  bool confirmed = choice && strcmp(choice, "Reboot") == 0;
+  lv_msgbox_close(lcdRebootConfirmBox);
+  lcdRebootConfirmBox = nullptr;
+  if (!confirmed) return;
+  if (lcdRebootConfirmHard) hardRestartPending = true;
+  else restartPending = true;
+}
+
+void showDebugRebootConfirmation(bool hard) {
+  if (lcdRebootConfirmBox) return;
+  lcdRebootConfirmHard = hard;
+  static const char *buttons[] = {"Reboot", "Cancel", ""};
+  lcdRebootConfirmBox = lv_msgbox_create(
+    lv_scr_act(), hard ? "Hard reboot?" : "Soft reboot?",
+    hard ? "Reset the complete ESP32 digital system now?"
+         : "Restart OpenRemote now?",
+    buttons, false);
+  lv_obj_set_width(lcdRebootConfirmBox, 220);
+  lv_obj_center(lcdRebootConfirmBox);
+  lv_obj_add_event_cb(lcdRebootConfirmBox, confirmDebugReboot,
+                      LV_EVENT_VALUE_CHANGED, nullptr);
+}
+
+void debugRebootButtonEvent(lv_event_t *e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  showDebugRebootConfirmation((bool)(uintptr_t)lv_event_get_user_data(e));
+}
+
+void renderDebugPage() {
+  setCinematicBackground(false);
+  configureContent(42, 278, false);
+  lv_obj_add_flag(content, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(content, LV_OBJ_FLAG_SCROLL_MOMENTUM);
+  lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLL_ELASTIC);
+  lv_obj_set_scroll_dir(content, LV_DIR_VER);
+  lv_obj_set_scrollbar_mode(content, LV_SCROLLBAR_MODE_AUTO);
+  lv_obj_set_style_pad_bottom(content, 18, 0);
+  renderTopBar("Debug", false);
+  renderSettingsBackButton();
+
+  makeSettingRow("Split Line", "Show live first-row Y position", 44,
+                 &debugSplitEnabled);
+  makeLabel(content, "Saved row positions", 10, 94,
+            &lv_font_montserrat_12, lvRgb(170, 178, 190));
+  for (uint8_t row = 0; row < 5; row++) makeDebugRowDropdown(row, 116 + row * 46);
+  makeSettingRow("Touch", "Live reticle, coordinates and trail", 352,
+                 &debugTouchEnabled);
+  makeSettingRow("CPU / RAM", "Processor load and heap used/free", 402,
+                 &debugCpuRamEnabled);
+  makeSettingRow("Accelerometer", "Live X,Y,Z tilt samples", 452,
+                 &debugAccelerometerEnabled);
+  makeSettingRow("FPS", "Display frames per second", 502, &debugFpsEnabled);
+  makeMicrophoneSourceRow(552);
+  lv_obj_t *softButton = makeButton(content, "Soft reboot", 8, 606, 108, 42,
+                                    lvRgb(28, 91, 150));
+  lv_obj_t *hardButton = makeButton(content, "Hard reboot", 124, 606, 108, 42,
+                                    lvRgb(132, 43, 48));
+  lv_obj_add_event_cb(softButton, debugRebootButtonEvent, LV_EVENT_CLICKED,
+                      (void *)(uintptr_t)false);
+  lv_obj_add_event_cb(hardButton, debugRebootButtonEvent, LV_EVENT_CLICKED,
+                      (void *)(uintptr_t)true);
 }
 
 String signedBatteryValue(float value, const char *suffix) {
@@ -10481,13 +11632,13 @@ void renderBackupRestorePage() {
   lv_obj_add_event_cb(create, createBackupFromLcd, LV_EVENT_CLICKED, nullptr);
   lcdBackupStatusLabel = makeLabel(
     content, lcdBackupStatus[0] ? lcdBackupStatus : "Backups are saved on the SD card",
-    10, 90, &lv_font_openremote_10, lvRgb(160, 170, 185));
+    10, 90, &lv_font_montserrat_10, lvRgb(160, 170, 185));
 
   loadLcdBackupEntries();
-  makeLabel(content, "Restore a backup", 10, 116, &lv_font_openremote_12, textPrimary());
+  makeLabel(content, "Restore a backup", 10, 116, &lv_font_montserrat_12, textPrimary());
   if (!lcdBackupCount) {
     makeLabel(content, "No full backups found", 10, 145,
-              &lv_font_openremote_12, lvRgb(160, 170, 185));
+              &lv_font_montserrat_12, lvRgb(160, 170, 185));
     return;
   }
   for (uint8_t index = 0; index < lcdBackupCount; index++) {
@@ -10507,7 +11658,7 @@ void renderAboutPage() {
   lv_obj_set_scrollbar_mode(content, LV_SCROLLBAR_MODE_AUTO);
   renderTopBar("About", false);
   renderSettingsBackButton();
-  makeLabel(content, "OpenRemote", 58, 12, &lv_font_openremote_16, textPrimary());
+  makeLabel(content, "OpenRemote", 58, 12, &lv_font_montserrat_16, textPrimary());
   makeSettingRow("Firmware", OPENREMOTE_VERSION_TEXT, 52, nullptr);
   makeSettingRow("Hardware", "OMOTE Rev 5 / ESP32-S3", 102, nullptr);
   String webVersion = installedWebConfigVersion();
@@ -10515,7 +11666,7 @@ void renderAboutPage() {
   makeSettingRow("Setup network", setupApSsid.c_str(), 202, nullptr);
   makeSettingRow("SD Card", sdStatusText, 252, nullptr);
 
-  makeLabel(content, "Battery", 10, 310, &lv_font_openremote_16, textPrimary());
+  makeLabel(content, "Battery", 10, 310, &lv_font_montserrat_16, textPrimary());
   makeBatteryMetricRows(336);
 }
 
@@ -10529,6 +11680,7 @@ void renderSettingsPage() {
     case SETTINGS_CLOCK_CITY: renderClockCityPage(); break;
     case SETTINGS_DISPLAY: renderDisplayPage(); break;
     case SETTINGS_BUTTONS: renderButtonsPage(); break;
+    case SETTINGS_DEBUG: renderDebugPage(); break;
     case SETTINGS_BATTERY: renderBatteryPage(); break;
     case SETTINGS_BACKUP: renderBackupRestorePage(); break;
     case SETTINGS_ABOUT: renderAboutPage(); break;
@@ -10583,7 +11735,8 @@ void activitySliderEvent(lv_event_t *e) {
     int maxX = max(4, (int)lv_obj_get_width(ui->card) -
                        (int)lv_obj_get_width(ui->thumb) - 4);
     if (lv_obj_get_x(ui->thumb) >= maxX - 8) {
-      activateActivity(ui->activityIndex);
+      pendingActivityOpen = ui->activityIndex;
+      lv_obj_clear_flag(ui->thumb, LV_OBJ_FLAG_CLICKABLE);
     } else {
       resetActivityThumb(ui);
     }
@@ -10605,7 +11758,7 @@ void renderActivitiesPage() {
 
   if (ACTIVITY_COUNT == 0) {
     lv_obj_t *empty = makeLabel(content, "No activities\nSync real activities in WebConfig", 18, 142,
-                                &lv_font_openremote_12, textPrimary());
+                                &lv_font_montserrat_12, textPrimary());
     lv_obj_set_width(empty, 204);
     lv_obj_set_style_text_align(empty, LV_TEXT_ALIGN_CENTER, 0);
     return;
@@ -10618,6 +11771,7 @@ void renderActivitiesPage() {
     lv_obj_t *card = lv_obj_create(content);
     int cardStart = activeRuntimeThemeStyle ? activeRuntimeThemeStyle->split + 4 : 104;
     lv_obj_set_pos(card, 8, cardStart + i * rowPitch);
+    registerSplitDiagnosticAnchor(card);
     lv_obj_set_size(card, 224, cardHeight);
     lv_color_t cardColour = activeRuntimeThemeStyle
       ? lv_color_hex(activeRuntimeThemeStyle->glassColour) : lvRgb(92, 46, 28);
@@ -10655,7 +11809,7 @@ void renderActivitiesPage() {
     } else {
       lv_obj_t *icon = lv_label_create(thumb);
       lv_label_set_text(icon, LV_SYMBOL_PLAY);
-      lv_obj_set_style_text_font(icon, &lv_font_openremote_16, 0);
+      lv_obj_set_style_text_font(icon, &lv_font_montserrat_16, 0);
       lv_obj_set_style_text_color(icon, textPrimary(), 0);
       lv_obj_center(icon);
       lv_obj_clear_flag(icon, LV_OBJ_FLAG_CLICKABLE);
@@ -10672,13 +11826,13 @@ void renderActivitiesPage() {
     lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
     lv_obj_clear_flag(name, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_t *instruction = makeLabel(card, "Slide to activate", textX, nameY + 22,
-                                      &lv_font_openremote_10, textPrimary());
+                                      &lv_font_montserrat_10, textPrimary());
     lv_obj_set_style_text_opa(instruction, (lv_opa_t)166, 0);
     lv_obj_clear_flag(instruction, LV_OBJ_FLAG_CLICKABLE);
 
     lv_obj_t *chevrons = makeLabel(card, LV_SYMBOL_RIGHT " " LV_SYMBOL_RIGHT,
                                    193, (cardHeight - 16) / 2,
-                                   &lv_font_openremote_12, textPrimary());
+                                   &lv_font_montserrat_12, textPrimary());
     lv_obj_set_style_text_opa(chevrons, LV_OPA_40, 0);
     lv_obj_clear_flag(chevrons, LV_OBJ_FLAG_CLICKABLE);
   }
@@ -10734,6 +11888,7 @@ void makeNestedActivitySlider(const Tile &tile, uint8_t targetActivityIndex,
 
   lv_obj_t *card = lv_obj_create(content);
   lv_obj_set_pos(card, 8, y);
+  registerSplitDiagnosticAnchor(card);
   lv_obj_set_size(card, 224, cardHeight);
   lv_color_t cardColour = activeRuntimeThemeStyle
     ? lv_color_hex(activeRuntimeThemeStyle->glassColour) : lvRgb(92, 46, 28);
@@ -10773,7 +11928,7 @@ void makeNestedActivitySlider(const Tile &tile, uint8_t targetActivityIndex,
   } else {
     lv_obj_t *icon = lv_label_create(thumb);
     lv_label_set_text(icon, LV_SYMBOL_PLAY);
-    lv_obj_set_style_text_font(icon, &lv_font_openremote_16, 0);
+    lv_obj_set_style_text_font(icon, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(icon, textPrimary(), 0);
     lv_obj_center(icon);
     lv_obj_clear_flag(icon, LV_OBJ_FLAG_CLICKABLE);
@@ -10791,14 +11946,14 @@ void makeNestedActivitySlider(const Tile &tile, uint8_t targetActivityIndex,
     lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
     lv_obj_clear_flag(name, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_t *instruction = makeLabel(card, "Slide to activate", textX, nameY + 22,
-                                      &lv_font_openremote_10, textPrimary());
+                                      &lv_font_montserrat_10, textPrimary());
     lv_obj_set_style_text_opa(instruction, (lv_opa_t)166, 0);
     lv_obj_clear_flag(instruction, LV_OBJ_FLAG_CLICKABLE);
   }
 
   lv_obj_t *chevrons = makeLabel(card, LV_SYMBOL_RIGHT " " LV_SYMBOL_RIGHT,
                                  193, (cardHeight - 16) / 2,
-                                 &lv_font_openremote_12, textPrimary());
+                                 &lv_font_montserrat_12, textPrimary());
   lv_obj_set_style_text_opa(chevrons, LV_OPA_40, 0);
   lv_obj_clear_flag(chevrons, LV_OBJ_FLAG_CLICKABLE);
 }
@@ -10842,6 +11997,7 @@ void makeTile(uint8_t slot, const char *label, const char *iconPath, bool showTe
   lv_color_t tileColour = activeRuntimeThemeStyle
     ? lv_color_hex(activeRuntimeThemeStyle->glassColour) : lvRgb(76, 48, 38);
   lv_obj_t *tile = makeButton(content, "", x, y, 68, 44, tileColour);
+  registerSplitDiagnosticAnchor(tile);
   bool themeAllowsBoundary = !activeRuntimeThemeStyle || activeRuntimeThemeStyle->glassEnabled;
   bool showBox = boxMode == 1 ||
     (boxMode == 0 && buttonBoxesEnabled && themeAllowsBoundary);
@@ -10955,15 +12111,15 @@ void renderButtonDiagnosticPage() {
   renderTopBar("Buttons", true);
 
   makeLabel(content, "Rev 5 raw keypad mapper", 10, 8,
-            &lv_font_openremote_12, lvRgb(110, 190, 255));
+            &lv_font_montserrat_12, lvRgb(110, 190, 255));
   if (buttonDiagnosticRequested < PHYSICAL_BUTTON_COUNT) {
     char progress[32];
     snprintf(progress, sizeof(progress), "Button %u of %u", buttonDiagnosticRequested + 1,
              PHYSICAL_BUTTON_COUNT);
-    makeLabel(content, progress, 10, 33, &lv_font_openremote_10, lvRgb(155, 165, 180));
-    makeLabel(content, "Press:", 10, 61, &lv_font_openremote_12, textPrimary());
+    makeLabel(content, progress, 10, 33, &lv_font_montserrat_10, lvRgb(155, 165, 180));
+    makeLabel(content, "Press:", 10, 61, &lv_font_montserrat_12, textPrimary());
     lv_obj_t *request = makeLabel(content, PHYSICAL_BUTTON_NAMES[buttonDiagnosticRequested],
-                                  10, 84, &lv_font_openremote_20, textPrimary());
+                                  10, 84, &lv_font_montserrat_20, textPrimary());
     lv_obj_set_width(request, 220);
     lv_label_set_long_mode(request, LV_LABEL_LONG_WRAP);
     if (buttonDiagnosticRequested > 0) {
@@ -10974,21 +12130,21 @@ void renderButtonDiagnosticPage() {
                PHYSICAL_BUTTON_NAMES[last], buttonDiagnosticKeys[last],
                buttonDiagnosticSwitches[last], buttonDiagnosticRows[last],
                buttonDiagnosticColumns[last], PIN_TCA_INT);
-      makeLabel(content, raw, 10, 132, &lv_font_openremote_12, lvRgb(190, 205, 220));
+      makeLabel(content, raw, 10, 132, &lv_font_montserrat_12, lvRgb(190, 205, 220));
     }
     return;
   }
 
   makeLabel(content, "Complete - raw mapping", 10, 34,
-            &lv_font_openremote_12, textPrimary());
+            &lv_font_montserrat_12, textPrimary());
   makeLabel(content, "Swipe or tap title to leave", 10, 55,
-            &lv_font_openremote_10, lvRgb(155, 165, 180));
+            &lv_font_montserrat_10, lvRgb(155, 165, 180));
   for (uint8_t i = 0; i < PHYSICAL_BUTTON_COUNT; i++) {
     char line[72];
     snprintf(line, sizeof(line), "%s  K%u S%u R%u C%u", PHYSICAL_BUTTON_NAMES[i],
              buttonDiagnosticKeys[i], buttonDiagnosticSwitches[i],
              buttonDiagnosticRows[i], buttonDiagnosticColumns[i]);
-    makeLabel(content, line, 10, 80 + i * 17, &lv_font_openremote_10, textPrimary());
+    makeLabel(content, line, 10, 80 + i * 17, &lv_font_montserrat_10, textPrimary());
   }
 }
 
@@ -11034,10 +12190,10 @@ void renderUnlockPage() {
     strftime(timeText, sizeof(timeText), "%l:%M", &timeInfo);
     if (timeText[0] == ' ') memmove(timeText, timeText + 1, strlen(timeText));
   }
-  lv_obj_t *time = makeLabel(lockOverlay, timeText, 0, 66, &lv_font_openremote_20, textPrimary());
+  lv_obj_t *time = makeLabel(lockOverlay, timeText, 0, 66, &lv_font_montserrat_20, textPrimary());
   lv_obj_set_width(time, LCD_W);
   lv_obj_set_style_text_align(time, LV_TEXT_ALIGN_CENTER, 0);
-  makeLabel(lockOverlay, "OpenRemote", 79, 96, &lv_font_openremote_12, lvRgb(190, 205, 220));
+  makeLabel(lockOverlay, "OpenRemote", 79, 96, &lv_font_montserrat_12, lvRgb(190, 205, 220));
 
   lv_obj_t *slider = lv_slider_create(lockOverlay);
   lv_obj_set_pos(slider, 20, 246);
@@ -11052,7 +12208,7 @@ void renderUnlockPage() {
   lv_obj_set_style_bg_color(slider, lv_color_white(), LV_PART_KNOB);
   lv_obj_set_style_pad_all(slider, 13, LV_PART_KNOB);
   lv_obj_add_event_cb(slider, unlockSliderEvent, LV_EVENT_ALL, nullptr);
-  lv_obj_t *hint = makeLabel(lockOverlay, "slide to unlock", 0, 260, &lv_font_openremote_12, textPrimary());
+  lv_obj_t *hint = makeLabel(lockOverlay, "slide to unlock", 0, 260, &lv_font_montserrat_12, textPrimary());
   lv_obj_set_width(hint, LCD_W);
   lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
   lv_obj_move_background(hint);
@@ -11084,7 +12240,33 @@ void animatePageEntrance(lv_obj_t *obj, int8_t direction) {
   lv_anim_start(&slide);
 }
 
+void beginUiMutation() {
+  if (uiMutationDepth++ > 0) return;
+  pageStripRendering = true;
+  if (touchInputDevice) lv_indev_reset(touchInputDevice, nullptr);
+  lvTouchDown = false;
+  touchWasDown = false;
+  activityDragActive = false;
+  touchQuarantineActive = true;
+  touchAcceptAfterMs = millis() + 80UL;
+  touchReleasedSinceMs = 0;
+}
+
+void endUiMutation() {
+  if (uiMutationDepth == 0 || --uiMutationDepth > 0) return;
+  if (touchInputDevice) lv_indev_reset(touchInputDevice, nullptr);
+  lvTouchDown = false;
+  touchWasDown = false;
+  activityDragActive = false;
+  touchQuarantineActive = true;
+  touchAcceptAfterMs = millis() + 80UL;
+  touchReleasedSinceMs = 0;
+  pageStripRendering = false;
+}
+
 void renderCurrentPage() {
+  beginUiMutation();
+  if (!boundPageUi) bindPageUi(currentPage);
   clearModalObjects();
   // A scrollable page can retain its displacement after its children are
   // deleted. Reset it while the old page still has valid scroll extents.
@@ -11103,12 +12285,14 @@ void renderCurrentPage() {
   memset(batteryMetricValueLabels, 0, sizeof(batteryMetricValueLabels));
   memset(displayValueLabels, 0, sizeof(displayValueLabels));
   memset(buttonValueLabels, 0, sizeof(buttonValueLabels));
+  memset(debugRowDropdowns, 0, sizeof(debugRowDropdowns));
   memset(scrollSafeSliderStates, 0, sizeof(scrollSafeSliderStates));
   scrollSafeSliderCount = 0;
   buttonTestPanel = nullptr;
   buttonTestLabel = nullptr;
   clearPageIconCache();
   setupApStatusLabel = nullptr;
+  resetSplitDiagnosticAnchor();
 
   switch (pages[currentPage].kind) {
     case PAGE_REMOTE_SETTINGS: renderSettingsPage(); break;
@@ -11119,12 +12303,134 @@ void renderCurrentPage() {
 
   if (lockActive) renderUnlockPage();
   drawDots();
-  int8_t transition = pendingPageTransition;
+  updateSplitDiagnostic();
   pendingPageTransition = 0;
-  if (!lockActive && transition) {
-    animatePageEntrance(content, transition);
-    animatePageEntrance(topBar, transition);
+  configurePageStripDirections();
+  endUiMutation();
+}
+
+void bindPageUi(uint8_t index) {
+  if (index >= PAGE_SLOT_COUNT) return;
+  boundPageUi = &pageUi[index];
+  screenRoot = boundPageUi->root;
+  wallpaper = boundPageUi->wallpaper;
+  topBar = boundPageUi->topBar;
+  content = boundPageUi->content;
+  dots = boundPageUi->dots;
+  clockLabel = boundPageUi->clockLabel;
+  statusPill = boundPageUi->statusPill;
+  statusBattery = boundPageUi->statusBattery;
+  statusBatteryTerminal = boundPageUi->statusBatteryTerminal;
+  batteryFill = boundPageUi->batteryFill;
+  uiCommandBindings = boundPageUi->commandBindings;
+  activitySliderUi = boundPageUi->sliderUi;
+}
+
+void configurePageStripDirections() {
+  if (!pageStrip) return;
+  for (uint8_t i = 0; i < PAGE_SLOT_COUNT; i++) {
+    lv_dir_t direction = LV_DIR_NONE;
+    if (i < pageCount) {
+      if (i > 0) direction = (lv_dir_t)(direction | LV_DIR_LEFT);
+      if (i + 1 < pageCount) direction = (lv_dir_t)(direction | LV_DIR_RIGHT);
+      if (i == 0 && settingsView != SETTINGS_HOME) direction = LV_DIR_NONE;
+    }
+    reinterpret_cast<lv_tileview_tile_t *>(pageUi[i].tile)->dir = direction;
   }
+  lv_obj_t *activeTile = lv_tileview_get_tile_act(pageStrip);
+  if (activeTile) {
+    lv_obj_set_scroll_dir(pageStrip,
+      reinterpret_cast<lv_tileview_tile_t *>(activeTile)->dir);
+  }
+}
+
+void renderAllPageSlots() {
+  if (!pageStrip || pageStripRendering) return;
+  beginUiMutation();
+  uint8_t active = min(currentPage, (uint8_t)(pageCount - 1));
+
+  // Tile coordinates are produced by LVGL's layout pass. Selecting a tile
+  // before that pass leaves the strip at x=0 even when currentPage is not 0,
+  // so controls are built on a different tile from the wallpaper on screen.
+  lv_obj_update_layout(pageStrip);
+
+  for (uint8_t i = 0; i < pageCount; i++) {
+    if (i == active) continue;
+    currentPage = i;
+    bindPageUi(i);
+    renderCurrentPage();
+  }
+
+  // Invalidations generated for an off-screen tile are clipped by LVGL. Move
+  // the strip first, then build the destination while it is the visible tile.
+  // This preserves the persistent object strip and finger-following navigation
+  // without leaving only the slot's top/bottom wallpaper bands on screen.
+  currentPage = active;
+  lv_obj_set_tile(pageStrip, pageUi[active].tile, LV_ANIM_OFF);
+  lv_obj_update_layout(pageStrip);
+  bindPageUi(active);
+  renderCurrentPage();
+  lv_obj_update_layout(pageUi[active].root);
+  configurePageStripDirections();
+  pendingUiRefresh = false;
+  pageStripRebuildPending = false;
+  endUiMutation();
+
+  // Cleaning and rebuilding a transparent content layer invalidates several
+  // overlapping regions. Submit one final complete frame only after every
+  // replacement object exists, instead of allowing the old top/bottom bands
+  // to remain around an undrawn content region.
+  lv_obj_invalidate(lv_scr_act());
+  lv_refr_now(nullptr);
+
+  lv_area_t tileArea;
+  lv_obj_get_coords(pageUi[active].tile, &tileArea);
+  Serial.printf("Page strip ready: page=%u count=%u scroll=%d tile=(%d,%d)-(%d,%d) top=%u content=%u heap=%lu psram=%lu\n",
+                currentPage, pageCount,
+                (int)lv_obj_get_scroll_x(pageStrip),
+                tileArea.x1, tileArea.y1, tileArea.x2, tileArea.y2,
+                (unsigned)lv_obj_get_child_cnt(topBar),
+                (unsigned)lv_obj_get_child_cnt(content),
+                (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getFreePsram());
+}
+
+void requestPageStripRebuild() {
+  pageStripRebuildPending = true;
+}
+
+void pageStripEvent(lv_event_t *event) {
+  if (lv_event_get_code(event) != LV_EVENT_VALUE_CHANGED || pageStripRendering) return;
+  lv_obj_t *activeTile = lv_tileview_get_tile_act(pageStrip);
+  for (uint8_t i = 0; i < pageCount; i++) {
+    if (pageUi[i].tile == activeTile) {
+      pageStripPendingPage = i;
+      pageStripChangePending = true;
+      return;
+    }
+  }
+}
+
+void servicePageStripChange() {
+  if (!pageStripChangePending || touchWasDown || lvTouchDown ||
+      (pageStrip && lv_obj_is_scrolling(pageStrip))) return;
+  pageStripChangePending = false;
+  uint8_t previous = currentPage;
+  uint8_t target = min(pageStripPendingPage, (uint8_t)(pageCount - 1));
+
+  if (pages[previous].kind == PAGE_DEVICE && target != previous) {
+    activeDevice = -1;
+    buttonDiagnosticActive = false;
+    rebuildPages();
+    target = min(deviceReturnPage, (uint8_t)(pageCount - 1));
+    currentPage = target;
+    renderAllPageSlots();
+  } else {
+    currentPage = target;
+    bindPageUi(currentPage);
+    configurePageStripDirections();
+  }
+  applyBluetoothState();
+  lastWakeMs = millis();
 }
 
 // ---------------------------------------------------------------------------
@@ -11133,7 +12439,11 @@ void renderCurrentPage() {
 
 void deviceChoiceEvent(lv_event_t *e) {
   int index = (int)(intptr_t)lv_event_get_user_data(e);
-  if (index >= 0 && index < DEVICE_COUNT) openDevice(index);
+  if (index < 0 || index >= DEVICE_COUNT) return;
+  // Let LVGL finish dispatching the event before the main loop deletes the
+  // picker object tree and builds the selected device page.
+  pendingDeviceOpen = index;
+  if (deviceModal) lv_obj_add_flag(deviceModal, LV_OBJ_FLAG_HIDDEN);
 }
 
 void showDevicePicker() {
@@ -11156,7 +12466,7 @@ void showDevicePicker() {
   stylePanel(deviceModal, lvRgb(18, 22, 30), lvRgb(60, 180, 220), LV_OPA_COVER);
   lv_obj_clear_flag(deviceModal, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_set_scroll_dir(deviceModal, LV_DIR_NONE);
-  makeLabel(deviceModal, "Devices", 8, 4, &lv_font_openremote_16, textPrimary());
+  makeLabel(deviceModal, "Devices", 8, 4, &lv_font_montserrat_16, textPrimary());
 
   lv_obj_t *list = lv_obj_create(deviceModal);
   lv_obj_remove_style_all(list);
@@ -11274,7 +12584,7 @@ void activateActivity(uint8_t index) {
   rebuildPages();
   currentPage = 2;
   pendingPageTransition = 1;
-  renderCurrentPage();
+  renderAllPageSlots();
   applyBluetoothState();
   activitySequenceMacro = -1;
   activitySequenceActivity = index;
@@ -11288,12 +12598,13 @@ void activateActivity(uint8_t index) {
 void openDevice(uint8_t index) {
   if (index >= DEVICE_COUNT) return;
   Serial.printf("Open device page: %s\n", devices[index].name);
+  if (pages[currentPage].kind != PAGE_DEVICE) deviceReturnPage = currentPage;
   activeDevice = index;
   buttonDiagnosticActive = false;
   rebuildPages();
   currentPage = pageCount - 1;
   pendingPageTransition = 1;
-  renderCurrentPage();
+  renderAllPageSlots();
   applyBluetoothState();
 }
 
@@ -11309,43 +12620,18 @@ void openButtonDiagnostic() {
   rebuildPages();
   currentPage = pageCount - 1;
   pendingPageTransition = 1;
-  renderCurrentPage();
+  renderAllPageSlots();
 }
 
 void changePage(int delta) {
+  if (!pageStrip || delta == 0) return;
   activityDragActive = false;
-  PageKind currentKind = pages[currentPage].kind;
-  if (delta != 0 && currentKind == PAGE_DEVICE) {
-    activeDevice = -1;
-    buttonDiagnosticActive = false;
-    rebuildPages();
-    currentPage = activeActivity >= 0 ? pageCount - 1 : 1;
-    pendingPageTransition = delta > 0 ? 1 : -1;
-    renderCurrentPage();
-    applyBluetoothState();
-    return;
-  }
   int next = (int)currentPage + delta;
   if (next < 0) next = 0;
   if (next >= pageCount) next = pageCount - 1;
   if (next == currentPage) return;
-
-  currentPage = next;
-  pendingPageTransition = delta > 0 ? 1 : -1;
-
-  if (pages[currentPage].kind == PAGE_REMOTE_SETTINGS &&
-      settingsView != SETTINGS_HOME) {
-    openSettingsView(SETTINGS_HOME);
-    pendingUiRefresh = false;
-  }
-
-  if (activeDevice >= 0 && pages[currentPage].kind != PAGE_DEVICE) {
-    activeDevice = -1;
-    rebuildPages();
-  }
-
-  renderCurrentPage();
-  applyBluetoothState();
+  pageStripPendingPage = (uint8_t)next;
+  lv_obj_set_tile(pageStrip, pageUi[next].tile, LV_ANIM_ON);
 }
 
 void rootGestureEvent(lv_event_t *e) {
@@ -11481,8 +12767,8 @@ bool enterDeepPowerSleep(bool allowQrPage) {
   }
   saveDeepSleepRuntimeState();
   serviceBatteryHistory(millis(), true);
-  stopNetworkStack();
   if (bleReady) stopBluetoothRadio("deep sleep");
+  stopNetworkStack();
   IrReceiver.stop();
   pinMode(PIN_IR_RX, INPUT);
   digitalWrite(PIN_IR_LED, HIGH);
@@ -11674,8 +12960,8 @@ void enterLowPowerWait() {
     return;
   }
 
-  stopNetworkStack();
   if (bleReady) stopBluetoothRadio("light sleep");
+  stopNetworkStack();
   uint32_t idleMs = millis() -
     (displaySleepStartedMs ? displaySleepStartedMs : lastWakeMs);
   uint32_t deepSleepAfterMs = (uint32_t)deepSleepMinutes * 60UL * 1000UL;
@@ -11744,9 +13030,10 @@ void enterDisplaySleep() {
 
   captureSleepBaseline();
   fadeBacklightsToOff();
-  lv_obj_add_flag(screenRoot, LV_OBJ_FLAG_HIDDEN);
+  sleepTouchController();
+  lv_obj_add_flag(uiRoot, LV_OBJ_FLAG_HIDDEN);
   lv_refr_now(nullptr);
-  gfx->fillScreen(0x0000);
+  tft.fillScreen(TFT_BLACK);
   setLcdControllerSleeping(true);
   IrReceiver.stop();
   digitalWrite(PIN_IR_VCC, LOW);
@@ -11770,13 +13057,16 @@ void wakeDisplay() {
   restoreBacklightPwmAfterSleep();
   setLcdControllerSleeping(false);
   digitalWrite(PIN_IR_VCC, HIGH);
-  lv_obj_clear_flag(screenRoot, LV_OBJ_FLAG_HIDDEN);
+  wakeTouchController(100);
+  lv_obj_clear_flag(uiRoot, LV_OBJ_FLAG_HIDDEN);
   displaySleeping = false;
   displaySleepStartedMs = 0;
   nextDeepSleepAttemptMs = 0;
   lockActive = slideToUnlock;
   lastWakeMs = millis();
-  renderCurrentPage();
+  bindPageUi(currentPage);
+  refreshStatusPill();
+  lv_obj_invalidate(pageUi[currentPage].tile);
   lv_refr_now(nullptr);
   lcdBacklight(true);
   applyBluetoothState();
@@ -11813,61 +13103,167 @@ void setupLvgl() {
   sdLvglFsDriver.seek_cb = lvSdSeek;
   sdLvglFsDriver.tell_cb = lvSdTell;
   lv_fs_drv_register(&sdLvglFsDriver);
-  lv_disp_draw_buf_init(&drawBuf, lvBuf1, lvBuf2, LCD_W * 32);
+
+  lvBuf1 = lvFallbackBuf1;
+  lvBuf2 = lvFallbackBuf2;
+  lvDrawBufferPixels = LCD_W * 32;
+  lvFullFrameDoubleBuffer = false;
+  if (displayColourLutActive) ensureDisplayFlushBuffers(lvDrawBufferPixels);
+  lv_disp_draw_buf_init(&drawBuf, lvBuf1, lvBuf2, lvDrawBufferPixels);
 
   lv_disp_drv_init(&dispDrv);
   dispDrv.hor_res = LCD_W;
   dispDrv.ver_res = LCD_H;
   dispDrv.flush_cb = lvFlush;
+  dispDrv.monitor_cb = lvMonitor;
   dispDrv.draw_buf = &drawBuf;
+  dispDrv.full_refresh = 0;
   lv_disp_drv_register(&dispDrv);
+  Serial.printf("LVGL display: persistent tile strip, dual 32-row DMA buffers, %lu pixels each, PSRAM free=%lu\n",
+                (unsigned long)lvDrawBufferPixels,
+                (unsigned long)ESP.getFreePsram());
 
   lv_indev_drv_init(&touchDrv);
   touchDrv.type = LV_INDEV_TYPE_POINTER;
   touchDrv.read_cb = lvTouchRead;
   touchDrv.long_press_time = IR_REPEAT_DELAY_MS;
   touchDrv.long_press_repeat_time = IR_REPEAT_INTERVAL_MS;
-  touchDrv.scroll_limit = 4;
-  touchDrv.scroll_throw = 7;
-  lv_indev_drv_register(&touchDrv);
+  touchDrv.scroll_limit = LV_INDEV_DEF_SCROLL_LIMIT;
+  touchDrv.scroll_throw = LV_INDEV_DEF_SCROLL_THROW;
+  touchInputDevice = lv_indev_drv_register(&touchDrv);
 }
 
 void setupUiRoot() {
-  screenRoot = lv_obj_create(lv_scr_act());
-  lv_obj_remove_style_all(screenRoot);
-  lv_obj_set_size(screenRoot, LCD_W, LCD_H);
-  lv_obj_set_style_bg_color(screenRoot, lv_color_black(), 0);
-  lv_obj_set_style_bg_opa(screenRoot, LV_OPA_COVER, 0);
+  uiRoot = lv_obj_create(lv_scr_act());
+  lv_obj_remove_style_all(uiRoot);
+  lv_obj_set_size(uiRoot, LCD_W, LCD_H);
+  lv_obj_set_style_bg_color(uiRoot, lv_color_black(), 0);
+  lv_obj_set_style_bg_opa(uiRoot, LV_OPA_COVER, 0);
 
-  wallpaper = lv_img_create(screenRoot);
-  lv_img_set_src(wallpaper, &cinemaWallpaper);
-  lv_obj_set_pos(wallpaper, 0, 0);
-  // Draw the stored RGB565 wallpaper exactly as supplied: no tint, recolor,
-  // dark overlay, or transparency is applied at runtime.
-  lv_obj_set_style_img_opa(wallpaper, LV_OPA_COVER, 0);
-  lv_obj_set_style_img_recolor_opa(wallpaper, LV_OPA_TRANSP, 0);
-  lv_obj_clear_flag(wallpaper, LV_OBJ_FLAG_CLICKABLE);
+  pageStrip = lv_tileview_create(uiRoot);
+  lv_obj_remove_style_all(pageStrip);
+  lv_obj_set_size(pageStrip, LCD_W, LCD_H);
+  lv_obj_set_pos(pageStrip, 0, 0);
+  lv_obj_set_style_bg_color(pageStrip, lv_color_black(), 0);
+  lv_obj_set_style_bg_opa(pageStrip, LV_OPA_COVER, 0);
+  lv_obj_set_scrollbar_mode(pageStrip, LV_SCROLLBAR_MODE_OFF);
+  lv_obj_clear_flag(pageStrip, LV_OBJ_FLAG_SCROLL_ELASTIC);
+  lv_obj_add_flag(pageStrip, LV_OBJ_FLAG_SCROLL_MOMENTUM | LV_OBJ_FLAG_SCROLL_ONE);
+  lv_obj_add_event_cb(pageStrip, pageStripEvent, LV_EVENT_VALUE_CHANGED, nullptr);
 
-  content = lv_obj_create(screenRoot);
-  lv_obj_remove_style_all(content);
-  lv_obj_set_pos(content, 0, 42);
-  lv_obj_set_size(content, LCD_W, 250);
-  lv_obj_set_style_bg_color(content, lv_color_black(), 0);
-  lv_obj_set_style_bg_opa(content, LV_OPA_COVER, 0);
+  for (uint8_t i = 0; i < PAGE_SLOT_COUNT; i++) {
+    PageUi &slot = pageUi[i];
+    slot.tile = lv_tileview_add_tile(pageStrip, i, 0, LV_DIR_HOR);
+    lv_obj_remove_style_all(slot.tile);
+    lv_obj_set_size(slot.tile, LCD_W, LCD_H);
+    lv_obj_clear_flag(slot.tile, LV_OBJ_FLAG_SCROLLABLE);
 
-  topBar = lv_obj_create(screenRoot);
-  lv_obj_remove_style_all(topBar);
-  lv_obj_set_pos(topBar, 0, 0);
-  lv_obj_set_size(topBar, LCD_W, 42);
-  lv_obj_set_style_bg_opa(topBar, LV_OPA_TRANSP, 0);
+    slot.root = lv_obj_create(slot.tile);
+    lv_obj_remove_style_all(slot.root);
+    lv_obj_set_size(slot.root, LCD_W, LCD_H);
+    lv_obj_set_pos(slot.root, 0, 0);
+    lv_obj_set_style_bg_color(slot.root, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(slot.root, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(slot.root, LV_OBJ_FLAG_SCROLLABLE);
 
-  dots = lv_obj_create(screenRoot);
-  lv_obj_remove_style_all(dots);
-  lv_obj_set_size(dots, 80, 12);
+    slot.wallpaper = lv_img_create(slot.root);
+    lv_img_set_src(slot.wallpaper, &cinemaWallpaper);
+    lv_obj_set_pos(slot.wallpaper, 0, 0);
+    lv_obj_set_style_img_opa(slot.wallpaper, LV_OPA_COVER, 0);
+    lv_obj_set_style_img_recolor_opa(slot.wallpaper, LV_OPA_TRANSP, 0);
+    lv_obj_clear_flag(slot.wallpaper, LV_OBJ_FLAG_CLICKABLE);
 
-  // Keep touch diagnostics on Serial. The old orange tracking dot caused
-  // unnecessary redraws and is deliberately omitted from the finished UI.
-  touchDot = nullptr;
+    slot.content = lv_obj_create(slot.root);
+    lv_obj_remove_style_all(slot.content);
+    lv_obj_set_pos(slot.content, 0, 42);
+    lv_obj_set_size(slot.content, LCD_W, 250);
+    lv_obj_set_style_bg_color(slot.content, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(slot.content, LV_OPA_COVER, 0);
+    lv_obj_add_flag(slot.content, LV_OBJ_FLAG_SCROLL_CHAIN_HOR);
+
+    slot.topBar = lv_obj_create(slot.root);
+    lv_obj_remove_style_all(slot.topBar);
+    lv_obj_set_pos(slot.topBar, 0, 0);
+    lv_obj_set_size(slot.topBar, LCD_W, 42);
+    lv_obj_set_style_bg_opa(slot.topBar, LV_OPA_TRANSP, 0);
+    lv_obj_clear_flag(slot.topBar, LV_OBJ_FLAG_SCROLLABLE);
+
+    slot.dots = lv_obj_create(slot.root);
+    lv_obj_remove_style_all(slot.dots);
+    lv_obj_set_size(slot.dots, 80, 12);
+    lv_obj_clear_flag(slot.dots, LV_OBJ_FLAG_SCROLLABLE);
+  }
+
+  // Resolve all tile x positions before the first call to lv_obj_set_tile().
+  // This is essential because startup normally selects Activities (tile 1),
+  // not the tile at the strip's initial x=0 position.
+  lv_obj_update_layout(pageStrip);
+
+  bindPageUi(0);
+
+  auto createDiagnosticLabel = [](const char *text, int x, int y, int width,
+                                  lv_color_t colour) {
+    lv_obj_t *label = lv_label_create(uiRoot);
+    lv_label_set_text(label, text);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(label, colour, 0);
+    lv_obj_set_style_text_opa(label, LV_OPA_COVER, 0);
+    lv_obj_set_pos(label, x, y);
+    lv_obj_set_width(label, width);
+    lv_obj_clear_flag(label, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(label, LV_OBJ_FLAG_SCROLLABLE);
+    return label;
+  };
+
+  cpuRamDiagnosticLabel = createDiagnosticLabel("CPU 0% RAM 0/0K", 3, 43, 184,
+                                                lv_color_hex(0xFFD04A));
+  fpsDiagnosticLabel = createDiagnosticLabel("FPS 0", 188, 43, 49,
+                                             lv_color_hex(0xFF5BE1));
+  lv_obj_set_style_text_align(fpsDiagnosticLabel, LV_TEXT_ALIGN_RIGHT, 0);
+  accelerometerDiagnosticLabel = createDiagnosticLabel("ACC X0 Y0 Z0", 3, 55, 234,
+                                                       lv_color_hex(0x42D9FF));
+  splitDiagnosticLabel = createDiagnosticLabel("S 0", 3, LCD_H - 14, 92,
+                                               lv_color_hex(0x36FF78));
+  touchDiagnosticLabel = createDiagnosticLabel("T 0,0", 145, LCD_H - 14, 92,
+                                               lv_color_hex(0xFF3C45));
+  lv_obj_set_style_text_align(touchDiagnosticLabel, LV_TEXT_ALIGN_RIGHT, 0);
+
+  for (TouchTrailPoint &point : touchTrail) {
+    point.dot = lv_obj_create(uiRoot);
+    lv_obj_remove_style_all(point.dot);
+    lv_obj_set_size(point.dot, 6, 6);
+    lv_obj_set_style_radius(point.dot, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(point.dot, lv_color_hex(0xFF9D2E), 0);
+    lv_obj_set_style_bg_opa(point.dot, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(point.dot, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(point.dot, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(point.dot, LV_OBJ_FLAG_HIDDEN);
+  }
+
+  touchDot = lv_obj_create(uiRoot);
+  lv_obj_remove_style_all(touchDot);
+  lv_obj_set_size(touchDot, 44, 44);
+  lv_obj_set_style_radius(touchDot, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_opa(touchDot, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_color(touchDot, lv_color_hex(0xFF2028), 0);
+  lv_obj_set_style_border_width(touchDot, 2, 0);
+  lv_obj_clear_flag(touchDot, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_clear_flag(touchDot, LV_OBJ_FLAG_SCROLLABLE);
+
+  const int16_t tickPositions[4][4] = {
+    {19, 0, 6, 10}, {19, 34, 6, 10}, {0, 19, 10, 6}, {34, 19, 10, 6}
+  };
+  for (uint8_t i = 0; i < 4; i++) {
+    touchReticleTicks[i] = lv_obj_create(touchDot);
+    lv_obj_remove_style_all(touchReticleTicks[i]);
+    lv_obj_set_pos(touchReticleTicks[i], tickPositions[i][0], tickPositions[i][1]);
+    lv_obj_set_size(touchReticleTicks[i], tickPositions[i][2], tickPositions[i][3]);
+    lv_obj_set_style_bg_color(touchReticleTicks[i], lv_color_hex(0xFF2028), 0);
+    lv_obj_set_style_bg_opa(touchReticleTicks[i], LV_OPA_COVER, 0);
+    lv_obj_clear_flag(touchReticleTicks[i], LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(touchReticleTicks[i], LV_OBJ_FLAG_SCROLLABLE);
+  }
+  refreshDebugOverlayVisibility();
 }
 
 void setup() {
@@ -11913,6 +13309,9 @@ void setup() {
   Wire.setClock(400000);
   initialiseChargingState();
 
+  // Match firmware 2.09's proven touch startup. The controller comes up with
+  // the shared LCD rail and needs only an address probe; writing FT5x06 mode
+  // registers here can preserve/replay stale contacts on this Rev 5 panel.
   touchFound = i2cDevicePresent(ADDR_TOUCH);
   initTca8418();
   initLIS3DH();
@@ -11930,11 +13329,11 @@ void setup() {
   applyClockMode();
   applyBluetoothState();
 
-  if (!gfx->begin()) {
-    Serial.println("LCD init failed");
-  } else {
-    lcdControllerReady = true;
-  }
+  tft.init();
+  tft.initDMA();
+  tft.setSwapBytes(true);
+  tft.fillScreen(TFT_BLACK);
+  lcdControllerReady = true;
   ensureDisplayFlushBuffers();
   rebuildDisplayColourLut();
   applyDisplayControllerSettings();
@@ -11944,11 +13343,12 @@ void setup() {
   rebuildPages();
   currentPage = activeDevice >= 0 ? pageCount - 1 :
                 (activeActivity >= 0 ? 2 : 1);
+  deviceReturnPage = activeActivity >= 0 ? 2 : 1;
   lastWakeMs = millis();
   lastTickMs = millis();
   nextStatusRefreshMs = millis() + STATUS_REFRESH_MS;
   nextBatteryHistoryCheckMs = millis() + 1000UL;
-  renderCurrentPage();
+  renderAllPageSlots();
   // Allocate the Voice Search overlay before any BLE interaction. During a
   // physical hold, displaying it requires no heap allocation or object tree
   // construction in Chromecast's time-sensitive MIC_OPEN handshake window.
@@ -11974,6 +13374,13 @@ void loop() {
   uint32_t elapsed = now - lastTickMs;
   lastTickMs = now;
   lv_tick_inc(elapsed);
+
+  // Service touch, scrolling and animation before storage, radio and command
+  // work so input cadence remains smooth even when those subsystems are busy.
+  if (!displaySleeping) {
+    lv_timer_handler();
+    servicePageStripChange();
+  }
 
   if (dnsServerStarted) dnsServer.processNextRequest();
   now = millis();
@@ -12001,8 +13408,17 @@ void loop() {
   serviceBluetooth(now);
   now = millis();
   serviceAtvvVoice(now);
+  if (microphoneStopPending && !atvvAudioStarted) {
+    microphoneStopPending = false;
+    stopRealMicrophoneCapture();
+    now = millis();
+  }
   servicePhysicalVoiceOverlay();
   serviceAtvvDebug(now);
+  if (!displaySleeping) {
+    serviceDebugOverlay(now);
+    updateSplitDiagnostic();
+  }
   serviceInternetTime(now);
   serviceNetworkPower(now);
   serviceBatteryHistory(now);
@@ -12100,6 +13516,12 @@ void loop() {
     delay(600);
     ESP.restart();
   }
+  if (hardRestartPending) {
+    tft.waitDMA();
+    delay(100);
+    esp_rom_software_reset_system();
+    while (true) delay(1000);
+  }
 
   if (displaySleeping) {
     bool connectedActivityIdle = !webConfigQrPageActive() &&
@@ -12141,7 +13563,6 @@ void loop() {
     return;
   }
 
-  lv_timer_handler();
   // The old IR heartbeat is disabled. Bound tiles call the real transmitter
   // directly, so GPIO5 is quiet unless the user sends a command.
 
@@ -12149,17 +13570,34 @@ void loop() {
   // afterwards; otherwise subtracting the newer touch timestamp from the old
   // loop timestamp underflows and immediately sends the display to sleep.
   now = millis();
+  bool pageUiSettled = !touchWasDown && !lvTouchDown &&
+    !pageStripChangePending &&
+    (!pageStrip || !lv_obj_is_scrolling(pageStrip));
 
-  if (pendingUiRefresh) {
+  if (pendingDeviceOpen >= 0 && pageUiSettled) {
+    int8_t deviceIndex = pendingDeviceOpen;
+    pendingDeviceOpen = -1;
+    openDevice((uint8_t)deviceIndex);
+    now = millis();
+  }
+
+  if (pendingActivityOpen >= 0 && pageUiSettled) {
+    int8_t activityIndex = pendingActivityOpen;
+    pendingActivityOpen = -1;
+    activateActivity((uint8_t)activityIndex);
+    now = millis();
+  }
+
+  if (pendingUiRefresh && pageUiSettled) {
     pendingUiRefresh = false;
+    bindPageUi(currentPage);
     renderCurrentPage();
     now = millis();
   }
 
-  if (pendingPageDelta != 0) {
-    int8_t delta = pendingPageDelta;
-    pendingPageDelta = 0;
-    changePage(delta);
+  if (pageStripRebuildPending && pageUiSettled) {
+    pageStripRebuildPending = false;
+    renderAllPageSlots();
     now = millis();
   }
 
