@@ -1,6 +1,23 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  2.44 - 2026-08-01
+    - Adds a "Menu Style" option to Debug > Menu style: "OpenRemote" (this
+      project's existing bordered-row list) or "OMOTE" (dark rounded cards
+      grouped by section, thin dividers between rows, chevron-style
+      navigation rows) - matching the two OMOTE reference photos the user
+      supplied. Purely a rendering choice, read live by each render*Page()
+      function, so it applies immediately with no reboot.
+    - This is a SAMPLE rollout covering only Settings home and the Display
+      page, to confirm the look on hardware before extending OMOTE styling
+      to the rest of the Settings pages (Wi-Fi, Bluetooth, Buttons, Debug,
+      Backup, About, etc.).
+    - Added reusable OMOTE-style helpers: makeOmoteCard() (dark rounded
+      card), makeOmoteDivider() (thin row separator), makeOmoteRow() (name +
+      sub-value row with either a switch or a chevron). makeDisplaySlider()
+      gained optional parent/x/width parameters so its existing slider logic
+      can be reused unmodified inside OMOTE-style cards.
+
   2.43 - 2026-08-01
     - Confirmed via the user's own official OMOTE-Community reference
       firmware build (identical Rev 5 hardware, LovyanGFX, 40MHz DMA) that
@@ -967,8 +984,8 @@
   1.00 - Initial LVGL cinematic runtime prototype.
 */
 
-static constexpr float OPENREMOTE_VERSION = 2.43f;
-static constexpr char OPENREMOTE_VERSION_TEXT[] = "2.43";
+static constexpr float OPENREMOTE_VERSION = 2.44f;
+static constexpr char OPENREMOTE_VERSION_TEXT[] = "2.44";
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
   "OPENREMOTE_FIRMWARE_VERSION=2.37";
 
@@ -1403,6 +1420,13 @@ void applyLcdDriveStrength() {
 // LovyanGFX, since it attaches through tft.init()). Loaded from Preferences
 // at boot; changing it requires a reboot to take effect.
 uint8_t touchDriverChoice = 0;
+
+// 0 = "OpenRemote" (this project's existing bordered-row list style), 1 =
+// "OMOTE" (dark rounded cards grouped under section headers, with chevron
+// navigation rows, matching the reference photos). Purely a rendering
+// choice - every render*Page() function reads this live, so unlike the
+// display/touch driver options this applies immediately, no reboot needed.
+uint8_t menuStyle = 0;
 
 // Persistent native LVGL tiles are transferred through two DMA-safe 32-row
 // buffers. This remains true double buffering, while keeping each parallel-bus
@@ -2182,6 +2206,7 @@ bool requestWebServerStopAndWait(uint32_t timeoutMs = 1800UL);
 bool recoverWifiRadio(wifi_mode_t targetMode, const char *reason);
 void renderSettingsHome();
 void backToSettings(lv_event_t *e);
+void openSettingsView(SettingsView view);
 void renderWifiPage();
 void renderWifiPasswordPage();
 void renderWifiQrPage();
@@ -3702,6 +3727,7 @@ void loadSettings() {
   lcdBufferMode = preferences.getUChar("lcdBufMode", 1);
   lcdDriveStrength = constrain((int)preferences.getUChar("lcdDriveStr", 2), 0, 3);
   touchDriverChoice = preferences.getUChar("touchDrv", 0);
+  menuStyle = preferences.getUChar("menuStyle", 0);
   physicalRepeatEnabled = preferences.getBool("btnRpt", true);
   physicalRepeatDelayMs = constrain(
     (int)preferences.getUShort("btnDelay", 400),
@@ -10742,6 +10768,118 @@ lv_obj_t *makeSettingRow(const char *name, const char *sub, int y, bool *switchT
   return row;
 }
 
+// ---------------------------------------------------------------------------
+// OMOTE-style menu rendering: dark rounded card groups with thin dividers and
+// chevron navigation rows, matching the reference photos. Selected via the
+// Debug menu's "Menu Style" dropdown. Purely a visual variant - navigation
+// (openSettingsView/backToSettings) and every setting's underlying behaviour
+// are unchanged and shared with the OpenRemote-style renderers above.
+// ---------------------------------------------------------------------------
+
+lv_obj_t *makeOmoteCard(lv_obj_t *parent, int y, int height) {
+  lv_obj_t *card = lv_obj_create(parent);
+  lv_obj_set_pos(card, 8, y);
+  lv_obj_set_size(card, 224, height);
+  lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(card, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_style_bg_color(card, lvRgb(28, 29, 33), 0);
+  lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(card, 0, 0);
+  lv_obj_set_style_radius(card, 14, 0);
+  lv_obj_set_style_pad_all(card, 0, 0);
+  return card;
+}
+
+void makeOmoteDivider(lv_obj_t *card, int y) {
+  lv_obj_t *line = lv_obj_create(card);
+  lv_obj_remove_style_all(line);
+  lv_obj_set_pos(line, 14, y);
+  lv_obj_set_size(line, 196, 1);
+  lv_obj_clear_flag(line, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(line, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_style_bg_color(line, lvRgb(46, 48, 54), 0);
+  lv_obj_set_style_bg_opa(line, LV_OPA_COVER, 0);
+}
+
+// A single row inside an OMOTE-style card: title (+ optional sub-value) on
+// the left, a switch OR a chevron on the right depending on which is passed.
+lv_obj_t *makeOmoteRow(lv_obj_t *card, const char *name, const char *value, int y, int height,
+                       bool *switchTarget, lv_event_cb_t clickCallback = nullptr) {
+  lv_obj_t *row = lv_obj_create(card);
+  lv_obj_remove_style_all(row);
+  lv_obj_set_pos(row, 0, y);
+  lv_obj_set_size(row, 224, height);
+  lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(row, LV_OBJ_FLAG_GESTURE_BUBBLE);
+  if (clickCallback) {
+    lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(row, clickCallback, LV_EVENT_CLICKED, nullptr);
+  } else {
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_CLICKABLE);
+  }
+  bool hasValue = value && value[0];
+  makeLabel(row, name, 14, hasValue ? 6 : (height - 16) / 2, &lv_font_montserrat_14, textPrimary());
+  if (hasValue) {
+    lv_obj_t *sub = makeLabel(row, value, 14, 27, &lv_font_montserrat_10, lvRgb(140, 145, 155));
+    lv_obj_set_width(sub, switchTarget ? 130 : 155);
+    lv_label_set_long_mode(sub, LV_LABEL_LONG_DOT);
+  }
+  if (switchTarget) {
+    lv_obj_t *sw = lv_switch_create(row);
+    lv_obj_set_size(sw, 38, 22);
+    lv_obj_align(sw, LV_ALIGN_RIGHT_MID, -12, 0);
+    styleModernSwitch(sw);
+    if (*switchTarget) lv_obj_add_state(sw, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(sw, switchEvent, LV_EVENT_VALUE_CHANGED, switchTarget);
+  } else if (clickCallback) {
+    lv_obj_t *chevron = makeLabel(row, LV_SYMBOL_RIGHT, 200, height / 2 - 6, &lv_font_montserrat_12, lvRgb(110, 114, 122));
+    lv_obj_set_style_text_opa(chevron, LV_OPA_70, 0);
+  }
+  return row;
+}
+
+void renderSettingsHomeOmote() {
+  const int rowH = 48;
+  const int rowCount = 9;
+  lv_obj_t *card = makeOmoteCard(content, 8, rowCount * rowH + (rowCount - 1));
+  int y = 0;
+  String wifiState = !wifiOn ? "Off" : (WiFi.status() == WL_CONNECTED ? WiFi.SSID() : "Tap to scan networks");
+  makeOmoteRow(card, "Wi-Fi", wifiState.c_str(), y, rowH, &wifiOn,
+    [](lv_event_t *e) {
+      if (lv_event_get_target(e) == lv_event_get_current_target(e) && wifiOn) openSettingsView(SETTINGS_WIFI);
+    });
+  makeOmoteDivider(card, y + rowH); y += rowH + 1;
+  const char *bluetoothState = bleConnected ? "Connected" :
+    (blePairingMode ? "Pairing" : (bleBonded ? "Paired" : (bluetoothOn ? "Not paired" : "Off")));
+  makeOmoteRow(card, "Bluetooth", bluetoothState, y, rowH, &bluetoothOn,
+    [](lv_event_t *e) {
+      if (lv_event_get_target(e) == lv_event_get_current_target(e)) openSettingsView(SETTINGS_BLUETOOTH);
+    });
+  makeOmoteDivider(card, y + rowH); y += rowH + 1;
+  makeOmoteRow(card, "Clock", clockUseInternetTime ? "Internet time and manual wheels" : "Manual time wheels", y, rowH, &clockEnabled,
+    [](lv_event_t *e) {
+      if (lv_event_get_target(e) == lv_event_get_current_target(e)) openSettingsView(SETTINGS_CLOCK);
+    });
+  makeOmoteDivider(card, y + rowH); y += rowH + 1;
+  makeOmoteRow(card, "Wi-Fi Config", WiFi.status() == WL_CONNECTED ? "Scan QR to open WebConfig" : "Scan QR to join setup network", y, rowH, nullptr,
+    [](lv_event_t *e) { openSettingsView(SETTINGS_WIFI_QR); });
+  makeOmoteDivider(card, y + rowH); y += rowH + 1;
+  makeOmoteRow(card, "Display", "Brightness, sleep, wake, lock", y, rowH, nullptr,
+    [](lv_event_t *e) { openSettingsView(SETTINGS_DISPLAY); });
+  makeOmoteDivider(card, y + rowH); y += rowH + 1;
+  makeOmoteRow(card, "Buttons", "Repeat timing and button test", y, rowH, nullptr,
+    [](lv_event_t *e) { openSettingsView(SETTINGS_BUTTONS); });
+  makeOmoteDivider(card, y + rowH); y += rowH + 1;
+  makeOmoteRow(card, "Debug", "Touch, display, sensors and microphone", y, rowH, nullptr,
+    [](lv_event_t *e) { openSettingsView(SETTINGS_DEBUG); });
+  makeOmoteDivider(card, y + rowH); y += rowH + 1;
+  makeOmoteRow(card, "Backup / Restore", "Full configuration backups", y, rowH, nullptr,
+    [](lv_event_t *e) { openSettingsView(SETTINGS_BACKUP); });
+  makeOmoteDivider(card, y + rowH); y += rowH + 1;
+  makeOmoteRow(card, "About", "Version, device and battery information", y, rowH, nullptr,
+    [](lv_event_t *e) { openSettingsView(SETTINGS_ABOUT); });
+}
+
 void openSettingsView(SettingsView view) {
   bool leavingQrPage = settingsView == SETTINGS_WIFI_QR && view != SETTINGS_WIFI_QR;
   bool enteringQrPage = settingsView != SETTINGS_WIFI_QR && view == SETTINGS_WIFI_QR;
@@ -10821,6 +10959,10 @@ void renderSettingsHome() {
   lv_obj_set_scrollbar_mode(content, LV_SCROLLBAR_MODE_ACTIVE);
   lv_obj_set_style_pad_bottom(content, 20, 0);
   renderTopBar("Settings", false);
+  if (menuStyle == 1) {
+    renderSettingsHomeOmote();
+    return;
+  }
   String wifiState = !wifiOn ? "Off" : (WiFi.status() == WL_CONNECTED ? WiFi.SSID() : "Tap to scan networks");
   makeSettingRow("Wi-Fi", wifiState.c_str(), 8, &wifiOn,
     [](lv_event_t *e) {
@@ -11638,20 +11780,22 @@ void displaySliderEvent(lv_event_t *e) {
   lastWakeMs = millis();
 }
 
-void makeDisplaySlider(const char *label, int y, int minValue, int maxValue, int value, int setting) {
-  makeLabel(content, label, 10, y, &lv_font_montserrat_12, textPrimary());
+void makeDisplaySlider(const char *label, int y, int minValue, int maxValue, int value, int setting,
+                       lv_obj_t *parent = nullptr, int x = 10, int width = 220) {
+  if (!parent) parent = content;
+  makeLabel(parent, label, x, y, &lv_font_montserrat_12, textPrimary());
   char valueText[12];
   if (setting == 4) snprintf(valueText, sizeof(valueText), "%.2f", value / 100.0f);
   else if (setting == 2) snprintf(valueText, sizeof(valueText), "%dmin", value);
   else if (setting == 3) snprintf(valueText, sizeof(valueText), "%udeg", motionWakeAngleDegrees());
   else snprintf(valueText, sizeof(valueText), "%d%s", value, setting == 1 ? "s" : "%");
-  lv_obj_t *number = makeLabel(content, valueText, 190, y, &lv_font_montserrat_12, lvRgb(95, 180, 255));
+  lv_obj_t *number = makeLabel(parent, valueText, x + width - 38, y, &lv_font_montserrat_12, lvRgb(95, 180, 255));
   displayValueLabels[setting] = number;
   lv_obj_set_width(number, 38);
   lv_obj_set_style_text_align(number, LV_TEXT_ALIGN_RIGHT, 0);
-  lv_obj_t *slider = lv_slider_create(content);
-  lv_obj_set_pos(slider, 10, y + 23);
-  lv_obj_set_size(slider, 220, 12);
+  lv_obj_t *slider = lv_slider_create(parent);
+  lv_obj_set_pos(slider, x, y + 23);
+  lv_obj_set_size(slider, width, 12);
   styleModernSlider(slider);
   if (setting == 2) {
     uint8_t index = deepSleepSliderIndex(value);
@@ -11667,6 +11811,33 @@ void makeDisplaySlider(const char *label, int y, int minValue, int maxValue, int
   lv_obj_add_event_cb(slider, displaySliderEvent, LV_EVENT_RELEASED, (void *)(intptr_t)setting);
 }
 
+void renderDisplayPageOmote() {
+  const int sliderH = 46;
+  const int rowH = 48;
+  int y = 44;
+
+  lv_obj_t *screenCard = makeOmoteCard(content, y, 3 * sliderH + 2);
+  makeDisplaySlider("Brightness", 8, 5, 100, brightness, 0, screenCard, 14, 196);
+  makeOmoteDivider(screenCard, sliderH);
+  makeDisplaySlider("Gamma", sliderH + 8, 50, 250, displayGamma, 4, screenCard, 14, 196);
+  makeOmoteDivider(screenCard, sliderH * 2 + 1);
+  makeDisplaySlider("Saturation", sliderH * 2 + 8, 0, 200, displaySaturation, 5, screenCard, 14, 196);
+  y += 3 * sliderH + 2 + 12;
+
+  lv_obj_t *sleepCard = makeOmoteCard(content, y, 3 * sliderH + 2);
+  makeDisplaySlider("Sleep timer", 8, 5, 120, timeoutSeconds, 1, sleepCard, 14, 196);
+  makeOmoteDivider(sleepCard, sliderH);
+  makeDisplaySlider("Deep Sleep", sliderH + 8, 1, 30, deepSleepMinutes, 2, sleepCard, 14, 196);
+  makeOmoteDivider(sleepCard, sliderH * 2 + 1);
+  makeDisplaySlider("Motion sensitivity", sliderH * 2 + 8, 1, 100, wakeSensitivity, 3, sleepCard, 14, 196);
+  y += 3 * sliderH + 2 + 12;
+
+  lv_obj_t *optionsCard = makeOmoteCard(content, y, 2 * rowH + 1);
+  makeOmoteRow(optionsCard, "Slide to unlock", slideToUnlock ? "Required after sleep" : "Wake directly", 0, rowH, &slideToUnlock);
+  makeOmoteDivider(optionsCard, rowH);
+  makeOmoteRow(optionsCard, "Colour Depth", displayRgb666 ? "RGB666 panel transfer" : "RGB565 panel transfer", rowH + 1, rowH, &displayRgb666);
+}
+
 void renderDisplayPage() {
   setCinematicBackground(false);
   configureContent(42, 278, false);
@@ -11676,6 +11847,10 @@ void renderDisplayPage() {
   lv_obj_set_style_pad_bottom(content, 14, 0);
   renderTopBar("Display", false);
   renderSettingsBackButton();
+  if (menuStyle == 1) {
+    renderDisplayPageOmote();
+    return;
+  }
   makeDisplaySlider("Brightness", 46, 5, 100, brightness, 0);
   makeDisplaySlider("Sleep timer", 100, 5, 120, timeoutSeconds, 1);
   makeDisplaySlider("Deep Sleep", 154, 1, 30, deepSleepMinutes, 2);
@@ -12041,6 +12216,37 @@ void makeTouchDriverRow(int y) {
   lv_obj_add_event_cb(dropdown, touchDriverDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
 }
 
+// Menu Style is a pure rendering choice (menuStyle global, read live by every
+// render*Page() function), unlike the driver options above - no reboot, just
+// a UI refresh so the current page redraws in the new style immediately.
+void menuStyleDropdownEvent(lv_event_t *e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  uint16_t selected = lv_dropdown_get_selected(lv_event_get_target(e));
+  menuStyle = (uint8_t)selected;
+  preferences.begin(PREFERENCES_NAMESPACE, false);
+  preferences.putUChar("menuStyle", menuStyle);
+  preferences.end();
+  lastWakeMs = millis();
+  pendingUiRefresh = true;
+}
+
+void makeMenuStyleRow(int y) {
+  lv_obj_t *panel = lv_obj_create(content);
+  lv_obj_set_pos(panel, 8, y);
+  lv_obj_set_size(panel, 224, 44);
+  lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(panel, LV_OBJ_FLAG_CLICKABLE);
+  stylePanel(panel, lvRgb(34, 35, 39), lvRgb(54, 56, 62));
+  makeLabel(panel, "Menu Style", 8, 8, &lv_font_montserrat_14, textPrimary());
+  lv_obj_t *dropdown = lv_dropdown_create(panel);
+  lv_obj_set_pos(dropdown, 104, 1);
+  lv_obj_set_size(dropdown, 112, 32);
+  styleDebugDropdown(dropdown);
+  lv_dropdown_set_options(dropdown, "OpenRemote\nOMOTE");
+  lv_dropdown_set_selected(dropdown, menuStyle ? 1 : 0);
+  lv_obj_add_event_cb(dropdown, menuStyleDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
+}
+
 void renderDebugPage() {
   setCinematicBackground(false);
   configureContent(42, 278, false);
@@ -12084,6 +12290,13 @@ void renderDebugPage() {
     makeTouchDriverRow(driverSectionY);
     driverSectionY += 50;
   }
+
+  makeLabel(content, "Menu style (applies immediately)", 10, driverSectionY,
+            &lv_font_montserrat_12, lvRgb(170, 178, 190));
+  driverSectionY += 22;
+  makeMenuStyleRow(driverSectionY);
+  driverSectionY += 50;
+
   int rebootButtonY = driverSectionY + 8;
 
   lv_obj_t *softButton = makeButton(content, "Soft reboot", 8, rebootButtonY, 108, 42,
