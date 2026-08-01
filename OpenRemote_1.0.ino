@@ -2,7 +2,18 @@
   OpenRemote firmware change log (newest first)
 
   2.38 - 2026-08-01
-    - In progress.
+    - Fixes the Wi-Fi password keyboard's backspace key overlapping the "m"
+      key by ~30%. Recomputes the last letter row and its neighbors to tile
+      the available width with no overlap, and adds a pressed-state colour
+      change to every key so a tap now gives visible feedback.
+    - Adds a swipe-right-to-go-back gesture anywhere in a nested Settings
+      view, doing exactly what the existing back button does.
+    - Redesigns every switch and slider (Settings and lock/brightness
+      panels) with a shared dark track, blue accent fill and plain white
+      knob, replacing LVGL's unstyled default theme.
+    - Button Test mode already suppressed real IR/BLE transmission, but its
+      pulse reused the same red flash as a genuine send, making the two
+      indistinguishable. It now flashes the status pill green instead.
 
   2.37 - 2026-08-01
     - Fixes persistent tile selection before the first LVGL layout pass. The
