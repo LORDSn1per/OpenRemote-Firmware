@@ -1,6 +1,9 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  2.38 - 2026-08-01
+    - In progress.
+
   2.37 - 2026-08-01
     - Fixes persistent tile selection before the first LVGL layout pass. The
       visible tile is now positioned, selected and laid out before its controls
@@ -861,8 +864,8 @@
   1.00 - Initial LVGL cinematic runtime prototype.
 */
 
-static constexpr float OPENREMOTE_VERSION = 2.37f;
-static constexpr char OPENREMOTE_VERSION_TEXT[] = "2.37";
+static constexpr float OPENREMOTE_VERSION = 2.38f;
+static constexpr char OPENREMOTE_VERSION_TEXT[] = "2.38";
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
   "OPENREMOTE_FIRMWARE_VERSION=2.37";
 
