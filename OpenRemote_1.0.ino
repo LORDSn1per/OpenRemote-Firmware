@@ -1,6 +1,22 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  2.45 - 2026-08-01
+    - Fixed: on the OMOTE-style Display page, dragging a slider knob
+      vertically scrolled the slider's own card out of view instead of
+      scrolling the page. scrollSafeSliderEvent's vertical-drag handler was
+      calling lv_obj_scroll_by() on the slider's direct parent, which used to
+      always be the page's scrollable "content" object - but OMOTE-style
+      sliders live inside an intermediate (non-scrollable) card container, so
+      that scrolled the card instead. Added findScrollableAncestor() to walk
+      up to the actual scrollable ancestor regardless of nesting.
+    - Fixed: OMOTE-style Display page dividers sliced through the bottom of
+      the slider knob directly above them whenever a slider followed another
+      slider in the same card. The divider line was positioned at a fixed
+      row-boundary offset that fell inside the knob's padded (24px, due to
+      styleModernSlider's 6px knob padding) hit area. Repositioned dividers
+      to sit a few pixels below each knob's actual bottom edge instead.
+
   2.44 - 2026-08-01
     - Adds a "Menu Style" option to Debug > Menu style: "OpenRemote" (this
       project's existing bordered-row list) or "OMOTE" (dark rounded cards
@@ -984,8 +1000,8 @@
   1.00 - Initial LVGL cinematic runtime prototype.
 */
 
-static constexpr float OPENREMOTE_VERSION = 2.44f;
-static constexpr char OPENREMOTE_VERSION_TEXT[] = "2.44";
+static constexpr float OPENREMOTE_VERSION = 2.45f;
+static constexpr char OPENREMOTE_VERSION_TEXT[] = "2.45";
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
   "OPENREMOTE_FIRMWARE_VERSION=2.37";
 
@@ -11671,6 +11687,19 @@ void renderClockPage() {
   lv_obj_add_event_cb(set, setManualClockEvent, LV_EVENT_CLICKED, nullptr);
 }
 
+// OMOTE-style rows nest sliders inside a card container that sits between
+// the slider and the page's actual scrollable area, so the slider's direct
+// parent is no longer the thing that should scroll (see scrollSafeSliderEvent
+// below) - walk up to the nearest ancestor that is actually scrollable.
+lv_obj_t *findScrollableAncestor(lv_obj_t *obj) {
+  lv_obj_t *parent = lv_obj_get_parent(obj);
+  while (parent) {
+    if (lv_obj_has_flag(parent, LV_OBJ_FLAG_SCROLLABLE)) return parent;
+    parent = lv_obj_get_parent(parent);
+  }
+  return nullptr;
+}
+
 void restoreScrollSafeSlider(lv_obj_t *slider, ScrollSafeSliderState *state) {
   if (!slider || !state || state->restoring ||
       lv_slider_get_value(slider) == state->committedValue) return;
@@ -11712,8 +11741,8 @@ void scrollSafeSliderEvent(lv_event_t *e) {
       // refuses to move for any drag that starts on top of a slider.
       lv_coord_t deltaY = point.y - state->lastPoint.y;
       if (deltaY != 0) {
-        lv_obj_t *parent = lv_obj_get_parent(slider);
-        if (parent) lv_obj_scroll_by(parent, 0, deltaY, LV_ANIM_OFF);
+        lv_obj_t *scrollTarget = findScrollableAncestor(slider);
+        if (scrollTarget) lv_obj_scroll_by(scrollTarget, 0, deltaY, LV_ANIM_OFF);
       }
     }
     state->lastPoint = point;
@@ -11812,23 +11841,29 @@ void makeDisplaySlider(const char *label, int y, int minValue, int maxValue, int
 }
 
 void renderDisplayPageOmote() {
-  const int sliderH = 46;
+  // Row stride for a label+slider block, and how far below the row's start
+  // the padded slider knob's bottom edge actually reaches (23px down to the
+  // track, +6 track half-height, +12 knob radius from styleModernSlider's
+  // default 6px knob padding = 41). Dividers must sit below that offset or
+  // the knob's rounded bottom edge gets sliced by the divider line.
+  const int sliderH = 50;
+  const int sliderKnobBottom = 41;
   const int rowH = 48;
   int y = 44;
 
   lv_obj_t *screenCard = makeOmoteCard(content, y, 3 * sliderH + 2);
   makeDisplaySlider("Brightness", 8, 5, 100, brightness, 0, screenCard, 14, 196);
-  makeOmoteDivider(screenCard, sliderH);
+  makeOmoteDivider(screenCard, 8 + sliderKnobBottom + 4);
   makeDisplaySlider("Gamma", sliderH + 8, 50, 250, displayGamma, 4, screenCard, 14, 196);
-  makeOmoteDivider(screenCard, sliderH * 2 + 1);
+  makeOmoteDivider(screenCard, sliderH + 8 + sliderKnobBottom + 4);
   makeDisplaySlider("Saturation", sliderH * 2 + 8, 0, 200, displaySaturation, 5, screenCard, 14, 196);
   y += 3 * sliderH + 2 + 12;
 
   lv_obj_t *sleepCard = makeOmoteCard(content, y, 3 * sliderH + 2);
   makeDisplaySlider("Sleep timer", 8, 5, 120, timeoutSeconds, 1, sleepCard, 14, 196);
-  makeOmoteDivider(sleepCard, sliderH);
+  makeOmoteDivider(sleepCard, 8 + sliderKnobBottom + 4);
   makeDisplaySlider("Deep Sleep", sliderH + 8, 1, 30, deepSleepMinutes, 2, sleepCard, 14, 196);
-  makeOmoteDivider(sleepCard, sliderH * 2 + 1);
+  makeOmoteDivider(sleepCard, sliderH + 8 + sliderKnobBottom + 4);
   makeDisplaySlider("Motion sensitivity", sliderH * 2 + 8, 1, 100, wakeSensitivity, 3, sleepCard, 14, 196);
   y += 3 * sliderH + 2 + 12;
 
