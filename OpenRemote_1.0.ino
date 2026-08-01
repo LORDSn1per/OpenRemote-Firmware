@@ -13156,6 +13156,10 @@ void setupUiRoot() {
     slot.tile = lv_tileview_add_tile(pageStrip, i, 0, LV_DIR_HOR);
     lv_obj_remove_style_all(slot.tile);
     lv_obj_set_size(slot.tile, LCD_W, LCD_H);
+    // lv_obj_remove_style_all() above wipes the x position the tileview
+    // constructor just assigned (it's stored as a local style property), so
+    // every tile ended up stacked at (0,0) instead of (i*LCD_W, 0). Restore it.
+    lv_obj_set_pos(slot.tile, i * LCD_W, 0);
     lv_obj_clear_flag(slot.tile, LV_OBJ_FLAG_SCROLLABLE);
 
     slot.root = lv_obj_create(slot.tile);
