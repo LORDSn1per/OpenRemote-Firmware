@@ -1,6 +1,31 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  2.46 - 2026-08-02
+    - Adds Debug > Backlight PWM: 640 Hz / 1 kHz / 5 kHz / 25 kHz. Applies
+      instantly via ledcChangeFrequency() (no reboot), so frequencies can be
+      A/B tested against the touch debug overlay in one sitting.
+    - New phantom-touch lead, from directly comparing this firmware against
+      the user's own working copy of the official OMOTE firmware: OMOTE runs
+      its LCD backlight PWM at 640 Hz (tft_hal_esp32.cpp, ledc_timer.freq_hz)
+      and calls ledc_stop() outright at full brightness. This project has run
+      25 kHz since 1.05, when it was raised from 5 kHz to silence audible
+      backlight whine. The backlight LEDs sit behind the touch sensor on the
+      shared LCD rail, and 25 kHz puts its 5th/7th harmonics (125/175 kHz)
+      inside the FT5x06's ~100-200 kHz sensing band, where 640 Hz cannot
+      reach with any meaningful amplitude.
+    - Consistent with every observation so far: phantom touches vanish
+      entirely on the rare boot where the backlight fails to come on (PWM
+      not switching at all), vanish on Arduino_GFX (removes the second,
+      LCD-bus noise contribution), ease off at 16 MHz, and never appear on
+      OMOTE despite identical LovyanGFX 40 MHz DMA. It also explains why
+      2.43's back-to-back double-read validation did not help: these are
+      genuine FT5x06 detections, not corrupted I2C reads, so the chip
+      reports the same phantom point twice and passes validation.
+    - Note that at exactly 100% brightness the duty is 0, which holds the pin
+      at a static level and stops switching regardless of this setting - so
+      100% brightness is itself a zero-flash test of the same theory.
+
   2.45 - 2026-08-01
     - Fixed: on the OMOTE-style Display page, dragging a slider knob
       vertically scrolled the slider's own card out of view instead of
@@ -1000,8 +1025,8 @@
   1.00 - Initial LVGL cinematic runtime prototype.
 */
 
-static constexpr float OPENREMOTE_VERSION = 2.45f;
-static constexpr char OPENREMOTE_VERSION_TEXT[] = "2.45";
+static constexpr float OPENREMOTE_VERSION = 2.46f;
+static constexpr char OPENREMOTE_VERSION_TEXT[] = "2.46";
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
   "OPENREMOTE_FIRMWARE_VERSION=2.37";
 
@@ -1167,6 +1192,12 @@ static const uint16_t BLE_CONN_IDLE_MIN_INTERVAL = 96;    // 120 ms.
 static const uint16_t BLE_CONN_IDLE_MAX_INTERVAL = 120;   // 150 ms.
 static const uint16_t BLE_CONN_IDLE_LATENCY = 3;
 static const uint16_t BLE_CONN_SUPERVISION_TIMEOUT = 600; // 6 seconds.
+// Default only. The live value is backlightPwmHz below, selectable from
+// Debug > Backlight PWM. The backlight LEDs sit behind the touch sensor on
+// the shared LCD rail, so this frequency's odd harmonics can land inside the
+// FT5x06's ~100-200 kHz sensing band: 25 kHz puts its 5th/7th harmonic
+// (125/175 kHz) right in it, while the official OMOTE firmware runs 640 Hz,
+// whose harmonics are too far down to matter. Suspected phantom-touch source.
 static const uint32_t BACKLIGHT_PWM_HZ = 25000;
 static const uint8_t BACKLIGHT_PWM_BITS = 10;
 static const uint32_t BACKLIGHT_PWM_MAX = (1UL << BACKLIGHT_PWM_BITS) - 1UL;
@@ -1414,6 +1445,24 @@ uint8_t lcdBufferMode = 1;
 // without changing the bus clock or giving up DMA. Default (2) matches the
 // ESP32's own default pad drive strength, i.e. unchanged prior behaviour.
 uint8_t lcdDriveStrength = 2;
+// LCD backlight PWM frequency in Hz (see BACKLIGHT_PWM_HZ above for why this
+// is a phantom-touch suspect). Applies live via ledcChangeFrequency() - no
+// reboot needed, so it can be A/B tested against the touch overlay directly.
+// Only switches at brightness < 100%; at exactly 100% the duty is 0, which
+// holds the pin at a static level and stops switching entirely.
+uint32_t backlightPwmHz = BACKLIGHT_PWM_HZ;
+// 640 Hz matches the official OMOTE firmware; 25 kHz is this project's prior
+// behaviour. The two middle steps let a bad frequency be bracketed rather
+// than only toggled between the extremes.
+static const uint32_t BACKLIGHT_PWM_OPTIONS[] = {640UL, 1000UL, 5000UL, 25000UL};
+static const uint8_t BACKLIGHT_PWM_OPTION_COUNT = 4;
+
+bool backlightPwmFrequencyValid(uint32_t hz) {
+  for (uint8_t i = 0; i < BACKLIGHT_PWM_OPTION_COUNT; i++) {
+    if (BACKLIGHT_PWM_OPTIONS[i] == hz) return true;
+  }
+  return false;
+}
 
 // Called from setup() after tft.init(), once LovyanGFX has configured the
 // parallel bus pins. Drive capability is a pad-level property independent
@@ -2882,17 +2931,31 @@ void applyBrightness() {
 }
 
 void initBacklightPwm() {
-  backlightPwmReady = ledcAttachChannel(PIN_LCD_BL, BACKLIGHT_PWM_HZ, BACKLIGHT_PWM_BITS,
+  backlightPwmReady = ledcAttachChannel(PIN_LCD_BL, backlightPwmHz, BACKLIGHT_PWM_BITS,
                                         LCD_BACKLIGHT_PWM_CHANNEL);
-  buttonBacklightPwmReady = ledcAttachChannel(PIN_BUTTON_BL, BACKLIGHT_PWM_HZ, BACKLIGHT_PWM_BITS,
+  buttonBacklightPwmReady = ledcAttachChannel(PIN_BUTTON_BL, backlightPwmHz, BACKLIGHT_PWM_BITS,
                                               BUTTON_BACKLIGHT_PWM_CHANNEL);
   // setup() reveals both backlights only after LVGL has flushed its first
   // complete frame. This also keeps scheduled background NTP wakes invisible.
   if (backlightPwmReady) ledcWrite(PIN_LCD_BL, BACKLIGHT_PWM_MAX);
   else digitalWrite(PIN_LCD_BL, HIGH);
   buttonBacklight(false);
-  Serial.printf("Backlight PWM: %s\n", backlightPwmReady ? "ready" : "failed");
+  Serial.printf("Backlight PWM: %s at %lu Hz\n",
+                backlightPwmReady ? "ready" : "failed", (unsigned long)backlightPwmHz);
   Serial.printf("Button LED PWM: %s\n", buttonBacklightPwmReady ? "ready" : "failed");
+}
+
+// Retunes the already-attached LCD backlight timer in place, so a new
+// frequency takes effect immediately without a reboot or a visible backlight
+// glitch. Brightness is re-applied afterwards because changing the timer
+// frequency does not carry the duty across on its own. The button LEDs are
+// deliberately left alone: buttonBacklight() only ever writes duty 0 or full
+// scale, neither of which switches, so their frequency is irrelevant here.
+void applyBacklightPwmFrequency() {
+  if (!backlightPwmReady) return;
+  ledcChangeFrequency(PIN_LCD_BL, backlightPwmHz, BACKLIGHT_PWM_BITS);
+  applyBrightness();
+  Serial.printf("Backlight PWM: retuned to %lu Hz\n", (unsigned long)backlightPwmHz);
 }
 
 void suspendBacklightPwmForSleep() {
@@ -2917,10 +2980,10 @@ void suspendBacklightPwmForSleep() {
 void restoreBacklightPwmAfterSleep() {
   if (!sleepBacklightPwmSuspended) return;
   backlightPwmReady = ledcAttachChannel(
-    PIN_LCD_BL, BACKLIGHT_PWM_HZ, BACKLIGHT_PWM_BITS,
+    PIN_LCD_BL, backlightPwmHz, BACKLIGHT_PWM_BITS,
     LCD_BACKLIGHT_PWM_CHANNEL);
   buttonBacklightPwmReady = ledcAttachChannel(
-    PIN_BUTTON_BL, BACKLIGHT_PWM_HZ, BACKLIGHT_PWM_BITS,
+    PIN_BUTTON_BL, backlightPwmHz, BACKLIGHT_PWM_BITS,
     BUTTON_BACKLIGHT_PWM_CHANNEL);
   if (backlightPwmReady) ledcWrite(PIN_LCD_BL, BACKLIGHT_PWM_MAX);
   else {
@@ -3743,6 +3806,8 @@ void loadSettings() {
   lcdBufferMode = preferences.getUChar("lcdBufMode", 1);
   lcdDriveStrength = constrain((int)preferences.getUChar("lcdDriveStr", 2), 0, 3);
   touchDriverChoice = preferences.getUChar("touchDrv", 0);
+  backlightPwmHz = preferences.getULong("blPwmHz", BACKLIGHT_PWM_HZ);
+  if (!backlightPwmFrequencyValid(backlightPwmHz)) backlightPwmHz = BACKLIGHT_PWM_HZ;
   menuStyle = preferences.getUChar("menuStyle", 0);
   physicalRepeatEnabled = preferences.getBool("btnRpt", true);
   physicalRepeatDelayMs = constrain(
@@ -12251,6 +12316,42 @@ void makeTouchDriverRow(int y) {
   lv_obj_add_event_cb(dropdown, touchDriverDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
 }
 
+// Unlike the LCD driver/clock/buffer options, this retunes the live LEDC
+// timer, so it applies instantly and can be A/B tested against the touch
+// debug overlay without a reboot between frequencies.
+void backlightPwmDropdownEvent(lv_event_t *e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  uint16_t selected = lv_dropdown_get_selected(lv_event_get_target(e));
+  if (selected >= BACKLIGHT_PWM_OPTION_COUNT) return;
+  backlightPwmHz = BACKLIGHT_PWM_OPTIONS[selected];
+  preferences.begin(PREFERENCES_NAMESPACE, false);
+  preferences.putULong("blPwmHz", backlightPwmHz);
+  preferences.end();
+  applyBacklightPwmFrequency();
+  lastWakeMs = millis();
+}
+
+void makeBacklightPwmRow(int y) {
+  lv_obj_t *panel = lv_obj_create(content);
+  lv_obj_set_pos(panel, 8, y);
+  lv_obj_set_size(panel, 224, 44);
+  lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(panel, LV_OBJ_FLAG_CLICKABLE);
+  stylePanel(panel, lvRgb(34, 35, 39), lvRgb(54, 56, 62));
+  makeLabel(panel, "Backlight PWM", 8, 8, &lv_font_montserrat_14, textPrimary());
+  lv_obj_t *dropdown = lv_dropdown_create(panel);
+  lv_obj_set_pos(dropdown, 104, 1);
+  lv_obj_set_size(dropdown, 112, 32);
+  styleDebugDropdown(dropdown);
+  lv_dropdown_set_options(dropdown, "640 Hz\n1 kHz\n5 kHz\n25 kHz");
+  uint16_t selectedIndex = BACKLIGHT_PWM_OPTION_COUNT - 1;
+  for (uint8_t i = 0; i < BACKLIGHT_PWM_OPTION_COUNT; i++) {
+    if (BACKLIGHT_PWM_OPTIONS[i] == backlightPwmHz) { selectedIndex = i; break; }
+  }
+  lv_dropdown_set_selected(dropdown, selectedIndex);
+  lv_obj_add_event_cb(dropdown, backlightPwmDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
+}
+
 // Menu Style is a pure rendering choice (menuStyle global, read live by every
 // render*Page() function), unlike the driver options above - no reboot, just
 // a UI refresh so the current page redraws in the new style immediately.
@@ -12325,6 +12426,14 @@ void renderDebugPage() {
     makeTouchDriverRow(driverSectionY);
     driverSectionY += 50;
   }
+
+  // Not gated on the LCD driver: the backlight rail is shared with the touch
+  // controller either way, so this is worth testing under both.
+  makeLabel(content, "Backlight PWM (applies immediately)", 10, driverSectionY,
+            &lv_font_montserrat_12, lvRgb(170, 178, 190));
+  driverSectionY += 22;
+  makeBacklightPwmRow(driverSectionY);
+  driverSectionY += 50;
 
   makeLabel(content, "Menu style (applies immediately)", 10, driverSectionY,
             &lv_font_montserrat_12, lvRgb(170, 178, 190));
