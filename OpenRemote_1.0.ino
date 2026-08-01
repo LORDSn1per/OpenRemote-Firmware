@@ -1922,6 +1922,7 @@ bool displayColourLutActive = false;
 struct ScrollSafeSliderState {
   int32_t committedValue;
   lv_point_t startPoint;
+  lv_point_t lastPoint;
   bool tracking;
   bool horizontal;
   bool vertical;
@@ -2004,6 +2005,7 @@ void requestWebServerStop();
 bool requestWebServerStopAndWait(uint32_t timeoutMs = 1800UL);
 bool recoverWifiRadio(wifi_mode_t targetMode, const char *reason);
 void renderSettingsHome();
+void backToSettings(lv_event_t *e);
 void renderWifiPage();
 void renderWifiPasswordPage();
 void renderWifiQrPage();
@@ -9757,6 +9759,18 @@ void lvTouchRead(lv_indev_drv_t *drv, lv_indev_data_t *data) {
     if (touchWasDown) {
       holdReleasedTouchDiagnostic(touchLastX, touchLastY, now);
       touchWasDown = false;
+      // A left-to-right swipe anywhere in a nested Settings view does exactly
+      // what the back button does. This can't be done with LV_EVENT_GESTURE:
+      // LVGL assigns any scrollable ancestor (e.g. content on pages like
+      // Display) as the touch's scroll target as soon as it's scrollable at
+      // all, regardless of whether the drag direction matches, which starves
+      // gesture detection entirely for those pages. Checking the raw
+      // touch-down/touch-up points directly sidesteps that.
+      if (pages[currentPage].kind == PAGE_REMOTE_SETTINGS && settingsView != SETTINGS_HOME) {
+        int dx = (int)touchLastX - (int)touchStartX;
+        int dy = abs((int)touchLastY - (int)touchStartY);
+        if (dx > 60 && dy < 40) backToSettings(nullptr);
+      }
     }
     if (touchDot && !debugTouchEnabled) lv_obj_add_flag(touchDot, LV_OBJ_FLAG_HIDDEN);
   }
@@ -10514,18 +10528,6 @@ void renderSettingsBackButton() {
   lv_obj_add_event_cb(back, backToSettings, LV_EVENT_CLICKED, nullptr);
 }
 
-// Attached once to every page-slot's persistent content container (see
-// setupUiRoot) rather than per-render, since content survives lv_obj_clean
-// across renders. A left-to-right swipe anywhere in a nested Settings view
-// does exactly what the back button does - it does not "pop one level",
-// because backToSettings() itself always jumps straight to SETTINGS_HOME.
-void settingsBackGestureEvent(lv_event_t *e) {
-  if (pages[currentPage].kind != PAGE_REMOTE_SETTINGS || settingsView == SETTINGS_HOME) return;
-  lv_indev_t *indev = lv_indev_get_act();
-  if (!indev) return;
-  if (lv_indev_get_gesture_dir(indev) == LV_DIR_RIGHT) backToSettings(nullptr);
-}
-
 void renderSettingsHome() {
   setCinematicBackground(false);
   configureContent(42, 250, false);
@@ -11264,6 +11266,7 @@ void scrollSafeSliderEvent(lv_event_t *e) {
     state->vertical = false;
     lv_indev_t *indev = lv_indev_get_act();
     if (indev) lv_indev_get_point(indev, &state->startPoint);
+    state->lastPoint = state->startPoint;
     restoreScrollSafeSlider(slider, state);
   } else if (code == LV_EVENT_PRESSING && state->tracking) {
     lv_indev_t *indev = lv_indev_get_act();
@@ -11277,6 +11280,18 @@ void scrollSafeSliderEvent(lv_event_t *e) {
       state->vertical = !state->horizontal;
     }
     if (!state->horizontal) restoreScrollSafeSlider(slider, state);
+    if (state->vertical) {
+      // Once vertical intent is locked in, LVGL still treats the slider
+      // (not its parent list) as this touch's owner and never hands the
+      // parent a scroll on its own - drive it directly, or the page simply
+      // refuses to move for any drag that starts on top of a slider.
+      lv_coord_t deltaY = point.y - state->lastPoint.y;
+      if (deltaY != 0) {
+        lv_obj_t *parent = lv_obj_get_parent(slider);
+        if (parent) lv_obj_scroll_by(parent, 0, deltaY, LV_ANIM_OFF);
+      }
+    }
+    state->lastPoint = point;
   } else if (code == LV_EVENT_VALUE_CHANGED) {
     if (!state->tracking || !state->horizontal) {
       restoreScrollSafeSlider(slider, state);
@@ -13372,7 +13387,6 @@ void setupUiRoot() {
     lv_obj_set_style_bg_color(slot.content, lv_color_black(), 0);
     lv_obj_set_style_bg_opa(slot.content, LV_OPA_COVER, 0);
     lv_obj_add_flag(slot.content, LV_OBJ_FLAG_SCROLL_CHAIN_HOR);
-    lv_obj_add_event_cb(slot.content, settingsBackGestureEvent, LV_EVENT_GESTURE, nullptr);
 
     slot.topBar = lv_obj_create(slot.root);
     lv_obj_remove_style_all(slot.topBar);
