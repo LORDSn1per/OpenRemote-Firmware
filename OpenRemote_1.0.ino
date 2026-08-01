@@ -1837,6 +1837,8 @@ unsigned long nextSetupApStatusRefreshMs = 0;
 unsigned long brightnessLastActivityMs = 0;
 unsigned long commandFeedbackUntilMs = 0;
 bool commandFeedbackActive = false;
+unsigned long buttonTestFeedbackUntilMs = 0;
+bool buttonTestFeedbackActive = false;
 bool buttonTestActive = false;
 int8_t buttonTestHeldIndex = -1;
 unsigned long buttonTestPulseUntilMs = 0;
@@ -4531,6 +4533,7 @@ void sendJson(int status, const String &body) {
 }
 
 void serviceCommandFeedback(unsigned long now);
+void serviceButtonTestFeedback(unsigned long now);
 void refreshStatusPill();
 
 String webConfigUrl() {
@@ -5477,6 +5480,47 @@ void serviceCommandFeedback(unsigned long now) {
   applyCommandFeedbackStyle(false);
 }
 
+// Button Test mode never transmits a real IR/BLE command (see buttonTestModeActive()
+// and its two call sites in serviceKeypad(), which continue before any binding lookup
+// or send). This paints the status pill green instead of applyCommandFeedbackStyle's
+// red, so a test-mode press is visually unmistakable from a genuine transmit.
+void applyButtonTestFeedbackStyle(bool active) {
+  lv_color_t green = lv_color_hex(0x30D158);
+  if (statusPill && lv_obj_is_valid(statusPill)) {
+    lv_obj_set_style_bg_color(statusPill, active ? lv_color_hex(0x0B3A1E) : lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(statusPill, active ? LV_OPA_COVER : (lv_opa_t)115, 0);
+    lv_obj_set_style_border_color(statusPill, active ? green : lv_color_white(), 0);
+    lv_obj_set_style_border_opa(statusPill, active ? LV_OPA_COVER : (lv_opa_t)64, 0);
+  }
+  if (clockLabel && lv_obj_is_valid(clockLabel)) {
+    lv_obj_set_style_text_color(clockLabel, active ? green : lv_color_white(), 0);
+  }
+  if (statusBattery && lv_obj_is_valid(statusBattery)) {
+    lv_obj_set_style_border_color(statusBattery, active ? green : lv_color_white(), 0);
+  }
+  if (batteryFill && lv_obj_is_valid(batteryFill)) {
+    lv_obj_set_style_bg_color(batteryFill, active ? green : lv_color_make(166, 255, 184), 0);
+  }
+  if (statusBatteryTerminal && lv_obj_is_valid(statusBatteryTerminal)) {
+    lv_obj_set_style_bg_color(statusBatteryTerminal, active ? green : lv_color_white(), 0);
+  }
+}
+
+void flashButtonTestFeedback() {
+  buttonTestFeedbackUntilMs = millis() + 80UL;
+  if (!buttonTestFeedbackActive) {
+    buttonTestFeedbackActive = true;
+    applyButtonTestFeedbackStyle(true);
+  }
+  lv_refr_now(nullptr);
+}
+
+void serviceButtonTestFeedback(unsigned long now) {
+  if (!buttonTestFeedbackActive || (int32_t)(now - buttonTestFeedbackUntilMs) < 0) return;
+  buttonTestFeedbackActive = false;
+  applyButtonTestFeedbackStyle(false);
+}
+
 bool buttonTestModeActive() {
   return buttonTestActive && pages[currentPage].kind == PAGE_REMOTE_SETTINGS &&
          settingsView == SETTINGS_BUTTONS;
@@ -5500,7 +5544,7 @@ void setButtonTestVisual(bool pulsing, const char *name = nullptr) {
 void pulseButtonTest() {
   if (!buttonTestModeActive() || buttonTestHeldIndex == -1) return;
   setButtonTestVisual(true, buttonTestHeldName);
-  flashCommandFeedback();
+  flashButtonTestFeedback();
   buttonTestPulseUntilMs = millis() + 80UL;
 }
 
@@ -5519,9 +5563,9 @@ void endButtonTest(int8_t index) {
   buttonTestPulseUntilMs = 0;
   nextButtonTestRepeatMs = 0;
   setButtonTestVisual(false);
-  commandFeedbackActive = false;
-  commandFeedbackUntilMs = 0;
-  applyCommandFeedbackStyle(false);
+  buttonTestFeedbackActive = false;
+  buttonTestFeedbackUntilMs = 0;
+  applyButtonTestFeedbackStyle(false);
   lv_refr_now(nullptr);
 }
 
@@ -13493,6 +13537,7 @@ void loop() {
   serviceButtonTest(now);
   serviceActivitySequence(now);
   serviceCommandFeedback(now);
+  serviceButtonTestFeedback(now);
   serviceBluetooth(now);
   now = millis();
   serviceAtvvVoice(now);
