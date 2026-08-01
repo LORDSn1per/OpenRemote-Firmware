@@ -1,6 +1,25 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  2.41 - 2026-08-01
+    - Battery life: runs the LIS3DH accelerometer in low-power mode (8-bit,
+      LPen=1) instead of normal mode for every idle/wake-detect
+      configuration (BLE-connected idle, light-sleep motion wake, deep-sleep
+      motion wake) - cuts its standby current for the states that can run
+      unattended the longest, without changing the interrupt-based wake
+      logic itself.
+    - Battery life: sets an explicit 100-200ms BLE advertising interval
+      while disconnected (pairing/reconnect only - never touches the
+      active-connection interval, so Chromecast HID stays fully responsive
+      and connected).
+    - Wake latency: defers BLEDevice::init() until after the first LVGL
+      frame is drawn and the backlight is on. It previously ran before the
+      LCD panel was even initialized, so waking back into a Bluetooth-bound
+      activity or device (the common case after deep sleep) paid a few
+      hundred ms of blocking Bluedroid stack bring-up before anything was
+      visible. Pure reordering - applyBluetoothState() already no-ops when
+      Bluetooth isn't actually needed yet.
+
   2.40 - 2026-08-01
     - Reverts 2.39: dropping the ghost-touch debounce's 12px proximity check
       to fix hesitant swipes let ghost touches back in almost immediately.
@@ -910,8 +929,8 @@
   1.00 - Initial LVGL cinematic runtime prototype.
 */
 
-static constexpr float OPENREMOTE_VERSION = 2.40f;
-static constexpr char OPENREMOTE_VERSION_TEXT[] = "2.40";
+static constexpr float OPENREMOTE_VERSION = 2.41f;
+static constexpr char OPENREMOTE_VERSION_TEXT[] = "2.41";
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
   "OPENREMOTE_FIRMWARE_VERSION=2.37";
 
@@ -3013,9 +3032,12 @@ bool configureLis3dhBleIdleOrientation() {
   // BLE idle keeps the CPU available for HID, so use low-rate raw orientation
   // samples rather than a high-pass interrupt. This measures a real pickup
   // angle and cannot retrigger from the accelerometer mode-change transient.
+  // LPen=1 (bit 3) runs the analog front end in the LIS3DH's low-power mode
+  // (8-bit output) instead of normal mode, cutting its standby current for
+  // the potentially long stretches BLE-connected idle can last.
   return writeReg8(ADDR_LIS3DH, 0x22, 0x00) &&
          writeReg8(ADDR_LIS3DH, 0x30, 0x00) &&
-         writeReg8(ADDR_LIS3DH, 0x20, 0x37) &&
+         writeReg8(ADDR_LIS3DH, 0x20, 0x3F) &&
          writeReg8(ADDR_LIS3DH, 0x21, 0x00) &&
          writeReg8(ADDR_LIS3DH, 0x23, 0x80) &&
          writeReg8(ADDR_LIS3DH, 0x24, 0x00) &&
@@ -3024,14 +3046,16 @@ bool configureLis3dhBleIdleOrientation() {
 
 bool configureLis3dhMotionWake() {
   if (!lis3dhReady || !raiseToWake) return false;
-  // A 25 Hz normal-mode sample rate responds promptly to lifting while drawing
-  // less current than the previous 50 Hz mode. The low-cutoff high-pass
-  // filter retains slow movement while rejecting the stationary gravity
-  // vector. INT1_THS is 16 mg/LSB at +/-2g.
+  // A 25 Hz low-power-mode sample rate responds promptly to lifting while
+  // drawing less current than normal mode did at the same rate (LPen=1, bit
+  // 3 of 0x20). The low-cutoff high-pass filter retains slow movement while
+  // rejecting the stationary gravity vector. INT1_THS is still 16 mg/LSB at
+  // +/-2g - the interrupt generator's threshold scaling is tied to the
+  // analog full-scale range, not the LPen output-resolution bit.
   uint8_t threshold = motionWakeInterruptThreshold();
   bool configured = writeReg8(ADDR_LIS3DH, 0x22, 0x00) &&
                     writeReg8(ADDR_LIS3DH, 0x30, 0x00) &&
-                    writeReg8(ADDR_LIS3DH, 0x20, 0x37) &&
+                    writeReg8(ADDR_LIS3DH, 0x20, 0x3F) &&
                     writeReg8(ADDR_LIS3DH, 0x21, 0x09) &&
                     writeReg8(ADDR_LIS3DH, 0x23, 0x80) &&
                     writeReg8(ADDR_LIS3DH, 0x24, 0x08) &&
@@ -3057,16 +3081,23 @@ bool configureLis3dhMotionWake() {
 bool configureLis3dhDeepSleepWake() {
   if (!lis3dhReady || !raiseToWake) return false;
 
-  // Match the OMOTE Community Rev 5 standby setup. Its deliberately high
-  // threshold ignores table vibration while still detecting a real pickup.
-  // INT1 is latched and active-low so GPIO2 can share an EXT1 ANY_LOW wake
-  // mask with the active-low TCA8418 keypad interrupt on GPIO8.
+  // Match the OMOTE Community Rev 5 standby setup, plus LPen=1 (bit 3 of
+  // 0x20) for low-power mode: this is the state that can run unattended for
+  // the longest (hours to days), so its own standby current matters most.
+  // LPen only trades output resolution for current draw - the interrupt
+  // generator's threshold/duration/AOI logic behind INT1 is unaffected, so
+  // wake sensitivity should be unchanged, but re-check a few real pickups
+  // after flashing given how costly a missed deep-sleep wake would be.
+  // Its deliberately high threshold ignores table vibration while still
+  // detecting a real pickup. INT1 is latched and active-low so GPIO2 can
+  // share an EXT1 ANY_LOW wake mask with the active-low TCA8418 keypad
+  // interrupt on GPIO8.
   uint8_t ignored = 0;
   uint8_t threshold = motionWakeInterruptThreshold();
   bool configured = readReg8(ADDR_LIS3DH, 0x31, ignored) &&
                     writeReg8(ADDR_LIS3DH, 0x22, 0x00) &&
                     writeReg8(ADDR_LIS3DH, 0x30, 0x00) &&
-                    writeReg8(ADDR_LIS3DH, 0x20, 0x47) &&
+                    writeReg8(ADDR_LIS3DH, 0x20, 0x4F) &&
                     writeReg8(ADDR_LIS3DH, 0x21, 0x09) &&
                     writeReg8(ADDR_LIS3DH, 0x23, 0x80) &&
                     writeReg8(ADDR_LIS3DH, 0x24, 0x08) &&
@@ -4527,6 +4558,12 @@ void applyBluetoothState() {
     advertising->addServiceUUID(bleHid->hidService()->getUUID());
     if (atvvReady) advertising->addServiceUUID(BLEUUID(String(ATVV_SERVICE_UUID)));
     advertising->setScanResponse(true);
+    // Only affects the disconnected pairing/reconnect window (never the
+    // active-connection interval, which stays untouched to keep Chromecast
+    // HID responsive) - 100-200ms is plenty fast for a host to find us while
+    // costing less radio-on time than the library's fast default.
+    advertising->setMinInterval(160);
+    advertising->setMaxInterval(320);
     advertising->setMinPreferred(0x06);
     advertising->setMaxPreferred(0x12);
     bleReady = true;
@@ -13764,7 +13801,6 @@ void setup() {
   Serial.printf("SD storage: %s\n", sdReady ? "ready" : "unavailable");
 
   applyClockMode();
-  applyBluetoothState();
 
   if (displayDriverChoice == 1) {
     if (!agfx->begin()) {
@@ -13809,6 +13845,14 @@ void setup() {
   // has restored and flushed the real first frame after cold or deep sleep.
   lv_refr_now(nullptr);
   if (!scheduledNtpWake) lcdBacklight(true);
+  // Deferred past the first rendered frame: BLEDevice::init() is a
+  // synchronous, blocking Bluedroid stack bring-up (commonly a few hundred
+  // ms) that previously ran before the LCD panel was even initialized,
+  // adding pure invisible latency to every boot that wakes back into a
+  // Bluetooth-bound activity/device - the common case after deep sleep.
+  // applyBluetoothState() already no-ops when !scheduledNtpWake is false or
+  // Bluetooth isn't actually needed yet, so this is a pure reordering.
+  applyBluetoothState();
   // A movement wake from deep sleep keeps the retained RTC time and avoids a
   // needless radio burst. Cold boots and the scheduled 3am timer refresh NTP.
   if (clockUseInternetTime &&
