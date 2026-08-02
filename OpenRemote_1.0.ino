@@ -1,6 +1,54 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  2.48 - 2026-08-02
+    - Raised the LCD_EN rail's touch-controller settle time from 120ms to
+      300ms in lcdPowerOn() (boot/deep-sleep-wake) and from 240ms to 300ms in
+      recoverTouchControllerPower() (I2C-recovery rail cycle), via a shared
+      TOUCH_POWER_ON_SETTLE_MS constant.
+    - Prompted by an overnight investigation on the separate OpenRemote_2.0
+      tree (PHANTOM_TOUCH_FINDINGS.md, 2 August 2026), which measured the
+      FT6x06 touch family needing roughly 300ms from power-up to a stable
+      capacitive baseline. Calibrating sooner while LCD DMA traffic starts
+      moments later can leave the baseline hypersensitive, producing ghost
+      touches until it re-tracks. This firmware already waited longer than
+      that project's original 5ms, but still short of the measured figure.
+      The panel bus was already quiet across this window (the touch probe
+      runs before tft.init()/DMA starts in setup()), so only the delay
+      values changed, not the ordering.
+    - Not yet validated against a reproducible ghost-touch case on this Rev 5
+      unit - the existing touchQuarantineActive double-read mechanism (2.43)
+      already covers the "reject a lone post-DMA sample" case this filter
+      would otherwise add.
+
+  2.47 - 2026-08-02
+    - Fixed a boot-window crash surfaced by loading WebConfig right after
+      flashing: a task_wdt abort inside ArduinoJson's JsonDeserializer::
+      skipQuotedString, confirmed twice live via serial with an identical
+      backtrace. First fix attempt targeted the wrong function
+      (handleRuntimeConfigDownload) and the crash reproduced again on retest
+      with the exact same signature - decoding the second backtrace pointed
+      at ensureBluetoothRuntimeDevice() instead, called once from
+      serviceBluetooth() on the first loop() tick after boot whenever the
+      remote is BLE-bonded. It only looked WebConfig-related because both
+      happen in the same few seconds after a fresh boot; the timing was
+      coincidental, not causal.
+    - Root cause, confirmed for real this time: ArduinoJson reads a File one
+      byte at a time while scanning quoted string values (icon/theme base64
+      data in runtime.json can be large), and never yields during the whole
+      parse. With enough embedded image data this alone can run long enough
+      to starve the idle task and trigger a hard reboot.
+    - Added readSdFileToPsramBuffer(): reads the whole file into a PSRAM
+      buffer with a handful of large, yielded reads, then deserializeJson()
+      parses from that RAM buffer instead of streaming byte-by-byte off the
+      SD card. Applied to every deserializeJson(doc, file) call site reading
+      runtime.json or a backup file: handleRuntimeConfigDownload,
+      loadRuntimeConfig, uploadedRuntimeConfigLooksValid,
+      runtimeConfigFileLooksValid, ensureBluetoothRuntimeDevice (the one that
+      actually crashed), persistSettingsToRuntimeConfig, restoreLcdFullBackup
+      and the boot-time IRDB manifest read - every such call site in the
+      file, not just the ones caught crashing.
+
   2.46 - 2026-08-02
     - Adds Debug > Backlight PWM: 640 Hz / 1 kHz / 5 kHz / 25 kHz. Applies
       instantly via ledcChangeFrequency() (no reboot), so frequencies can be
@@ -1025,8 +1073,8 @@
   1.00 - Initial LVGL cinematic runtime prototype.
 */
 
-static constexpr float OPENREMOTE_VERSION = 2.46f;
-static constexpr char OPENREMOTE_VERSION_TEXT[] = "2.46";
+static constexpr float OPENREMOTE_VERSION = 2.48f;
+static constexpr char OPENREMOTE_VERSION_TEXT[] = "2.48";
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
   "OPENREMOTE_FIRMWARE_VERSION=2.37";
 
@@ -2286,6 +2334,7 @@ void renderBackupRestorePage();
 void renderAboutPage();
 void renderUnlockPage();
 uint16_t countSavedIrDeviceFiles();
+uint8_t *readSdFileToPsramBuffer(File &file, size_t &outSize);
 bool i2cDevicePresent(uint8_t address);
 bool transmitIrCommand(const DeviceCommand &command);
 bool isVoiceSearchCommand(const DeviceCommand *command);
@@ -2332,6 +2381,15 @@ void buttonBacklight(bool on) {
   }
 }
 
+// The FT5x06 touch controller shares the LCD_EN rail and needs its own
+// power-on settle time before anything drives the panel bus. The OpenRemote_2.0
+// overnight investigation (2 August 2026, PHANTOM_TOUCH_FINDINGS.md) measured
+// the FocalTech FT6x06 family at ~300ms from power-up to a valid capacitive
+// baseline; calibrating any sooner (this rail used only 120ms) lets LCD DMA
+// traffic that starts moments later corrupt that baseline, producing ghost
+// touches until it re-tracks. Keep the panel/bus quiet across this wait.
+static const uint32_t TOUCH_POWER_ON_SETTLE_MS = 300;
+
 void lcdPowerOn() {
   pinMode(PIN_LCD_EN, OUTPUT);
   pinMode(PIN_LCD_BL, OUTPUT);
@@ -2360,7 +2418,7 @@ void lcdPowerOn() {
   releaseDeepSleepPinHolds();
   delay(40);
   digitalWrite(PIN_LCD_EN, LOW);
-  delay(120);
+  delay(TOUCH_POWER_ON_SETTLE_MS);
 }
 
 bool tcaWriteRegister(uint8_t reg, uint8_t value) {
@@ -3210,7 +3268,7 @@ bool recoverTouchControllerPower() {
   digitalWrite(PIN_LCD_EN, HIGH);
   delay(180);
   digitalWrite(PIN_LCD_EN, LOW);
-  delay(240);
+  delay(TOUCH_POWER_ON_SETTLE_MS);
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
   Wire.setClock(400000);
   return initialiseTouchController();
@@ -4045,9 +4103,13 @@ void loadIrdbMetadata() {
 
   File file = SD.open(manifestPath, FILE_READ);
   if (!file) return;
-  JsonDocument doc;
-  DeserializationError error = deserializeJson(doc, file);
+  size_t rawSize = 0;
+  uint8_t *raw = readSdFileToPsramBuffer(file, rawSize);
   file.close();
+  if (!raw) return;
+  JsonDocument doc;
+  DeserializationError error = deserializeJson(doc, raw, rawSize);
+  free(raw);
   if (error) {
     Serial.printf("IRDB manifest parse failed: %s\n", error.c_str());
     return;
@@ -4898,6 +4960,94 @@ void serviceUiDuringLongHttpTransfer() {
   // HTTP runs on core 0. LVGL, touch and keypad belong exclusively to the
   // Arduino loop on core 1, so a long transfer only yields its worker here.
   vTaskDelay(1);
+}
+
+// ArduinoJson reads a File one byte at a time while scanning string values
+// (see ArduinoStreamReader::read()), and neither that nor deserializeJson()
+// itself ever yields. A runtime.json with embedded base64 image data is large
+// enough that this can run for several seconds straight, starving the idle
+// task on whichever core called it and tripping the task watchdog outright -
+// confirmed by a live crash (task_wdt abort inside JsonDeserializer::
+// skipQuotedString, reached from deserializeJson(doc, file) in
+// handleRuntimeConfigDownload). Reading the whole file into a PSRAM buffer
+// first is a few large, yielded SD reads instead of thousands of tiny ones,
+// and parsing JSON from RAM afterwards is fast enough to need no yielding of
+// its own. Caller must free() the returned buffer. Returns nullptr on any
+// read failure or if the file is empty.
+uint8_t *readSdFileToPsramBuffer(File &file, size_t &outSize) {
+  outSize = 0;
+  const size_t total = file.size();
+  if (!file || total == 0) return nullptr;
+  uint8_t *buffer = static_cast<uint8_t *>(
+    psramFound() ? ps_malloc(total + 1) : malloc(total + 1));
+  if (!buffer) return nullptr;
+  size_t read = 0;
+  while (read < total) {
+    int chunk = file.read(buffer + read, min((size_t)4096, total - read));
+    if (chunk <= 0) {
+      free(buffer);
+      return nullptr;
+    }
+    read += (size_t)chunk;
+    vTaskDelay(1);
+  }
+  buffer[total] = '\0';
+  outSize = total;
+  return buffer;
+}
+
+// One-shot boot diagnostic: reports card type/size/free space, the exact
+// size of runtime.json, and how long a plain sequential read of it actually
+// takes on THIS card. If the card itself has gone slow or marginal (worn,
+// failing contacts, near-full filesystem), that would explain a watchdog
+// trip regardless of firmware version or how the JSON is parsed afterwards -
+// added after 2.45 (predates every JSON/backlight change this session)
+// reproduced the same crash, which rules out this session's edits as the
+// sole cause and points back at the card/file itself.
+void diagnoseSdCardHealth() {
+  const char *cardTypeName = "UNKNOWN";
+  switch (SD.cardType()) {
+    case CARD_NONE: cardTypeName = "NONE"; break;
+    case CARD_MMC: cardTypeName = "MMC"; break;
+    case CARD_SD: cardTypeName = "SDSC"; break;
+    case CARD_SDHC: cardTypeName = "SDHC/SDXC"; break;
+    default: break;
+  }
+  uint64_t cardSizeMb = SD.cardSize() / (1024ULL * 1024ULL);
+  uint64_t totalMb = SD.totalBytes() / (1024ULL * 1024ULL);
+  uint64_t usedMb = SD.usedBytes() / (1024ULL * 1024ULL);
+  Serial.printf("SD health: type=%s size=%lluMB fsTotal=%lluMB fsUsed=%lluMB (%.1f%% full)\n",
+                cardTypeName, cardSizeMb, totalMb, usedMb,
+                totalMb ? (100.0 * usedMb / totalMb) : 0.0);
+
+  if (!SD.exists(RUNTIME_CONFIG_PATH)) {
+    Serial.println("SD health: runtime.json does not exist yet");
+    return;
+  }
+  File file = SD.open(RUNTIME_CONFIG_PATH, FILE_READ);
+  if (!file) {
+    Serial.println("SD health: runtime.json exists but could not be opened");
+    return;
+  }
+  size_t fileSize = file.size();
+  uint8_t probe[4096];
+  unsigned long start = millis();
+  size_t totalRead = 0;
+  size_t worstChunkMs = 0;
+  while (totalRead < fileSize) {
+    unsigned long chunkStart = millis();
+    int chunk = file.read(probe, min(sizeof(probe), fileSize - totalRead));
+    unsigned long chunkMs = millis() - chunkStart;
+    if (chunkMs > worstChunkMs) worstChunkMs = chunkMs;
+    if (chunk <= 0) break;
+    totalRead += (size_t)chunk;
+  }
+  unsigned long elapsedMs = millis() - start;
+  file.close();
+  Serial.printf("SD health: runtime.json is %u bytes, read %u bytes in %lu ms "
+                "(worst single 4KB read: %lu ms)%s\n",
+                (unsigned)fileSize, (unsigned)totalRead, elapsedMs, worstChunkMs,
+                totalRead != fileSize ? " -- SHORT READ, possible bad sector" : "");
 }
 
 bool streamSdFileCooperatively(File &file, const char *mimeType) {
@@ -6816,9 +6966,16 @@ bool loadRuntimeConfig() {
   if (!sdReady || !SD.exists(RUNTIME_CONFIG_PATH)) return false;
   File file = SD.open(RUNTIME_CONFIG_PATH, FILE_READ);
   if (!file) return false;
-  JsonDocument doc(&psramJsonAllocator);
-  DeserializationError error = deserializeJson(doc, file);
+  size_t rawSize = 0;
+  uint8_t *raw = readSdFileToPsramBuffer(file, rawSize);
   file.close();
+  if (!raw) {
+    Serial.println("Runtime config read failed");
+    return false;
+  }
+  JsonDocument doc(&psramJsonAllocator);
+  DeserializationError error = deserializeJson(doc, raw, rawSize);
+  free(raw);
   if (error) {
     Serial.printf("Runtime config parse failed: %s\n", error.c_str());
     return false;
@@ -6856,9 +7013,13 @@ bool persistSettingsToRuntimeConfig() {
   if (!sdReady || !SD.exists(RUNTIME_CONFIG_PATH)) return false;
   File file = SD.open(RUNTIME_CONFIG_PATH, FILE_READ);
   if (!file) return false;
-  JsonDocument doc(&psramJsonAllocator);
-  DeserializationError parseError = deserializeJson(doc, file);
+  size_t rawSize = 0;
+  uint8_t *raw = readSdFileToPsramBuffer(file, rawSize);
   file.close();
+  if (!raw) return false;
+  JsonDocument doc(&psramJsonAllocator);
+  DeserializationError parseError = deserializeJson(doc, raw, rawSize);
+  free(raw);
   if (parseError) {
     Serial.printf("Settings runtime parse failed: %s\n", parseError.c_str());
     return false;
@@ -6913,9 +7074,13 @@ bool ensureBluetoothRuntimeDevice() {
   if (!sdReady || !SD.exists(RUNTIME_CONFIG_PATH)) return false;
   File file = SD.open(RUNTIME_CONFIG_PATH, FILE_READ);
   if (!file) return false;
-  JsonDocument doc(&psramJsonAllocator);
-  DeserializationError parseError = deserializeJson(doc, file);
+  size_t rawSize = 0;
+  uint8_t *raw = readSdFileToPsramBuffer(file, rawSize);
   file.close();
+  if (!raw) return false;
+  JsonDocument doc(&psramJsonAllocator);
+  DeserializationError parseError = deserializeJson(doc, raw, rawSize);
+  free(raw);
   if (parseError) return false;
 
   bool changed = false;
@@ -7259,9 +7424,13 @@ bool uploadedIrFileLooksValid(const String &path) {
 bool uploadedRuntimeConfigLooksValid(const String &path) {
   File file = SD.open(path, FILE_READ);
   if (!file) return false;
-  JsonDocument doc(&psramJsonAllocator);
-  DeserializationError error = deserializeJson(doc, file);
+  size_t rawSize = 0;
+  uint8_t *raw = readSdFileToPsramBuffer(file, rawSize);
   file.close();
+  if (!raw) return false;
+  JsonDocument doc(&psramJsonAllocator);
+  DeserializationError error = deserializeJson(doc, raw, rawSize);
+  free(raw);
   return !error && doc.is<JsonObject>();
 }
 
@@ -7526,9 +7695,16 @@ bool runtimeConfigFileLooksValid(const char *path, String &errorText) {
     errorText = "Could not open uploaded runtime config";
     return false;
   }
-  JsonDocument doc(&psramJsonAllocator);
-  DeserializationError parseError = deserializeJson(doc, file);
+  size_t rawSize = 0;
+  uint8_t *raw = readSdFileToPsramBuffer(file, rawSize);
   file.close();
+  if (!raw) {
+    errorText = "Could not read uploaded runtime config";
+    return false;
+  }
+  JsonDocument doc(&psramJsonAllocator);
+  DeserializationError parseError = deserializeJson(doc, raw, rawSize);
+  free(raw);
   if (parseError || !doc.is<JsonObject>()) {
     errorText = String("Invalid runtime JSON: ") + parseError.c_str();
     return false;
@@ -7702,8 +7878,15 @@ void handleRuntimeConfigDownload() {
   JsonDocument doc(&psramJsonAllocator);
   if (SD.exists(RUNTIME_CONFIG_PATH)) {
     File file = SD.open(RUNTIME_CONFIG_PATH, FILE_READ);
-    DeserializationError error = deserializeJson(doc, file);
+    size_t rawSize = 0;
+    uint8_t *raw = readSdFileToPsramBuffer(file, rawSize);
     file.close();
+    if (!raw) {
+      sendJson(500, "{\"ok\":false,\"error\":\"Could not read runtime configuration\"}");
+      return;
+    }
+    DeserializationError error = deserializeJson(doc, raw, rawSize);
+    free(raw);
     if (error) {
       sendJson(500, "{\"ok\":false,\"error\":\"Runtime configuration is invalid\"}");
       return;
@@ -8094,8 +8277,13 @@ bool convertWebBackupToRuntime(JsonDocument &backup, String &error) {
   if (SD.exists(RUNTIME_CONFIG_PATH)) {
     File current = SD.open(RUNTIME_CONFIG_PATH, FILE_READ);
     if (current) {
-      deserializeJson(runtime, current);
+      size_t rawSize = 0;
+      uint8_t *raw = readSdFileToPsramBuffer(current, rawSize);
       current.close();
+      if (raw) {
+        deserializeJson(runtime, raw, rawSize);
+        free(raw);
+      }
     }
   }
   runtime["schemaVersion"] = 1;
@@ -8195,10 +8383,17 @@ bool createLcdFullBackup(String &createdName, String &error) {
     error = "Runtime configuration is unavailable";
     return false;
   }
-  JsonDocument runtime(&psramJsonAllocator);
   File runtimeFile = SD.open(RUNTIME_CONFIG_PATH, FILE_READ);
-  DeserializationError parseError = deserializeJson(runtime, runtimeFile);
+  size_t rawSize = 0;
+  uint8_t *raw = readSdFileToPsramBuffer(runtimeFile, rawSize);
   runtimeFile.close();
+  if (!raw) {
+    error = "Could not read runtime configuration";
+    return false;
+  }
+  JsonDocument runtime(&psramJsonAllocator);
+  DeserializationError parseError = deserializeJson(runtime, raw, rawSize);
+  free(raw);
   if (parseError) {
     error = String("Runtime parse failed: ") + parseError.c_str();
     return false;
@@ -8331,9 +8526,16 @@ bool restoreLcdFullBackup(const char *name, String &error) {
     error = "Backup file not found";
     return false;
   }
-  JsonDocument backup(&psramJsonAllocator);
-  DeserializationError parseError = deserializeJson(backup, file);
+  size_t rawSize = 0;
+  uint8_t *raw = readSdFileToPsramBuffer(file, rawSize);
   file.close();
+  if (!raw) {
+    error = "Could not read backup file";
+    return false;
+  }
+  JsonDocument backup(&psramJsonAllocator);
+  DeserializationError parseError = deserializeJson(backup, raw, rawSize);
+  free(raw);
   if (parseError || strcmp(backup["category"] | "", "full-backup") != 0) {
     error = "This is not a valid full backup";
     return false;
@@ -8388,9 +8590,13 @@ void loadLcdBackupEntries() {
         JsonDocument filter;
         filter["category"] = true;
         filter["exportedAt"] = true;
+        size_t rawSize = 0;
+        uint8_t *raw = readSdFileToPsramBuffer(entry, rawSize);
         JsonDocument summary(&psramJsonAllocator);
-        DeserializationError jsonError = deserializeJson(
-          summary, entry, DeserializationOption::Filter(filter));
+        DeserializationError jsonError = raw
+          ? deserializeJson(summary, raw, rawSize, DeserializationOption::Filter(filter))
+          : DeserializationError::EmptyInput;
+        if (raw) free(raw);
         if (!jsonError && strcmp(summary["category"] | "", "full-backup") == 0) {
           LcdBackupEntry &backup = lcdBackupEntries[lcdBackupCount++];
           strlcpy(backup.name, name.c_str(), sizeof(backup.name));
@@ -8455,9 +8661,13 @@ void handleBackupList() {
           filter["exportedAt"] = true;
           filter["appVersion"] = true;
           filter["counts"] = true;
+          size_t rawSize = 0;
+          uint8_t *raw = readSdFileToPsramBuffer(entry, rawSize);
           JsonDocument summary(&psramJsonAllocator);
-          DeserializationError error = deserializeJson(
-            summary, entry, DeserializationOption::Filter(filter));
+          DeserializationError error = raw
+            ? deserializeJson(summary, raw, rawSize, DeserializationOption::Filter(filter))
+            : DeserializationError::EmptyInput;
+          if (raw) free(raw);
           const char *category = summary["category"] | "";
           if (!error && strcmp(category, "full-backup") == 0) {
             JsonObject item = files.add<JsonObject>();
@@ -8527,10 +8737,13 @@ void handleBackupDelete() {
   if (metadata) {
     JsonDocument filter;
     filter["nativeAssets"] = true;
+    size_t rawSize = 0;
+    uint8_t *raw = readSdFileToPsramBuffer(metadata, rawSize);
     JsonDocument summary(&psramJsonAllocator);
-    if (!deserializeJson(summary, metadata, DeserializationOption::Filter(filter))) {
+    if (raw && !deserializeJson(summary, raw, rawSize, DeserializationOption::Filter(filter))) {
       nativeAssets = summary["nativeAssets"] | "";
     }
+    if (raw) free(raw);
     metadata.close();
   }
   bool removed = SD.remove(path);
@@ -14341,6 +14554,7 @@ void setup() {
   initTca8418();
   initLIS3DH();
   sdReady = initSdStorage();
+  if (sdReady) diagnoseSdCardHealth();
   loadIrdbMetadata();
   loadRuntimeConfig();
   // Refresh an existing bonded Android TV device immediately so newly added

@@ -1,5 +1,6 @@
 .pio
 managed_components/
+.DS_Store
 .cache
 .dummy
 .vscode/.browse.c_cpp.db*
