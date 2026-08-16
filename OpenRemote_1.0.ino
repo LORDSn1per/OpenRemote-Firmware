@@ -1,6 +1,39 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  2.96 - 2026-08-16
+    - A 5-row activity page could still be dragged up and down by about ten
+      pixels even though every button already fitted. The tiles were never the
+      problem: renderActivityPage() and renderDevicePage() set a 12px bottom
+      pad on `content` for breathing room at the end of a scroll, and LVGL
+      counts that pad toward the scrollable extent. The content area is 258px
+      (configureContent(42, LCD_H - 62)) and a 5-row grid ends at y=257, so the
+      layout fitted with one pixel to spare and the pad alone made it scroll by
+      11. Every row count had this, not just 5 - 1 row scrolled by 6px, 2 by
+      7px, 3 by 8px, 4 by 9px - it was simply most obvious where the fit was
+      tightest. finaliseRemotePageScrolling() now measures the real overflow
+      with the pad removed, applies the pad only when the page genuinely
+      scrolls, and otherwise clears LV_OBJ_FLAG_SCROLLABLE so the page is
+      completely static.
+    - Changing the Row 5 split-line calibration appeared to do nothing while
+      rows 1-4 worked. The first row's Y came from
+      max(5, split - 42 + 4); 42 *is* the canonical 5-row split, so that
+      expression sits at its floor for the whole lower half of the dropdown -
+      every value from 32 to 43 produced exactly 5, i.e. 12 of the 21
+      offered settings were identical, including the default and every
+      downward step. The floor is now 0, which is safe because `content`
+      already begins below the top bar, so y=0 is the top of the usable area.
+      Rows 1-4 are unaffected (their grid starts are 55-208, nowhere near the
+      floor). Note that 32-38 still coincide at 0 - the grid cannot start above
+      the content area - so the useful 5-row range is 38 upward.
+    - Extracted themeGridStartY(). The same expression was duplicated in
+      makeTile() and makeNestedActivitySlider(), so a tile grid and a nested
+      activity slider on the same page could have drifted apart.
+    - Unrelated to the Split Line *toggle* in Settings > Debug, which is only
+      a read-only overlay showing the live first-row Y ("Show live first-row Y
+      position"). The numbers being adjusted are the per-row-count dropdowns
+      that write debugRowPixels[].
+
   2.95 - 2026-08-16
     - Battery: the idle BLE connection profile is now actually requested. The
       constants (BLE_CONN_IDLE_* , 120-150 ms interval, slave latency 3) and
@@ -2073,7 +2106,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "2.95"
+#define OPENREMOTE_VERSION_STRING "2.96"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -16396,6 +16429,42 @@ int activitySliderCardPixels(uint8_t thumbSize) {
   return max(44, (int)thumbSize + 6);
 }
 
+// Y of the first control row inside `content`, from the active theme's split.
+//
+// 42 is the canonical 5-row split, so this reads as "how far below the
+// tightest possible layout does this theme's split sit", plus a 4px margin.
+// The floor used to be 5, which quietly swallowed most of the Row 5 debug
+// calibration: that row's split is 42, the dropdown offers +/-10, and every
+// value from 32 to 43 came back as exactly 5. Twelve of twenty-one settings
+// did nothing, which is why adjusting the 5-row split appeared to be ignored
+// while 1-4 rows responded normally. A floor of 0 is safe because `content`
+// already starts below the top bar, so y=0 is the top of the usable area.
+int themeGridStartY() {
+  if (!activeRuntimeThemeStyle) return 5;
+  return max(0, (int)activeRuntimeThemeStyle->split - 42 + 4);
+}
+
+// Decide whether a page can scroll at all, after its tiles have been placed.
+//
+// Both remote pages set a 12px bottom pad to leave breathing room at the end
+// of a scroll. That pad counts toward LVGL's scrollable extent, so it made
+// every page scrollable by 6-11px even when the tiles themselves fitted with
+// room to spare - a 5-row activity ends at y=257 inside a 258px content area
+// and still dragged by 11px. The pad is now applied only when the content
+// genuinely overflows; when it fits, scrolling is turned off outright so the
+// page is completely static.
+void finaliseRemotePageScrolling() {
+  lv_obj_set_style_pad_bottom(content, 0, 0);
+  lv_obj_update_layout(content);
+  if (lv_obj_get_scroll_bottom(content) > 0) {
+    lv_obj_set_style_pad_bottom(content, 12, 0);
+    return;
+  }
+  lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_scrollbar_mode(content, LV_SCROLLBAR_MODE_OFF);
+  lv_obj_scroll_to_y(content, 0, LV_ANIM_OFF);
+}
+
 // Jumps straight to Settings > Wi-Fi Config from anywhere else in the app -
 // Settings is always pages[0] (see rebuildPages()), so this just points
 // currentPage/pageUi at it directly (LV_ANIM_OFF - no slide, since this is
@@ -16646,8 +16715,7 @@ void activateMacro(uint8_t index) {
 void makeNestedActivitySlider(const Tile &tile, uint8_t targetActivityIndex,
                               ActivitySliderUi *ui) {
   uint8_t row = tile.slot / 3;
-  int gridStart = activeRuntimeThemeStyle
-    ? max(5, (int)activeRuntimeThemeStyle->split - 42 + 4) : 5;
+  int gridStart = themeGridStartY();
   int y = gridStart + row * 52;
   uint8_t thumbSize = activitySliderThumbPixels();
   int cardHeight = activitySliderCardPixels(thumbSize);
@@ -16764,8 +16832,7 @@ void makeTile(uint8_t slot, const char *label, const char *iconPath, bool showTe
   uint8_t row = slot / 3;
   int x = 8 + col * 76;
   int iconPixels = constrain((int)map(buttonIconSize, 20, 64, 16, 40), 16, 40);
-  int gridStart = activeRuntimeThemeStyle
-    ? max(5, (int)activeRuntimeThemeStyle->split - 42 + 4) : 5;
+  int gridStart = themeGridStartY();
   int y = gridStart + row * 52;
 
   lv_color_t tileColour = activeRuntimeThemeStyle
@@ -16850,6 +16917,7 @@ void renderActivityPage() {
     makeTile(tiles[i].slot, tiles[i].label, tiles[i].iconPath ? tiles[i].iconPath : "", tiles[i].showText,
              tiles[i].boxMode, tiles[i].repeat, command, macro);
   }
+  finaliseRemotePageScrolling();
 }
 
 void renderDevicePage() {
@@ -16874,6 +16942,7 @@ void renderDevicePage() {
              devices[activeDevice].commands[i].repeatDefault,
              &devices[activeDevice].commands[i], nullptr);
   }
+  finaliseRemotePageScrolling();
 }
 
 void renderButtonDiagnosticPage() {
