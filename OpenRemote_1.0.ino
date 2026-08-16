@@ -1,6 +1,29 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  2.97 - 2026-08-16
+    - Scrolling a page that does overflow went 12px too far, clipping the top
+      of row 1. Same root cause as 2.96 and the same 12px bottom pad: 2.96
+      stopped it creating scroll on pages that fitted, but still applied it to
+      pages that did not, where it buys travel *past* the point the last row is
+      flush with the bottom - and that surplus comes off the top. Reported on a
+      4-row theme (split 93, so the grid starts at 55) carrying a fifth row of
+      buttons: the last tile ends at y=307 in a 258px content area, which is
+      49px of real overflow but 61px of permitted scroll. The Split Line
+      overlay bottomed out at S 32 instead of S 44, and the first row was
+      dragged 6px above the content top. The pad is now zero in both cases, so
+      travel stops exactly when the content is fully revealed.
+    - The overlay reads S = 38 + gridStart - scrollOffset, which is why an
+      unscrolled page shows S equal to the theme's own split value (a 5-row
+      theme calibrated to 39 reads S 39). At full scroll on the case above it
+      now reads S 44 - the point where the fifth row sits flush with the
+      bottom. Stopping at S 39 as expected would actually be 5px further than
+      flush and would leave a gap under the last row; 44 is the correct limit.
+    - A genuinely taller page still scrolls as far as it needs to. First-row
+      headroom at full scroll is 214 - (rows - 1) * 52: five rows keep 6px in
+      hand, six rows are -46px and must clip, which is right because six rows
+      cannot fit at any split setting.
+
   2.96 - 2026-08-16
     - A 5-row activity page could still be dragged up and down by about ten
       pixels even though every button already fitted. The tiles were never the
@@ -2106,7 +2129,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "2.96"
+#define OPENREMOTE_VERSION_STRING "2.97"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -16446,20 +16469,25 @@ int themeGridStartY() {
 
 // Decide whether a page can scroll at all, after its tiles have been placed.
 //
-// Both remote pages set a 12px bottom pad to leave breathing room at the end
-// of a scroll. That pad counts toward LVGL's scrollable extent, so it made
-// every page scrollable by 6-11px even when the tiles themselves fitted with
-// room to spare - a 5-row activity ends at y=257 inside a 258px content area
-// and still dragged by 11px. The pad is now applied only when the content
-// genuinely overflows; when it fits, scrolling is turned off outright so the
-// page is completely static.
+// The bottom pad is zero on purpose. Both remote pages used to set 12px for
+// breathing room at the end of a scroll, but LVGL counts that pad toward the
+// scrollable extent, so it bought 12px of travel *past* the point where the
+// last row is flush with the bottom of the content area - and that surplus
+// comes straight off the top, dragging the first row up under the title bar.
+// On a 4-row theme (split 93, grid starts at 55) carrying a fifth row of
+// buttons, the last tile ends at y=307 in a 258px area: 49px of real
+// overflow, but 61px of allowed scroll, so the first row was clipped by 6px
+// at the end of the drag. With no pad, travel stops exactly when the content
+// is fully revealed.
+//
+// This does not stop a genuinely taller page from scrolling further. First-row
+// headroom at full scroll is 214 - (rows - 1) * 52, so five rows keep 6px in
+// hand while six rows are -46px and must clip - which is correct, because six
+// rows cannot fit however the split is set.
 void finaliseRemotePageScrolling() {
   lv_obj_set_style_pad_bottom(content, 0, 0);
   lv_obj_update_layout(content);
-  if (lv_obj_get_scroll_bottom(content) > 0) {
-    lv_obj_set_style_pad_bottom(content, 12, 0);
-    return;
-  }
+  if (lv_obj_get_scroll_bottom(content) > 0) return;
   lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_set_scrollbar_mode(content, LV_SCROLLBAR_MODE_OFF);
   lv_obj_scroll_to_y(content, 0, LV_ANIM_OFF);
