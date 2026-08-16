@@ -1,6 +1,960 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  2.94 - 2026-08-16
+    - REVERTS 2.93 at the user's request after hardware testing. Releasing the
+      BLE activity session did save power, but it cost two things that matter
+      more than the saving:
+        1. Dropping the HID link makes the Chromecast pause the video for
+           about half a second. The disconnect is not silent to the host - it
+           is a real user-visible interruption every time the remote sleeps.
+        2. Waking from deep sleep then takes about 3 seconds.
+      DO NOT RE-ATTEMPT THIS. The 3 seconds is not a tuning problem and no
+      amount of trimming fixes it: deep sleep powers down the CPU and RAM, so
+      the wake path is a full cold boot - second-stage bootloader, PSRAM and
+      flash init, LVGL, SD mount, runtime.json parse, theme load - and then a
+      BLE re-init and reconnect that is itself 1-2 seconds of the total. Any
+      approach that ends in deep sleep while a Chromecast activity is selected
+      reintroduces both symptoms.
+    - The 2.93 diagnosis was still correct and is worth keeping on record: a
+      selected BLE activity vetoes light *and* deep sleep, so the remote sits
+      in modem-sleep with clocks running at 80 MHz (~15-20 mA), which is why a
+      charge lasts 3-4 days. That is the cost of an always-live HID link on
+      this build, not a defect.
+    - The remaining avenue that does not disconnect anything is BLE connection
+      parameters - a longer connection interval plus slave latency, which cuts
+      radio duty while the link stays up. Note the existing warning in
+      leaveBleConnectedIdle(): renegotiating at the instant modem sleep starts
+      can block Bluedroid's GAP task, so any attempt belongs at connection
+      setup, not at sleep entry.
+    - True light sleep with BLE live would need CONFIG_PM_ENABLE and
+      CONFIG_FREERTOS_USE_TICKLESS_IDLE, and neither is set in the pinned
+      Arduino framework's prebuilt libraries (only ESP_SLEEP_* and SPIRAM_*
+      appear in its sdkconfig). esp_pm_configure() is therefore unavailable,
+      which is why configureApplicationPowerMode() returns false - the comment
+      above it claiming the framework "already enables tickless idle" is
+      wrong. Getting it means building ESP-IDF from source.
+
+  2.93 - 2026-08-04
+    - ROOT CAUSE of 3-4 day battery life: selecting a Chromecast (or any BLE)
+      activity kept the remote out of *both* light and deep sleep for as long
+      as that activity stayed selected - not while it was being used.
+      bluetoothActivitySessionRequired() answers "is a BLE device selected",
+      and enterDeepPowerSleep(), enterLowPowerWait() and enterDisplaySleep()
+      all treated a true answer as an absolute veto. A remote left on the
+      table after watching something therefore sat in modem-sleep with the
+      clocks running at 80 MHz - roughly 15-20 mA on an ESP32-S3 - instead of
+      the tens of microamps deep sleep costs. On a ~1500 mAh cell that is
+      75-100 hours, which is exactly the reported 3-4 days.
+    - The BLE activity session is now *released* once the screen has been off
+      for the user's existing Deep Sleep interval, after which the normal
+      light-sleep-then-deep-sleep path runs as it always did. The link is
+      dropped rather than the sleep skipped, because the alternative -
+      light sleep with the BLE controller live - needs CONFIG_PM_ENABLE and
+      CONFIG_FREERTOS_USE_TICKLESS_IDLE, and neither is set in the pinned
+      Arduino framework's prebuilt libraries (checked: only ESP_SLEEP_* and
+      SPIRAM_* appear in its sdkconfig). esp_pm_configure() is therefore not
+      available on this build, which is also why configureApplicationPowerMode()
+      has always returned false - the comment above it claiming the framework
+      "already enables tickless idle" is wrong, and was the reason BLE idle
+      settled for a fixed 80 MHz clock instead of real sleep.
+    - Deliberately tied to the Deep Sleep slider rather than a new setting.
+      The cost of releasing the link is a reconnect on the first keypress
+      after a long idle (the remote is bonded, so this is a reconnect, not a
+      re-pair), and the user already has a control for how long the remote
+      should stay responsive before sleeping. Raising Deep Sleep holds the
+      Chromecast link open longer; lowering it saves more battery.
+    - Pairing mode and an in-flight voice capture are never interrupted, and
+      wakeDisplay() clears the release before applyBluetoothState() runs, so
+      any button or motion brings the link straight back.
+
+  2.92 - 2026-08-04
+    - ROOT CAUSE of "could not apply the backup", found because 2.91's
+      diagnostic named it outright: "NoMemory at byte 365688 of 1446399 on the
+      card, 7848012 PSRAM free, largest block 7733236". NoMemory with 7.7 MB
+      contiguous free is not a memory shortage, and it disproved 2.91's
+      fragmentation theory. ArduinoJson sizes two internal types from the
+      pointer width, so a 32-bit target silently gets uint16_t for both:
+      ARDUINOJSON_STRING_LENGTH_SIZE 2 caps a single string value at 65535
+      characters, and ARDUINOJSON_SLOT_ID_SIZE 2 caps a document at 65535
+      slots. StringNode::create() checks "if (length > maxLength) return
+      nullptr" *before* it calls the allocator, and a null return is reported
+      as NoMemory - which is why the free-heap figures looked irrelevant, and
+      they were. A backup embeds theme wallpapers as base64: a 240x320 RGB565
+      image is 153600 bytes, or 204800 base64 characters, over three times the
+      ceiling. Byte 365688 is simply where the first wallpaper begins. Both
+      sizes are now set to 4 in platformio.ini, and a static_assert fails the
+      build if either is ever lost, because this failure mode reads as an
+      out-of-memory error and would cost the same investigation twice.
+    - This is why the same backup copied fine and then would not apply. 2.91
+      validates the upload through an empty filter, which materialises no
+      values at all, so no oversized string is ever constructed and the file
+      passes; restore has to build the real document and hit the limit on the
+      first wallpaper. Both paths work now, but the asymmetry is deliberate -
+      validation confirms the bytes parse, not that the tree fits.
+    - The pre-2.91 backups on file top out at 285-character strings because
+      they predate asset embedding (2.50 and 2.61), which is why this never
+      appeared until a backup carried a theme.
+
+  2.91 - 2026-08-04
+    - Restoring a 1.38 MB backup over USB failed at 100% with "USB payload did
+      not arrive as complete JSON - the backup was not saved". The transfer was
+      not the problem and the message was an assumption. Studio parses the file
+      with json.loads() before it sends a byte, and serial_upload_payload()
+      aborts unless every 1024-byte window comes back as "ACK n" with n equal
+      to the exact number of bytes sent; finishUsbFileUpload() only runs when
+      uploadReceived == uploadExpected. Reaching 100% therefore proves all
+      ~1348 windows landed at their exact offsets and the bytes on the card are
+      correct. What actually failed was the remote's own parse.
+    - ROOT CAUSE: both uploadedRuntimeConfigLooksValid() and
+      restoreLcdFullBackup() called readSdFileToPsramBuffer(), which needs a
+      single *contiguous* PSRAM block the size of the whole file. ORUSB PING
+      reports total free PSRAM (~8 MB) but the largest free *block* is far
+      smaller once LVGL's draw buffers and the theme wallpapers are placed, so
+      ps_malloc(1.4 MB) fails on fragmentation nowhere near the 4 MB upload
+      cap. The validator returned a bare bool, so 2.90 reported that failure as
+      a truncated transfer - and the backups that were saved before 2.90 hit
+      the same allocation at restore, which is the "copies but will not apply"
+      case. One cause, three symptoms.
+    - The buffer was never needed for the parse itself. ArduinoJson 7 has no
+      zero-copy mode (BoundedReader copies every string into the document
+      pool), so the raw file buffer was ~1.4 MB held *in addition* to a tree
+      that already contained all of it. Both call sites now feed the parser
+      through BufferedSdJsonStream, which reads the file in 1 KB blocks and
+      yields every 16 KB - keeping the large yielded reads that
+      readSdFileToPsramBuffer() was introduced to guarantee, since a plain
+      deserializeJson(doc, file) reads one byte at a time, never yields, and is
+      what starved the idle task and rebooted the remote back then. Validation
+      also parses through an empty filter, so it now materialises nothing and
+      costs a few kilobytes whatever the backup's size.
+    - Both failures now name themselves: the DeserializationError, the byte
+      offset it stopped at, the file size and the largest free PSRAM block, on
+      serial and in the message Studio shows. 2.90 added this to the restore
+      path but not to the upload gate that was doing the rejecting.
+    - The upload timeout reported usbSerialRxOverflows, which counts since
+      boot, so the "2 UART receive overflow(s)" on a failed transfer included
+      every earlier attempt in the same session. It is now snapshotted when the
+      upload begins and reported as the count for that transfer only.
+
+  2.90 - 2026-08-04
+    - Applying a full backup failed with "This backup file could not be read",
+      which is not a diagnosis: that one string covered a truncated upload, a
+      corrupt file and an out-of-memory parse, and those need three different
+      responses. The message now carries the actual DeserializationError, the
+      byte count present on the card and free PSRAM, and logs the same to
+      serial. IncompleteInput means the bytes stop early and the file should
+      be re-copied; NoMemory means the file is fine and PSRAM was not;
+      InvalidInput means it is not the JSON it claims to be. The cause of the
+      reported failure is not yet known - this is deliberately a diagnostic
+      rather than a guessed fix, after four blind attempts at the USB transfer
+      fault earlier in this session established how expensive guessing is.
+    - Backups were the only USB upload category with no arrival check at all.
+      .ir, runtime.json, WebConfig and firmware are each validated in
+      finishUsbFileUpload() before the temp file is renamed into place, but a
+      backup was renamed into /backups regardless of what actually landed -
+      so a file that arrived truncated or corrupt was stored as if sound and
+      only failed much later at restore, by which time it may have overwritten
+      a good copy of the same name. A backup that does not deserialize is now
+      refused at upload and the existing file is left alone. This is the same
+      failure shape as the truncated WebConfig that 2.68 closed off.
+
+  2.89 - 2026-08-04
+    - The .ir file now copied over but the merge refused with "No
+      configuration on this remote to merge into. Restore a full backup or
+      sync from WebConfig first." That guard, added in 2.86, was wrong: it
+      collapsed two situations that need opposite handling. A card with no
+      runtime.json has no configuration to lose, so importing into an empty
+      one is precisely what was asked for - refusing left a freshly prepared
+      remote unable to accept its first device at all, and offered advice
+      ("restore a full backup") that a user importing one learned device may
+      have no way to follow. That case now starts from an empty runtime
+      document with the standard arrays and merges into it. A runtime.json
+      that exists but cannot be opened, read or parsed is the opposite case:
+      it still holds the user's devices, and starting fresh there would write
+      one imported device over everything they had. That case still refuses,
+      leaves the card untouched, and now reports which step failed and the
+      actual parse error instead of blaming a missing file - the previous
+      wording made an unreadable config indistinguishable from an absent one.
+
+  2.88 - 2026-08-04
+    - Copying a learned IR device over USB failed with "USB writes are not
+      allowed for this path". 2.86 taught restoreLcdFullBackup(), the LCD
+      backup list and /api/backups to accept a .ir file in /backups - because
+      WebConfig's per-device learned export is named "<Device>.ir" while
+      holding OpenRemote JSON - but missed usbWritableSdPath(), the allowlist
+      that decides where an ORUSB WRITE may land at all. It still permitted
+      only "/backups/*.json", so the transfer was refused before a single byte
+      moved and every downstream fix went unreached. A fourth gate on the same
+      file; that path now accepts .ir alongside .json. Flipper signals files
+      are unaffected - they still go to /devices via ORUSB IRFILE.
+
+  2.87 - 2026-08-04
+    - The USB Connected screen drew two labels on top of each other. The
+      subtitle "Use OpenRemote Studio on your computer" is 38 characters in
+      montserrat_12, which does not fit 240px, so it wrapped to two lines -
+      and the hint below it was positioned at a hard-coded y of 246, which is
+      where that second line lands. The overlap only showed up once a theme
+      wallpaper was in place, which is why it looked like it happened on any
+      sync that was not a fresh install. The idle hint ("Manage this remote
+      from Studio while connected") is now gone entirely - it repeated what
+      the subtitle already says - and the transfer warning that replaced it in
+      that slot is aligned below the subtitle's real height instead of a fixed
+      y, so re-wording either one cannot reintroduce the collision.
+
+  2.86 - 2026-08-04
+    - A learned IR device exported from WebConfig could not be restored by any
+      route. Three separate gates each refused it. restoreLcdFullBackup() -
+      which the LCD Backup/Restore menu, WebConfig's restore and ORUSB RESTORE
+      all funnel through - bailed out unless category was exactly
+      "full-backup", so every single-category export ("Your Devices",
+      "Learned", "Activities", "Macros", "Icons", "Themes") could be copied to
+      /backups and then never applied. Studio's Load .IR File demanded a
+      Flipper "Filetype: IR signals file" header, but WebConfig's per-device
+      export is named "<Device>.ir" while containing OpenRemote JSON, so it
+      was rejected as "not a Flipper-format .ir signals file"; the same check
+      in uploadedIrFileLooksValid() would have rejected it again. And
+      restoreLcdFullBackup() only accepted filenames ending in .json.
+      Single-category exports now restore as a *merge* rather than a
+      replacement: items are matched by id, so an existing device is updated
+      in place, a new one is appended, re-importing the same export twice
+      produces no duplicates, and the categories the file does not mention are
+      left untouched. Dispatching inside restoreLcdFullBackup() rather than at
+      each caller means all three restore routes gained this at once.
+    - Extracted rebuildRuntimeDerivedPages() from convertWebBackupToRuntime().
+      devicePages, the resolved theme/icon paths and the Settings/Activities
+      system pages are all derived from devices/activities/themes and have to
+      be regenerated whenever those change; leaving that inline would have
+      meant a category restore merging devices correctly and still leaving
+      devicePages describing the previous set.
+    - restoreEmbeddedFiles() now also accepts an embedded asset supplied as a
+      data: URL in "src", not only bare base64 in "data". WebConfig writes the
+      former for custom icons, so every icon entry fell through the empty-data
+      check and custom icons were silently never written back to the card -
+      from a full backup as well as from an icons export.
+    - The backup lists behind the LCD menu and /api/backups filtered to
+      full-backup only, which would have left the newly restorable category
+      exports invisible. Both now list anything restorable, report its
+      category, and the LCD confirmation says "Merge <category> backup?"
+      rather than "Restore full backup?" for a merge.
+
+  2.85 - 2026-08-04
+    - ROOT CAUSE of the USB SD transfer dying part-way through: the UART
+      receive buffer was only 256 bytes, a quarter of one upload window.
+      Arduino-ESP32's HardwareSerial defaults _rxBufferSize to 256 and
+      setRxBufferSize() was never called, so the driver's ring buffer held
+      256 bytes while Studio wrote a full 1024-byte window in one blocking
+      burst. The CH340C link has no hardware flow control, so nothing told
+      the host to wait: every byte past the 256th had to be pulled out by
+      loop() within 5.5 ms at 460800 baud or it was silently discarded.
+      That is why the failure was reproducible but not at a fixed point -
+      it needed one loop() pass longer than 5.5 ms to coincide with a window
+      in flight. The reported failure at ~31 KB is one window short of 32 KB,
+      the usual FAT cluster size, where allocating a new cluster makes the SD
+      write take far longer than a normal 512-byte block. With bytes lost,
+      uploadReceived could never reach uploadNextAck, no ACK was ever sent,
+      Studio timed out waiting for it and reported "No OpenRemote USB
+      response" - which read as a sleeping or crashed remote and sent four
+      previous fixes (2.74, 2.77, 2.78, 2.81) after the wrong cause. The
+      remote was awake the whole time and had simply not received the data.
+      Serial.setRxBufferSize(8192) is now called before Serial.begin(), which
+      must happen in that order because setRxBufferSize() is a no-op once the
+      UART driver is installed. Any buffer larger than one window makes the
+      overflow impossible regardless of loop() latency, because Studio never
+      has more than one unacknowledged window outstanding.
+    - Added Serial.onReceiveError() tracking so this class of fault can never
+      again be diagnosed by guessing. Dropped-byte events are counted and
+      reported by ORUSB PING as uartRxOverflows, and the upload timeout now
+      says how many bytes of the file arrived and how many overflows were
+      seen instead of the bare "USB payload timed out".
+
+  2.84 - 2026-08-04
+    - ORUSB PING now reports resetReason, uptimeSec, heapFree and psramFree.
+      USB transfers to the SD card have failed repeatedly part-way through
+      and four separate attempted fixes have not resolved it; the obstacle to
+      diagnosing it is that Studio holds the only serial port for the whole
+      transfer, so a crash on the remote cannot be observed while it happens.
+      Studio now re-pings after a failure and reports these values, which
+      distinguishes the two possibilities directly: a short uptime with a
+      panic or watchdog reset reason means the remote rebooted mid-copy,
+      while a long uptime means it stayed up and the fault lies in the serial
+      link or the SD write path.
+
+  2.83 - 2026-08-04
+    - A freshly flashed remote still came up on LovyanGFX with the Split Line
+      debug overlay drawn, despite 2.76 and 2.74 changing both defaults.
+      Changing a preference default only affects a remote that has never
+      stored that key, and flashing firmware does not erase NVS - so any
+      remote that had already saved dispDrv=0 or dbgSplit=true kept them.
+    - Added a one-time preference migration, run once after loadSettings()
+      and guarded by a prefMig1 flag: it forces Arduino_GFX and switches every
+      debug overlay off, then records that it has run so a later deliberate
+      change in Settings > Debug is respected. The flag is preserved across
+      Factory Reset alongside the other hardware settings, so the migration
+      cannot re-run and override a choice made afterwards.
+
+  2.82 - 2026-08-04
+    - Added ORUSB RESTORE <name>, which applies a backup already present in
+      /backups using the same restoreLcdFullBackup() the LCD menu and
+      WebConfig use. Studio's Recovery tab can now copy a backup over USB and
+      then have the remote install it, rather than only leaving the file on
+      the card for the user to restore by hand afterwards.
+
+  2.81 - 2026-08-04
+    - Enabled UART as a light-sleep wake source, which is very likely the real
+      cause of the long-running "No OpenRemote USB response" failures. Once
+      the display slept the CPU stopped servicing UART entirely, so Studio's
+      first ORUSB PING was never answered and the remote had to be woken by
+      hand before any transfer would start. 2.77's sleep guards could not fix
+      this: they keep the remote awake once a link exists, but no link can be
+      established while it is already asleep.
+    - enterLowPowerWait() now calls uart_set_wakeup_threshold(UART_NUM_0, 3)
+      and esp_sleep_enable_uart_wakeup(UART_NUM_0) alongside the existing GPIO
+      wake sources, disables it again on the way out, and treats an
+      ESP_SLEEP_WAKEUP_UART wake as Studio traffic - stamping the USB link
+      active and lighting the display immediately.
+
+  2.80 - 2026-08-04
+    - usbWritableSdPath() now permits /backups/*.json, so OpenRemote Studio's
+      Recovery tab can load a saved backup onto a remote whose web UI cannot
+      be reached. .ir device files already had their own ORUSB IRFILE command
+      and are unaffected.
+
+  2.79 - 2026-08-04
+    - OPENREMOTE_FIRMWARE_MARKER carried its own hard-coded version string and
+      was last updated at 2.57, so every build for the last twenty-odd
+      releases identified itself as 2.57. OpenRemote Studio reads that marker
+      out of the .bin, which is why choosing OpenRemote_2.77.bin displayed
+      "Firmware 2.57" - and why there was no reliable way to confirm which
+      firmware was actually installed. Both the marker and
+      OPENREMOTE_VERSION_TEXT now derive from a single
+      OPENREMOTE_VERSION_STRING macro, so they cannot drift again.
+
+  2.78 - 2026-08-04
+    - Fixed the fault introduced with the USB screen in 2.75 and carried into
+      2.77's sleep guards: lastUsbStudioActivityMs was only stamped by
+      handleUsbCommand(), but bulk file data is consumed by
+      serviceUsbUpload()/serviceUsbDownload() and never passes through it.
+      A long single-file transfer therefore issued no commands at all, the
+      12s window expired mid-copy, and the remote decided the link was idle -
+      reverting the Activities page and re-arming the sleep timers during
+      exactly the operation both features exist to protect.
+      serviceUsbSerialImport() now stamps activity whenever a transfer is in
+      flight or bytes are arriving on an established link.
+
+  2.77 - 2026-08-04
+    - The remote could fall asleep partway through a USB setup and abort it
+      with "No OpenRemote USB response". Every sleep guard tested
+      usbSdTransferActive(), which is only true while a file is actually
+      being transferred - so the gaps between files, and especially the long
+      run of STAT checks that skips files already present, looked completely
+      idle and the ordinary display sleep timer fired. Light sleep then took
+      the serial link down with it.
+    - All seven sleep decision points (display sleep, light sleep, deep
+      sleep, BLE idle) now also test usbStudioLinkActive(), so the remote
+      stays fully awake for as long as OpenRemote Studio is talking to it and
+      for 12s after the last command. Normal timers resume once the link goes
+      quiet; the QR page keeps its own 30 minute timeout.
+
+  2.76 - 2026-08-04
+    - Arduino_GFX is now the default LCD driver (dispDrv default 0 -> 1), in
+      loadSettings() and in the Factory Reset preserve read. LovyanGFX's DMA
+      path is faster, but this panel shows touch problems with it, so the
+      synchronous driver is the correct out-of-the-box behaviour and only a
+      deliberate Settings > Debug change should move off it.
+    - Note this only affects a remote with no stored preference - a fresh
+      flash, or one whose preferences were cleared by Format SD Card. A remote
+      that has already saved dispDrv=0 keeps LovyanGFX until it is changed in
+      Settings > Debug or its preferences are wiped.
+
+  2.75 - 2026-08-04
+    - The Activities page now shows a "USB Connected" screen while OpenRemote
+      Studio is talking to the remote: a glowing brand-blue emblem with the
+      USB symbol, built the same way as makeOpenRemoteLogoEmblem() so the two
+      screens read as one family, plus a line pointing the user at OpenRemote
+      Studio and a hint that changes to "Transferring files" during an actual
+      transfer. A card preparation can run for minutes, and until now the
+      remote looked completely idle throughout.
+    - Detection is based on real ORUSB traffic (lastUsbStudioActivityMs, 12s
+      idle window), not on the cable being plugged in - the CH340C bridge is
+      powered from USB, so a connected lead proves nothing on its own.
+      handleUsbCommand() repaints on the appearing edge and loop() watches for
+      the link lapsing, since that has no event of its own.
+
+  2.74 - 2026-08-04
+    - Split Line debug defaulted to true, so a freshly flashed remote came up
+      with the diagnostic overlay already drawn over every page. It now
+      defaults off, matching the other debug toggles (touch, CPU/RAM,
+      accelerometer, FPS), in both loadSettings() and the Factory Reset
+      preserve list.
+    - Opening the Wi-Fi QR page during a USB transfer aborted the transfer.
+      Entering that page stops the BLE radio, starts the setup access point
+      and brings up the HTTP server, which is enough to break Studio's SD
+      card preparation part-way through - reported as the remote jumping to
+      the QR screen around 25% of an index.html copy. openSettingsView() now
+      refuses to enter the QR page while usbSdTransferActive() is true.
+
+  2.73 - 2026-08-04
+    - usbWritableSdPath() now permits /themes/Default/*.rgb565, .png and
+      .json. /icons/Default was already allowed but the matching theme folder
+      was not, so preparing a blank SD card over USB installed the folders,
+      WebConfig and every Default icon and was then refused on the first
+      theme file with "USB writes are not allowed for this path" - which read
+      as a card formatting problem rather than a missing permission. Existing
+      cards never hit it because those files were already present and got
+      skipped.
+
+  2.72 - 2026-08-04
+    - ORUSB PREPARESD now reports foldersCreated and foldersTotal alongside
+      the existing card details, so Studio's "Prepare over USB" can tell the
+      user what actually changed on the card instead of finishing silently.
+
+  2.71 - 2026-08-04
+    - Added ORUSB STAT <path>, returning whether a file exists on the SD card
+      and its size. OpenRemote Studio uses it to prepare a blank SD card over
+      USB while skipping anything already present - without it every setup
+      re-sent several megabytes over a 460800 baud link regardless of what
+      the card already held.
+
+  2.70 - 2026-08-04
+    - Added the ORUSB FACTORYRESET command so a remote can be reset over USB
+      when its web UI is unreachable, which is the situation recovery is
+      needed in. handleFactoryReset()'s body was extracted into a shared
+      performFactoryReset() and both paths now call it, so a USB reset erases
+      exactly what WebConfig's Restore Factory Settings does rather than
+      being a second, subtly different implementation. Uses the same
+      hardRestartPending reboot as the HTTP path (see 2.59).
+    - Companion change in OpenRemote Studio 2.46: a new Recovery tab with its
+      own USB port picker, WebConfig install (progress bar with KB/MB) and
+      Restore Factory Settings.
+
+  2.69 - 2026-08-04
+    - Recovery for a WebConfig that was installed incomplete, which locked the
+      user out of the web UI entirely with no way back in except pulling the
+      SD card. Every install already moves the outgoing copy to
+      /backups/index.previous.html, but nothing ever looked at it.
+    - Added htmlFileLooksComplete(): a whole HTML document ends with </html>,
+      so checking the tail distinguishes a complete file from a truncated one.
+      Checking only the header (as uploadedWebConfigLooksValid() did) cannot -
+      every opening tag lives in the first few hundred bytes, which is exactly
+      why a 90%-transferred file passed validation and was installed.
+    - uploadedWebConfigLooksValid() now requires the closing tag as well, so a
+      truncated WebConfig cannot be installed in the first place (alongside
+      2.68's CRC check), and recoverWebConfigIfIncomplete() runs at boot: if
+      the installed copy is incomplete and the previous one is intact, the bad
+      copy is set aside as /backups/index.corrupt.html and the previous
+      working version is put back automatically.
+    - Note on USB mass storage, which was requested: it is not possible on
+      this hardware. The USB-C connector is wired to a CH340C USB-to-UART
+      bridge (hence the port enumerating as usbserial rather than usbmodem),
+      so the host never sees the ESP32-S3 itself. The S3's native USB
+      peripheral is fixed to GPIO19/GPIO20 and cannot be routed elsewhere,
+      and both pins are used here as the shared I2C bus (touch, keypad,
+      accelerometer, fuel gauge). Presenting the SD card as a USB drive would
+      need a hardware change, so this build makes the remote repair itself
+      instead.
+
+  2.68 - 2026-08-04
+    - Found why an uploaded WebConfig could install visibly corrupted (part of
+      the remote mock-up image decoding, then noise): nothing anywhere
+      verified that an upload arrived complete. uploadedWebConfigLooksValid()
+      only inspects the first 768 bytes, so an HTML truncated at 90% still
+      contains <html and the version meta, passes validation and is installed
+      - and a browser renders exactly that far into the embedded image before
+      hitting garbage. Every upload path had the same hole; a short transfer
+      was silently accepted rather than reported.
+    - The chunked upload now carries an end-to-end integrity check. The client
+      sends the exact byte count and a CRC-32 of the payload; the remote
+      accumulates the same CRC as chunks are written (no extra pass over the
+      SD card) and refuses to commit on any size or checksum mismatch, naming
+      which one failed. Both parameters are optional, so an older client still
+      works against this firmware.
+    - WebConfig 2.36.html computes the CRC before sending and, on an integrity
+      failure specifically, restarts the whole transfer rather than resuming -
+      resuming would only preserve the bad bytes. Verified both CRC
+      implementations against the standard CRC-32 test vector, including the
+      firmware's chained-across-chunks form.
+
+  2.67 - 2026-08-03
+    - Restoring an SD-card backup from WebConfig no longer uploads anything.
+      It used to download the whole backup, rebuild the entire model in the
+      browser, and then push every byte back to the remote - re-rendering and
+      re-uploading each theme's ~150 KB .rgb565, every custom icon and the
+      full runtime.json - to restore data that had never left the SD card.
+      That is why it was slow, why it stressed exactly the upload path that
+      has been unreliable, and why one theme the browser could not re-render
+      ("Sync failed: Could not prepare the selected LCD theme") sank the whole
+      restore even though the remote's own Backup/Restore menu handled the
+      same file perfectly.
+    - Added POST /api/backups/restore, which runs the same
+      restoreLcdFullBackup() the LCD menu uses. WebConfig now calls that and
+      simply re-reads the remote's new configuration afterwards, so an SD
+      restore costs no upload at all and behaves identically from either
+      side. restoreLcdFullBackup() gained a reloadNow flag: the HTTP worker
+      runs on core 0, so it restores the files and lets the main loop rebuild
+      the runtime model, as the runtime-config upload path already did.
+    - stepLcdBackupAnim() now returns immediately unless it is running on
+      core 1. Its callers (copySdTree(), restoreEmbeddedFiles()) are reached
+      by the new HTTP-triggered restore as well, and LVGL belongs exclusively
+      to the Arduino loop - previously this was only saved by the animation
+      bar happening to be hidden.
+    - Companion changes in WebConfig 2.35.html: SD restore reports through
+      the normal transfer pill while the remote's configuration is
+      downloaded back; a theme that genuinely cannot be prepared is now
+      skipped (and named in the pill) instead of failing an entire sync; and
+      a theme whose bitmap cannot be loaded falls back to re-rendering from
+      its saved gradient recipe rather than erroring.
+
+  2.66 - 2026-08-03
+    - Added a resumable chunked upload path, replacing the single
+      multi-megabyte POST used for syncing configuration and for installing
+      WebConfig and firmware. One long POST over the SoftAP is inherently
+      fragile: a drop anywhere loses the whole transfer, which is why a full
+      sync or an install could still fail intermittently even after 2.64/2.65
+      made each individual transfer more robust.
+        POST /api/upload/begin?target=T    start (or restart) a session
+        GET  /api/upload/status?target=T   bytes the remote actually holds
+        POST /api/upload/chunk?target=T&offset=N   append one chunk
+        POST /api/upload/finish?target=T   validate and commit
+      Targets are config, webconfig and firmware; each commits through the
+      same code the existing single-shot endpoint used, so behaviour after
+      the bytes land is unchanged. Chunks append to one temp file and the
+      payload is only validated and installed by the finish step, so a
+      half-delivered upload can never be committed. A mismatched offset is
+      refused rather than written, and the client re-reads /status and
+      resumes from wherever the remote really got to.
+    - The old single-shot endpoints are all still registered, so this build
+      stays compatible with older WebConfig versions.
+    - WebConfig 2.34.html uses 192 KB chunks, retries an individual chunk up
+      to six times, resynchronises against /status after any failure, and
+      falls back to the original single POST when it detects firmware without
+      these routes - so a remote on older firmware can still be updated to
+      this one.
+
+  2.65 - 2026-08-03
+    - Sync still failed after 2.64, and large WebConfig uploads still needed
+      several attempts, so this makes the failure diagnosable instead of
+      guessing again - the reason was never actually visible to anyone.
+      WebConfig collapsed every sync error into "Sync failed - tap to retry"
+      and put the remote's real explanation in the browser console only, so
+      messages like "Runtime config is larger than N MB" or "Invalid runtime
+      JSON: NoMemory" never reached the user. WebConfig 2.33.html now shows
+      the remote's own message, and this build logs the upload's size,
+      duration, free heap and free PSRAM to serial at start, validation and
+      commit.
+    - Fixed a real defect found while adding that: runtimeConfigFileLooksValid()
+      deserialized the whole uploaded document into a JsonDocument purely to
+      confirm three top-level arrays existed. ArduinoJson's in-memory form of
+      a multi-megabyte config is several times its text size, so a large but
+      perfectly valid runtime.json could exhaust the 8 MB PSRAM and be
+      rejected as NoMemory - the more devices and IR data configured, the
+      more likely the sync failed, which matches a sync that fails
+      consistently once a configuration is fully populated. It also ran a
+      long, allocation-heavy, non-yielding parse on the same core as the
+      Wi-Fi stack immediately before the HTTP response had to be sent.
+      Validation now uses a filtered parse (identical syntax checking,
+      materialises nothing) and confirms the required sections against the
+      raw text, so its cost no longer scales with configuration size.
+
+  2.64 - 2026-08-03
+    - Investigated "sync failed - tap to retry", reported as always failing
+      at 2.44 MB and as firmware/WebConfig uploads needing three or four
+      attempts. Three independent causes, all fixed:
+    - handleRuntimeConfigUploadData() rejected anything over a hard-coded
+      2 MB ("Runtime config is larger than 2 MB"). runtime.json carries
+      embedded icon/theme image data and a fully populated remote now
+      exceeds that, so the sync was doomed part-way through every time and
+      only surfaced as a generic failure at the end. Raised to 6 MB;
+      validation still fails cleanly (PSRAM alloc / ArduinoJson NoMemory)
+      rather than crashing if a file really is too large.
+    - None of the eight upload handlers (firmware, firmware stage,
+      WebConfig, IRDB, theme, custom icon, backup, device file) yielded
+      while writing to SD - only handleRuntimeConfigUploadData() did. A
+      multi-megabyte upload therefore ran back-to-back SD writes on core 0,
+      the same core the Wi-Fi stack runs on, with no cooperative break for
+      the whole transfer. That starves the network stack exactly when the
+      transfer is longest, which is why big uploads tended to die near the
+      end and succeed on a later attempt. Every write branch now calls
+      serviceUiDuringLongHttpTransfer() like the runtime path already did.
+    - Companion fixes in WebConfig 2.31.html: the sync upload used a flat
+      45-second XMLHttpRequest timeout regardless of payload size, and at
+      the SoftAP's ~50-60 KB/s that expires at almost exactly 2.4 MB every
+      run - the reported "always fails at 2.44 MB" was a time limit showing
+      up at a consistent byte offset. It is now budgeted from the actual
+      payload size (12 KB/s floor, 60s minimum, 15 minute ceiling). Firmware
+      and WebConfig uploads additionally retry twice on a dropped or
+      timed-out connection, rather than asking the user to retry by hand;
+      genuine rejections from the remote still surface immediately.
+
+  2.63 - 2026-08-03
+    - Added static serving for /devices/, matching the existing /icons/ and
+      /themes/ entries. WebConfig's "Backup All Categories" builds its JSON
+      entirely in the browser and can only embed what it can fetch, so with
+      /devices unreachable a WebConfig-created backup could never contain
+      file-backed (Studio/IRDB) device files at all - only a backup created
+      on the LCD could, since that reads the SD card directly. Served
+      no-store rather than cached, since a re-imported device can reuse a
+      filename.
+    - Companion fixes in WebConfig 2.30.html, both found from a real
+      wipe-and-restore where themes came back but custom icons and .ir
+      devices did not:
+      * normaliseRestoredCustomIcon() overwrote each restored icon's src -
+        which holds the embedded base64 image data in a WebConfig-created
+        backup - with a live remoteApiUrl(path) pointing at a
+        /icons/Custom file that no longer existed on the wiped card. The
+        embedded bytes were discarded, so syncIconAssets() had nothing to
+        upload and the icons vanished on the next sync. It now only points
+        src at the remote when there is no embedded data to keep.
+        normaliseRestoredTheme() had the same latent bug and got the same
+        guard (themes happened to survive because their rgb565 is
+        regenerated at sync time).
+      * WebConfig's own backup now fetches and embeds /devices/*.ir bytes
+        into the same deviceFiles array the firmware writes, so a
+        browser-made backup can restore file-backed devices too.
+
+  2.62 - 2026-08-03
+    - Fixed the status bar still showing "--:--" on a remote that has never
+      had Wi-Fi set up. 2.58 gave *backup timestamps* a manual-time/1pm-
+      2026-01-01 fallback but never touched the actual system clock, which
+      was the real complaint: applyClockMode() bailed out at
+      "if (clockUseInternetTime) return;" before setting anything, and
+      internet time is the default, so with no Wi-Fi profile the clock was
+      simply never seeded and time(nullptr) stayed invalid forever.
+      applyClockMode() now keeps an already-valid clock, otherwise seeds it
+      from the last manually-set time, otherwise from the fixed 1pm on
+      1 January 2026 default - in every clock mode, not just manual. A real
+      NTP sync still overwrites the seed the moment one succeeds.
+    - Extracted that fallback as defaultClockSeedEpoch() and pointed
+      backupTimestampNow() at it too, so the backup label and the device
+      clock can no longer disagree about the default.
+
+  2.61 - 2026-08-03
+    - Found the rest of why a WebConfig restore never brought back every
+      device. 2.60 put file-backed devices' *metadata* into the backup so a
+      restore could at least list all six, but listing was as far as it could
+      ever get: an OpenRemote Studio / IRDB device exists only as a
+      /devices/*.ir file, buildRuntimePayload() deliberately omits fileBacked
+      devices from runtime.json, and POST /api/config never writes /devices -
+      so the three file-backed devices reappeared in the browser and then
+      vanished again on the next sync/refresh, exactly as reported. The
+      backup also never carried the .ir bytes themselves, and there was no
+      HTTP route that could write one back: /api/devices/file was
+      DELETE-only.
+    - createLcdFullBackup() now embeds /devices as base64 (new deviceFiles
+      array) alongside the existing icon/theme embedding.
+    - convertWebBackupToRuntime() restores those files, so the LCD's own
+      portable restore path (different remote, or a fresh SD card) recovers
+      file-backed devices too rather than only the ones in runtime.json.
+    - Added POST /api/devices/file, mirroring the existing upload handlers:
+      sanitised .ir filename, staged through /tmp, validated with the same
+      uploadedIrFileLooksValid() header check the USB import path uses, then
+      renamed into /devices and registered via rememberSavedIrDeviceFile()
+      so /devices/index.txt stays correct. Serial-logged at every failure
+      point.
+    - Companion change in WebConfig 2.29.html: a restored full backup's
+      deviceFiles are held and POSTed to that new route during the next
+      sync, before the runtime payload, so the files exist by the time the
+      remote re-reads its configuration.
+    - WebConfig 2.29.html also replaces the small "No activities yet" card in
+      the screen designer with the full-screen loading-screen artwork
+      (identical background, glow, OpenRemote logo lockup and core), with the
+      orbiting arc completed into a solid ring since nothing is loading, and
+      "Loading..." reading "No Activities" instead.
+
+  2.60 - 2026-08-03
+    - Fixed a WebConfig JSON restore (SD card or a file saved to a computer)
+      only ever recovering some devices, even though the LCD's own restore
+      of the identical file recovered all of them. buildRuntimePayload()
+      (WebConfig) deliberately excludes fileBacked devices - OpenRemote
+      Studio/IRDB imports living purely as /devices/*.ir files - from
+      runtime.json's devices array, since GET /api/config merges those back
+      in for live display instead. createLcdFullBackup() copied
+      runtime["devices"] straight into the backup, so its JSON never had
+      them either; the LCD's restore didn't notice because it also restores
+      the whole /devices folder as real files, but WebConfig's browser-side
+      restore only ever reads the backup's JSON, which is now the only place
+      a fileBacked device could come from at all. createLcdFullBackup() now
+      calls the same appendIrDeviceFileSummaries() GET /api/config already
+      uses, so every device is actually represented in the backup JSON
+      itself, not just those synced into runtime.json.
+
+  2.59 - 2026-08-03
+    - Fixed an edited custom theme's image never updating on the LCD after
+      saving a crop/zoom change, even though WebConfig's own screen-designer
+      preview updated correctly. applyRuntimeTheme() has a fast path that
+      reuses a page slot's already-decoded PSRAM wallpaper whenever the
+      requested path matches what that slot last loaded, on the reasonable
+      assumption the same SD path still holds the same pixels - editing a
+      theme's image re-uploads the .rgb565 to that same path (the theme's id
+      doesn't change), so nothing ever invalidated the cached pixels. Added
+      invalidateWallpaperCacheForPath(), called from handleThemeUploadData()
+      right after a .rgb565 upload completes, so every page slot currently
+      showing that path is forced to re-read fresh bytes next render.
+    - Fixed touch staying dead until a physical reset button press after
+      "Restore Factory Settings": handleFactoryReset() used a plain
+      ESP.restart() (restartPending), the same class of soft app-level
+      restart that displayDriverDropdownEvent()/touchDriverDropdownEvent()
+      etc. already deliberately avoid via hardRestartPending
+      (esp_rom_software_reset_system()) for any change needing a genuine
+      peripheral reinit. Switched Factory Reset to the same hard-restart
+      path.
+    - WebConfig's "Backup All Categories as One File" saved to the remote SD
+      card silently failing was invisible: downloadBackupFile()'s SD branch
+      already set a precise status (success or the real upload error) via
+      setBackupStatus(), but backupAllCategories()'s own trailing .then()
+      unconditionally overwrote it with a generic "Saving..." message that
+      read as success either way. Fixed to only show the generic message for
+      a browser download, not an SD save. Also added Serial diagnostics to
+      handleBackupUploadData() (start/write/rename failures), matching the
+      sibling WebConfig/IRDB upload handlers, which never logged anything -
+      if the SD save still fails, serial output should now show why.
+    - Replaced the "Slide to unlock after sleep" lock-screen toggle (Display
+      settings) with a "Wake" dropdown: Motion (default) is today's
+      behaviour - motion lights the LCD directly. Button leaves the LCD dark
+      on a motion-only wake: the MCU still comes fully out of light sleep
+      (network/keypad polling resume normally, so a physical button press
+      gets its usual instant response and fires its command exactly as
+      before), but only that button press ever turns the backlight on.
+      Implemented as a bounded (8s) awaitingButtonWake window in
+      enterLowPowerWait()/loop() after a motion-only light-sleep wake, so a
+      missed window just falls back to a normal light-sleep re-arm rather
+      than leaving the MCU spinning awake indefinitely. The existing
+      BLE-connected-idle motion wake is gated the same way. Deep-sleep wake
+      is unchanged for now - motion still lights the LCD there regardless of
+      this setting, since distinguishing which pin woke EXT1 and holding the
+      LCD dark through a full setup() reboot is a materially bigger, riskier
+      change than the light-sleep case and deep sleep's much longer idle
+      threshold makes it the less common case this setting matters for.
+      Removed the entire lock-screen mechanism (renderUnlockPage(),
+      lockActive, the slide-to-unlock overlay) since it's fully superseded.
+      Companion change in WebConfig 2.27.html: same toggle replaced with a
+      "Wake method" Motion/Button dropdown, synced via the existing
+      settings JSON (slideToUnlock field renamed to wakeMode, now numeric
+      0/1 instead of boolean).
+    - WebConfig 2.27.html also fixes: the Motion sensitivity slider showing
+      a raw 1-100 percentage instead of the same pickup-angle-in-degrees
+      label the remote's own LCD slider already shows for the identical
+      value (mirrored motionWakeAngleDegrees()'s conversion); "This is not a
+      valid Custom Icons/Themes backup file" rejecting every backup that
+      actually mattered, since a remote-created full backup's data.icons/
+      data.themes/themeAssets are firmware's {path,data} shape (no name/src/
+      image fields at all), not WebConfig's own {name,src} export shape -
+      restore now accepts and decodes both; missing icons/theme wallpapers
+      (blank "?" boxes) after restoring a full backup saved to a computer,
+      for the same {path,data} vs {name,src} reason, now decoded directly
+      from the embedded base64 instead of assuming a live path on whichever
+      remote happens to be connected; and the "ugly" blank Activities
+      screen-designer canvas when no activities exist yet, replaced with a
+      branded empty state (matching the loading screen's visual language)
+      that explains new activities/devices are added from the menu on the
+      left.
+
+  2.58 - 2026-08-03
+    - Backups created on the LCD (createLcdFullBackup()) showed "Date
+      Unavailable" whenever Wi-Fi had never been set up: clockUseInternetTime
+      defaults true, and with no Wi-Fi profile configured time(nullptr) never
+      becomes valid, while applyClockMode() only ever applies the saved
+      manual clock while in manual mode - so backupDateStrings() fell back to
+      an "Uptime N seconds" stamp that formatBackupDisplayDate() can't parse.
+      Added backupTimestampNow(), used only for backup timestamps: real time
+      if valid, else the last manually-set clock, else a fixed default of
+      1pm on 2026-01-01.
+    - The Wi-Fi QR settings page inherited the user's normal (often short)
+      screen timeout plus a 15-minute grace period. It now ignores the
+      normal timeout entirely while open and only sleeps after a flat 30
+      minutes of inactivity, so it stays lit for as long as someone is
+      actually scanning it.
+    - Added a thin animated blue bar under the LCD backup/restore status
+      text ("Creating full backup...", "Restoring full backup...") that
+      bounces left/right while the operation is running, stepped once per
+      file from inside copySdTree()/embedSdFilesAsBase64()/
+      restoreEmbeddedFiles() since the operation itself runs synchronously
+      on the UI core with no timer available to drive a real lv_anim.
+
+  2.57 - 2026-08-03
+    - Found the real cause of the setup AP never starting, via 2.56's added
+      logging: startSetupAccessPoint() was reaching requestWebServerStopAndWait(),
+      which timed out every single time. requestWebServerStop() sets
+      webServerStopRequested = true unconditionally, but that flag is only
+      ever cleared by the HTTP worker task's own loop - and that task is
+      only created lazily, by requestWebServerListen(). The very first time
+      WebConfig is opened with no saved Wi-Fi network (a fresh boot, or
+      right after Factory Reset), the worker doesn't exist yet, so nothing
+      could ever clear the flag: it got stuck true permanently, and every
+      later requestWebServerStopAndWait() call (from startSetupAccessPoint(),
+      recoverWifiRadio(), etc., for the rest of that boot) timed out
+      immediately for the same reason. requestWebServerStop() now checks
+      whether the worker task actually exists first and just marks the
+      server already-stopped directly if not, instead of setting a flag
+      nothing will ever pick up.
+
+  2.56 - 2026-08-03
+    - Diagnostic build only: 2.55's servicePageStripChange() fix did not
+      resolve the setup AP/QR page never appearing - live serial over 90s
+      of reproduction attempts showed zero AP-related output at all, not
+      even "Setup AP: failed to start", meaning startSetupAccessPoint() is
+      likely never even being reached. Added Serial logging at the actual
+      decision points (openSettingsView()'s enteringQrPage branch,
+      jumpToWebConfigQr(), and startSetupAccessPoint()'s own entry/early-
+      return points) to find out for certain rather than guessing further.
+
+  2.55 - 2026-08-03
+    - Found and fixed the real cause of the setup AP/QR code never appearing
+      (including via the new "Open WebConfig" button): settingsView is a
+      global that isn't tied to which top-level page is showing, and
+      swiping away from Settings to another page (Activities, a device
+      page) skipped all the "leaving" cleanup backToSettings() normally
+      does - so it stayed pointing at whatever sub-view was last open (e.g.
+      SETTINGS_WIFI_QR). openSettingsView() only starts the setup AP /
+      connects to a saved network on a genuine settingsView transition, so
+      coming straight back to that same sub-view later (a new swipe, or the
+      Activities page's own shortcut button) silently skipped that entirely
+      and just sat on a stale "Connecting..." state forever, with no AP and
+      no QR code. servicePageStripChange() now runs the same
+      backToSettings() cleanup whenever a swipe leaves the Settings page.
+    - Added the Wi-Fi password page's show/hide eye toggle to the plain
+      OpenRemote menu style too - it only ever existed on the Omote variant.
+      Narrowed the password field from 224 to 184px to make room for it.
+
+  2.54 - 2026-08-03
+    - Redesigned the empty Activities page (shown whenever WebConfig hasn't
+      synced any real activities yet) from plain "No activities / Sync real
+      activities in WebConfig" text into a proper empty state: a recreated
+      OpenRemote brand mark (WebConfig's .logo emblem - glow, ring and dot in
+      brand blue 0x2F8CFF - rebuilt from plain LVGL circles, since there's no
+      bitmap logo asset bundled into this firmware), a friendlier heading/
+      subtitle, and a small "Open WebConfig" button.
+    - That button (jumpToWebConfigQr()) jumps straight to Settings > Wi-Fi
+      Config from any page - Settings is always pages[0], so it points
+      currentPage/pageUi at it directly (no slide animation, since this is
+      meant to load instantly) and lets openSettingsView()'s own
+      pendingUiRefresh render the QR page once currentPage is correct.
+
+  2.53 - 2026-08-03
+    - Fixed Restore Factory Settings wiping hardware/diagnostic preferences
+      (LCD/touch driver choice, Debug menu toggles, Menu Style) via a blanket
+      preferences.clear() - confirmed live: after a reset, Split Line came
+      back enabled (its no-preference-found default) and the LCD driver
+      reverted to LovyanGFX. Those are meant to survive a Factory Reset; only
+      Format SD Card should wipe them. preferences.clear() has no selective
+      mode, so handleFactoryReset() now reads those specific keys out first
+      and restores them after clearing everything else. handleSdRebuild()
+      (Format) previously never touched Preferences at all - it now clears
+      them too (no restore), since Format is meant to be the thorough reset.
+
+  2.52 - 2026-08-03
+    - Fixed "Forget this network" on an open Wi-Fi network's manage page
+      falling through to the password-entry keyboard instead of exiting -
+      forgetSavedWifiEvent() always re-rendered the same page afterward,
+      which only makes sense for a real password (re-enter a new one); an
+      open network has nothing to type, so it now exits straight back to the
+      Wi-Fi list instead.
+    - Increased the Clock page's date/time roller "rubber band" settle
+      animation from the default theme's 200ms to 320ms for a slower, more
+      pronounced pull-back after a drag/flick. A roller drives its own
+      drag/release logic rather than LVGL's generic elastic-scroll system,
+      so anim_time is the only publicly exposed lever here - the settle
+      path itself (ease-out) is hard-coded inside LVGL's roller widget and
+      would need patching the vendored library to change further.
+
+  2.51 - 2026-08-03
+    - Fixed no LCD path existing to forget an open (password-free) Wi-Fi
+      network. chooseWifiNetwork() saved and reconnected to an open network
+      immediately without ever visiting SETTINGS_WIFI_PASSWORD - the only
+      page with a Forget button - so once saved, an unwanted open network
+      (e.g. a neighbour's) could only be forgotten via WebConfig. Tapping an
+      already-saved open network now opens that same manage page instead of
+      silently reconnecting; a brand new open network still connects in one
+      tap as before. Also corrected that page's "A password is saved"/"Use
+      saved password" copy for open networks (saved with an empty password),
+      which read as if a real password existed.
+    - Verified handleSdRebuild() (Format) and handleFactoryReset() (Restore
+      factory settings) against expectations: Factory Reset already leaves
+      /backups untouched and only recreates the folders it just erased
+      (createSdFolderIfMissing() is a no-op for everything else, so looping
+      it over the full sdFolders[] list has no observable effect beyond
+      that); Format already excludes /backups, /www and /firmware from its
+      erase list. No code change needed - both already matched.
+
+  2.50 - 2026-08-03
+    - Fixed a full backup being useless for restoring onto a different
+      remote, or this remote with a fresh SD card. createLcdFullBackup()
+      only ever recorded nativeAssets, a *path* to a sibling "_assets" folder
+      it copies custom icons/theme wallpapers into on the same SD card -
+      data["icons"] was always written as an empty array, and restore
+      trusted nativeAssets blindly, failing outright ("Native backup assets
+      are incomplete") instead of falling back whenever that exact folder
+      didn't already exist locally.
+    - createLcdFullBackup() now embeds every custom icon (/icons/Custom) and
+      theme wallpaper (/themes/Default, /themes/Custom) as base64 directly
+      in the backup JSON (data.icons, new themeAssets field), in addition to
+      the existing on-device folder copy.
+    - restoreLcdFullBackup() now checks whether the referenced _assets
+      folder actually exists on this SD card before trusting it, instead of
+      assuming any non-empty nativeAssets path will resolve here.
+    - convertWebBackupToRuntime() (the portable fallback path) now decodes
+      and writes back the embedded icon/theme files before rebuilding
+      runtime.json, instead of only ever reconstructing path references to
+      files it assumed already existed.
+    - Companion fix in WebConfig 2.25.html: its own "Backup All" button
+      builds a full-backup JSON entirely client-side from data already in
+      the browser and never went through createLcdFullBackup() at all, so
+      it had the identical gap independently - customIcons/customThemes
+      only ever held a path back to this device. Now fetches and embeds the
+      actual file bytes as base64 before download, for both the full backup
+      and the standalone Custom Icons/Themes exports.
+
+  2.49 - 2026-08-03
+    - Menu Style "Omote" now matches OpenRemote_2.0's real settings screen
+      instead of an invented dark-card look: flat 0x303030 boxes (radius 8px,
+      no divider-and-chevron card styling), 40x22 switches, 0x2196F3 accent
+      (LVGL's own default-theme blue, which is what that project actually
+      renders since it never overrides it), and muted secondary text via
+      LV_OPA_60 rather than a fixed grey - all read directly from
+      OpenRemote_2.0's gui_settings.cpp/guiBase.cpp and the LVGL default
+      theme it inherits from, not guessed. Applied across every settings
+      page (Home, Display, Wi-Fi, Wi-Fi Password, Wi-Fi QR, Bluetooth, Clock,
+      Clock City, Buttons, Debug, Battery, Backup/Restore, About) - previously
+      only Home and Display had an Omote variant at all.
+    - Added an iOS-style push/pop transition between settings pages under
+      Omote style: snapshots the outgoing page via lv_snapshot_take() (PSRAM-
+      backed, freed right after), lets the new page render at rest, then
+      slides the new page in over the old (forward) or the old page off to
+      reveal the previous one (back). OpenRemote_2.0 has no such navigation
+      of its own to match - this recreates the iPhone Settings app's feel on
+      top of this project's existing per-view sub-pages.
+    - Redesigned the Wi-Fi password keyboard to match a reference layout:
+      title, password field with a show/hide eye toggle, Cancel/Join pills
+      above the grid, a symbols/backspace header row, and a shift + dismiss-
+      to-Enter key flanking the space bar - reskinned in this project's own
+      flat palette rather than that reference's colours.
+    - Fixed a real, pre-existing bug surfaced while testing this: several of
+      the manual clock-set roller option buffers (month, hour, minute) were
+      sized to the exact byte needed, and buildNumberOptions()'s own overflow
+      check can't tell "fits exactly" from "doesn't fit" - it silently
+      dropped the last entry every time. That's why December, hour 23 and
+      minute 59 were all missing from their rollers, on both menu styles.
+      All option buffers now carry real headroom. Also switched the hour
+      roller to 1-12 with a separate AM/PM roller instead of 0-23, and
+      extended the year roller from 2024-2035 to 2024-2099.
+    - Fixed the Internet Time switch being impossible to turn on despite a
+      saved Wi-Fi network existing: it was gated on hasSelectedWifiProfile(),
+      which only checks the currently-*selected* SSID, not whether any
+      network is saved at all. requestInternetTimeSync() had the identical
+      gate, which also silently broke the advertised "boot and daily 3am
+      sync" for anyone whose Wi-Fi toggle wasn't already on. Both now accept
+      any saved profile and auto-select one if none is active.
+    - Several smaller Omote-page fixes found via on-device testing: dropdown
+      list popups had no text colour of their own and fell back to the
+      default theme's dark-on-dark text; six pages placed their first card at
+      the same spot as the shared back button, hiding it entirely, while
+      others still used the old blue OpenRemote-style button colour; the
+      WebConfig QR page wrapped the QR code in a card and let its bottom text
+      run past the (non-scrollable) content bounds; the Buttons page's
+      "No button pressed" label was positioned to only look centred by
+      coincidence; and three Debug page dropdown row labels ("Backlight PWM",
+      "Touch Driver", "Drive Strength") didn't fit next to their own
+      dropdown at this style's row width.
+
   2.48 - 2026-08-02
     - Raised the LCD_EN rail's touch-controller settle time from 120ms to
       300ms in lcdPowerOn() (boot/deep-sleep-wake) and from 240ms to 300ms in
@@ -1073,10 +2027,17 @@
   1.00 - Initial LVGL cinematic runtime prototype.
 */
 
-static constexpr float OPENREMOTE_VERSION = 2.48f;
-static constexpr char OPENREMOTE_VERSION_TEXT[] = "2.48";
+// One source of truth. OPENREMOTE_FIRMWARE_MARKER used to carry its own
+// hard-coded copy of the version and was last updated at 2.57, so every
+// build since then reported itself to OpenRemote Studio as 2.57 - Studio
+// reads this marker out of the .bin, which is why a freshly built
+// OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
+// macro makes that drift impossible.
+#define OPENREMOTE_VERSION_STRING "2.94"
+static constexpr float OPENREMOTE_VERSION = 2.84f;
+static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
-  "OPENREMOTE_FIRMWARE_VERSION=2.37";
+  "OPENREMOTE_FIRMWARE_VERSION=" OPENREMOTE_VERSION_STRING;
 
 /*
   OpenRemote / OMOTE Rev 5 - LVGL cinematic runtime prototype
@@ -1129,9 +2090,21 @@ static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
 #include <esp_rom_sys.h>
 #include <esp_sleep.h>
 #include <esp_sntp.h>
+#include "driver/uart.h"
+#include <mbedtls/base64.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <ArduinoJson.h>
+// Set in platformio.ini. Without them ArduinoJson caps a string value at 65535
+// characters on this 32-bit target, which no backup carrying an embedded theme
+// wallpaper can satisfy - and the failure surfaces as NoMemory with megabytes
+// free, which is a hard thing to recognise twice. Fail the build instead.
+static_assert(ARDUINOJSON_STRING_LENGTH_SIZE >= 4,
+              "ARDUINOJSON_STRING_LENGTH_SIZE must be 4: backups embed base64 "
+              "theme wallpapers far longer than 65535 characters");
+static_assert(ARDUINOJSON_SLOT_ID_SIZE >= 4,
+              "ARDUINOJSON_SLOT_ID_SIZE must be 4: a full backup exceeds 65535 "
+              "document slots");
 #define USE_ACTIVE_LOW_OUTPUT_FOR_SEND_PIN
 #define NO_LED_SEND_FEEDBACK_CODE
 #define NO_LED_RECEIVE_FEEDBACK_CODE
@@ -1269,7 +2242,16 @@ static const size_t USB_UPLOAD_WINDOW_BYTES = 1024;
 static const uint16_t USB_IO_BUDGET_BYTES = USB_UPLOAD_WINDOW_BYTES;
 static const uint32_t USB_UPLOAD_IDLE_TIMEOUT_MS = 30000;
 static const uint32_t USB_STUDIO_BAUD = 460800;
-static const uint32_t QR_PAGE_AWAKE_GRACE_MS = 15UL * 60UL * 1000UL;
+// The Arduino-ESP32 default UART receive buffer is 256 bytes, which is a
+// quarter of one upload window. Studio writes a whole window in a single
+// blocking burst and the CH340C link has no flow control, so every byte past
+// the 256th had to be consumed by loop() within 5.5 ms at 460800 baud or the
+// ring buffer overran and the bytes were gone. This must exceed
+// USB_UPLOAD_WINDOW_BYTES - Studio never has more than one unacknowledged
+// window in flight, so a buffer larger than a window cannot overflow no
+// matter how long a single loop() pass takes.
+static const size_t USB_SERIAL_RX_BUFFER_BYTES = 8192;
+static const uint32_t QR_PAGE_AWAKE_TIMEOUT_MS = 30UL * 60UL * 1000UL;
 static const uint32_t NTP_SYNC_TIMEOUT_MS = 60000UL;
 static const uint32_t NETWORK_IDLE_SHUTDOWN_MS = 1200UL;
 static const uint32_t BATTERY_SAMPLE_INTERVAL_SEC = 30UL * 60UL;
@@ -1754,6 +2736,12 @@ struct UsbSerialSession {
   size_t uploadReceived = 0;
   size_t uploadNextAck = 0;
   uint32_t uploadLastDataMs = 0;
+  // usbSerialRxOverflows counts since boot, so a stalled transfer reported a
+  // total that included every earlier attempt in the same session - two
+  // overflows from a previous failure read as two overflows in this one.
+  // Snapshotting it at the start makes the timeout message say what this
+  // transfer actually lost.
+  uint32_t uploadOverflowBaseline = 0;
   bool uploadIsIrFile = false;
   bool uploadIsRuntimeConfig = false;
   File downloadFile;
@@ -1764,6 +2752,34 @@ struct UsbSerialSession {
 
 UsbSerialSession usbCdcSession;
 UsbSerialSession uart0Session;
+
+// Set whenever an ORUSB command arrives, so the UI can tell that OpenRemote
+// Studio is actually talking to this remote. The CH340C bridge is powered
+// from the cable, so a plugged-in USB lead alone proves nothing - only real
+// traffic does.
+unsigned long lastUsbStudioActivityMs = 0;
+bool usbConnectedScreenShown = false;
+// Counted in the UART event task whenever the driver reports that it dropped
+// incoming bytes. Reported by ORUSB PING and in the upload timeout message so
+// a stalled transfer says whether data was lost on the wire rather than
+// leaving "the remote stopped answering" to be guessed at again.
+volatile uint32_t usbSerialRxOverflows = 0;
+
+void usbSerialReceiveError(hardwareSerial_error_t error) {
+  if (error == UART_BUFFER_FULL_ERROR || error == UART_FIFO_OVF_ERROR) {
+    usbSerialRxOverflows++;
+  }
+}
+static const uint32_t USB_LINK_IDLE_MS = 12000UL;
+// Also gates every sleep decision. usbSdTransferActive() is only true while
+// a file is literally in flight, so the gaps between files - notably the
+// long run of STAT checks that skips files already on the card - left the
+// display sleep timer free to fire and drop the remote into light sleep,
+// which kills the serial link mid-setup ("No OpenRemote USB response").
+bool usbStudioLinkActive() {
+  return lastUsbStudioActivityMs != 0 &&
+         (uint32_t)(millis() - lastUsbStudioActivityMs) < USB_LINK_IDLE_MS;
+}
 
 bool usbSdTransferActive() {
   return usbCdcSession.uploadExpected > 0 || uart0Session.uploadExpected > 0 ||
@@ -1800,7 +2816,26 @@ bool wifiOn = true;
 bool bluetoothOn = true;
 bool clockEnabled = true;
 bool clockUseInternetTime = true;
-bool slideToUnlock = true;
+// Replaces the old slideToUnlock lock-screen concept: Motion (default) keeps
+// today's behaviour (motion lights the LCD directly); Button leaves the LCD
+// dark on a motion-only wake - the MCU still comes back out of light sleep
+// (network/keypad polling resume normally) so a physical button press has
+// its usual zero-latency response, but only that button press (never
+// motion alone) turns the backlight on. See enterLowPowerWait()'s
+// awaitingButtonWake handling. Deep-sleep wake is unaffected by this
+// setting for now - motion still lights the LCD there regardless of mode.
+static const uint8_t WAKE_MODE_MOTION = 0;
+static const uint8_t WAKE_MODE_BUTTON = 1;
+uint8_t wakeMode = WAKE_MODE_MOTION;
+// True for a short window after a motion-only light-sleep wake while
+// wakeMode is WAKE_MODE_BUTTON: the MCU stays fully running (not back in
+// esp_light_sleep_start()) so a follow-up button press gets its usual
+// instant response, but the LCD stays dark unless/until that press
+// actually arrives. Cleared the moment a button lights the display, or
+// when the window expires and normal light sleep resumes.
+bool awaitingButtonWake = false;
+unsigned long buttonWakeWindowEndMs = 0;
+static const uint32_t BUTTON_WAKE_WINDOW_MS = 8000UL;
 bool raiseToWake = true;
 bool physicalRepeatEnabled = true;
 uint16_t physicalRepeatDelayMs = 400;
@@ -1892,6 +2927,11 @@ bool wifiScanStartPending = false;
 bool wifiConnectPending = false;
 bool wifiScanKeepSetupAp = false;
 volatile bool pendingUiRefresh = false;
+// Set by openSettingsView() only, and consumed once by renderCurrentPage():
+// 0 = next settings render is a plain in-place refresh (e.g. a Wi-Fi scan
+// result updating the current page), +1/-1 = an actual navigation to a
+// different settingsView, which should push/pop-slide like iOS instead.
+int8_t pendingSettingsSlideDirection = 0;
 bool pendingNetworkApply = false;
 bool pendingBluetoothApply = false;
 bool ntpSyncPending = false;
@@ -1902,7 +2942,6 @@ unsigned long networkShutdownAtMs = 0;
 int16_t lastNtpSyncYDay = -1;
 bool runtimeSettingsSavePending = false;
 unsigned long runtimeSettingsSaveAtMs = 0;
-bool lockActive = false;
 bool customKeyboardCaps = false;
 bool customKeyboardSymbols = false;
 int wifiScanCount = -2;
@@ -1977,11 +3016,27 @@ String runtimeConfigUploadError;
 File backupUploadFile;
 String backupUploadPath;
 bool backupUploadOk = false;
+File deviceFileUploadFile;
+String deviceFileUploadPath;
+bool deviceFileUploadOk = false;
+// Resumable chunked upload session. One at a time is enough - WebConfig only
+// ever transfers one large payload at once - and keeping a single session
+// avoids any bookkeeping about concurrent writers to the same temp file.
+String chunkUploadTarget;
+String chunkUploadTempPath;
+File chunkUploadFile;
+size_t chunkUploadBytes = 0;
+uint32_t chunkUploadCrc = 0;
+bool chunkUploadChunkOk = false;
+String chunkUploadError;
 static const uint8_t MAX_LCD_BACKUPS = 16;
 struct LcdBackupEntry {
   char name[64];
   char exportedAt[32];
   char displayDate[40];
+  // The list is no longer full backups only, and "Restore full backup?" over
+  // a devices-only export would describe the wrong thing entirely.
+  char category[20];
 };
 LcdBackupEntry lcdBackupEntries[MAX_LCD_BACKUPS] = {};
 uint8_t lcdBackupCount = 0;
@@ -1989,6 +3044,8 @@ char lcdBackupStatus[88] = "";
 char lcdPendingBackupName[64] = "";
 lv_obj_t *lcdBackupStatusLabel = nullptr;
 lv_obj_t *lcdBackupConfirmBox = nullptr;
+lv_obj_t *lcdBackupAnimBar = nullptr;
+unsigned long lcdBackupAnimStartMs = 0;
 volatile bool pendingRuntimeReload = false;
 volatile bool runtimeReloadCanRollback = false;
 volatile unsigned long runtimeReloadAfterMs = 0;
@@ -2111,7 +3168,6 @@ int16_t splitDiagnosticAnchorY = INT16_MAX;
 int16_t splitDiagnosticLastY = INT16_MIN;
 lv_obj_t *deviceModal = nullptr;
 lv_obj_t *brightnessOverlay = nullptr;
-lv_obj_t *lockOverlay = nullptr;
 lv_obj_t *physicalVoiceOverlay = nullptr;
 lv_obj_t *physicalVoicePulse = nullptr;
 bool physicalVoiceOverlayVisible = false;
@@ -2142,7 +3198,8 @@ lv_obj_t *buttonTestPanel = nullptr;
 lv_obj_t *buttonTestLabel = nullptr;
 lv_obj_t *lcdRebootConfirmBox = nullptr;
 bool lcdRebootConfirmHard = false;
-lv_obj_t *clockRollers[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
+// 0=Year, 1=Month, 2=Day, 3=Hour(1-12), 4=AM/PM, 5=Minute.
+lv_obj_t *clockRollers[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
 lv_obj_t *displayValueLabels[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
 lv_obj_t *buttonValueLabels[2] = {nullptr, nullptr};
 lv_obj_t *debugRowDropdowns[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
@@ -2326,13 +3383,14 @@ void renderWifiQrPage();
 void renderBluetoothPage();
 void renderClockPage();
 void renderClockCityPage();
+void styleDebugDropdown(lv_obj_t *dropdown);
 void renderDisplayPage();
 void renderButtonsPage();
 void renderDebugPage();
 void renderBatteryPage();
 void renderBackupRestorePage();
+void stepLcdBackupAnim();
 void renderAboutPage();
-void renderUnlockPage();
 uint16_t countSavedIrDeviceFiles();
 uint8_t *readSdFileToPsramBuffer(File &file, size_t &outSize);
 bool i2cDevicePresent(uint8_t address);
@@ -2350,8 +3408,13 @@ void serviceHardwarePowerHold(unsigned long now);
 void serviceKeypad(unsigned long now);
 void handleHardwareAllOff();
 String sanitizeBackupFileName(String name);
+bool restoreLcdFullBackup(const char *name, String &error, bool reloadNow = true);
+bool performFactoryReset();
+void scheduleRuntimeReloadAfterSync();
+const char *resetReasonText(esp_reset_reason_t reason);
 void clearPageIconCache();
 const void *cachedPageIconSource(const char *path);
+void invalidateWallpaperCacheForPath(const String &path);
 void requestInternetTimeSync();
 void serviceInternetTime(unsigned long now);
 void serviceWebControlRequests(unsigned long now);
@@ -3784,6 +4847,22 @@ bool hasSelectedWifiProfile() {
   return selectedWifiSsid.length() && findWifiProfile(selectedWifiSsid) >= 0;
 }
 
+// hasSelectedWifiProfile() only answers "is the CURRENTLY selected SSID a
+// saved one" - a user can have a network saved without it being the active
+// selection (e.g. right after forgetting/re-picking, or a profile added via
+// WebConfig). Internet Time only needs SOME saved network to exist; it
+// doesn't care which. ensureSelectedWifiProfile() then makes that network
+// the active selection so startNetworkStack() (which only calls WiFi.begin()
+// when hasSelectedWifiProfile() is true) actually has something to connect to.
+bool hasAnyWifiProfile() {
+  return wifiProfileCount > 0;
+}
+
+void ensureSelectedWifiProfile() {
+  if (hasSelectedWifiProfile() || !wifiProfileCount) return;
+  selectedWifiSsid = wifiProfiles[0].ssid;
+}
+
 void saveWifiProfiles() {
   preferences.begin(PREFERENCES_NAMESPACE, false);
   preferences.putUChar("wifiCnt", wifiProfileCount);
@@ -3849,7 +4928,8 @@ void loadSettings() {
   bleBonded = preferences.getBool("bleBonded", false);
   clockEnabled = preferences.getBool("clock", true);
   clockUseInternetTime = preferences.getBool("ntp", true);
-  slideToUnlock = preferences.getBool("lock", true);
+  wakeMode = constrain((int)preferences.getUChar("wakeMode", WAKE_MODE_MOTION),
+                       (int)WAKE_MODE_MOTION, (int)WAKE_MODE_BUTTON);
   brightness = preferences.getUChar("bright", 72);
   timeoutSeconds = preferences.getUChar("sleep", 25);
   deepSleepMinutes = normaliseDeepSleepMinutes(
@@ -3859,7 +4939,11 @@ void loadSettings() {
   displaySaturation = constrain((int)preferences.getUShort("saturation", 100), 0, 200);
   displayRgb666 = preferences.getBool("rgb666", false);
   displayInverted = preferences.getBool("invert", false);
-  displayDriverChoice = preferences.getUChar("dispDrv", 0);
+  // Arduino_GFX (index 1) is the default LCD driver. LovyanGFX's DMA path is
+  // faster but this panel exhibits touch problems with it, so the safe
+  // synchronous driver is what a remote should come up with unless the user
+  // deliberately selects otherwise in Settings > Debug.
+  displayDriverChoice = preferences.getUChar("dispDrv", 1);
   lcdFreqHz = preferences.getULong("lcdFreqHz", 40000000UL);
   lcdBufferMode = preferences.getUChar("lcdBufMode", 1);
   lcdDriveStrength = constrain((int)preferences.getUChar("lcdDriveStr", 2), 0, 3);
@@ -3875,7 +4959,7 @@ void loadSettings() {
   physicalRepeatRateHz = constrain(
     (int)preferences.getUChar("btnRate", 9),
     (int)BUTTON_REPEAT_RATE_MIN_HZ, (int)BUTTON_REPEAT_RATE_MAX_HZ);
-  debugSplitEnabled = preferences.getBool("dbgSplit", true);
+  debugSplitEnabled = preferences.getBool("dbgSplit", false);
   debugTouchEnabled = preferences.getBool("dbgTouch", false);
   debugCpuRamEnabled = preferences.getBool("dbgCpu", false);
   debugAccelerometerEnabled = preferences.getBool("dbgAccel", false);
@@ -3906,6 +4990,34 @@ void loadSettings() {
   homebridgeUsername = preferences.getString("hbUser", "");
   homebridgePassword = preferences.getString("hbPass", "");
   remoteName = preferences.getString("remoteName", "OpenRemote");
+  preferences.end();
+
+  // One-time preference migration.
+  //
+  // Changing a getUChar()/getBool() default only affects a remote that has
+  // never stored that key. Flashing new firmware does not erase NVS, so a
+  // remote that had already saved dispDrv=0 (LovyanGFX) or dbgSplit=true kept
+  // them regardless of the new defaults - which is why a freshly flashed
+  // remote still came up on the wrong driver with the split-line overlay on.
+  // This forces both to their intended values exactly once, then records that
+  // it has run so a later deliberate change in Settings > Debug sticks.
+  preferences.begin(PREFERENCES_NAMESPACE, false);
+  if (!preferences.getBool("prefMig1", false)) {
+    displayDriverChoice = 1;              // Arduino_GFX
+    debugSplitEnabled = false;
+    debugTouchEnabled = false;
+    debugCpuRamEnabled = false;
+    debugAccelerometerEnabled = false;
+    debugFpsEnabled = false;
+    preferences.putUChar("dispDrv", displayDriverChoice);
+    preferences.putBool("dbgSplit", false);
+    preferences.putBool("dbgTouch", false);
+    preferences.putBool("dbgCpu", false);
+    preferences.putBool("dbgAccel", false);
+    preferences.putBool("dbgFps", false);
+    preferences.putBool("prefMig1", true);
+    Serial.println("Preferences migrated: Arduino_GFX driver, all debug overlays off");
+  }
   preferences.end();
   bool migratedWifiProfile = false;
   if (!wifiProfileCount && selectedWifiSsid.length()) {
@@ -3949,7 +5061,7 @@ void saveSettings() {
   preferences.putBool("bleBonded", (bool)bleBonded);
   preferences.putBool("clock", clockEnabled);
   preferences.putBool("ntp", clockUseInternetTime);
-  preferences.putBool("lock", slideToUnlock);
+  preferences.putUChar("wakeMode", wakeMode);
   preferences.putUChar("bright", brightness);
   preferences.putUChar("sleep", timeoutSeconds);
   preferences.putUChar("deepMin", deepSleepMinutes);
@@ -4020,19 +5132,56 @@ String clockTimezoneRule() {
   return String(rule);
 }
 
+// 1pm on 1 January 2026 - the last-resort wall clock for a remote that has
+// never had Wi-Fi and has never had its time set by hand. Depends on TZ
+// already being applied by applyClockMode(), since mktime() reads it.
+time_t defaultClockSeedEpoch() {
+  struct tm fallback = {};
+  fallback.tm_year = 2026 - 1900;
+  fallback.tm_mon = 0;
+  fallback.tm_mday = 1;
+  fallback.tm_hour = 13;
+  fallback.tm_min = 0;
+  fallback.tm_sec = 0;
+  fallback.tm_isdst = -1;
+  return mktime(&fallback);
+}
+
 void applyClockMode() {
   String timezone = clockTimezoneRule();
   setenv("TZ", timezone.c_str(), 1);
   tzset();
-  if (clockUseInternetTime) return;
-  if (manualClockEpoch > 0) {
+  if (!clockUseInternetTime && manualClockEpoch > 0) {
     timeval now = {(time_t)manualClockEpoch, 0};
     settimeofday(&now, nullptr);
+    return;
   }
+  // Internet time is the default, so on a remote where Wi-Fi has never been
+  // set up this used to return immediately and leave the system clock at the
+  // epoch forever - the status bar just showed "--:--" and every date-aware
+  // feature had nothing to work with. NTP still overwrites whatever is seeded
+  // here the moment a real sync succeeds, so seeding costs nothing: keep an
+  // already-valid clock, otherwise fall back to the last manually-set time,
+  // otherwise to the fixed 1pm 2026-01-01 default.
+  if (time(nullptr) >= 1700000000) return;
+  time_t seed = manualClockEpoch > 0 ? (time_t)manualClockEpoch : defaultClockSeedEpoch();
+  timeval seeded = {seed, 0};
+  settimeofday(&seeded, nullptr);
 }
 
 void requestInternetTimeSync() {
-  if (!clockUseInternetTime || !wifiOn || !hasSelectedWifiProfile()) return;
+  if (!clockUseInternetTime || !hasAnyWifiProfile()) return;
+  // Internet time manages its own brief Wi-Fi use (the Clock page's own
+  // copy promises "Wi-Fi turns on only while time syncs"), so grant it here
+  // rather than requiring the user's separate Wi-Fi toggle to already be on
+  // - startNetworkStack() itself refuses to do anything while wifiOn is
+  // false, which silently broke every scheduled/boot sync whenever the
+  // user's Wi-Fi toggle happened to be off. hasAnyWifiProfile()/
+  // ensureSelectedWifiProfile() (rather than hasSelectedWifiProfile()) so a
+  // saved network that just isn't the current "selection" still works -
+  // startNetworkStack() only calls WiFi.begin() once something is selected.
+  wifiOn = true;
+  ensureSelectedWifiProfile();
   ntpSyncPending = true;
   ntpConfigured = false;
   ntpSyncStartedMs = millis();
@@ -5201,7 +6350,7 @@ String buildStatusJson() {
   doc["physicalRepeatEnabled"] = physicalRepeatEnabled;
   doc["physicalRepeatDelayMs"] = physicalRepeatDelayMs;
   doc["physicalRepeatRateHz"] = physicalRepeatRateHz;
-  doc["slideToUnlock"] = slideToUnlock;
+  doc["wakeMode"] = wakeMode;
   doc["displaySleeping"] = displaySleeping;
   doc["touchDown"] = lvTouchDown;
   doc["awakeForMs"] = (uint32_t)(millis() - lastWakeMs);
@@ -5452,7 +6601,8 @@ void applySettingsJson(JsonVariantConst settings) {
     -12 * 60, 14 * 60);
   uint64_t configuredManualEpoch = settings["manualClockEpoch"] | (uint64_t)0;
   if (configuredManualEpoch > 0) manualClockEpoch = configuredManualEpoch;
-  slideToUnlock = settings["slideToUnlock"] | slideToUnlock;
+  wakeMode = constrain((int)(settings["wakeMode"] | wakeMode),
+                       (int)WAKE_MODE_MOTION, (int)WAKE_MODE_BUTTON);
   brightness = constrain((int)(settings["brightness"] | brightness), 5, 100);
   timeoutSeconds = constrain((int)(settings["sleepSeconds"] | timeoutSeconds), 5, 120);
   deepSleepMinutes = normaliseDeepSleepMinutes(
@@ -7039,7 +8189,7 @@ bool persistSettingsToRuntimeConfig() {
   settings["sleepSeconds"] = timeoutSeconds;
   settings["deepSleepMinutes"] = deepSleepMinutes;
   settings["wakeSensitivity"] = wakeSensitivity;
-  settings["slideToUnlock"] = slideToUnlock;
+  settings["wakeMode"] = wakeMode;
   settings["displayGamma"] = displayGamma;
   settings["displaySaturation"] = displaySaturation;
   settings["displayRgb666"] = displayRgb666;
@@ -7399,6 +8549,7 @@ bool beginUsbFileUpload(Stream &port, UsbSerialSession &session,
   session.uploadReceived = 0;
   session.uploadNextAck = min(length, USB_UPLOAD_WINDOW_BYTES);
   session.uploadLastDataMs = millis();
+  session.uploadOverflowBaseline = usbSerialRxOverflows;
   session.uploadIsIrFile = isIrFile;
   session.uploadIsRuntimeConfig = isRuntimeConfig;
   usbImportReply(port, String("READY ") + String(USB_UPLOAD_WINDOW_BYTES));
@@ -7421,17 +8572,167 @@ bool uploadedIrFileLooksValid(const String &path) {
   return header.indexOf("Filetype: IR signals file") >= 0;
 }
 
-bool uploadedRuntimeConfigLooksValid(const String &path) {
+// Feeds ArduinoJson from an SD file through a small RAM buffer, yielding as it
+// goes. deserializeJson(doc, file) reads one byte at a time and never yields,
+// which is what starved the idle task and rebooted the remote before
+// readSdFileToPsramBuffer() was introduced; this keeps the large yielded reads
+// that fixed it without needing a buffer the size of the whole file.
+class BufferedSdJsonStream : public Stream {
+ public:
+  explicit BufferedSdJsonStream(File &file) : file_(file) {}
+  int available() override { return (int)(fill_ - pos_) + (int)file_.available(); }
+  int read() override {
+    if (pos_ >= fill_ && !refill()) return -1;
+    consumed_++;
+    return buffer_[pos_++];
+  }
+  int peek() override {
+    if (pos_ >= fill_ && !refill()) return -1;
+    return buffer_[pos_];
+  }
+  size_t readBytes(char *destination, size_t length) override {
+    size_t moved = 0;
+    while (moved < length) {
+      if (pos_ >= fill_ && !refill()) break;
+      size_t take = min(length - moved, fill_ - pos_);
+      memcpy(destination + moved, buffer_ + pos_, take);
+      pos_ += take;
+      moved += take;
+    }
+    consumed_ += moved;
+    return moved;
+  }
+  size_t write(uint8_t) override { return 0; }
+  void flush() override {}
+  size_t consumed() const { return consumed_; }
+
+ private:
+  bool refill() {
+    int got = file_.read(buffer_, sizeof(buffer_));
+    if (got <= 0) {
+      pos_ = fill_ = 0;
+      return false;
+    }
+    fill_ = (size_t)got;
+    pos_ = 0;
+    // One yield per 16 KB read rather than per buffer: enough to keep the idle
+    // task and the watchdog fed through a multi-megabyte parse without adding
+    // a tick of latency to every kilobyte.
+    if (++refills_ % 16 == 0) vTaskDelay(1);
+    return true;
+  }
+  File &file_;
+  uint8_t buffer_[1024];
+  size_t fill_ = 0;
+  size_t pos_ = 0;
+  size_t consumed_ = 0;
+  uint32_t refills_ = 0;
+};
+
+// Confirms a JSON file on the card parses end to end, and says why when it
+// does not.
+//
+// This used to call readSdFileToPsramBuffer() and parse the result into a full
+// JsonDocument, which needs one *contiguous* PSRAM block the size of the file
+// plus a document tree - about 1.4 MB for a full backup carrying embedded
+// icons, themes and .ir files. ORUSB PING reports ~8 MB of PSRAM free, but
+// that is the total; LVGL's draw buffers and the theme wallpapers leave the
+// largest free *block* much smaller, and ps_malloc() fails on fragmentation
+// well before the 4 MB upload cap. Either failure returned a bare false, which
+// 2.90 reported as "did not arrive as complete JSON" - so a backup that had in
+// fact arrived perfectly (Studio verifies every 1024-byte window is
+// acknowledged at its exact offset, and the upload only finishes when the byte
+// count matches exactly) was rejected as a truncated transfer, and the same
+// parse is what failed later at restore for the backups that did get saved.
+//
+// Streaming the file through an empty filter costs a few kilobytes whatever
+// the file size: the filter keeps nothing, so there is no tree, and the stream
+// means there is no whole-file copy. Nothing here scales with the backup.
+bool jsonFileParsesCompletely(const String &path, String &reason) {
+  File file = SD.open(path, FILE_READ);
+  if (!file) {
+    reason = "the file could not be opened on the SD card";
+    return false;
+  }
+  const size_t size = file.size();
+  if (size == 0) {
+    file.close();
+    reason = "the file is empty";
+    return false;
+  }
+
+  // Check the top level is an object directly rather than inferring it from
+  // what an empty filter leaves behind for a non-object document.
+  int firstByte = -1;
+  while (file.available()) {
+    int value = file.read();
+    if (value < 0) break;
+    if (value == ' ' || value == '\t' || value == '\r' || value == '\n') continue;
+    firstByte = value;
+    break;
+  }
+  if (firstByte != '{') {
+    file.close();
+    reason = "the file does not start a JSON object";
+    return false;
+  }
+  if (!file.seek(0)) {
+    file.close();
+    reason = "the file could not be rewound for parsing";
+    return false;
+  }
+
+  JsonDocument filter;
+  filter.to<JsonObject>();  // empty object: check syntax, keep nothing
+  JsonDocument doc(&psramJsonAllocator);
+  BufferedSdJsonStream stream(file);
+  const uint32_t startedMs = millis();
+  DeserializationError parseError =
+    deserializeJson(doc, stream, DeserializationOption::Filter(filter));
+  const uint32_t elapsedMs = millis() - startedMs;
+  const size_t consumed = stream.consumed();
+  file.close();
+
+  if (parseError) {
+    reason = String(parseError.c_str()) + " at byte " + String((uint32_t)consumed) +
+             " of " + String((uint32_t)size);
+    Serial.printf("JSON validate: %s failed (%s) at %u of %u byte(s) in %u ms; "
+                  "largest free PSRAM block %u\n",
+                  path.c_str(), parseError.c_str(), (unsigned)consumed,
+                  (unsigned)size, (unsigned)elapsedMs,
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+    return false;
+  }
+  Serial.printf("JSON validate: %s parsed %u byte(s) in %u ms\n",
+                path.c_str(), (unsigned)size, (unsigned)elapsedMs);
+  reason = "";
+  return true;
+}
+
+// A complete HTML document ends with </html>. Checking only the header (as
+// uploadedWebConfigLooksValid() used to) cannot tell a whole file from one
+// truncated at 90%, because the opening tags are all in the first few hundred
+// bytes - which is how a partial upload was installed and left the browser
+// rendering half the embedded remote image and then noise.
+bool htmlFileLooksComplete(const String &path) {
   File file = SD.open(path, FILE_READ);
   if (!file) return false;
-  size_t rawSize = 0;
-  uint8_t *raw = readSdFileToPsramBuffer(file, rawSize);
+  size_t size = file.size();
+  if (size < 1024) {
+    file.close();
+    return false;
+  }
+  size_t tailLength = size < 512 ? size : 512;
+  if (!file.seek(size - tailLength)) {
+    file.close();
+    return false;
+  }
+  String tail;
+  tail.reserve(tailLength + 1);
+  while (file.available()) tail += (char)file.read();
   file.close();
-  if (!raw) return false;
-  JsonDocument doc(&psramJsonAllocator);
-  DeserializationError error = deserializeJson(doc, raw, rawSize);
-  free(raw);
-  return !error && doc.is<JsonObject>();
+  tail.toLowerCase();
+  return tail.indexOf("</html>") >= 0;
 }
 
 bool uploadedWebConfigLooksValid(const String &path) {
@@ -7442,8 +8743,35 @@ bool uploadedWebConfigLooksValid(const String &path) {
   while (file.available() && header.length() < 768) header += (char)file.read();
   file.close();
   header.toLowerCase();
-  return header.indexOf("<html") >= 0 &&
-    header.indexOf("openremote-webconfig-version") >= 0;
+  if (header.indexOf("<html") < 0 ||
+      header.indexOf("openremote-webconfig-version") < 0) {
+    return false;
+  }
+  return htmlFileLooksComplete(path);
+}
+
+// Self-heal a WebConfig that was installed incomplete. Every install already
+// moves the outgoing copy to /backups/index.previous.html, so a known-good
+// version is normally sitting right there - but nothing ever looked at it,
+// and a truncated install simply locked the user out of the web UI with no
+// way back in except pulling the SD card. Runs at boot, before the HTTP
+// server can serve anything.
+void recoverWebConfigIfIncomplete() {
+  if (!sdReady || !SD.exists(WEB_CONFIG_PATH)) return;
+  if (htmlFileLooksComplete(WEB_CONFIG_PATH)) return;
+  Serial.println("WebConfig: installed copy is incomplete (no closing </html>)");
+  const char *previousPath = "/backups/index.previous.html";
+  if (!SD.exists(previousPath) || !htmlFileLooksComplete(previousPath)) {
+    Serial.println("WebConfig: no complete previous copy available to restore");
+    return;
+  }
+  SD.remove("/backups/index.corrupt.html");
+  SD.rename(WEB_CONFIG_PATH, "/backups/index.corrupt.html");
+  if (SD.rename(previousPath, WEB_CONFIG_PATH)) {
+    Serial.println("WebConfig: restored the previous working copy from /backups");
+  } else {
+    Serial.println("WebConfig: could not restore the previous copy");
+  }
 }
 
 bool uploadedFirmwareLooksValid(const String &path) {
@@ -7463,6 +8791,31 @@ bool usbWritableSdPath(const String &path) {
   if (path.startsWith("/icons/Default/") &&
       (path.endsWith(".png") || path.endsWith(".jpg") ||
        path.endsWith(".jpeg") || path.endsWith(".html"))) return true;
+  // Default theme assets. /icons/Default was allowed but this was not, so
+  // Studio could install the Default icons onto a blank card over USB and
+  // then be refused on the very next file with "USB writes are not allowed
+  // for this path" - which looked like a corrupt or wrongly formatted card
+  // rather than a missing permission. Same read-only factory content as the
+  // icons above: the wallpaper the LCD renders, its preview, and themes.json.
+  if (path.startsWith("/themes/Default/") &&
+      (path.endsWith(".rgb565") || path.endsWith(".png") ||
+       path.endsWith(".jpg") || path.endsWith(".jpeg") ||
+       path.endsWith(".json"))) return true;
+  // Backup files, so Studio can restore a saved configuration onto a remote
+  // whose web UI is unreachable. Content is validated by Studio before it is
+  // sent and by the restore path before it is applied; this only decides
+  // where a USB write may land. (Flipper .ir device files have their own
+  // dedicated ORUSB IRFILE command and do not go through here.)
+  //
+  // .ir is allowed alongside .json because WebConfig names its per-device
+  // learned export "<Device>.ir" while the contents are OpenRemote JSON, not
+  // a Flipper signals file. Restoring one has to land in /backups - it is
+  // configuration, not something the IR sender reads from /devices - and
+  // allowing only .json here refused it with "USB writes are not allowed for
+  // this path" after the restore path itself had already been taught to
+  // accept it.
+  if (path.startsWith("/backups/") &&
+      (path.endsWith(".json") || path.endsWith(".ir"))) return true;
   return false;
 }
 
@@ -7478,12 +8831,27 @@ void finishUsbFileUpload(Stream &port, UsbSerialSession &session) {
     failUsbUpload(port, session, "USB payload is not a valid .ir file");
     return;
   }
-  if (isRuntimeConfig && !uploadedRuntimeConfigLooksValid(tempPath)) {
-    failUsbUpload(port, session, "USB payload is not valid runtime JSON");
+  String parseReason;
+  if (isRuntimeConfig && !jsonFileParsesCompletely(tempPath, parseReason)) {
+    failUsbUpload(port, session,
+      "USB payload is not valid runtime JSON: " + parseReason);
     return;
   }
   if (finalPath == WEB_CONFIG_PATH && !uploadedWebConfigLooksValid(tempPath)) {
     failUsbUpload(port, session, "USB payload is not a valid OpenRemote WebConfig");
+    return;
+  }
+  // Backups were the one upload category with no arrival check at all. A file
+  // that landed truncated or corrupt was renamed into /backups as if it were
+  // sound, and only failed much later at restore - by which point the good
+  // copy on the computer had been overwritten. Every other category is
+  // verified here; this one now is too. The parse is the whole test: a
+  // backup that does not deserialize cannot be restored by anything.
+  // Says which of the two it was. "Did not arrive" was an assumption, and a
+  // wrong one whenever the transfer had in fact completed byte for byte.
+  if (finalPath.startsWith("/backups/") && !jsonFileParsesCompletely(tempPath, parseReason)) {
+    failUsbUpload(port, session,
+      "The backup would not parse on the remote and was not saved: " + parseReason);
     return;
   }
   if (finalPath.startsWith("/firmware/") && !uploadedFirmwareLooksValid(tempPath)) {
@@ -7514,7 +8882,14 @@ void finishUsbFileUpload(Stream &port, UsbSerialSession &session) {
 bool serviceUsbUpload(Stream &port, UsbSerialSession &session) {
   if (session.uploadExpected == 0) return false;
   if ((uint32_t)(millis() - session.uploadLastDataMs) > USB_UPLOAD_IDLE_TIMEOUT_MS) {
-    failUsbUpload(port, session, "USB payload timed out");
+    // Report how far the file got and whether the UART driver dropped bytes.
+    // A stall with a non-zero overflow count is lost data on the wire, not a
+    // sleeping remote or a failed SD write.
+    failUsbUpload(port, session,
+      String("USB payload timed out after ") + String((uint32_t)session.uploadReceived) +
+      " of " + String((uint32_t)session.uploadExpected) + " byte(s); " +
+      String((uint32_t)(usbSerialRxOverflows - session.uploadOverflowBaseline)) +
+      " UART receive overflow(s) during this transfer");
     return false;
   }
 
@@ -7617,12 +8992,28 @@ void serviceUsbDownload(Stream &port, UsbSerialSession &session) {
 }
 
 void handleUsbCommand(Stream &port, UsbSerialSession &session, String command) {
+  bool wasLinked = usbStudioLinkActive();
+  lastUsbStudioActivityMs = millis();
+  // Repaint the moment the link appears so the USB screen is up before any
+  // long transfer starts, and again when it lapses back to normal.
+  if (!wasLinked && pages[currentPage].kind == PAGE_ACTIVITIES) pendingUiRefresh = true;
   command.trim();
   if (command == "ORUSB PING") {
     clearUsbDownload(session);
+    // Reset reason and uptime are reported so a failed USB transfer can be
+    // diagnosed without a serial monitor - Studio holds the only serial port
+    // during a transfer, so a crash could not previously be observed at all.
+    // A short uptime plus a panic/watchdog reason after a failure means the
+    // remote rebooted mid-copy; a long uptime means it stayed up and the
+    // fault is in the link or the SD write.
     usbImportReply(port, String("{\"ok\":true,\"firmwareVersion\":\"") +
       OPENREMOTE_VERSION_TEXT + "\",\"deviceFileCount\":" +
-      String(countSavedIrDeviceFiles()) + "}");
+      String(countSavedIrDeviceFiles()) +
+      ",\"resetReason\":\"" + resetReasonText(esp_reset_reason()) +
+      "\",\"uptimeSec\":" + String((uint32_t)(millis() / 1000UL)) +
+      ",\"heapFree\":" + String((uint32_t)ESP.getFreeHeap()) +
+      ",\"psramFree\":" + String((uint32_t)ESP.getFreePsram()) +
+      ",\"uartRxOverflows\":" + String((uint32_t)usbSerialRxOverflows) + "}");
   } else if (command == "ORUSB STATUS") {
     usbImportReply(port, buildStatusJson());
   } else if (command == "ORUSB PREPARESD") {
@@ -7631,8 +9022,17 @@ void handleUsbCommand(Stream &port, UsbSerialSession &session, String command) {
       usbImportReply(port, "{\"ok\":false,\"error\":\"SD card unavailable; insert a FAT32 card into the remote and retry\"}");
       return;
     }
+    // Count what was actually missing so Studio can report it, rather than
+    // silently bootstrapping and leaving the user unsure anything happened.
+    uint8_t foldersCreated = 0;
+    for (uint8_t i = 0; i < SD_FOLDER_COUNT; i++) {
+      if (SD.exists(sdFolders[i])) continue;
+      if (createSdFolderIfMissing(sdFolders[i])) foldersCreated++;
+    }
     usbImportReply(port, String("{\"ok\":true,\"sdReady\":true,\"runtimeExists\":") +
       (SD.exists(RUNTIME_CONFIG_PATH) ? "true" : "false") +
+      ",\"foldersTotal\":" + String((unsigned)SD_FOLDER_COUNT) +
+      ",\"foldersCreated\":" + String((unsigned)foldersCreated) +
       ",\"cardMb\":" + String((uint32_t)(SD.cardSize() / (1024ULL * 1024ULL))) + "}");
   } else if (command == "ORUSB NEXT") {
     serviceUsbDownload(port, session);
@@ -7657,6 +9057,62 @@ void handleUsbCommand(Stream &port, UsbSerialSession &session, String command) {
     clearUsbDownload(session);
     beginUsbFileUpload(port, session, path, length, false,
                        path == RUNTIME_CONFIG_PATH);
+  } else if (command.startsWith("ORUSB STAT ")) {
+    // Lets Studio skip files the card already holds when preparing an SD
+    // card over USB, instead of re-sending several megabytes every time.
+    String path = command.substring(11);
+    path.trim();
+    if (!sdReady) sdReady = initSdStorage();
+    if (!sdReady) {
+      usbImportReply(port, "{\"ok\":false,\"error\":\"SD card unavailable\"}");
+      return;
+    }
+    bool exists = path.length() && SD.exists(path);
+    uint32_t size = 0;
+    if (exists) {
+      File probe = SD.open(path, FILE_READ);
+      if (probe) {
+        size = (uint32_t)probe.size();
+        probe.close();
+      }
+    }
+    usbImportReply(port, String("{\"ok\":true,\"exists\":") + (exists ? "true" : "false") +
+                         ",\"size\":" + String(size) + "}");
+  } else if (command.startsWith("ORUSB RESTORE ")) {
+    // Applies a backup already sitting in /backups, so Studio can copy a
+    // backup over USB and then have the remote actually install it - the
+    // same restoreLcdFullBackup() the LCD menu and WebConfig both use.
+    String name = command.substring(14);
+    name.trim();
+    if (!sdReady) {
+      usbImportReply(port, "{\"ok\":false,\"error\":\"SD card unavailable\"}");
+      return;
+    }
+    String clean = sanitizeBackupFileName(name);
+    if (!clean.length()) {
+      usbImportReply(port, "{\"ok\":false,\"error\":\"Invalid backup filename\"}");
+      return;
+    }
+    String error;
+    // reloadNow=false: the runtime model belongs to the main loop on core 1.
+    bool ok = restoreLcdFullBackup(clean.c_str(), error, false);
+    Serial.printf("USB restore: %s %s\n", clean.c_str(), ok ? "ok" : error.c_str());
+    usbImportReply(port, ok
+      ? String("{\"ok\":true,\"name\":\"") + clean + "\"}"
+      : String("{\"ok\":false,\"error\":\"") + error + "\"}");
+    if (ok) scheduleRuntimeReloadAfterSync();
+  } else if (command == "ORUSB FACTORYRESET") {
+    // Recovery path for a remote that cannot be reached over Wi-Fi at all.
+    if (!sdReady) {
+      usbImportReply(port, "{\"ok\":false,\"error\":\"SD card unavailable\"}");
+      return;
+    }
+    bool ok = performFactoryReset();
+    Serial.printf("USB factory reset: %s\n", ok ? "ok" : "failed");
+    usbImportReply(port, ok
+      ? "{\"ok\":true,\"restarting\":true}"
+      : "{\"ok\":false,\"error\":\"Factory reset could not rebuild user folders\"}");
+    if (ok) hardRestartPending = true;
   } else if (command.startsWith("ORUSB IRFILE ")) {
     int nameEnd = command.indexOf(' ', 14);
     if (nameEnd < 0) {
@@ -7671,6 +9127,16 @@ void handleUsbCommand(Stream &port, UsbSerialSession &session, String command) {
 }
 
 void serviceUsbSerialImport(Stream &port, UsbSerialSession &session) {
+  // Bulk file data is consumed by serviceUsbUpload()/serviceUsbDownload()
+  // and never reaches handleUsbCommand(), which was the only place stamping
+  // activity. So during the very transfers this is meant to protect - a
+  // multi-minute index.html copy - the link went "idle" after 12s, the USB
+  // screen reverted to No Activities and the sleep guards lapsed. Stamp on
+  // an in-flight transfer, or on incoming bytes once a link is established.
+  if (session.uploadExpected > 0 || session.downloadTotal > 0 ||
+      (lastUsbStudioActivityMs != 0 && port.available())) {
+    lastUsbStudioActivityMs = millis();
+  }
   if (serviceUsbUpload(port, session)) return;
 
   size_t budget = USB_IO_BUDGET_BYTES;
@@ -7689,6 +9155,26 @@ void serviceUsbSerialImport(Stream &port, UsbSerialSession &session) {
   serviceUsbUpload(port, session);
 }
 
+bool rawBufferContainsKey(const uint8_t *data, size_t size, const char *key) {
+  size_t keyLength = strlen(key);
+  if (!data || size < keyLength) return false;
+  for (size_t i = 0; i + keyLength <= size; i++) {
+    if (data[i] == (uint8_t)key[0] && memcmp(data + i, key, keyLength) == 0) return true;
+  }
+  return false;
+}
+
+// Validating the upload used to deserialize the entire document into a
+// JsonDocument just to confirm three top-level arrays existed. ArduinoJson's
+// in-memory representation of a multi-megabyte config runs several times the
+// size of its text, so a large-but-perfectly-valid runtime.json could exhaust
+// the 8 MB PSRAM and come back as "Invalid runtime JSON: NoMemory" - reported
+// to the user only as a generic "sync failed" - and the parse itself never
+// yields, putting a long single-shot allocation-heavy operation on the same
+// core as the Wi-Fi stack right before the HTTP response has to be sent.
+// A filtered parse validates exactly the same syntax while materialising
+// nothing, and the three required sections are confirmed against the raw text
+// instead, so validation cost no longer scales with configuration size.
 bool runtimeConfigFileLooksValid(const char *path, String &errorText) {
   File file = SD.open(path, FILE_READ);
   if (!file) {
@@ -7696,22 +9182,37 @@ bool runtimeConfigFileLooksValid(const char *path, String &errorText) {
     return false;
   }
   size_t rawSize = 0;
+  uint32_t startedMs = millis();
   uint8_t *raw = readSdFileToPsramBuffer(file, rawSize);
   file.close();
   if (!raw) {
     errorText = "Could not read uploaded runtime config";
+    Serial.printf("Runtime validate: PSRAM buffer alloc failed (largest free block %u)\n",
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
     return false;
   }
+
+  JsonDocument filter;
+  filter.to<JsonObject>();  // empty object: check syntax, keep nothing
   JsonDocument doc(&psramJsonAllocator);
-  DeserializationError parseError = deserializeJson(doc, raw, rawSize);
-  free(raw);
-  if (parseError || !doc.is<JsonObject>()) {
+  DeserializationError parseError =
+    deserializeJson(doc, raw, rawSize, DeserializationOption::Filter(filter));
+  if (parseError) {
+    Serial.printf("Runtime validate: parse failed (%s) size=%u\n",
+                  parseError.c_str(), (unsigned)rawSize);
+    free(raw);
     errorText = String("Invalid runtime JSON: ") + parseError.c_str();
     return false;
   }
-  if (!doc["devices"].is<JsonArray>() ||
-      !doc["activities"].is<JsonArray>() ||
-      !doc["pages"].is<JsonArray>()) {
+
+  bool hasSections = rawBufferContainsKey(raw, rawSize, "\"devices\"") &&
+                     rawBufferContainsKey(raw, rawSize, "\"activities\"") &&
+                     rawBufferContainsKey(raw, rawSize, "\"pages\"");
+  Serial.printf("Runtime validate: ok size=%u took=%ums heapFree=%u psramFree=%u\n",
+                (unsigned)rawSize, (unsigned)(millis() - startedMs),
+                (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
+  free(raw);
+  if (!hasSections) {
     errorText = "Runtime config is missing devices, activities or pages";
     return false;
   }
@@ -7755,6 +9256,8 @@ void handleRuntimeConfigUploadData() {
     webConfigTransferCancelRequested = false;
     webConfigTransferActive = true;
     runtimeConfigUploadStarted = true;
+    Serial.printf("Runtime sync: upload starting heapFree=%u psramFree=%u\n",
+                  (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
     runtimeConfigUploadOk = requestAuthorized() && sdReady;
     runtimeConfigUploadBytes = 0;
     runtimeConfigUploadError = runtimeConfigUploadOk ? "" :
@@ -7778,10 +9281,17 @@ void handleRuntimeConfigUploadData() {
       webConfigTransferActive = false;
       return;
     }
-    static const size_t MAX_RUNTIME_UPLOAD_BYTES = 2UL * 1024UL * 1024UL;
+    // Was 2 MB, which a real configuration outgrew: runtime.json carries
+    // embedded icon/theme image data, and a fully populated remote now sends
+    // well over that, so every sync was rejected part-way through and
+    // reported only as a generic failure at the end. Raised to 6 MB - the
+    // ceiling that matters is PSRAM during validation, and both
+    // readSdFileToPsramBuffer() and deserializeJson() already fail cleanly
+    // (nullptr / NoMemory) rather than crashing if a file really is too big.
+    static const size_t MAX_RUNTIME_UPLOAD_BYTES = 6UL * 1024UL * 1024UL;
     if (runtimeConfigUploadBytes + upload.currentSize > MAX_RUNTIME_UPLOAD_BYTES) {
       runtimeConfigUploadOk = false;
-      runtimeConfigUploadError = "Runtime config is larger than 2 MB";
+      runtimeConfigUploadError = "Runtime config is larger than 6 MB";
     } else if (runtimeConfigUploadFile.write(upload.buf, upload.currentSize) !=
                upload.currentSize) {
       runtimeConfigUploadOk = false;
@@ -7804,12 +9314,18 @@ void handleRuntimeConfigUploadData() {
       runtimeConfigUploadOk = commitRuntimeConfigTemp(runtimeConfigUploadError);
     }
     if (!runtimeConfigUploadOk) SD.remove(RUNTIME_CONFIG_UPLOAD_PATH);
+    Serial.printf("Runtime sync: %s received=%u %s\n",
+                  runtimeConfigUploadOk ? "committed" : "FAILED",
+                  (unsigned)runtimeConfigUploadBytes,
+                  runtimeConfigUploadOk ? "" : runtimeConfigUploadError.c_str());
     webConfigTransferActive = false;
   } else if (upload.status == UPLOAD_FILE_ABORTED) {
     if (runtimeConfigUploadFile) runtimeConfigUploadFile.close();
     SD.remove(RUNTIME_CONFIG_UPLOAD_PATH);
     runtimeConfigUploadOk = false;
     runtimeConfigUploadError = "Runtime config upload was interrupted";
+    Serial.printf("Runtime sync: ABORTED after %u byte(s)\n",
+                  (unsigned)runtimeConfigUploadBytes);
     webConfigTransferActive = false;
   }
 }
@@ -8158,6 +9674,12 @@ void handleSdRebuild() {
   bool ok = true;
   for (uint8_t i = 0; i < SD_FOLDER_COUNT; i++) ok = createSdFolderIfMissing(sdFolders[i]) && ok;
   sdReady = ok;
+  // Unlike Factory Reset, Format is the thorough option and is meant to wipe
+  // hardware/diagnostic preferences too (LCD/touch driver choice, Debug menu
+  // toggles, Menu Style, Wi-Fi credentials, etc.) - no selective restore.
+  preferences.begin(PREFERENCES_NAMESPACE, false);
+  preferences.clear();
+  preferences.end();
   sendJson(ok ? 200 : 500, ok ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"SD rebuild failed\"}");
 }
 
@@ -8212,6 +9734,7 @@ bool copySdTree(const String &sourcePath, const String &destinationPath) {
     String destination = destinationPath + "/" + name;
     ok = (directory ? copySdTree(entryPath, destination)
                     : copySdFile(entryPath, destination)) && ok;
+    stepLcdBackupAnim();
   }
   source.close();
   return ok;
@@ -8263,6 +9786,171 @@ void normaliseRuntimeItemIcons(JsonArray items) {
   }
 }
 
+// A full backup previously only ever recorded a *path* to a sibling
+// "_assets" folder on the same SD card (nativeAssets) - restoring it on a
+// different remote, or the same remote with a fresh SD card, silently
+// dropped every custom icon and theme wallpaper, since that folder simply
+// doesn't exist there. These two functions instead embed the actual file
+// bytes (base64) directly in the backup JSON, so a copy saved to a computer
+// is fully self-contained. Recurses like copySdTree()/countSdFiles(), since
+// icons/themes can have subfolders.
+void embedSdFilesAsBase64(JsonArray target, const String &directory) {
+  File root = SD.open(directory);
+  if (!root || !root.isDirectory()) {
+    if (root) root.close();
+    return;
+  }
+  while (true) {
+    File entry = root.openNextFile();
+    if (!entry) break;
+    String path = entry.path();
+    bool isDirectory = entry.isDirectory();
+    if (isDirectory) {
+      entry.close();
+      embedSdFilesAsBase64(target, path);
+      continue;
+    }
+    size_t rawSize = 0;
+    uint8_t *raw = readSdFileToPsramBuffer(entry, rawSize);
+    entry.close();
+    if (!raw || !rawSize) {
+      if (raw) free(raw);
+      continue;
+    }
+    size_t encodedLen = 0;
+    mbedtls_base64_encode(nullptr, 0, &encodedLen, raw, rawSize);
+    uint8_t *encoded = static_cast<uint8_t *>(ps_malloc(encodedLen + 1));
+    if (!encoded) {
+      free(raw);
+      continue;
+    }
+    size_t actualLen = 0;
+    int rc = mbedtls_base64_encode(encoded, encodedLen, &actualLen, raw, rawSize);
+    free(raw);
+    if (rc != 0) {
+      free(encoded);
+      continue;
+    }
+    encoded[actualLen] = '\0';
+    JsonObject fileEntry = target.add<JsonObject>();
+    fileEntry["path"] = path;
+    fileEntry["data"] = reinterpret_cast<const char *>(encoded);
+    free(encoded);
+    stepLcdBackupAnim();
+  }
+  root.close();
+}
+
+bool restoreEmbeddedFiles(JsonArrayConst files, String &error) {
+  for (JsonObjectConst fileEntry : files) {
+    const char *path = fileEntry["path"] | "";
+    const char *data = fileEntry["data"] | "";
+    // WebConfig embeds custom icons as a full data: URL in "src" rather than
+    // the bare base64 in "data" that the firmware's own backups use. Only the
+    // latter was recognised, so every icon entry fell through the !data[0]
+    // check below and custom icons were silently never written back - from a
+    // full backup as well as from an icons export. Accept both shapes and
+    // skip past the "data:image/png;base64," prefix.
+    if (!data[0]) {
+      const char *src = fileEntry["src"] | "";
+      const char *comma = strchr(src, ',');
+      if (comma && strncmp(src, "data:", 5) == 0) data = comma + 1;
+    }
+    if (!path[0] || !data[0]) continue;
+    size_t dataLen = strlen(data);
+    size_t decodedLen = 0;
+    mbedtls_base64_decode(nullptr, 0, &decodedLen,
+                          reinterpret_cast<const unsigned char *>(data), dataLen);
+    uint8_t *decoded = static_cast<uint8_t *>(ps_malloc(decodedLen));
+    if (!decoded) {
+      error = "Out of memory restoring backed-up icons/themes";
+      return false;
+    }
+    size_t actualLen = 0;
+    int rc = mbedtls_base64_decode(decoded, decodedLen, &actualLen,
+                                   reinterpret_cast<const unsigned char *>(data), dataLen);
+    if (rc != 0) {
+      free(decoded);
+      error = String("Corrupt embedded asset data for ") + path;
+      return false;
+    }
+    SD.remove(path);
+    File out = SD.open(path, FILE_WRITE);
+    bool ok = out && out.write(decoded, actualLen) == actualLen;
+    if (out) out.close();
+    free(decoded);
+    if (!ok) {
+      error = String("Could not restore ") + path;
+      return false;
+    }
+    stepLcdBackupAnim();
+  }
+  return true;
+}
+
+// Rebuilds everything in runtime.json that is *derived* from devices,
+// activities and themes: the per-device pages, the resolved theme/icon paths
+// and the Settings/Activities system pages. Both restore paths need this and
+// they used to be the same forty lines written twice, so a category restore
+// that merged devices correctly could still leave devicePages describing the
+// old set. Anything that changes devices/activities/themes must call this
+// before saving.
+void rebuildRuntimeDerivedPages(JsonDocument &runtime,
+                                const char *settingsTheme,
+                                const char *activitiesTheme) {
+  JsonArray devicesJson = runtime["devices"].as<JsonArray>();
+  JsonArrayConst themes = runtime["themes"].as<JsonArrayConst>();
+  JsonArray devicePages = runtime["devicePages"].to<JsonArray>();
+  for (JsonObjectConst device : devicesJson) {
+    JsonObject page = devicePages.add<JsonObject>();
+    page["deviceId"] = device["id"] | "";
+    page["name"] = device["name"] | "Unnamed device";
+    page["filePath"] = device["filePath"] | "";
+    const char *pageTheme = device["pageTheme"] | "simple";
+    page["pageTheme"] = pageTheme;
+    page["themePath"] = runtimeThemePathForId(themes, pageTheme);
+    page["items"].set(device["pageItems"]);
+    normaliseRuntimeItemIcons(page["items"].as<JsonArray>());
+    page["physicalBindings"].set(device["physicalBindings"]);
+    page["powerTracking"].set(device["powerTracking"]);
+  }
+
+  JsonArray activitiesJson = runtime["activities"].as<JsonArray>();
+  for (JsonObject activity : activitiesJson) {
+    const char *pageTheme = activity["pageTheme"] | "simple";
+    activity["pageThemePath"] = runtimeThemePathForId(themes, pageTheme);
+    String iconPath = runtimeAssetPath(activity["iconSrc"] | "", "/icons/");
+    activity["iconSrc"] = iconPath;
+    normaliseRuntimeItemIcons(activity["pageItems"].as<JsonArray>());
+  }
+
+  JsonArray pageRecords = runtime["pages"].to<JsonArray>();
+  JsonObject settingsPage = pageRecords.add<JsonObject>();
+  settingsPage["name"] = "Remote Settings";
+  settingsPage["pageType"] = "settings";
+  settingsPage["theme"] = settingsTheme;
+  settingsPage["themePath"] = runtimeThemePathForId(themes, settingsTheme);
+  settingsPage["items"].to<JsonArray>();
+
+  JsonObject activitiesPage = pageRecords.add<JsonObject>();
+  activitiesPage["name"] = "Activities";
+  activitiesPage["pageType"] = "activities";
+  activitiesPage["theme"] = activitiesTheme;
+  activitiesPage["themePath"] = runtimeThemePathForId(themes, activitiesTheme);
+  JsonArray landingItems = activitiesPage["items"].to<JsonArray>();
+  for (JsonObjectConst activity : activitiesJson) {
+    JsonObject item = landingItems.add<JsonObject>();
+    item["id"] = String("item_") + String((const char *)(activity["id"] | ""));
+    item["type"] = "activity";
+    item["name"] = activity["name"] | "Activity";
+    item["refId"] = activity["id"] | "";
+    item["iconSrc"] = activity["iconSrc"] | "";
+    item["iconName"] = activity["iconName"] | "";
+    item["showText"] = true;
+    item["boxMode"] = activity["boxMode"] | "global";
+  }
+}
+
 bool convertWebBackupToRuntime(JsonDocument &backup, String &error) {
   JsonObjectConst data = backup["data"].as<JsonObjectConst>();
   if (data.isNull() || !data["devices"].is<JsonArrayConst>() ||
@@ -8271,6 +9959,24 @@ bool convertWebBackupToRuntime(JsonDocument &backup, String &error) {
       !data["themes"].is<JsonArrayConst>()) {
     error = "Backup categories are incomplete";
     return false;
+  }
+
+  // This is the "portable" restore path - used whenever the sibling
+  // nativeAssets folder isn't physically present on this SD card (a
+  // different remote, or this remote with a fresh card). Write back any
+  // embedded custom icons/theme wallpapers before rebuilding runtime.json,
+  // since normaliseRuntimeItemIcons()/runtimeThemePathForId() below just
+  // reference their paths and expect the actual files to already exist.
+  if (data["icons"].is<JsonArrayConst>()) {
+    if (!restoreEmbeddedFiles(data["icons"].as<JsonArrayConst>(), error)) return false;
+  }
+  if (backup["themeAssets"].is<JsonArrayConst>()) {
+    if (!restoreEmbeddedFiles(backup["themeAssets"].as<JsonArrayConst>(), error)) return false;
+  }
+  // Restores /devices/*.ir (and its index.txt) for file-backed Studio/IRDB
+  // devices, which have no representation in runtime.json at all.
+  if (backup["deviceFiles"].is<JsonArrayConst>()) {
+    if (!restoreEmbeddedFiles(backup["deviceFiles"].as<JsonArrayConst>(), error)) return false;
   }
 
   JsonDocument runtime(&psramJsonAllocator);
@@ -8308,68 +10014,192 @@ bool convertWebBackupToRuntime(JsonDocument &backup, String &error) {
     if (!found) devicesJson.add(candidate);
   }
 
-  JsonArrayConst themes = runtime["themes"].as<JsonArrayConst>();
-  JsonArray devicePages = runtime["devicePages"].to<JsonArray>();
-  for (JsonObjectConst device : devicesJson) {
-    JsonObject page = devicePages.add<JsonObject>();
-    page["deviceId"] = device["id"] | "";
-    page["name"] = device["name"] | "Unnamed device";
-    page["filePath"] = device["filePath"] | "";
-    const char *pageTheme = device["pageTheme"] | "simple";
-    page["pageTheme"] = pageTheme;
-    page["themePath"] = runtimeThemePathForId(themes, pageTheme);
-    page["items"].set(device["pageItems"]);
-    normaliseRuntimeItemIcons(page["items"].as<JsonArray>());
-    page["physicalBindings"].set(device["physicalBindings"]);
-    page["powerTracking"].set(device["powerTracking"]);
-  }
-
-  JsonArray activitiesJson = runtime["activities"].as<JsonArray>();
-  for (JsonObject activity : activitiesJson) {
-    const char *pageTheme = activity["pageTheme"] | "simple";
-    activity["pageThemePath"] = runtimeThemePathForId(themes, pageTheme);
-    String iconPath = runtimeAssetPath(activity["iconSrc"] | "", "/icons/");
-    activity["iconSrc"] = iconPath;
-    normaliseRuntimeItemIcons(activity["pageItems"].as<JsonArray>());
-  }
-
   JsonObjectConst systemThemes = backup["systemPageThemes"].as<JsonObjectConst>();
-  const char *settingsTheme = systemThemes["settings"] | "simple";
-  const char *activitiesTheme = systemThemes["activities"] | "simple";
-  JsonArray pageRecords = runtime["pages"].to<JsonArray>();
-  JsonObject settingsPage = pageRecords.add<JsonObject>();
-  settingsPage["name"] = "Remote Settings";
-  settingsPage["pageType"] = "settings";
-  settingsPage["theme"] = settingsTheme;
-  settingsPage["themePath"] = runtimeThemePathForId(themes, settingsTheme);
-  settingsPage["items"].to<JsonArray>();
-
-  JsonObject activitiesPage = pageRecords.add<JsonObject>();
-  activitiesPage["name"] = "Activities";
-  activitiesPage["pageType"] = "activities";
-  activitiesPage["theme"] = activitiesTheme;
-  activitiesPage["themePath"] = runtimeThemePathForId(themes, activitiesTheme);
-  JsonArray landingItems = activitiesPage["items"].to<JsonArray>();
-  for (JsonObjectConst activity : activitiesJson) {
-    JsonObject item = landingItems.add<JsonObject>();
-    item["id"] = String("item_") + String((const char *)(activity["id"] | ""));
-    item["type"] = "activity";
-    item["name"] = activity["name"] | "Activity";
-    item["refId"] = activity["id"] | "";
-    item["iconSrc"] = activity["iconSrc"] | "";
-    item["iconName"] = activity["iconName"] | "";
-    item["showText"] = true;
-    item["boxMode"] = activity["boxMode"] | "global";
-  }
+  rebuildRuntimeDerivedPages(runtime,
+                             systemThemes["settings"] | "simple",
+                             systemThemes["activities"] | "simple");
 
   return saveRuntimeConfigDocument(runtime, error);
 }
 
+// WebConfig can export one category on its own ("Your Devices", "Learned",
+// "Activities", "Macros", "Icons", "Themes") and one learned device at a time
+// as a .ir file that is really an OpenRemote JSON document. Studio would copy
+// those to /backups quite happily but nothing could ever apply them: every
+// restore path insisted on category == "full-backup", so restoring a single
+// learned IR device meant restoring a whole backup over the top of the
+// current configuration - or, if you had no full backup, not at all.
+bool backupCategoryIsRestorable(const char *category) {
+  if (!category || !category[0]) return false;
+  return strcmp(category, "devices") == 0 ||
+         strcmp(category, "learned") == 0 ||
+         strcmp(category, "learned-device") == 0 ||
+         strcmp(category, "activities") == 0 ||
+         strcmp(category, "macros") == 0 ||
+         strcmp(category, "icons") == 0 ||
+         strcmp(category, "themes") == 0;
+}
+
+// Merges exported items into a runtime array by id: an id already present is
+// replaced in place, a new one is appended. Restoring one category must not
+// disturb the others, and re-importing the same export twice must not produce
+// duplicates, which is why this matches on id rather than appending blindly.
+size_t mergeRuntimeItemsById(JsonArray target, JsonArrayConst items) {
+  size_t merged = 0;
+  for (JsonObjectConst candidate : items) {
+    const char *id = candidate["id"] | "";
+    bool replaced = false;
+    if (id[0]) {
+      for (JsonVariant existing : target) {
+        if (strcmp(existing["id"] | "", id) == 0) {
+          existing.set(candidate);
+          replaced = true;
+          break;
+        }
+      }
+    }
+    if (!replaced && !target.add(candidate)) {
+      return merged;
+    }
+    merged++;
+  }
+  return merged;
+}
+
+// Applies a single-category export on top of the configuration already on the
+// card. Unlike the full-backup path this is a merge, not a replacement - the
+// categories the file does not mention are left exactly as they are.
+bool restoreCategoryBackup(JsonDocument &backup, String &error) {
+  String category = backup["category"] | "";
+  if (!backupCategoryIsRestorable(category.c_str())) {
+    error = "This backup category cannot be restored";
+    return false;
+  }
+
+  // A learned-device export holds one device under "device"; every other
+  // category holds an array under "items". Normalise to an array so the
+  // merge below has a single shape to deal with.
+  JsonDocument singleItem(&psramJsonAllocator);
+  JsonArrayConst items;
+  if (category == "learned-device") {
+    if (!backup["device"].is<JsonObjectConst>()) {
+      error = "This .ir file has no device in it";
+      return false;
+    }
+    JsonArray wrapper = singleItem.to<JsonArray>();
+    if (!wrapper.add(backup["device"])) {
+      error = "Out of memory reading that device";
+      return false;
+    }
+    items = wrapper;
+  } else {
+    if (!backup["items"].is<JsonArrayConst>()) {
+      error = "This backup has no items in it";
+      return false;
+    }
+    items = backup["items"].as<JsonArrayConst>();
+  }
+
+  // "No configuration to merge into" is two very different situations and
+  // they must not share an outcome. A card with no runtime.json has nothing
+  // to lose, so importing into an empty one is exactly what was asked for.
+  // A runtime.json that exists but will not parse still holds the user's
+  // devices, and starting fresh there would merge one device on top of
+  // nothing and write that over everything they had - so that case refuses,
+  // and says what actually went wrong rather than blaming a missing file.
+  JsonDocument runtime(&psramJsonAllocator);
+  if (SD.exists(RUNTIME_CONFIG_PATH)) {
+    File current = SD.open(RUNTIME_CONFIG_PATH, FILE_READ);
+    if (!current) {
+      error = "This remote's configuration could not be opened; nothing was changed";
+      return false;
+    }
+    size_t rawSize = 0;
+    uint8_t *raw = readSdFileToPsramBuffer(current, rawSize);
+    current.close();
+    if (!raw) {
+      error = "This remote's configuration could not be read into memory; nothing was changed";
+      return false;
+    }
+    DeserializationError parseError = deserializeJson(runtime, raw, rawSize);
+    free(raw);
+    if (parseError || !runtime.is<JsonObject>()) {
+      error = String("This remote's configuration could not be parsed (") +
+        (parseError ? parseError.c_str() : "not an object") + "); nothing was changed";
+      return false;
+    }
+  } else {
+    runtime.to<JsonObject>();
+    runtime["schemaVersion"] = 1;
+    runtime["webConfigVersion"] = installedWebConfigVersion();
+    // Create the standard arrays up front so the saved document has the same
+    // shape as one WebConfig writes, whichever single category is imported.
+    runtime["devices"].to<JsonArray>();
+    runtime["activities"].to<JsonArray>();
+    runtime["macros"].to<JsonArray>();
+    runtime["themes"].to<JsonArray>();
+  }
+
+  // The system page themes live in runtime.json, not in a category export, so
+  // read them before rebuildRuntimeDerivedPages() rewrites the pages array.
+  String settingsTheme = "simple";
+  String activitiesTheme = "simple";
+  for (JsonObjectConst page : runtime["pages"].as<JsonArrayConst>()) {
+    const char *pageType = page["pageType"] | "";
+    if (strcmp(pageType, "settings") == 0) settingsTheme = page["theme"] | "simple";
+    else if (strcmp(pageType, "activities") == 0) activitiesTheme = page["theme"] | "simple";
+  }
+
+  const char *targetKey = nullptr;
+  if (category == "devices" || category == "learned" || category == "learned-device") {
+    targetKey = "devices";
+  } else if (category == "activities") {
+    targetKey = "activities";
+  } else if (category == "macros") {
+    targetKey = "macros";
+  } else if (category == "themes") {
+    targetKey = "themes";
+  }
+
+  size_t merged = 0;
+  if (category == "icons") {
+    // Icons are pure files - they have no runtime.json representation, so
+    // writing them back into /icons/Custom is the whole job.
+    if (!restoreEmbeddedFiles(items, error)) return false;
+    merged = items.size();
+  } else {
+    if (!runtime[targetKey].is<JsonArray>()) runtime[targetKey].to<JsonArray>();
+    merged = mergeRuntimeItemsById(runtime[targetKey].as<JsonArray>(), items);
+    if (merged != items.size()) {
+      error = "Ran out of memory merging that backup; nothing was changed";
+      return false;
+    }
+  }
+
+  rebuildRuntimeDerivedPages(runtime, settingsTheme.c_str(), activitiesTheme.c_str());
+  if (!saveRuntimeConfigDocument(runtime, error)) return false;
+  Serial.printf("Category restore: %s, %u item(s) merged\n",
+                category.c_str(), (unsigned)merged);
+  return true;
+}
+
+// Backups need *some* date even if the system clock somehow still isn't
+// valid. applyClockMode() now seeds the real clock with the same ladder
+// (manual time, else defaultClockSeedEpoch()), so this is normally just
+// time(nullptr) - it stays as a belt-and-braces guard so a backup can never
+// be stamped "Date unavailable".
+time_t backupTimestampNow() {
+  time_t now = time(nullptr);
+  if (now >= 1700000000) return now;
+  if (manualClockEpoch > 0) return (time_t)manualClockEpoch;
+  return defaultClockSeedEpoch();
+}
+
 void backupDateStrings(char *fileStamp, size_t fileStampSize,
                        char *exportedAt, size_t exportedAtSize) {
-  time_t now = time(nullptr);
+  time_t now = backupTimestampNow();
   tm local = {};
-  if (now >= 1700000000 && localtime_r(&now, &local)) {
+  if (localtime_r(&now, &local)) {
     strftime(fileStamp, fileStampSize, "%Y-%m-%d_%H-%M-%S", &local);
     strftime(exportedAt, exportedAtSize, "%Y-%m-%dT%H:%M:%S", &local);
   } else {
@@ -8447,6 +10277,19 @@ bool createLcdFullBackup(String &createdName, String &error) {
 
   JsonObject data = backup["data"].to<JsonObject>();
   data["devices"].set(runtime["devices"]);
+  // runtime["devices"] (and therefore this array so far) only ever holds
+  // devices WebConfig has synced into runtime.json - buildRuntimePayload()
+  // deliberately filters out fileBacked devices (OpenRemote Studio/IRDB
+  // imports living purely as /devices/*.ir files) since GET /api/config
+  // merges those back in for live display instead. A restore driven purely
+  // by this JSON (WebConfig's SD/computer restore, unlike the LCD's own
+  // restore which also copies the whole /devices folder) would otherwise
+  // silently never see them at all. Append the same file-backed summaries
+  // GET /api/config already builds, so every device is actually present in
+  // the backup JSON itself.
+  JsonArray devicesArray = data["devices"].as<JsonArray>();
+  appendIrDeviceFileSummaries(devicesArray);
+  counts["devices"] = devicesArray.size();
   data["activities"].set(runtime["activities"]);
   data["macros"].set(runtime["macros"]);
   data["themes"].set(runtime["themes"]);
@@ -8457,7 +10300,24 @@ bool createLcdFullBackup(String &createdName, String &error) {
     if ((device["learned"] | false) || source == "learned") learned.add(device);
   }
   counts["learned"] = learned.size();
-  data["icons"].to<JsonArray>();
+  // Embed the actual custom icon/theme files (base64), not just the
+  // physical _assets folder copy below - nativeAssets only helps restoring
+  // onto *this* SD card; a copy saved to a computer needs everything inline
+  // to restore onto a different remote or a fresh card.
+  JsonArray icons = data["icons"].to<JsonArray>();
+  embedSdFilesAsBase64(icons, "/icons/Custom");
+  JsonArray themeAssets = backup["themeAssets"].to<JsonArray>();
+  embedSdFilesAsBase64(themeAssets, "/themes/Default");
+  embedSdFilesAsBase64(themeAssets, "/themes/Custom");
+  // File-backed devices (OpenRemote Studio / IRDB imports) exist only as
+  // /devices/*.ir files - appendIrDeviceFileSummaries() above puts their
+  // *metadata* in data.devices so a restore can list them, but the summary
+  // alone can't recreate the file, and POST /api/config deliberately never
+  // writes /devices. Embed the real file bytes too so both restore paths
+  // (the LCD's own, and WebConfig uploading them back via POST
+  // /api/devices/file) can put the actual devices back.
+  JsonArray deviceFiles = backup["deviceFiles"].to<JsonArray>();
+  embedSdFilesAsBase64(deviceFiles, "/devices");
   backup["runtimeConfig"].set(runtime.as<JsonVariantConst>());
 
   for (JsonObjectConst page : runtime["pages"].as<JsonArrayConst>()) {
@@ -8515,9 +10375,16 @@ bool restoreNativeBackupAssets(const String &assetsPath, String &error) {
   return true;
 }
 
-bool restoreLcdFullBackup(const char *name, String &error) {
+// reloadNow=false is used by the WebConfig-triggered restore: rebuilding the
+// runtime model touches structures LVGL references from core 1, so the HTTP
+// worker on core 0 must not do it inline - it schedules the reload for the
+// main loop instead, exactly as the runtime-config upload path does.
+bool restoreLcdFullBackup(const char *name, String &error, bool reloadNow) {
   String clean = sanitizeBackupFileName(name ? name : "");
-  if (!clean.endsWith(".json")) {
+  // WebConfig names its per-device learned export "<Device>.ir" even though
+  // the contents are OpenRemote JSON, so .ir has to be accepted here as well
+  // or that file could be copied to /backups and never applied.
+  if (!clean.endsWith(".json") && !clean.endsWith(".ir")) {
     error = "Invalid backup filename";
     return false;
   }
@@ -8526,27 +10393,71 @@ bool restoreLcdFullBackup(const char *name, String &error) {
     error = "Backup file not found";
     return false;
   }
-  size_t rawSize = 0;
-  uint8_t *raw = readSdFileToPsramBuffer(file, rawSize);
+  // Streamed rather than read into one PSRAM buffer first. A full backup
+  // carrying embedded icons, themes and .ir files runs to well over a
+  // megabyte, and readSdFileToPsramBuffer() has to find that many *contiguous*
+  // bytes - which fails on a fragmented heap long before ESP.getFreePsram()
+  // looks anywhere near exhausted, and reported it as a file that "could not
+  // be parsed". The document tree still grows with the backup, but it is built
+  // from many small allocations that fit around the LVGL buffers and theme
+  // wallpapers instead of one block that has to fit whole.
+  const size_t rawSize = file.size();
+  JsonDocument backup(&psramJsonAllocator);
+  BufferedSdJsonStream backupStream(file);
+  DeserializationError parseError = deserializeJson(backup, backupStream);
+  const size_t consumed = backupStream.consumed();
   file.close();
-  if (!raw) {
-    error = "Could not read backup file";
+  if (parseError) {
+    // Name the actual failure. "could not be read" described a truncated
+    // upload, a corrupt file and an out-of-memory parse identically, which is
+    // no basis for deciding whether to re-copy the file, shrink it, or look
+    // somewhere else entirely. IncompleteInput means the bytes on the card
+    // stop early; NoMemory means the file is fine and PSRAM was not.
+    error = String("This backup could not be parsed (") + parseError.c_str() +
+      " at byte " + String((uint32_t)consumed) + " of " +
+      String((uint32_t)rawSize) + " on the card, " +
+      String((uint32_t)ESP.getFreePsram()) + " PSRAM free, largest block " +
+      String((uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)) + ")";
+    Serial.printf("Backup restore parse failed: %s (%s) at %u of %u byte(s); "
+                  "largest free PSRAM block %u\n",
+                  clean.c_str(), parseError.c_str(), (unsigned)consumed,
+                  (unsigned)rawSize,
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
     return false;
   }
-  JsonDocument backup(&psramJsonAllocator);
-  DeserializationError parseError = deserializeJson(backup, raw, rawSize);
-  free(raw);
-  if (parseError || strcmp(backup["category"] | "", "full-backup") != 0) {
-    error = "This is not a valid full backup";
+  const char *category = backup["category"] | "";
+  // Single-category exports merge on top of the current configuration instead
+  // of replacing it. Dispatching here rather than at each caller means the LCD
+  // Backup/Restore menu, WebConfig's restore and ORUSB RESTORE all gained this
+  // at once - they already all funnel through this one function.
+  if (backupCategoryIsRestorable(category)) {
+    if (!restoreCategoryBackup(backup, error)) return false;
+    if (reloadNow && !loadRuntimeConfig()) {
+      error = "Backup restored, but runtime reload failed";
+      return false;
+    }
+    saveSettings();
+    return true;
+  }
+  if (strcmp(category, "full-backup") != 0) {
+    error = "This is not a valid OpenRemote backup";
     return false;
   }
 
+  // nativeAssets being non-empty only means *this backup's own device* had
+  // that folder when it was created - it says nothing about whether it
+  // still exists on the SD card doing the restoring right now (a different
+  // remote, or this remote with a fresh card, never will). Check for real
+  // rather than trusting the string was ever going to resolve here; the
+  // portable path below restores from the embedded base64 data instead.
   String assetsPath = backup["nativeAssets"] | "";
-  bool restored = assetsPath.length()
+  bool nativeAssetsPresent = assetsPath.length() &&
+    SD.exists(assetsPath + "/config/runtime.json");
+  bool restored = nativeAssetsPresent
     ? restoreNativeBackupAssets(assetsPath, error)
     : convertWebBackupToRuntime(backup, error);
   if (!restored) return false;
-  if (!loadRuntimeConfig()) {
+  if (reloadNow && !loadRuntimeConfig()) {
     error = "Backup restored, but runtime reload failed";
     return false;
   }
@@ -8586,7 +10497,7 @@ void loadLcdBackupEntries() {
       String name = path.substring(path.lastIndexOf('/') + 1);
       String lower = name;
       lower.toLowerCase();
-      if (lower.endsWith(".json")) {
+      if (lower.endsWith(".json") || lower.endsWith(".ir")) {
         JsonDocument filter;
         filter["category"] = true;
         filter["exportedAt"] = true;
@@ -8597,11 +10508,16 @@ void loadLcdBackupEntries() {
           ? deserializeJson(summary, raw, rawSize, DeserializationOption::Filter(filter))
           : DeserializationError::EmptyInput;
         if (raw) free(raw);
-        if (!jsonError && strcmp(summary["category"] | "", "full-backup") == 0) {
+        const char *category = summary["category"] | "";
+        // Category exports are now restorable, so listing only full backups
+        // here would leave them invisible on the remote itself.
+        if (!jsonError && (strcmp(category, "full-backup") == 0 ||
+                           backupCategoryIsRestorable(category))) {
           LcdBackupEntry &backup = lcdBackupEntries[lcdBackupCount++];
           strlcpy(backup.name, name.c_str(), sizeof(backup.name));
           strlcpy(backup.exportedAt, summary["exportedAt"] | "", sizeof(backup.exportedAt));
           formatBackupDisplayDate(backup.exportedAt, backup.displayDate, sizeof(backup.displayDate));
+          strlcpy(backup.category, category, sizeof(backup.category));
         }
       }
     }
@@ -8655,12 +10571,13 @@ void handleBackupList() {
         String name = path.substring(path.lastIndexOf('/') + 1);
         String lowerName = name;
         lowerName.toLowerCase();
-        if (lowerName.endsWith(".json")) {
+        if (lowerName.endsWith(".json") || lowerName.endsWith(".ir")) {
           JsonDocument filter;
           filter["category"] = true;
           filter["exportedAt"] = true;
           filter["appVersion"] = true;
           filter["counts"] = true;
+          filter["count"] = true;
           size_t rawSize = 0;
           uint8_t *raw = readSdFileToPsramBuffer(entry, rawSize);
           JsonDocument summary(&psramJsonAllocator);
@@ -8669,12 +10586,14 @@ void handleBackupList() {
             : DeserializationError::EmptyInput;
           if (raw) free(raw);
           const char *category = summary["category"] | "";
-          if (!error && strcmp(category, "full-backup") == 0) {
+          bool isFull = strcmp(category, "full-backup") == 0;
+          if (!error && (isFull || backupCategoryIsRestorable(category))) {
             JsonObject item = files.add<JsonObject>();
             item["name"] = name;
             item["size"] = entry.size();
             item["exportedAt"] = summary["exportedAt"] | "";
             item["appVersion"] = summary["appVersion"] | "";
+            item["category"] = category;
             JsonObjectConst counts = summary["counts"];
             item["devices"] = counts["devices"] | 0;
             item["learned"] = counts["learned"] | 0;
@@ -8682,6 +10601,12 @@ void handleBackupList() {
             item["macros"] = counts["macros"] | 0;
             item["icons"] = counts["icons"] | 0;
             item["themes"] = counts["themes"] | 0;
+            // A category export has no per-category counts block, just one
+            // total, so report it against its own category.
+            if (!isFull) {
+              const char *key = strcmp(category, "learned-device") == 0 ? "learned" : category;
+              if (item[key].is<int>()) item[key] = summary["count"] | 1;
+            }
           }
         }
       }
@@ -8758,24 +10683,373 @@ void handleBackupUploadData() {
   HTTPUpload &upload = webServer.upload();
   if (upload.status == UPLOAD_FILE_START) {
     String name = sanitizeBackupFileName(upload.filename);
-    backupUploadOk = requestAuthorized() && sdReady && name.length();
+    bool authorized = requestAuthorized();
+    backupUploadOk = authorized && sdReady && name.length();
     backupUploadPath = backupUploadOk ? String("/backups/") + name : "";
     SD.remove("/tmp/backup.upload");
     if (backupUploadOk) backupUploadFile = SD.open("/tmp/backup.upload", FILE_WRITE);
     backupUploadOk = backupUploadOk && (bool)backupUploadFile;
+    // Unlike the sibling WebConfig/IRDB upload handlers, this one never
+    // logged anything, so a failed "Backup All Categories... to SD Card"
+    // save had no way to be diagnosed beyond WebConfig's own (previously
+    // misleading, see backupAllCategories()) status text.
+    Serial.printf("Backup upload: name=%s authorized=%d sdReady=%d fileOpen=%d\n",
+                  upload.filename.c_str(), (int)authorized, (int)sdReady, (int)backupUploadOk);
   } else if (upload.status == UPLOAD_FILE_WRITE && backupUploadOk) {
     backupUploadOk = backupUploadFile.write(upload.buf, upload.currentSize) == upload.currentSize;
+    if (!backupUploadOk) Serial.println("Backup upload: SD write failed mid-transfer");
+    serviceUiDuringLongHttpTransfer();
   } else if (upload.status == UPLOAD_FILE_END) {
     if (backupUploadFile) backupUploadFile.close();
     if (backupUploadOk) {
       SD.remove(backupUploadPath);
       backupUploadOk = SD.rename("/tmp/backup.upload", backupUploadPath);
+      if (!backupUploadOk) {
+        Serial.printf("Backup upload: rename to %s failed (totalSize=%u)\n",
+                      backupUploadPath.c_str(), (unsigned)upload.totalSize);
+      }
     }
   } else if (upload.status == UPLOAD_FILE_ABORTED) {
     if (backupUploadFile) backupUploadFile.close();
     SD.remove("/tmp/backup.upload");
     backupUploadOk = false;
+    Serial.println("Backup upload: aborted");
   }
+}
+
+// /api/devices/file previously only supported DELETE, so there was no way at
+// all for WebConfig to put a file-backed device (OpenRemote Studio / IRDB
+// import, which lives purely as a /devices/*.ir file) back onto the SD card.
+// Restoring a backup in the browser could therefore never recover those
+// devices, no matter what the backup JSON contained - buildRuntimePayload()
+// deliberately omits fileBacked devices from runtime.json, and POST
+// /api/config never writes /devices. This accepts the real .ir bytes back.
+void handleDeviceFileUploadData() {
+  HTTPUpload &upload = webServer.upload();
+  if (upload.status == UPLOAD_FILE_START) {
+    String requested = webServer.arg("name");
+    if (!requested.length()) requested = upload.filename;
+    String name = sanitizeBackupFileName(requested);
+    String lower = name;
+    lower.toLowerCase();
+    bool authorized = requestAuthorized();
+    deviceFileUploadOk = authorized && sdReady && name.length() && lower.endsWith(".ir");
+    deviceFileUploadPath = deviceFileUploadOk ? normaliseIrDevicePath(name) : "";
+    SD.remove("/tmp/device.upload");
+    if (deviceFileUploadOk) deviceFileUploadFile = SD.open("/tmp/device.upload", FILE_WRITE);
+    deviceFileUploadOk = deviceFileUploadOk && (bool)deviceFileUploadFile;
+    Serial.printf("Device file upload: name=%s authorized=%d sdReady=%d fileOpen=%d\n",
+                  requested.c_str(), (int)authorized, (int)sdReady, (int)deviceFileUploadOk);
+  } else if (upload.status == UPLOAD_FILE_WRITE && deviceFileUploadOk) {
+    deviceFileUploadOk =
+      deviceFileUploadFile.write(upload.buf, upload.currentSize) == upload.currentSize;
+    if (!deviceFileUploadOk) Serial.println("Device file upload: SD write failed mid-transfer");
+    serviceUiDuringLongHttpTransfer();
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (deviceFileUploadFile) deviceFileUploadFile.close();
+    // Same header check the USB import path uses, so a truncated or wrong
+    // file can't land in /devices and be listed as a broken device.
+    if (deviceFileUploadOk) deviceFileUploadOk = uploadedIrFileLooksValid("/tmp/device.upload");
+    if (deviceFileUploadOk) {
+      SD.remove(deviceFileUploadPath);
+      deviceFileUploadOk = SD.rename("/tmp/device.upload", deviceFileUploadPath);
+      if (deviceFileUploadOk) rememberSavedIrDeviceFile(deviceFileUploadPath);
+      else Serial.printf("Device file upload: rename to %s failed\n", deviceFileUploadPath.c_str());
+    } else {
+      SD.remove("/tmp/device.upload");
+      Serial.println("Device file upload: rejected (not a valid .ir file)");
+    }
+  } else if (upload.status == UPLOAD_FILE_ABORTED) {
+    if (deviceFileUploadFile) deviceFileUploadFile.close();
+    SD.remove("/tmp/device.upload");
+    deviceFileUploadOk = false;
+    Serial.println("Device file upload: aborted");
+  }
+}
+
+// Plain CRC-32 (same polynomial as zip/PNG), accumulated as chunks arrive so
+// verifying an upload costs no extra pass over the SD card.
+uint32_t crc32Update(uint32_t crc, const uint8_t *data, size_t length) {
+  crc = ~crc;
+  while (length--) {
+    crc ^= *data++;
+    for (uint8_t bit = 0; bit < 8; bit++) {
+      crc = (crc & 1) ? ((crc >> 1) ^ 0xEDB88320UL) : (crc >> 1);
+    }
+  }
+  return ~crc;
+}
+
+// Restores a backup that is already sitting on the SD card, entirely on the
+// remote. WebConfig previously had to download the whole backup, rebuild its
+// model in the browser and then push every byte back - regenerating and
+// re-uploading each theme's 150 KB .rgb565, every custom icon and the full
+// runtime.json - to restore data that had never left the card. This runs the
+// same restoreLcdFullBackup() the LCD's own Backup/Restore menu uses, so an
+// SD restore costs no upload at all and behaves identically either way.
+void handleBackupRestoreApi() {
+  if (!requestAuthorized()) {
+    sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
+    return;
+  }
+  if (!sdReady) {
+    sendJson(503, "{\"ok\":false,\"error\":\"SD card unavailable\"}");
+    return;
+  }
+  JsonDocument request;
+  deserializeJson(request, webServer.arg("plain"));
+  String name = request["name"] | "";
+  if (!name.length()) name = webServer.arg("name");
+  String clean = sanitizeBackupFileName(name);
+  if (!clean.length()) {
+    sendJson(400, "{\"ok\":false,\"error\":\"Invalid backup filename\"}");
+    return;
+  }
+  String error;
+  uint32_t startedMs = millis();
+  // reloadNow=false: the runtime model must be rebuilt by the main loop, not
+  // by this HTTP worker on core 0, since LVGL on core 1 references it.
+  bool ok = restoreLcdFullBackup(clean.c_str(), error, false);
+  Serial.printf("SD restore (WebConfig): %s %s took=%ums\n", clean.c_str(),
+                ok ? "ok" : error.c_str(), (unsigned)(millis() - startedMs));
+  if (!ok) {
+    sendJson(400, String("{\"ok\":false,\"error\":\"") + error + "\"}");
+    return;
+  }
+  sendJson(200, String("{\"ok\":true,\"name\":\"") + clean + "\"}");
+  scheduleRuntimeReloadAfterSync();
+}
+
+// ---------------------------------------------------------------------------
+// Resumable chunked upload
+//
+// A single multi-megabyte POST over the remote's SoftAP is fragile: any drop
+// anywhere in the transfer loses the whole thing, which is why syncing a full
+// configuration or installing WebConfig/firmware could need several attempts.
+// These endpoints let WebConfig send the same payload as a sequence of small
+// POSTs appended to one temp file, so a dropped connection costs one chunk
+// rather than the entire upload, and the client can resume where the remote
+// actually got to instead of starting again.
+//
+//   POST /api/upload/begin?target=T   - start (or restart) a session
+//   GET  /api/upload/status?target=T  - bytes the remote currently holds
+//   POST /api/upload/chunk?target=T&offset=N - append one chunk
+//   POST /api/upload/finish?target=T  - validate and commit
+//
+// The commit step for each target is deliberately the same code the old
+// single-shot endpoints used, so both paths behave identically once the bytes
+// have landed.
+// ---------------------------------------------------------------------------
+String chunkUploadTempPathFor(const String &target) {
+  if (target == "config") return String(RUNTIME_CONFIG_UPLOAD_PATH);
+  if (target == "webconfig") return String("/tmp/index.upload.html");
+  if (target == "firmware") return String(FIRMWARE_STAGE_PATH);
+  return String();
+}
+
+void closeChunkUploadSession() {
+  if (chunkUploadFile) chunkUploadFile.close();
+  chunkUploadTarget = "";
+  chunkUploadTempPath = "";
+  chunkUploadBytes = 0;
+  chunkUploadCrc = 0;
+}
+
+void handleChunkUploadBegin() {
+  if (!requestAuthorized()) {
+    sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
+    return;
+  }
+  if (!sdReady) {
+    sendJson(503, "{\"ok\":false,\"error\":\"SD card unavailable\"}");
+    return;
+  }
+  String target = webServer.arg("target");
+  String path = chunkUploadTempPathFor(target);
+  if (!path.length()) {
+    sendJson(400, "{\"ok\":false,\"error\":\"Unknown upload target\"}");
+    return;
+  }
+  closeChunkUploadSession();
+  SD.remove(path);
+  chunkUploadTarget = target;
+  chunkUploadTempPath = path;
+  chunkUploadBytes = 0;
+  chunkUploadCrc = 0;
+  chunkUploadError = "";
+  Serial.printf("Chunked upload: begin target=%s heapFree=%u psramFree=%u\n",
+                target.c_str(), (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
+  sendJson(200, "{\"ok\":true,\"bytes\":0}");
+}
+
+void handleChunkUploadStatus() {
+  if (!requestAuthorized()) {
+    sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
+    return;
+  }
+  String target = webServer.arg("target");
+  size_t bytes = (target.length() && target == chunkUploadTarget) ? chunkUploadBytes : 0;
+  sendJson(200, String("{\"ok\":true,\"bytes\":") + String((unsigned)bytes) + "}");
+}
+
+void handleChunkUploadData() {
+  HTTPUpload &upload = webServer.upload();
+  if (upload.status == UPLOAD_FILE_START) {
+    String target = webServer.arg("target");
+    size_t offset = (size_t)strtoul(webServer.arg("offset").c_str(), nullptr, 10);
+    chunkUploadChunkOk = requestAuthorized() && sdReady &&
+                         target.length() && target == chunkUploadTarget;
+    if (!chunkUploadChunkOk) {
+      chunkUploadError = "No upload session for this target";
+    } else if (offset != chunkUploadBytes) {
+      // The client and remote disagree about progress (a chunk that landed
+      // but whose response was lost, or a stale retry). Refuse rather than
+      // corrupt the file - the client re-reads /status and resumes.
+      chunkUploadChunkOk = false;
+      chunkUploadError = "Chunk offset mismatch";
+    } else {
+      chunkUploadFile = SD.open(chunkUploadTempPath, FILE_APPEND);
+      chunkUploadChunkOk = (bool)chunkUploadFile;
+      if (!chunkUploadChunkOk) chunkUploadError = "Could not open upload file";
+    }
+  } else if (upload.status == UPLOAD_FILE_WRITE && chunkUploadChunkOk) {
+    if (chunkUploadFile.write(upload.buf, upload.currentSize) != upload.currentSize) {
+      chunkUploadChunkOk = false;
+      chunkUploadError = "SD write failed during upload";
+    } else {
+      chunkUploadCrc = crc32Update(chunkUploadCrc, upload.buf, upload.currentSize);
+      chunkUploadBytes += upload.currentSize;
+    }
+    serviceUiDuringLongHttpTransfer();
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (chunkUploadFile) chunkUploadFile.close();
+  } else if (upload.status == UPLOAD_FILE_ABORTED) {
+    if (chunkUploadFile) chunkUploadFile.close();
+    chunkUploadChunkOk = false;
+    chunkUploadError = "Chunk upload interrupted";
+  }
+}
+
+void handleChunkUploadFinish() {
+  if (!requestAuthorized()) {
+    sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
+    return;
+  }
+  String target = webServer.arg("target");
+  if (!target.length() || target != chunkUploadTarget || !chunkUploadTempPath.length()) {
+    sendJson(400, "{\"ok\":false,\"error\":\"No upload session for this target\"}");
+    return;
+  }
+  if (chunkUploadFile) chunkUploadFile.close();
+  String path = chunkUploadTempPath;
+  size_t received = chunkUploadBytes;
+  String error;
+  bool ok = received > 0;
+  if (!ok) error = "Upload was empty";
+
+  // End-to-end integrity check. Nothing previously verified that an upload
+  // arrived complete: uploadedWebConfigLooksValid() only inspects the first
+  // 768 bytes, so an HTML truncated at 90% still contains <html and the
+  // version meta and was installed anyway - which is exactly how a partly
+  // transferred WebConfig ends up rendering half a remote image and then
+  // garbage. The client sends the byte count and CRC-32 it expects; a
+  // mismatch is refused here so it can be retried instead of silently
+  // committed. Both are optional so an older client still works.
+  if (ok && webServer.hasArg("size")) {
+    size_t expected = (size_t)strtoul(webServer.arg("size").c_str(), nullptr, 10);
+    if (expected != received) {
+      ok = false;
+      error = String("Upload incomplete: expected ") + String((unsigned)expected) +
+              " bytes but stored " + String((unsigned)received);
+    }
+  }
+  if (ok && webServer.hasArg("crc")) {
+    uint32_t expectedCrc = (uint32_t)strtoul(webServer.arg("crc").c_str(), nullptr, 10);
+    if (expectedCrc != chunkUploadCrc) {
+      ok = false;
+      error = "Upload corrupted in transfer (checksum mismatch)";
+    }
+  }
+
+  if (ok && target == "config") {
+    ok = runtimeConfigFileLooksValid(path.c_str(), error);
+    if (ok) ok = commitRuntimeConfigTemp(error);
+  } else if (ok && target == "webconfig") {
+    ok = uploadedWebConfigLooksValid(path);
+    if (!ok) error = "Not a valid OpenRemote WebConfig file";
+    if (ok) {
+      SD.remove("/backups/index.previous.html");
+      if (SD.exists(WEB_CONFIG_PATH)) SD.rename(WEB_CONFIG_PATH, "/backups/index.previous.html");
+      ok = SD.rename(path, WEB_CONFIG_PATH);
+      if (!ok) error = "Could not install the uploaded WebConfig";
+    }
+  } else if (ok && target == "firmware") {
+    ok = received >= 65536UL && uploadedFirmwareLooksValid(path);
+    if (!ok) error = "Not a valid ESP32 firmware binary";
+  }
+
+  if (!ok && target != "webconfig") SD.remove(path);
+  Serial.printf("Chunked upload: finish target=%s %s received=%u %s\n",
+                target.c_str(), ok ? "committed" : "FAILED",
+                (unsigned)received, ok ? "" : error.c_str());
+  closeChunkUploadSession();
+
+  if (!ok) {
+    sendJson(400, String("{\"ok\":false,\"error\":\"") + error + "\"}");
+    return;
+  }
+  sendJson(200, String("{\"ok\":true,\"firmwareVersion\":\"") + OPENREMOTE_VERSION_TEXT +
+                "\",\"bytes\":" + String((unsigned)received) + "}");
+  if (target == "config") scheduleRuntimeReloadAfterSync();
+}
+
+// Shared by the HTTP handler and the USB ORUSB FACTORYRESET command, so a
+// recovery reset performed over USB erases exactly what WebConfig's own
+// Restore Factory Settings does - no second, subtly different implementation.
+bool performFactoryReset() {
+  const char *userFolders[] = {
+    "/config", "/devices", "/activities", "/macros",
+    "/icons/Custom", "/themes/Custom", "/logs", "/tmp"
+  };
+  for (const char *folder : userFolders) deleteSdTree(folder);
+  bool ok = true;
+  for (uint8_t i = 0; i < SD_FOLDER_COUNT; i++) ok = createSdFolderIfMissing(sdFolders[i]) && ok;
+
+  // Hardware/diagnostic preferences (LCD/touch driver choice, Debug menu
+  // toggles, Menu Style) are meant to survive a Factory Reset - only Format
+  // SD Card should wipe those. preferences.clear() has no selective mode, so
+  // read them out first and restore them after; everything else (Wi-Fi
+  // credentials, Homebridge, clock settings, etc.) is cleared as before.
+  preferences.begin(PREFERENCES_NAMESPACE, false);
+  uint8_t savedDisplayDriverChoice = preferences.getUChar("dispDrv", 1);
+  uint32_t savedLcdFreqHz = preferences.getULong("lcdFreqHz", 40000000UL);
+  uint8_t savedLcdBufferMode = preferences.getUChar("lcdBufMode", 1);
+  uint8_t savedLcdDriveStrength = preferences.getUChar("lcdDriveStr", 2);
+  uint8_t savedTouchDriverChoice = preferences.getUChar("touchDrv", 0);
+  uint32_t savedBacklightPwmHz = preferences.getULong("blPwmHz", BACKLIGHT_PWM_HZ);
+  uint8_t savedMenuStyle = preferences.getUChar("menuStyle", 0);
+  bool savedDbgSplit = preferences.getBool("dbgSplit", false);
+  bool savedDbgTouch = preferences.getBool("dbgTouch", false);
+  bool savedDbgCpu = preferences.getBool("dbgCpu", false);
+  bool savedDbgAccel = preferences.getBool("dbgAccel", false);
+  bool savedDbgFps = preferences.getBool("dbgFps", false);
+  bool savedPrefMig1 = preferences.getBool("prefMig1", false);
+  preferences.clear();
+  preferences.putUChar("dispDrv", savedDisplayDriverChoice);
+  preferences.putULong("lcdFreqHz", savedLcdFreqHz);
+  preferences.putUChar("lcdBufMode", savedLcdBufferMode);
+  preferences.putUChar("lcdDriveStr", savedLcdDriveStrength);
+  preferences.putUChar("touchDrv", savedTouchDriverChoice);
+  preferences.putULong("blPwmHz", savedBacklightPwmHz);
+  preferences.putUChar("menuStyle", savedMenuStyle);
+  preferences.putBool("dbgSplit", savedDbgSplit);
+  preferences.putBool("dbgTouch", savedDbgTouch);
+  preferences.putBool("dbgCpu", savedDbgCpu);
+  preferences.putBool("dbgAccel", savedDbgAccel);
+  preferences.putBool("dbgFps", savedDbgFps);
+  preferences.putBool("prefMig1", savedPrefMig1);
+  preferences.end();
+  return ok;
 }
 
 void handleFactoryReset() {
@@ -8789,23 +11063,19 @@ void handleFactoryReset() {
     sendJson(400, "{\"ok\":false,\"error\":\"Confirmation required\"}");
     return;
   }
-
-  const char *userFolders[] = {
-    "/config", "/devices", "/activities", "/macros",
-    "/icons/Custom", "/themes/Custom", "/logs", "/tmp"
-  };
-  for (const char *folder : userFolders) deleteSdTree(folder);
-  bool ok = true;
-  for (uint8_t i = 0; i < SD_FOLDER_COUNT; i++) ok = createSdFolderIfMissing(sdFolders[i]) && ok;
-  preferences.begin(PREFERENCES_NAMESPACE, false);
-  preferences.clear();
-  preferences.end();
-  if (!ok) {
+  if (!performFactoryReset()) {
     sendJson(500, "{\"ok\":false,\"error\":\"Factory reset could not rebuild user folders\"}");
     return;
   }
   sendJson(200, "{\"ok\":true,\"restarting\":true,\"sdFormatted\":false}");
-  restartPending = true;
+  // A plain ESP.restart() (restartPending) leaves touch dead until a real
+  // physical reset - the exact same reason displayDriverDropdownEvent() /
+  // touchDriverDropdownEvent() etc. already request hardRestartPending
+  // (esp_rom_software_reset_system()) instead for any change that needs a
+  // genuine peripheral reinit, not just an app-level restart. Factory Reset
+  // rewrites Preferences and rebuilds SD folders the running firmware has
+  // already cached in memory, so it needs the same guarantee.
+  hardRestartPending = true;
 }
 
 void handleFirmwareUploadData() {
@@ -8815,6 +11085,7 @@ void handleFirmwareUploadData() {
     Serial.printf("Firmware upload: %s\n", upload.filename.c_str());
   } else if (upload.status == UPLOAD_FILE_WRITE && firmwareUploadOk) {
     firmwareUploadOk = Update.write(upload.buf, upload.currentSize) == upload.currentSize;
+    serviceUiDuringLongHttpTransfer();
   } else if (upload.status == UPLOAD_FILE_END && firmwareUploadOk) {
     firmwareUploadOk = Update.end(true);
   } else if (upload.status == UPLOAD_FILE_ABORTED) {
@@ -8842,6 +11113,7 @@ void handleFirmwareStageUploadData() {
       firmwareStageOk = firmwareStageFile.write(upload.buf, upload.currentSize) == upload.currentSize;
       if (firmwareStageOk) firmwareStageBytes += upload.currentSize;
     }
+    serviceUiDuringLongHttpTransfer();
   } else if (upload.status == UPLOAD_FILE_END) {
     if (firmwareStageFile) firmwareStageFile.close();
     firmwareStageOk = firmwareStageOk && firmwareStageBytes >= 65536UL;
@@ -8901,6 +11173,7 @@ void handleWebConfigUploadData() {
     Serial.printf("WebConfig upload: %s\n", upload.filename.c_str());
   } else if (upload.status == UPLOAD_FILE_WRITE && webConfigUploadOk) {
     webConfigUploadOk = webConfigUploadFile.write(upload.buf, upload.currentSize) == upload.currentSize;
+    serviceUiDuringLongHttpTransfer();
   } else if (upload.status == UPLOAD_FILE_END) {
     if (webConfigUploadFile) webConfigUploadFile.close();
     if (webConfigUploadOk) {
@@ -8925,6 +11198,7 @@ void handleIrdbUploadData() {
     Serial.printf("IRDB upload: %s\n", upload.filename.c_str());
   } else if (upload.status == UPLOAD_FILE_WRITE && irdbUploadOk) {
     irdbUploadOk = irdbUploadFile.write(upload.buf, upload.currentSize) == upload.currentSize;
+    serviceUiDuringLongHttpTransfer();
   } else if (upload.status == UPLOAD_FILE_END) {
     if (irdbUploadFile) irdbUploadFile.close();
     if (irdbUploadOk) {
@@ -9122,6 +11396,7 @@ void handleCustomIconUploadData() {
     customIconUploadOk = customIconUploadOk && (bool)customIconUploadFile;
   } else if (upload.status == UPLOAD_FILE_WRITE && customIconUploadOk) {
     customIconUploadOk = customIconUploadFile.write(upload.buf, upload.currentSize) == upload.currentSize;
+    serviceUiDuringLongHttpTransfer();
   } else if (upload.status == UPLOAD_FILE_END) {
     if (customIconUploadFile) customIconUploadFile.close();
     if (customIconUploadOk) {
@@ -9175,6 +11450,7 @@ void handleThemeUploadData() {
     themeUploadOk = themeUploadOk && (bool)themeUploadFile;
   } else if (upload.status == UPLOAD_FILE_WRITE && themeUploadOk) {
     themeUploadOk = themeUploadFile.write(upload.buf, upload.currentSize) == upload.currentSize;
+    serviceUiDuringLongHttpTransfer();
   } else if (upload.status == UPLOAD_FILE_END) {
     if (themeUploadFile) themeUploadFile.close();
     String lowerPath = themeUploadPath;
@@ -9186,6 +11462,9 @@ void handleThemeUploadData() {
     if (themeUploadOk) {
       SD.remove(themeUploadPath);
       themeUploadOk = SD.rename("/tmp/theme.upload", themeUploadPath);
+      if (themeUploadOk && lowerPath.endsWith(".rgb565")) {
+        invalidateWallpaperCacheForPath(themeUploadPath);
+      }
     } else {
       SD.remove("/tmp/theme.upload");
     }
@@ -9565,6 +11844,13 @@ void configureWebServer() {
   webServer.on("/api/homebridge/control", HTTP_POST, handleHomebridgeControl);
   webServer.on("/api/bluetooth/pair", HTTP_POST, handleBluetoothApi);
   webServer.on("/api/devices/file", HTTP_DELETE, handleFileBackedDeviceDelete);
+  webServer.on("/api/devices/file", HTTP_POST, []() {
+    if (!requestAuthorized()) webServer.send(403, "application/json", "{\"ok\":false}");
+    else sendJson(deviceFileUploadOk ? 200 : 400,
+                  deviceFileUploadOk
+                    ? String("{\"ok\":true,\"path\":\"") + deviceFileUploadPath + "\"}"
+                    : "{\"ok\":false,\"error\":\"Device file upload failed; expected a valid .ir file\"}");
+  }, handleDeviceFileUploadData);
   webServer.on("/api/ir/learn/start", HTTP_POST, handleIrLearnStart);
   webServer.on("/api/ir/learn/status", HTTP_GET, handleIrLearnStatus);
   webServer.on("/api/ir/learn/cancel", HTTP_POST, handleIrLearnCancel);
@@ -9594,11 +11880,23 @@ void configureWebServer() {
     else sendJson(irdbUploadOk ? 200 : 400,
                   irdbUploadOk ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"IRDB upload failed; use OpenRemote Studio's .irdb file\"}");
   }, handleIrdbUploadData);
+  webServer.on("/api/upload/begin", HTTP_POST, handleChunkUploadBegin);
+  webServer.on("/api/upload/status", HTTP_GET, handleChunkUploadStatus);
+  webServer.on("/api/upload/finish", HTTP_POST, handleChunkUploadFinish);
+  webServer.on("/api/upload/chunk", HTTP_POST, []() {
+    if (!requestAuthorized()) webServer.send(403, "application/json", "{\"ok\":false}");
+    else sendJson(chunkUploadChunkOk ? 200 : 400,
+                  chunkUploadChunkOk
+                    ? String("{\"ok\":true,\"bytes\":") + String((unsigned)chunkUploadBytes) + "}"
+                    : String("{\"ok\":false,\"error\":\"") + chunkUploadError +
+                      "\",\"bytes\":" + String((unsigned)chunkUploadBytes) + "}");
+  }, handleChunkUploadData);
   webServer.on("/api/sd/format", HTTP_POST, handleSdRebuild);
   webServer.on("/api/factory-reset", HTTP_POST, handleFactoryReset);
   webServer.on("/api/backups", HTTP_GET, handleBackupList);
   webServer.on("/api/backups/file", HTTP_GET, handleBackupDownload);
   webServer.on("/api/backups/file", HTTP_DELETE, handleBackupDelete);
+  webServer.on("/api/backups/restore", HTTP_POST, handleBackupRestoreApi);
   webServer.on("/api/backups/file", HTTP_POST, []() {
     if (!requestAuthorized()) webServer.send(403, "application/json", "{\"ok\":false}");
     else sendJson(backupUploadOk ? 200 : 400,
@@ -9629,6 +11927,13 @@ void configureWebServer() {
   }, handleWebConfigUploadData);
   webServer.serveStatic("/icons/", SD, "/icons/", "max-age=300");
   webServer.serveStatic("/themes/", SD, "/themes/", "max-age=300");
+  // WebConfig's own "Backup All Categories" builds its JSON entirely in the
+  // browser, so it can only embed what it can actually fetch. Icons and
+  // themes were already reachable this way; /devices was not, which is why a
+  // WebConfig-created backup could never carry file-backed (Studio/IRDB)
+  // devices at all - unlike a backup created on the LCD, which reads the SD
+  // card directly. No caching: a re-imported device can reuse a filename.
+  webServer.serveStatic("/devices/", SD, "/devices/", "no-store");
   webServer.onNotFound([]() {
     if (webServer.uri().startsWith("/api/")) sendJson(404, "{\"ok\":false,\"error\":\"Not found\"}");
     else serveWebConfig();
@@ -9695,8 +12000,22 @@ void requestWebServerListen(bool rebind) {
 void requestWebServerStop() {
   webConfigTransferCancelRequested = true;
   webServerListenRequested = false;
+  if (!webServerTaskHandle) {
+    // The HTTP worker task is only ever created lazily, by
+    // requestWebServerListen() - if WebConfig has never been opened yet
+    // this boot (e.g. the very first "Open WebConfig" with no saved Wi-Fi
+    // network), it doesn't exist yet. webServerStopRequested is only ever
+    // cleared by that task's own loop, so setting it here with no task to
+    // read it left it permanently stuck true - every later
+    // requestWebServerStopAndWait() call (from startSetupAccessPoint(),
+    // recoverWifiRadio(), etc.) then timed out immediately and for good,
+    // since nothing could ever un-stick it without a reboot.
+    webServerStopRequested = false;
+    webServerStarted = false;
+    return;
+  }
   webServerStopRequested = true;
-  if (webServerTaskHandle) xTaskNotifyGive(webServerTaskHandle);
+  xTaskNotifyGive(webServerTaskHandle);
 }
 
 bool requestWebServerStopAndWait(uint32_t timeoutMs) {
@@ -9793,9 +12112,16 @@ void parkNetworkStackForBle() {
 }
 
 void startSetupAccessPoint() {
-  if (setupApActive) return;
+  Serial.println("startSetupAccessPoint: called");
+  if (setupApActive) {
+    Serial.println("startSetupAccessPoint: already active, skipping");
+    return;
+  }
   ensureSetupIdentity();
-  if (!requestWebServerStopAndWait()) return;
+  if (!requestWebServerStopAndWait()) {
+    Serial.println("startSetupAccessPoint: web server stop timed out, aborting");
+    return;
+  }
 
   if (wifiScanPending) {
     WiFi.scanDelete();
@@ -10140,6 +12466,34 @@ const lv_font_t *fontForSize(uint8_t size) {
   return &lv_font_montserrat_24;
 }
 
+// applyRuntimeTheme() below has a fast path that reuses a page slot's already-
+// decoded PSRAM wallpaper whenever the requested path is unchanged from what
+// that slot last loaded (strcmp(path, boundPageUi->themePath) == 0) - it never
+// re-reads the file, on the reasonable assumption that the same SD path still
+// holds the same pixels. Editing an existing theme's image (WebConfig's crop/
+// zoom editor) breaks that assumption: the .rgb565 gets re-uploaded to that
+// exact same path (the theme's id, and therefore its runtimePath, doesn't
+// change), so nothing about the path differs and the fast path keeps handing
+// out stale pixels indefinitely - visible as WebConfig's own preview updating
+// correctly (it just re-fetches the PNG, no cache) while the LCD keeps
+// showing the pre-edit wallpaper until a reboot. Call this right after a
+// theme .rgb565 upload completes so any page slot currently holding that path
+// drops its cached pixels and is forced to re-read fresh bytes next render.
+void invalidateWallpaperCacheForPath(const String &path) {
+  if (!path.length()) return;
+  for (uint8_t i = 0; i < PAGE_SLOT_COUNT; i++) {
+    PageUi &slot = pageUi[i];
+    if (slot.wallpaperPixels && path == slot.themePath) {
+      if (slot.wallpaper) lv_img_set_src(slot.wallpaper, nullptr);
+      lv_img_cache_invalidate_src(&slot.wallpaperDescriptor);
+      free(slot.wallpaperPixels);
+      slot.wallpaperPixels = nullptr;
+      memset(&slot.wallpaperDescriptor, 0, sizeof(slot.wallpaperDescriptor));
+      slot.themePath[0] = '\0';
+    }
+  }
+}
+
 bool applyRuntimeTheme(const char *path) {
   if (!boundPageUi || !wallpaper) return false;
   activeRuntimeThemeStyle = findRuntimeThemeStyle(path);
@@ -10432,6 +12786,184 @@ void styleModernSlider(lv_obj_t *sl, int knobPad = 6) {
   lv_obj_set_style_pad_all(sl, knobPad, LV_PART_KNOB);
 }
 
+// Matches the real OpenRemote_2.0 settings screen, read directly from that
+// project's source rather than invented: gui_settings.cpp sets each switch's
+// off-track to 0x505050 and never touches the checked/indicator colour, so
+// that colour is whatever LVGL's default theme was auto-initialised with -
+// lv_hal_disp.c calls lv_theme_default_init() with lv_palette_main(LV_PALETTE_
+// BLUE) (0x2196F3) as the primary colour. Knob stays plain white either way.
+// Used only when Menu Style is "Omote" - styleModernSwitch/styleModernSlider
+// above keep the OpenRemote-style controls' own accent unchanged.
+void styleOmoteSwitch(lv_obj_t *sw) {
+  lv_obj_set_style_radius(sw, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(sw, lvRgb(0x50, 0x50, 0x50), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(sw, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_radius(sw, LV_RADIUS_CIRCLE, LV_PART_INDICATOR);
+  lv_obj_set_style_bg_color(sw, lvRgb(0x50, 0x50, 0x50), LV_PART_INDICATOR);
+  lv_obj_set_style_bg_color(sw, lvRgb(0x21, 0x96, 0xF3), LV_PART_INDICATOR | LV_STATE_CHECKED);
+  lv_obj_set_style_bg_opa(sw, LV_OPA_COVER, LV_PART_INDICATOR);
+  lv_obj_set_style_bg_color(sw, lv_color_white(), LV_PART_KNOB);
+  lv_obj_set_style_bg_opa(sw, LV_OPA_COVER, LV_PART_KNOB);
+  lv_obj_set_style_pad_all(sw, 2, LV_PART_KNOB);
+}
+
+// Same source as styleOmoteSwitch: gui_settings.cpp's sliders set the track
+// (LV_PART_MAIN) to lv_color_lighten(color_primary, 50) where color_primary
+// is 0x303030, and leave the indicator/knob at the default theme's values
+// (primary blue fill, white knob).
+void styleOmoteSlider(lv_obj_t *sl, int knobPad = 6) {
+  lv_obj_set_style_radius(sl, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(sl, lv_color_lighten(lvRgb(0x30, 0x30, 0x30), 50), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(sl, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_radius(sl, LV_RADIUS_CIRCLE, LV_PART_INDICATOR);
+  lv_obj_set_style_bg_color(sl, lvRgb(0x21, 0x96, 0xF3), LV_PART_INDICATOR);
+  lv_obj_set_style_bg_opa(sl, LV_OPA_COVER, LV_PART_INDICATOR);
+  lv_obj_set_style_radius(sl, LV_RADIUS_CIRCLE, LV_PART_KNOB);
+  lv_obj_set_style_bg_color(sl, lv_color_white(), LV_PART_KNOB);
+  lv_obj_set_style_bg_opa(sl, LV_OPA_COVER, LV_PART_KNOB);
+  lv_obj_set_style_border_width(sl, 0, LV_PART_KNOB);
+  lv_obj_set_style_pad_all(sl, knobPad, LV_PART_KNOB);
+}
+
+// Flat-palette versions of stylePanel/makeButton/dropdown/roller/keyboard-key
+// for pages rendered under Menu Style "Omote" - no OpenRemote_2.0 equivalent
+// exists for buttons, dropdowns, rollers or a text-entry keyboard, so these
+// simply carry the same 0x303030/0x505050/0x2196F3 palette and 8px radius
+// used everywhere else in that style, rather than the OpenRemote-style
+// controls' own darker/bordered look.
+void styleOmotePanel(lv_obj_t *obj, lv_color_t bg) {
+  lv_obj_set_style_bg_color(obj, bg, 0);
+  lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(obj, 0, 0);
+  lv_obj_set_style_radius(obj, 8, 0);
+  lv_obj_set_style_pad_all(obj, 8, 0);
+}
+
+lv_obj_t *makeOmoteButton(lv_obj_t *parent, const char *text, int x, int y, int w, int h,
+                          lv_color_t bg = lvRgb(0x50, 0x50, 0x50)) {
+  lv_obj_t *btn = lv_btn_create(parent);
+  lv_obj_set_pos(btn, x, y);
+  lv_obj_set_size(btn, w, h);
+  lv_obj_add_flag(btn, LV_OBJ_FLAG_GESTURE_BUBBLE);
+  lv_obj_clear_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_style_color_filter_opa(btn, LV_OPA_TRANSP, LV_STATE_PRESSED);
+  styleOmotePanel(btn, bg);
+  lv_obj_t *label = lv_label_create(btn);
+  lv_label_set_text(label, text);
+  lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
+  lv_obj_set_style_text_color(label, textPrimary(), 0);
+  lv_obj_clear_flag(label, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_clear_flag(label, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_center(label);
+  return btn;
+}
+
+// Recreates the OpenRemote brand mark (WebConfig's .logo: a filled centre
+// dot + a ring, both brand blue, with a soft outer glow) using plain LVGL
+// circles rather than a bitmap asset - there's no image file for it bundled
+// into this firmware, but the CSS recipe gives an exact, reproducible
+// layout: glow ~100% of diameter, ring ~62%, dot ~30%, all centred.
+lv_obj_t *makeOpenRemoteLogoEmblem(lv_obj_t *parent, int centerX, int centerY, int diameter) {
+  lv_color_t brandBlue = lvRgb(0x2F, 0x8C, 0xFF);
+
+  lv_obj_t *glow = lv_obj_create(parent);
+  lv_obj_remove_style_all(glow);
+  lv_obj_set_size(glow, diameter, diameter);
+  lv_obj_align(glow, LV_ALIGN_TOP_LEFT, centerX - diameter / 2, centerY - diameter / 2);
+  lv_obj_set_style_radius(glow, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_color(glow, brandBlue, 0);
+  lv_obj_set_style_bg_opa(glow, LV_OPA_20, 0);
+  lv_obj_clear_flag(glow, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(glow, LV_OBJ_FLAG_CLICKABLE);
+
+  int ringSize = (int)(diameter * 0.62f);
+  lv_obj_t *ring = lv_obj_create(parent);
+  lv_obj_remove_style_all(ring);
+  lv_obj_set_size(ring, ringSize, ringSize);
+  lv_obj_align(ring, LV_ALIGN_TOP_LEFT, centerX - ringSize / 2, centerY - ringSize / 2);
+  lv_obj_set_style_radius(ring, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_opa(ring, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_color(ring, brandBlue, 0);
+  lv_obj_set_style_border_width(ring, max(3, diameter / 12), 0);
+  lv_obj_set_style_border_opa(ring, LV_OPA_COVER, 0);
+  lv_obj_clear_flag(ring, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(ring, LV_OBJ_FLAG_CLICKABLE);
+
+  int dotSize = (int)(diameter * 0.30f);
+  lv_obj_t *dot = lv_obj_create(parent);
+  lv_obj_remove_style_all(dot);
+  lv_obj_set_size(dot, dotSize, dotSize);
+  lv_obj_align(dot, LV_ALIGN_TOP_LEFT, centerX - dotSize / 2, centerY - dotSize / 2);
+  lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_color(dot, brandBlue, 0);
+  lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
+  lv_obj_clear_flag(dot, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(dot, LV_OBJ_FLAG_CLICKABLE);
+
+  return dot;
+}
+
+// Matches gui_settings.cpp's dropdown styling exactly: box and open-list both
+// on color_primary (0x303030), 1px 0x505050 border on the list only.
+void styleOmoteDropdown(lv_obj_t *dropdown) {
+  lv_obj_set_style_text_font(dropdown, &lv_font_montserrat_12, 0);
+  lv_obj_set_style_text_color(dropdown, textPrimary(), 0);
+  lv_obj_set_style_bg_color(dropdown, lvRgb(0x30, 0x30, 0x30), 0);
+  lv_obj_set_style_bg_opa(dropdown, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(dropdown, 0, 0);
+  lv_obj_set_style_radius(dropdown, 8, 0);
+  lv_obj_set_style_pad_left(dropdown, 8, 0);
+  lv_obj_add_flag(dropdown, LV_OBJ_FLAG_GESTURE_BUBBLE);
+  lv_dropdown_set_selected_highlight(dropdown, true);
+  lv_obj_t *list = lv_dropdown_get_list(dropdown);
+  lv_obj_set_style_bg_color(list, lvRgb(0x30, 0x30, 0x30), 0);
+  lv_obj_set_style_border_width(list, 1, 0);
+  lv_obj_set_style_border_color(list, lvRgb(0x50, 0x50, 0x50), 0);
+  // The list never inherited a text colour of its own before, so unselected
+  // options fell back to the default theme's dark text - unreadable on this
+  // dark background. Matches the muted sub-label look used elsewhere
+  // (textPrimary() at LV_OPA_60) rather than a plain near-white, which read
+  // as too bright/harsh for a whole list of options.
+  lv_obj_set_style_text_color(list, lvRgb(0xAC, 0xAC, 0xAC), 0);
+  lv_obj_set_style_bg_color(list, lvRgb(0x21, 0x96, 0xF3), LV_PART_SELECTED);
+  lv_obj_set_style_text_color(list, lv_color_white(), LV_PART_SELECTED);
+}
+
+void styleOmoteRoller(lv_obj_t *roller) {
+  lv_obj_set_style_bg_color(roller, lvRgb(0x30, 0x30, 0x30), 0);
+  lv_obj_set_style_bg_opa(roller, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(roller, 0, 0);
+  lv_obj_set_style_radius(roller, 8, 0);
+  lv_obj_set_style_text_font(roller, &lv_font_montserrat_12, 0);
+  lv_obj_set_style_text_color(roller, textPrimary(), 0);
+  lv_obj_set_style_bg_color(roller, lvRgb(0x21, 0x96, 0xF3), LV_PART_SELECTED);
+  lv_obj_set_style_text_color(roller, lv_color_white(), LV_PART_SELECTED);
+}
+
+lv_obj_t *makeOmoteKeyboardKey(lv_obj_t *parent, lv_event_cb_t clickCallback,
+                               const char *label, const char *key, int x, int y, int w, int h,
+                               lv_color_t bg = lvRgb(0x50, 0x50, 0x50)) {
+  lv_obj_t *button = lv_btn_create(parent);
+  lv_obj_set_pos(button, x, y);
+  lv_obj_set_size(button, w, h);
+  lv_obj_clear_flag(button, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_style_radius(button, 6, 0);
+  lv_obj_set_style_bg_color(button, bg, 0);
+  lv_obj_set_style_bg_opa(button, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(button, 0, 0);
+  lv_obj_set_style_shadow_width(button, 0, 0);
+  lv_obj_set_style_pad_all(button, 0, 0);
+  lv_obj_set_style_bg_color(button, lvRgb(0x21, 0x96, 0xF3), LV_STATE_PRESSED);
+  lv_obj_add_event_cb(button, clickCallback, LV_EVENT_CLICKED, (void *)key);
+  lv_obj_t *text = lv_label_create(button);
+  lv_label_set_text(text, label);
+  lv_obj_set_style_text_font(text, &lv_font_montserrat_12, 0);
+  lv_obj_set_style_text_color(text, textPrimary(), 0);
+  lv_obj_clear_flag(text, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_center(text);
+  return button;
+}
+
 lv_obj_t *makeLabel(lv_obj_t *parent, const char *text, int x, int y, const lv_font_t *font, lv_color_t colour) {
   lv_obj_t *label = lv_label_create(parent);
   lv_label_set_text(label, text);
@@ -10574,10 +13106,6 @@ void clearModalObjects() {
     lv_obj_del(deviceModal);
     deviceModal = nullptr;
   }
-  if (lockOverlay) {
-    lv_obj_del(lockOverlay);
-    lockOverlay = nullptr;
-  }
   closeBrightnessPanel();
 }
 
@@ -10604,7 +13132,7 @@ void rebuildPages() {
 
 void drawDots() {
   if (!dots) return;
-  if (lockActive || (currentPage == 0 && settingsView != SETTINGS_HOME)) {
+  if (currentPage == 0 && settingsView != SETTINGS_HOME) {
     lv_obj_add_flag(dots, LV_OBJ_FLAG_HIDDEN);
     return;
   }
@@ -10907,7 +13435,11 @@ void renderTopBar(const char *title, bool allowDevices) {
   lv_obj_set_pos(titleLabel, titleX, 9);
   lv_obj_set_width(titleLabel, titleWidth);
   lv_obj_set_style_text_align(titleLabel, LV_TEXT_ALIGN_LEFT, 0);
-  lv_obj_set_style_text_font(titleLabel, allowDevices ? &lv_font_montserrat_16 : &lv_font_montserrat_20, 0);
+  // A long title (e.g. "Backup / Restore") at 20pt doesn't fit titleWidth and
+  // was getting cut down to almost nothing by LV_LABEL_LONG_DOT; drop to 16pt
+  // for anything past ~10 characters so it still fits and truncates gracefully.
+  bool longTitle = strlen(title) > 10;
+  lv_obj_set_style_text_font(titleLabel, (allowDevices || longTitle) ? &lv_font_montserrat_16 : &lv_font_montserrat_20, 0);
   lv_obj_set_style_text_color(titleLabel, textPrimary(), 0);
   if (allowDevices) {
     lv_obj_add_flag(titleLabel, LV_OBJ_FLAG_CLICKABLE);
@@ -11005,14 +13537,19 @@ void switchEvent(lv_event_t *e) {
   } else if (target == &clockEnabled) {
     pendingUiRefresh = true;
   } else if (target == &clockUseInternetTime) {
-    if (clockUseInternetTime && (!wifiOn || !hasSelectedWifiProfile())) {
+    // Any saved network is enough here, not specifically the one currently
+    // "selected" (hasSelectedWifiProfile() - a user can have a network saved
+    // without it being the active selection) and not wifiOn itself - Wi-Fi is
+    // switched on automatically just to sync (see the Clock page's own
+    // "Wi-Fi turns on only while time syncs" note).
+    if (clockUseInternetTime && !hasAnyWifiProfile()) {
       clockUseInternetTime = false;
+    } else if (clockUseInternetTime) {
+      ensureSelectedWifiProfile();
     }
     applyClockMode();
     if (clockUseInternetTime) requestInternetTimeSync();
     pendingUiRefresh = settingsView == SETTINGS_CLOCK;
-  } else if (target == &slideToUnlock) {
-    // The new value takes effect the next time the screen wakes.
   } else if (target == &physicalRepeatEnabled) {
     endHeldIrCommand();
     pendingUiRefresh = settingsView == SETTINGS_BUTTONS;
@@ -11076,14 +13613,21 @@ lv_obj_t *makeOmoteCard(lv_obj_t *parent, int y, int height) {
   lv_obj_set_size(card, 224, height);
   lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_clear_flag(card, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_set_style_bg_color(card, lvRgb(28, 29, 33), 0);
+  // 0x303030 and radius 8 are OpenRemote_2.0's actual values: guiBase.cpp's
+  // color_primary and the LVGL default theme's RADIUS_DEFAULT for a small
+  // (<=320px) display - not the 28,29,33 / 14px this used to invent.
+  lv_obj_set_style_bg_color(card, lvRgb(0x30, 0x30, 0x30), 0);
   lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
   lv_obj_set_style_border_width(card, 0, 0);
-  lv_obj_set_style_radius(card, 14, 0);
+  lv_obj_set_style_radius(card, 8, 0);
   lv_obj_set_style_pad_all(card, 0, 0);
   return card;
 }
 
+// OpenRemote_2.0's real setting groups have no divider lines at all - each
+// topic is one flat box. Kept here only because 1.0's Omote style packs
+// several topics into one card with drill-down rows, a structure 2.0 doesn't
+// have; retinted to sit correctly against the corrected 0x303030 card colour.
 void makeOmoteDivider(lv_obj_t *card, int y) {
   lv_obj_t *line = lv_obj_create(card);
   lv_obj_remove_style_all(line);
@@ -11091,14 +13635,15 @@ void makeOmoteDivider(lv_obj_t *card, int y) {
   lv_obj_set_size(line, 196, 1);
   lv_obj_clear_flag(line, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_clear_flag(line, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_set_style_bg_color(line, lvRgb(46, 48, 54), 0);
+  lv_obj_set_style_bg_color(line, lvRgb(0x42, 0x42, 0x42), 0);
   lv_obj_set_style_bg_opa(line, LV_OPA_COVER, 0);
 }
 
 // A single row inside an OMOTE-style card: title (+ optional sub-value) on
 // the left, a switch OR a chevron on the right depending on which is passed.
 lv_obj_t *makeOmoteRow(lv_obj_t *card, const char *name, const char *value, int y, int height,
-                       bool *switchTarget, lv_event_cb_t clickCallback = nullptr) {
+                       bool *switchTarget, lv_event_cb_t clickCallback = nullptr,
+                       lv_obj_t **nameLabelOut = nullptr, lv_obj_t **subLabelOut = nullptr) {
   lv_obj_t *row = lv_obj_create(card);
   lv_obj_remove_style_all(row);
   lv_obj_set_pos(row, 0, y);
@@ -11112,17 +13657,27 @@ lv_obj_t *makeOmoteRow(lv_obj_t *card, const char *name, const char *value, int 
     lv_obj_clear_flag(row, LV_OBJ_FLAG_CLICKABLE);
   }
   bool hasValue = value && value[0];
-  makeLabel(row, name, 14, hasValue ? 6 : (height - 16) / 2, &lv_font_montserrat_14, textPrimary());
+  lv_obj_t *nameLabel = makeLabel(row, name, 14, hasValue ? 6 : (height - 16) / 2,
+                                  &lv_font_montserrat_14, textPrimary());
+  if (nameLabelOut) *nameLabelOut = nameLabel;
   if (hasValue) {
-    lv_obj_t *sub = makeLabel(row, value, 14, 27, &lv_font_montserrat_10, lvRgb(140, 145, 155));
+    // OpenRemote_2.0 mutes secondary text via LV_OPA_60 on the same text
+    // colour rather than a separate grey hex (e.g. its Wi-Fi "Not connected"
+    // and backup status labels) - matched here instead of the old fixed
+    // lvRgb(140,145,155).
+    lv_obj_t *sub = makeLabel(row, value, 14, 27, &lv_font_montserrat_10, textPrimary());
+    lv_obj_set_style_text_opa(sub, LV_OPA_60, 0);
     lv_obj_set_width(sub, switchTarget ? 130 : 155);
     lv_label_set_long_mode(sub, LV_LABEL_LONG_DOT);
+    if (subLabelOut) *subLabelOut = sub;
   }
   if (switchTarget) {
     lv_obj_t *sw = lv_switch_create(row);
-    lv_obj_set_size(sw, 38, 22);
+    // 40x22 matches every switch in OpenRemote_2.0's gui_settings.cpp
+    // (lv_obj_set_size(toggle, 40, 22)), not the 38x22 this used to invent.
+    lv_obj_set_size(sw, 40, 22);
     lv_obj_align(sw, LV_ALIGN_RIGHT_MID, -12, 0);
-    styleModernSwitch(sw);
+    styleOmoteSwitch(sw);
     if (*switchTarget) lv_obj_add_state(sw, LV_STATE_CHECKED);
     lv_obj_add_event_cb(sw, switchEvent, LV_EVENT_VALUE_CHANGED, switchTarget);
   } else if (clickCallback) {
@@ -11130,6 +13685,24 @@ lv_obj_t *makeOmoteRow(lv_obj_t *card, const char *name, const char *value, int 
     lv_obj_set_style_text_opa(chevron, LV_OPA_70, 0);
   }
   return row;
+}
+
+// Same row title as makeOmoteRow, but with a dropdown docked to the right
+// instead of a switch/chevron - used for the Debug page's device pickers.
+// Returns the (unconfigured) dropdown so the caller sets its own options,
+// selection and event callback.
+lv_obj_t *makeOmoteDropdownRow(lv_obj_t *card, const char *name, int y, int height, int dropdownWidth = 112) {
+  lv_obj_t *row = lv_obj_create(card);
+  lv_obj_remove_style_all(row);
+  lv_obj_set_pos(row, 0, y);
+  lv_obj_set_size(row, 224, height);
+  lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+  makeLabel(row, name, 14, (height - 16) / 2, &lv_font_montserrat_14, textPrimary());
+  lv_obj_t *dropdown = lv_dropdown_create(row);
+  lv_obj_set_pos(dropdown, 224 - dropdownWidth - 8, (height - 32) / 2);
+  lv_obj_set_size(dropdown, dropdownWidth, 32);
+  styleOmoteDropdown(dropdown);
+  return dropdown;
 }
 
 void renderSettingsHomeOmote() {
@@ -11158,7 +13731,7 @@ void renderSettingsHomeOmote() {
   makeOmoteRow(card, "Wi-Fi Config", WiFi.status() == WL_CONNECTED ? "Scan QR to open WebConfig" : "Scan QR to join setup network", y, rowH, nullptr,
     [](lv_event_t *e) { openSettingsView(SETTINGS_WIFI_QR); });
   makeOmoteDivider(card, y + rowH); y += rowH + 1;
-  makeOmoteRow(card, "Display", "Brightness, sleep, wake, lock", y, rowH, nullptr,
+  makeOmoteRow(card, "Display", "Brightness, sleep, wake", y, rowH, nullptr,
     [](lv_event_t *e) { openSettingsView(SETTINGS_DISPLAY); });
   makeOmoteDivider(card, y + rowH); y += rowH + 1;
   makeOmoteRow(card, "Buttons", "Repeat timing and button test", y, rowH, nullptr,
@@ -11175,9 +13748,17 @@ void renderSettingsHomeOmote() {
 }
 
 void openSettingsView(SettingsView view) {
+  if (view == SETTINGS_WIFI_QR && usbSdTransferActive()) {
+    Serial.println("WebConfig QR: ignored, a USB transfer is in progress");
+    return;
+  }
   bool leavingQrPage = settingsView == SETTINGS_WIFI_QR && view != SETTINGS_WIFI_QR;
   bool enteringQrPage = settingsView != SETTINGS_WIFI_QR && view == SETTINGS_WIFI_QR;
   bool enteringWifiPage = settingsView != SETTINGS_WIFI && view == SETTINGS_WIFI;
+  if (view == SETTINGS_WIFI_QR) {
+    Serial.printf("openSettingsView: -> WIFI_QR, was=%d enteringQrPage=%d wifiOn=%d hasSelectedWifiProfile=%d\n",
+                  (int)settingsView, (int)enteringQrPage, (int)wifiOn, (int)hasSelectedWifiProfile());
+  }
   bool keepingStationForWifi = view == SETTINGS_WIFI ||
                                view == SETTINGS_WIFI_PASSWORD;
   if (settingsView == SETTINGS_BUTTONS && view != SETTINGS_BUTTONS) {
@@ -11189,6 +13770,13 @@ void openSettingsView(SettingsView view) {
     wifiConnectPending = false;
     webConfigPausedBle = false;
     requestWebServerStop();
+  }
+  // Omote menu style only: flag a real navigation so renderCurrentPage() can
+  // push/pop-slide instead of instantly swapping content. Going to the home
+  // list is always "back"; anything else is "forward", matching a single-
+  // level iOS-style push (there's no deeper hierarchy to walk here).
+  if (menuStyle == 1 && view != settingsView) {
+    pendingSettingsSlideDirection = (view == SETTINGS_HOME) ? -1 : 1;
   }
   settingsView = view;
   if (leavingQrPage && !keepingStationForWifi) scheduleNetworkShutdown(50UL);
@@ -11239,6 +13827,14 @@ void backToSettings(lv_event_t *e) {
 }
 
 void renderSettingsBackButton() {
+  // Omote pages must leave this (8,6)-(50,36) footprint clear - several of
+  // them used to place their first card/button at y=4, which drew over this
+  // button and hid it entirely rather than just recolouring it.
+  if (menuStyle == 1) {
+    lv_obj_t *back = makeOmoteButton(content, LV_SYMBOL_LEFT, 8, 6, 42, 30, lvRgb(0x50, 0x50, 0x50));
+    lv_obj_add_event_cb(back, backToSettings, LV_EVENT_CLICKED, nullptr);
+    return;
+  }
   lv_obj_t *back = makeButton(content, LV_SYMBOL_LEFT, 8, 6, 42, 30, lvRgb(30, 38, 50));
   lv_obj_add_event_cb(back, backToSettings, LV_EVENT_CLICKED, nullptr);
 }
@@ -11276,7 +13872,7 @@ void renderSettingsHome() {
     });
   makeSettingRow("Wi-Fi Config", WiFi.status() == WL_CONNECTED ? "Scan QR to open WebConfig" : "Scan QR to join setup network", 158, nullptr,
     [](lv_event_t *e) { openSettingsView(SETTINGS_WIFI_QR); });
-  makeSettingRow("Display", "Brightness, sleep, wake, lock", 208, nullptr,
+  makeSettingRow("Display", "Brightness, sleep, wake", 208, nullptr,
     [](lv_event_t *e) { openSettingsView(SETTINGS_DISPLAY); });
   makeSettingRow("Buttons", "Repeat timing and button test", 258, nullptr,
     [](lv_event_t *e) { openSettingsView(SETTINGS_BUTTONS); });
@@ -11298,11 +13894,53 @@ void bluetoothForgetEvent(lv_event_t *e) {
   pendingUiRefresh = true;
 }
 
+void renderBluetoothPageOmote() {
+  // y=44, not 4 - the back button occupies (8,6)-(50,36) in this same
+  // content object, and starting a card at y=4 drew over it and hid it.
+  lv_obj_t *statusCard = makeOmoteCard(content, 44, 120);
+  const char *state = bleConnected ? "Connected to streamer" :
+    (blePairingMode ? "Ready to pair" : (bleBonded ? "Paired - waiting to reconnect" : "Not paired"));
+  lv_obj_t *stateLabel = makeLabel(statusCard, state, 14, 10, &lv_font_montserrat_16,
+            bleConnected ? lvRgb(0x21, 0x96, 0xF3) : textPrimary());
+  // "Paired - waiting to reconnect" doesn't fit the card width at 16pt and
+  // was clipping off the right edge with no width/long-mode set at all.
+  lv_obj_set_width(stateLabel, 196);
+  lv_label_set_long_mode(stateLabel, LV_LABEL_LONG_DOT);
+  makeLabel(statusCard, BLE_HID_NAME, 14, 42, &lv_font_montserrat_12, textPrimary());
+  lv_obj_t *l1 = makeLabel(statusCard, "On Chromecast open Settings >", 14, 66,
+                           &lv_font_montserrat_10, textPrimary());
+  lv_obj_set_style_text_opa(l1, LV_OPA_60, 0);
+  lv_obj_t *l2 = makeLabel(statusCard, "Remotes & Accessories > Pair", 14, 82,
+                           &lv_font_montserrat_10, textPrimary());
+  lv_obj_set_style_text_opa(l2, LV_OPA_60, 0);
+  lv_obj_t *l3 = makeLabel(statusCard, "remote, then choose OpenRemote HID.", 14, 98,
+                           &lv_font_montserrat_10, textPrimary());
+  lv_obj_set_style_text_opa(l3, LV_OPA_60, 0);
+
+  int y = 174;
+  lv_obj_t *pair = makeOmoteButton(content, bleBonded ? "Pair another" : "Start pairing",
+                                    12, y, 216, 42, lvRgb(0x21, 0x96, 0xF3));
+  lv_obj_add_event_cb(pair, bluetoothPairEvent, LV_EVENT_CLICKED, nullptr);
+  y += 50;
+
+  if (bleBonded) {
+    lv_obj_t *forget = makeOmoteButton(content, "Forget pairing", 12, y, 216, 38, lvRgb(115, 38, 45));
+    lv_obj_add_event_cb(forget, bluetoothForgetEvent, LV_EVENT_CLICKED, nullptr);
+  }
+}
+
 void renderBluetoothPage() {
   setCinematicBackground(false);
   configureContent(42, 278, false);
   renderTopBar("Bluetooth", false);
   renderSettingsBackButton();
+  if (menuStyle == 1) {
+    lv_obj_add_flag(content, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(content, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(content, LV_SCROLLBAR_MODE_AUTO);
+    renderBluetoothPageOmote();
+    return;
+  }
 
   const char *state = bleConnected ? "Connected to streamer" :
     (blePairingMode ? "Ready to pair" : (bleBonded ? "Paired - waiting to reconnect" : "Not paired"));
@@ -11425,6 +14063,16 @@ void chooseWifiNetwork(lv_event_t *e) {
   if (index < 0 || index >= wifiScanResultCount) return;
   selectedWifiSsid = wifiScanResults[index].ssid;
   if (wifiScanResults[index].encryption == WIFI_AUTH_OPEN) {
+    // An already-saved open network used to just silently reconnect here,
+    // same as tapping it the first time - there was no LCD path to forget
+    // it afterward (only the password page has a Forget button, and open
+    // networks never visited it). Route to the same manage/forget page
+    // secured networks already use once it's saved; a brand new open
+    // network still connects immediately below for one-tap simplicity.
+    if (findWifiProfile(selectedWifiSsid) >= 0) {
+      openSettingsView(SETTINGS_WIFI_PASSWORD);
+      return;
+    }
     saveWifiCredentials(selectedWifiSsid, "");
     WiFi.disconnect(false, false);
     WiFi.setAutoReconnect(true);
@@ -11439,6 +14087,41 @@ void chooseWifiNetwork(lv_event_t *e) {
   openSettingsView(SETTINGS_WIFI_PASSWORD);
 }
 
+void renderWifiPageOmote() {
+  char status[64];
+  if (WiFi.status() == WL_CONNECTED) {
+    snprintf(status, sizeof(status), "%s  %s", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+  } else if (wifiConnectPending) {
+    snprintf(status, sizeof(status), "Connecting to %s...", selectedWifiSsid.c_str());
+  } else if (findWifiProfile(selectedWifiSsid) >= 0) {
+    snprintf(status, sizeof(status), "Saved: %s", selectedWifiSsid.c_str());
+  } else {
+    snprintf(status, sizeof(status), "Not connected");
+  }
+  // y=44, not 4 - clears the back button's (8,6)-(50,36) footprint in this
+  // same content object.
+  lv_obj_t *statusCard = makeOmoteCard(content, 44, 36);
+  makeLabel(statusCard, status, 14, 10, &lv_font_montserrat_12,
+            WiFi.status() == WL_CONNECTED ? lvRgb(0x21, 0x96, 0xF3) : textPrimary());
+
+  lv_obj_t *scan = makeOmoteButton(content, wifiScanPending ? "Scanning..." : "Scan networks",
+                                   8, 88, 224, 36, lvRgb(0x21, 0x96, 0xF3));
+  lv_obj_add_event_cb(scan, beginWifiScan, LV_EVENT_CLICKED, nullptr);
+  if (wifiScanPending) lv_obj_add_state(scan, LV_STATE_DISABLED);
+
+  int visible = max(0, min(wifiScanCount, 10));
+  if (wifiScanCount == 0) {
+    makeLabel(content, "No Wi-Fi networks found", 12, 138, &lv_font_montserrat_12, textPrimary());
+  }
+  for (int i = 0; i < visible; i++) {
+    String label = wifiScanResults[i].ssid;
+    if (findWifiProfile(label) >= 0) label += "  Saved";
+    else if (wifiScanResults[i].encryption != WIFI_AUTH_OPEN) label += "  " LV_SYMBOL_EYE_CLOSE;
+    lv_obj_t *network = makeOmoteButton(content, label.c_str(), 8, 132 + i * 40, 224, 36);
+    lv_obj_add_event_cb(network, chooseWifiNetwork, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+  }
+}
+
 void renderWifiPage() {
   setCinematicBackground(false);
   configureContent(42, 278, false);
@@ -11449,6 +14132,10 @@ void renderWifiPage() {
   lv_obj_set_scrollbar_mode(content, LV_SCROLLBAR_MODE_ACTIVE);
   renderTopBar("Wi-Fi", false);
   renderSettingsBackButton();
+  if (menuStyle == 1) {
+    renderWifiPageOmote();
+    return;
+  }
 
   char status[64];
   if (WiFi.status() == WL_CONNECTED) {
@@ -11632,18 +14319,29 @@ void useSavedWifiEvent(lv_event_t *e) {
 
 void forgetSavedWifiEvent(lv_event_t *e) {
   String forgottenSsid = selectedWifiSsid;
+  // Check before forgetWifiCredentials() removes the profile - an open
+  // network is saved with an empty password (see chooseWifiNetwork()).
+  bool wasOpenNetwork = savedWifiPassword(forgottenSsid).isEmpty();
   bool wasConnected = WiFi.status() == WL_CONNECTED && WiFi.SSID() == forgottenSsid;
   forgetWifiCredentials(forgottenSsid);
   if (wasConnected) {
     WiFi.setAutoReconnect(false);
     WiFi.disconnect(false, true);
   }
-  // Keep the unsaved SSID only as the password-entry target. Automatic station
-  // connection paths require a saved profile and will ignore this value.
-  selectedWifiSsid = forgottenSsid;
   wifiConnectPending = false;
   stationFallbackToSetupAp = false;
   wifiPasswordArea = nullptr;
+  if (wasOpenNetwork) {
+    // There's nothing to type for an open network - exit to the Wi-Fi list
+    // instead of falling through to the password-entry keyboard below,
+    // which doesn't apply here and just adds a confusing extra step.
+    selectedWifiSsid = "";
+    openSettingsView(SETTINGS_WIFI);
+    return;
+  }
+  // Keep the unsaved SSID only as the password-entry target. Automatic station
+  // connection paths require a saved profile and will ignore this value.
+  selectedWifiSsid = forgottenSsid;
   pendingUiRefresh = true;
 }
 
@@ -11738,32 +14436,164 @@ void renderCompactWifiKeyboard() {
   makeKeyboardKey("Connect", "<OK>", 161, 128, 73, 27, lvRgb(42, 155, 230));
 }
 
+void addOmoteKeyboardTextRow(const char *keys, int count, int x, int y, int keyW, bool letters) {
+  char label[2] = {0, 0};
+  for (int i = 0; i < count; i++) {
+    char c = keys[i];
+    if (letters && customKeyboardCaps) c = toupper((unsigned char)c);
+    label[0] = c;
+    static char keyStore[64][2];
+    static uint8_t keyIndex = 0;
+    keyStore[keyIndex][0] = c;
+    keyStore[keyIndex][1] = '\0';
+    makeOmoteKeyboardKey(wifiKeyboard, wifiKeyboardEvent, label, keyStore[keyIndex],
+                         x + i * (keyW + 2), y, keyW, 24);
+    keyIndex = (keyIndex + 1) % 64;
+  }
+}
+
+// Layout matches a reference keyboard the user liked: title + password field
+// with a show/hide eye toggle, Cancel/Join pills above the grid, a dedicated
+// symbols/backspace header row, and a shift + dismiss key flanking the space
+// bar - reskinned with this project's own flat palette (0x303030/0x505050/
+// 0x2196F3) rather than that reference's colours.
+void renderCompactWifiKeyboardOmote() {
+  wifiKeyboard = lv_obj_create(content);
+  lv_obj_remove_style_all(wifiKeyboard);
+  // y=114/height=164, not 104/174 - the last row (space bar) only ever used
+  // 164 of that 174, so this reclaims the same unused 10px lower instead of
+  // changing any row position below.
+  lv_obj_set_pos(wifiKeyboard, 0, 114);
+  lv_obj_set_size(wifiKeyboard, 240, 164);
+  lv_obj_set_style_bg_color(wifiKeyboard, lvRgb(0x30, 0x30, 0x30), 0);
+  lv_obj_set_style_bg_opa(wifiKeyboard, LV_OPA_COVER, 0);
+  lv_obj_set_style_radius(wifiKeyboard, 8, 0);
+  lv_obj_set_style_pad_all(wifiKeyboard, 0, 0);
+  lv_obj_clear_flag(wifiKeyboard, LV_OBJ_FLAG_SCROLLABLE);
+
+  makeOmoteKeyboardKey(wifiKeyboard, wifiKeyboardEvent, customKeyboardSymbols ? "ABC" : "&123", "<SYM>", 4, 2, 40, 22);
+  makeOmoteKeyboardKey(wifiKeyboard, wifiKeyboardEvent, LV_SYMBOL_BACKSPACE, "<DEL>", 196, 2, 40, 22);
+
+  addOmoteKeyboardTextRow("1234567890", 10, 4, 28, 21, false);
+  addOmoteKeyboardTextRow(customKeyboardSymbols ? "!@#$%^&*()" : "qwertyuiop", 10, 4, 56, 21, !customKeyboardSymbols);
+  addOmoteKeyboardTextRow(customKeyboardSymbols ? "-_=+[]{};" : "asdfghjkl", 9, 15, 84, 21, !customKeyboardSymbols);
+
+  makeOmoteKeyboardKey(wifiKeyboard, wifiKeyboardEvent, LV_SYMBOL_UP, "<CAPS>", 4, 112, 36, 24,
+                       customKeyboardCaps ? lvRgb(0x21, 0x96, 0xF3) : lvRgb(0x50, 0x50, 0x50));
+  // x=46/keyW=19 (not 44/21 like the rows above) leaves the "m" key ending at
+  // x=193, clear of the Enter key starting at x=195 - reusing the wider
+  // pitch from the rows above overlapped the two by ~10px.
+  addOmoteKeyboardTextRow(customKeyboardSymbols ? ".,:?/\\'" : "zxcvbnm", 7, 46, 112, 19, !customKeyboardSymbols);
+  makeOmoteKeyboardKey(wifiKeyboard, wifiKeyboardEvent, LV_SYMBOL_NEW_LINE, "<OK>", 195, 112, 41, 24,
+                       lvRgb(0x21, 0x96, 0xF3));
+
+  makeOmoteKeyboardKey(wifiKeyboard, wifiKeyboardEvent, "Space", "<SPACE>", 4, 140, 232, 24);
+}
+
+void wifiPasswordVisibilityEvent(lv_event_t *e) {
+  if (!wifiPasswordArea) return;
+  bool wasHidden = lv_textarea_get_password_mode(wifiPasswordArea);
+  lv_textarea_set_password_mode(wifiPasswordArea, !wasHidden);
+  lv_obj_t *icon = (lv_obj_t *)lv_event_get_user_data(e);
+  if (icon) lv_label_set_text(icon, wasHidden ? LV_SYMBOL_EYE_CLOSE : LV_SYMBOL_EYE_OPEN);
+}
+
+void renderWifiPasswordPageOmote() {
+  wifiPasswordArea = nullptr;
+  if (findWifiProfile(selectedWifiSsid) >= 0) {
+    // y=48, not 44 - a little more clearance under the back button per
+    // feedback that the box was still touching it.
+    lv_obj_t *nameCard = makeOmoteCard(content, 48, 32);
+    makeLabel(nameCard, selectedWifiSsid.c_str(), 14, 8, &lv_font_montserrat_12, textPrimary());
+    // An open network is saved with an empty password (see chooseWifiNetwork()/
+    // saveWifiCredentials(ssid, "")), so an empty saved password reliably means
+    // "open network" here rather than a real (never blank in practice) one.
+    bool savedIsOpen = savedWifiPassword(selectedWifiSsid).isEmpty();
+    makeLabel(content, savedIsOpen ? "This is a saved open network - no password required."
+                                   : "A password is saved for this network.",
+              10, 88, &lv_font_montserrat_10, textPrimary());
+    lv_obj_t *useSaved = makeOmoteButton(content, savedIsOpen ? "Reconnect" : "Use saved password",
+                                        8, 116, 224, 42, lvRgb(0x21, 0x96, 0xF3));
+    lv_obj_add_event_cb(useSaved, useSavedWifiEvent, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t *forget = makeOmoteButton(content, savedIsOpen ? "Forget this network" : "Forget & enter password",
+                                      8, 170, 224, 42, lvRgb(115, 38, 45));
+    lv_obj_add_event_cb(forget, forgetSavedWifiEvent, LV_EVENT_CLICKED, nullptr);
+    return;
+  }
+
+  // The SSID sits beside the back button (same row, x=58+) rather than
+  // stacked below it as its own centred block - that was overlapping/
+  // printing over the button, and this page has very little vertical room
+  // to spare above the keyboard.
+  lv_obj_t *titleLabel = makeLabel(content, selectedWifiSsid.c_str(), 58, 13,
+                                    &lv_font_montserrat_12, textPrimary());
+  lv_obj_set_width(titleLabel, 174);
+  lv_label_set_long_mode(titleLabel, LV_LABEL_LONG_DOT);
+
+  wifiPasswordArea = lv_textarea_create(content);
+  lv_obj_set_pos(wifiPasswordArea, 8, 44);
+  lv_obj_set_size(wifiPasswordArea, 184, 30);
+  lv_textarea_set_one_line(wifiPasswordArea, true);
+  lv_textarea_set_password_mode(wifiPasswordArea, true);
+  lv_textarea_set_placeholder_text(wifiPasswordArea, "Wi-Fi password");
+  lv_obj_set_style_bg_color(wifiPasswordArea, lvRgb(0x30, 0x30, 0x30), 0);
+  lv_obj_set_style_bg_opa(wifiPasswordArea, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(wifiPasswordArea, 1, 0);
+  lv_obj_set_style_border_color(wifiPasswordArea, lvRgb(0x50, 0x50, 0x50), 0);
+  lv_obj_set_style_radius(wifiPasswordArea, 8, 0);
+  lv_obj_set_style_text_color(wifiPasswordArea, textPrimary(), 0);
+
+  lv_obj_t *eyeIcon = makeOmoteButton(content, LV_SYMBOL_EYE_OPEN, 196, 44, 36, 30, lvRgb(0x30, 0x30, 0x30));
+  lv_obj_t *eyeLabel = lv_obj_get_child(eyeIcon, 0);
+  lv_obj_add_event_cb(eyeIcon, wifiPasswordVisibilityEvent, LV_EVENT_CLICKED, eyeLabel);
+
+  makeOmoteKeyboardKey(content, wifiKeyboardEvent, "Cancel", "<CANCEL>", 8, 80, 108, 30);
+  makeOmoteKeyboardKey(content, wifiKeyboardEvent, "Join", "<OK>", 124, 80, 108, 30, lvRgb(0x21, 0x96, 0xF3));
+
+  renderCompactWifiKeyboardOmote();
+}
+
 void renderWifiPasswordPage() {
   setCinematicBackground(false);
   configureContent(42, 278, false);
   renderTopBar("Password", false);
   renderSettingsBackButton();
+  if (menuStyle == 1) {
+    renderWifiPasswordPageOmote();
+    return;
+  }
   makeLabel(content, selectedWifiSsid.c_str(), 58, 13, &lv_font_montserrat_12, textPrimary());
 
   wifiPasswordArea = nullptr;
   if (findWifiProfile(selectedWifiSsid) >= 0) {
-    makeLabel(content, "A password is saved for this network.", 10, 50,
-              &lv_font_montserrat_10, lvRgb(165, 180, 200));
-    lv_obj_t *useSaved = makeButton(content, "Use saved password", 8, 78, 224, 42,
-                                    lvRgb(24, 105, 220));
+    // An open network is saved with an empty password (see chooseWifiNetwork()/
+    // saveWifiCredentials(ssid, "")), so an empty saved password reliably means
+    // "open network" here rather than a real (never blank in practice) one.
+    bool savedIsOpen = savedWifiPassword(selectedWifiSsid).isEmpty();
+    makeLabel(content, savedIsOpen ? "This is a saved open network - no password required."
+                                   : "A password is saved for this network.",
+              10, 50, &lv_font_montserrat_10, lvRgb(165, 180, 200));
+    lv_obj_t *useSaved = makeButton(content, savedIsOpen ? "Reconnect" : "Use saved password",
+                                    8, 78, 224, 42, lvRgb(24, 105, 220));
     lv_obj_add_event_cb(useSaved, useSavedWifiEvent, LV_EVENT_CLICKED, nullptr);
-    lv_obj_t *forget = makeButton(content, "Forget & enter password", 8, 132, 224, 42,
-                                  lvRgb(115, 38, 45));
+    lv_obj_t *forget = makeButton(content, savedIsOpen ? "Forget this network" : "Forget & enter password",
+                                  8, 132, 224, 42, lvRgb(115, 38, 45));
     lv_obj_add_event_cb(forget, forgetSavedWifiEvent, LV_EVENT_CLICKED, nullptr);
     return;
   }
 
   wifiPasswordArea = lv_textarea_create(content);
   lv_obj_set_pos(wifiPasswordArea, 8, 41);
-  lv_obj_set_size(wifiPasswordArea, 224, 36);
+  // 184, not 224 - leaves room for the show/hide eye toggle to its right
+  // (this page never had one; only the Omote version did).
+  lv_obj_set_size(wifiPasswordArea, 184, 36);
   lv_textarea_set_one_line(wifiPasswordArea, true);
   lv_textarea_set_password_mode(wifiPasswordArea, true);
   lv_textarea_set_placeholder_text(wifiPasswordArea, "Wi-Fi password");
+
+  lv_obj_t *eyeIcon = makeButton(content, LV_SYMBOL_EYE_OPEN, 196, 41, 36, 36, lvRgb(30, 38, 50));
+  lv_obj_t *eyeLabel = lv_obj_get_child(eyeIcon, 0);
+  lv_obj_add_event_cb(eyeIcon, wifiPasswordVisibilityEvent, LV_EVENT_CLICKED, eyeLabel);
 
   renderCompactWifiKeyboard();
 }
@@ -11783,11 +14613,64 @@ void refreshSetupApStatusLabel() {
   lv_label_set_text(setupApStatusLabel, apStatus);
 }
 
+void renderWifiQrPageOmote() {
+  bool stationConnected = !setupApActive && WiFi.status() == WL_CONNECTED;
+  bool connectionReady = stationConnected || setupApActive;
+  if (!connectionReady) {
+    makeLabel(content, "Connecting to saved Wi-Fi...", 18, 112, &lv_font_montserrat_12, textPrimary());
+    lv_obj_t *sub = makeLabel(content, "Setup AP starts automatically if needed", 15, 140,
+                              &lv_font_montserrat_10, textPrimary());
+    lv_obj_set_style_text_opa(sub, LV_OPA_60, 0);
+    setupApStatusLabel = makeLabel(content, "", 18, 172, &lv_font_montserrat_10, textPrimary());
+    lv_obj_set_style_text_opa(setupApStatusLabel, LV_OPA_60, 0);
+    refreshSetupApStatusLabel();
+    nextSetupApStatusRefreshMs = millis() + 1000UL;
+    return;
+  }
+  String payload = stationConnected
+    ? webConfigUrl()
+    : String("WIFI:T:nopass;S:") + setupApSsid + ";;";
+  // No card/background here - a QR code needs to sit on a clean quiet
+  // background to scan reliably, and this project's own black is already
+  // higher-contrast than a grey box would be.
+  // y=40, not 22 - clears the back button's (8,6)-(50,36) footprint (the
+  // QR's left edge otherwise sat right under it).
+  lv_obj_t *qr = lv_qrcode_create(content, 166, lv_color_black(), lv_color_white());
+  lv_obj_set_pos(qr, (LCD_W - 166) / 2, 40);
+  lv_qrcode_update(qr, payload.c_str(), payload.length());
+
+  lv_obj_t *scanLabel = makeLabel(content, stationConnected ? "Scan to open WebConfig" : "Open network - no password",
+            0, 214, &lv_font_montserrat_12, textPrimary());
+  lv_obj_set_width(scanLabel, LCD_W);
+  lv_obj_set_style_text_align(scanLabel, LV_TEXT_ALIGN_CENTER, 0);
+
+  lv_obj_t *wifiLabel = makeLabel(content, stationConnected ? "Connected Wi-Fi" :
+            (setupApActive ? setupApSsid.c_str() : "Turn Wi-Fi on to start setup"), 0, 236,
+            &lv_font_montserrat_10, textPrimary());
+  lv_obj_set_width(wifiLabel, LCD_W);
+  lv_obj_set_style_text_align(wifiLabel, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_set_style_text_opa(wifiLabel, LV_OPA_60, 0);
+
+  setupApStatusLabel = makeLabel(content, "", 0, 252, &lv_font_montserrat_10, textPrimary());
+  lv_obj_set_width(setupApStatusLabel, LCD_W);
+  lv_obj_set_style_text_align(setupApStatusLabel, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_set_style_text_opa(setupApStatusLabel, LV_OPA_60, 0);
+  refreshSetupApStatusLabel();
+  nextSetupApStatusRefreshMs = millis() + 1000UL;
+}
+
 void renderWifiQrPage() {
   setCinematicBackground(false);
   configureContent(42, 278, false);
   renderTopBar("WebConfig", false);
   renderSettingsBackButton();
+  if (menuStyle == 1) {
+    lv_obj_add_flag(content, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(content, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(content, LV_SCROLLBAR_MODE_AUTO);
+    renderWifiQrPageOmote();
+    return;
+  }
 
   bool stationConnected = !setupApActive && WiFi.status() == WL_CONNECTED;
   bool connectionReady = stationConnected || setupApActive;
@@ -11830,23 +14713,43 @@ void buildNumberOptions(char *buffer, size_t size, int start, int end, uint8_t w
 }
 
 lv_obj_t *makeClockRoller(int index, const char *label, int x, int y, int w,
-                          const char *options, int selected) {
-  makeLabel(content, label, x, y - 16, &lv_font_montserrat_10, lvRgb(150, 160, 176));
+                          const char *options, int selected, bool omoteStyle = false) {
+  lv_obj_t *lbl = makeLabel(content, label, x, y - 16, &lv_font_montserrat_10,
+                            omoteStyle ? textPrimary() : lvRgb(150, 160, 176));
+  if (omoteStyle) lv_obj_set_style_text_opa(lbl, LV_OPA_60, 0);
   lv_obj_t *roller = lv_roller_create(content);
   lv_obj_set_pos(roller, x, y);
   lv_obj_set_size(roller, w, 64);
   lv_roller_set_options(roller, options, LV_ROLLER_MODE_NORMAL);
   lv_roller_set_visible_row_count(roller, 3);
+  // lv_roller_set_visible_row_count() recomputes and overwrites the height
+  // above using whatever font the roller had at that moment (the inherited
+  // default, since the 12pt font below is applied after) - forcing it back
+  // to 64px here keeps the layout math below (rollerY + fixed gap) reliable
+  // regardless of that font-height math, which was leaving too little
+  // clearance before the "Set manual time" button.
+  lv_obj_set_size(roller, w, 64);
   lv_roller_set_selected(roller, selected, LV_ANIM_OFF);
-  lv_obj_set_style_bg_color(roller, lvRgb(28, 32, 40), 0);
-  lv_obj_set_style_bg_opa(roller, LV_OPA_COVER, 0);
-  lv_obj_set_style_border_color(roller, lvRgb(58, 72, 92), 0);
-  lv_obj_set_style_border_width(roller, 1, 0);
-  lv_obj_set_style_radius(roller, 8, 0);
-  lv_obj_set_style_text_font(roller, &lv_font_montserrat_12, 0);
-  lv_obj_set_style_text_color(roller, textPrimary(), 0);
-  lv_obj_set_style_bg_color(roller, lvRgb(44, 92, 140), LV_PART_SELECTED);
-  lv_obj_set_style_text_color(roller, lv_color_white(), LV_PART_SELECTED);
+  if (omoteStyle) {
+    styleOmoteRoller(roller);
+  } else {
+    lv_obj_set_style_bg_color(roller, lvRgb(28, 32, 40), 0);
+    lv_obj_set_style_bg_opa(roller, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(roller, lvRgb(58, 72, 92), 0);
+    lv_obj_set_style_border_width(roller, 1, 0);
+    lv_obj_set_style_radius(roller, 8, 0);
+    lv_obj_set_style_text_font(roller, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(roller, textPrimary(), 0);
+    lv_obj_set_style_bg_color(roller, lvRgb(44, 92, 140), LV_PART_SELECTED);
+    lv_obj_set_style_text_color(roller, lv_color_white(), LV_PART_SELECTED);
+  }
+  // A roller clears LV_OBJ_FLAG_SCROLLABLE and drives its own drag/release
+  // logic (lv_roller.c), so the generic elastic-scroll flags used elsewhere
+  // in this file don't apply here - the settle-to-selection glide after a
+  // drag/flick is entirely governed by this anim_time style property (LVGL's
+  // default theme sets 200ms; this project's rollers want a slower, more
+  // pronounced "rubber band" pull-back rather than a quick snap).
+  lv_obj_set_style_anim_time(roller, 320, 0);
   clockRollers[index] = roller;
   return roller;
 }
@@ -11857,8 +14760,10 @@ void setManualClockEvent(lv_event_t *e) {
   manual.tm_year = 2024 + lv_roller_get_selected(clockRollers[0]) - 1900;
   manual.tm_mon = lv_roller_get_selected(clockRollers[1]);
   manual.tm_mday = 1 + lv_roller_get_selected(clockRollers[2]);
-  manual.tm_hour = lv_roller_get_selected(clockRollers[3]);
-  manual.tm_min = lv_roller_get_selected(clockRollers[4]);
+  int hour12 = 1 + lv_roller_get_selected(clockRollers[3]);
+  bool isPM = lv_roller_get_selected(clockRollers[4]) == 1;
+  manual.tm_hour = (hour12 % 12) + (isPM ? 12 : 0);
+  manual.tm_min = lv_roller_get_selected(clockRollers[5]);
   manual.tm_sec = 0;
   manual.tm_isdst = -1;
   setenv("TZ", OPENREMOTE_TZ, 1);
@@ -11886,6 +14791,23 @@ void chooseClockCity(lv_event_t *e) {
   openSettingsView(SETTINGS_CLOCK);
 }
 
+void renderClockCityPageOmote() {
+  if (!wifiOn || !hasSelectedWifiProfile()) {
+    makeLabel(content, "Connect Wi-Fi before selecting\nan Internet time city.", 12, 70,
+              &lv_font_montserrat_12, textPrimary());
+    return;
+  }
+  static const char *cities[] = {
+    "Canberra", "Sydney", "Melbourne", "Brisbane", "Perth",
+    "Adelaide", "Darwin", "Hobart", "UTC"
+  };
+  makeLabel(content, "Select nearest city", 8, 4, &lv_font_montserrat_12, textPrimary());
+  for (uint8_t i = 0; i < sizeof(cities) / sizeof(cities[0]); i++) {
+    lv_obj_t *city = makeOmoteButton(content, cities[i], 8, 34 + i * 40, 224, 36);
+    lv_obj_add_event_cb(city, chooseClockCity, LV_EVENT_CLICKED, (void *)cities[i]);
+  }
+}
+
 void renderClockCityPage() {
   setCinematicBackground(false);
   configureContent(42, 278, false);
@@ -11894,6 +14816,10 @@ void renderClockCityPage() {
   lv_obj_set_scrollbar_mode(content, LV_SCROLLBAR_MODE_AUTO);
   renderTopBar("Search City", false);
   renderSettingsBackButton();
+  if (menuStyle == 1) {
+    renderClockCityPageOmote();
+    return;
+  }
 
   if (!wifiOn || !hasSelectedWifiProfile()) {
     makeLabel(content, "Connect Wi-Fi before selecting\nan Internet time city.", 12, 70,
@@ -11912,35 +14838,43 @@ void renderClockCityPage() {
   }
 }
 
-void renderClockPage() {
-  setCinematicBackground(false);
-  configureContent(42, 278, false);
-  renderTopBar("Clock", false);
-  renderSettingsBackButton();
+void renderClockPageOmote() {
+  // y=44, not 4 - clears the back button's (8,6)-(50,36) footprint.
+  lv_obj_t *toggleCard = makeOmoteCard(content, 44, 2 * 48 + 1);
+  makeOmoteRow(toggleCard, "Status bar", clockEnabled ? "Show time in top right" : "Battery only",
+               0, 48, &clockEnabled);
+  makeOmoteDivider(toggleCard, 48);
+  makeOmoteRow(toggleCard, "Internet time", hasAnyWifiProfile()
+    ? "Boot and daily 3am sync" : "Needs a saved Wi-Fi network", 49, 48, &clockUseInternetTime);
 
-  makeSettingRow("Status bar", clockEnabled ? "Show time in top right" : "Battery only", 42, &clockEnabled);
-  makeSettingRow("Internet time", wifiOn && hasSelectedWifiProfile()
-    ? "Boot and daily 3am sync" : "Needs a saved Wi-Fi network", 92,
-    &clockUseInternetTime);
-
+  int y = 44 + 2 * 48 + 1 + 12;
   if (clockUseInternetTime) {
-    makeSettingRow("City", clockCityName.c_str(), 142, nullptr,
+    lv_obj_t *cityCard = makeOmoteCard(content, y, 48);
+    makeOmoteRow(cityCard, "City", clockCityName.c_str(), 0, 48, nullptr,
       [](lv_event_t *e) { openSettingsView(SETTINGS_CLOCK_CITY); });
-    makeLabel(content, "Wi-Fi turns on only while time syncs.", 12, 200,
-              &lv_font_montserrat_12, lvRgb(170, 175, 185));
+    y += 48 + 12;
+    lv_obj_t *note = makeLabel(content, "Wi-Fi turns on only while time syncs.", 12, y,
+              &lv_font_montserrat_12, textPrimary());
+    lv_obj_set_style_text_opa(note, LV_OPA_60, 0);
     return;
   }
 
-  makeLabel(content, "Set manually", 10, 148, &lv_font_montserrat_12, textPrimary());
-  static char yearOptions[72];
-  static char monthOptions[36];
-  static char dayOptions[96];
-  static char hourOptions[72];
-  static char minuteOptions[180];
-  buildNumberOptions(yearOptions, sizeof(yearOptions), 2024, 2035, 4);
+  makeLabel(content, "Set manually", 8, y, &lv_font_montserrat_12, textPrimary());
+  y += 26;
+  // Sized with real headroom, not exactly to the byte: buildNumberOptions()
+  // silently drops the LAST entry whenever a buffer has zero slack left,
+  // since its own overflow check can't tell "fits exactly" from "doesn't
+  // fit" - that's what was dropping December (12), hour 23, and minute 59
+  // before (each of those buffers was sized to the exact byte).
+  static char yearOptions[420];
+  static char monthOptions[48];
+  static char dayOptions[110];
+  static char hourOptions[48];
+  static char minuteOptions[200];
+  buildNumberOptions(yearOptions, sizeof(yearOptions), 2024, 2099, 4);
   buildNumberOptions(monthOptions, sizeof(monthOptions), 1, 12, 2);
   buildNumberOptions(dayOptions, sizeof(dayOptions), 1, 31, 2);
-  buildNumberOptions(hourOptions, sizeof(hourOptions), 0, 23, 2);
+  buildNumberOptions(hourOptions, sizeof(hourOptions), 1, 12, 2);
   buildNumberOptions(minuteOptions, sizeof(minuteOptions), 0, 59, 2);
 
   time_t now = time(nullptr);
@@ -11954,12 +14888,85 @@ void renderClockPage() {
     timeInfo.tm_hour = 12;
     timeInfo.tm_min = 0;
   }
+  int hour12 = timeInfo.tm_hour % 12;
+  if (hour12 == 0) hour12 = 12;
+  bool isPM = timeInfo.tm_hour >= 12;
 
-  makeClockRoller(0, "Year", 8, 176, 50, yearOptions, constrain(timeInfo.tm_year + 1900 - 2024, 0, 11));
-  makeClockRoller(1, "Mon", 62, 176, 39, monthOptions, constrain(timeInfo.tm_mon, 0, 11));
-  makeClockRoller(2, "Day", 105, 176, 39, dayOptions, constrain(timeInfo.tm_mday - 1, 0, 30));
-  makeClockRoller(3, "Hr", 148, 176, 39, hourOptions, constrain(timeInfo.tm_hour, 0, 23));
-  makeClockRoller(4, "Min", 191, 176, 39, minuteOptions, constrain(timeInfo.tm_min, 0, 59));
+  int rollerY = y + 16;
+  makeClockRoller(0, "Year", 8, rollerY, 44, yearOptions,
+                  constrain(timeInfo.tm_year + 1900 - 2024, 0, 75), true);
+  makeClockRoller(1, "Mon", 58, rollerY, 30, monthOptions, constrain(timeInfo.tm_mon, 0, 11), true);
+  makeClockRoller(2, "Day", 94, rollerY, 30, dayOptions, constrain(timeInfo.tm_mday - 1, 0, 30), true);
+  makeClockRoller(3, "Hr", 130, rollerY, 26, hourOptions, constrain(hour12 - 1, 0, 11), true);
+  makeClockRoller(4, "AM/PM", 162, rollerY, 34, "AM\nPM", isPM ? 1 : 0, true);
+  makeClockRoller(5, "Min", 202, rollerY, 30, minuteOptions, constrain(timeInfo.tm_min, 0, 59), true);
+
+  lv_obj_t *set = makeOmoteButton(content, "Set manual time", 8, rollerY + 80, 224, 36, lvRgb(0x21, 0x96, 0xF3));
+  lv_obj_add_event_cb(set, setManualClockEvent, LV_EVENT_CLICKED, nullptr);
+}
+
+void renderClockPage() {
+  setCinematicBackground(false);
+  configureContent(42, 278, false);
+  renderTopBar("Clock", false);
+  renderSettingsBackButton();
+  if (menuStyle == 1) {
+    lv_obj_add_flag(content, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(content, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(content, LV_SCROLLBAR_MODE_AUTO);
+    renderClockPageOmote();
+    return;
+  }
+
+  makeSettingRow("Status bar", clockEnabled ? "Show time in top right" : "Battery only", 42, &clockEnabled);
+  makeSettingRow("Internet time", hasAnyWifiProfile()
+    ? "Boot and daily 3am sync" : "Needs a saved Wi-Fi network", 92,
+    &clockUseInternetTime);
+
+  if (clockUseInternetTime) {
+    makeSettingRow("City", clockCityName.c_str(), 142, nullptr,
+      [](lv_event_t *e) { openSettingsView(SETTINGS_CLOCK_CITY); });
+    makeLabel(content, "Wi-Fi turns on only while time syncs.", 12, 200,
+              &lv_font_montserrat_12, lvRgb(170, 175, 185));
+    return;
+  }
+
+  makeLabel(content, "Set manually", 10, 148, &lv_font_montserrat_12, textPrimary());
+  // Sized with real headroom, not exactly to the byte - see the matching
+  // comment in renderClockPageOmote() for why an exact-fit buffer silently
+  // drops its last entry (December, hour 23, minute 59 were all missing).
+  static char yearOptions[420];
+  static char monthOptions[48];
+  static char dayOptions[110];
+  static char hourOptions[48];
+  static char minuteOptions[200];
+  buildNumberOptions(yearOptions, sizeof(yearOptions), 2024, 2099, 4);
+  buildNumberOptions(monthOptions, sizeof(monthOptions), 1, 12, 2);
+  buildNumberOptions(dayOptions, sizeof(dayOptions), 1, 31, 2);
+  buildNumberOptions(hourOptions, sizeof(hourOptions), 1, 12, 2);
+  buildNumberOptions(minuteOptions, sizeof(minuteOptions), 0, 59, 2);
+
+  time_t now = time(nullptr);
+  if (now < 1700000000 && manualClockEpoch > 0) now = (time_t)manualClockEpoch;
+  tm timeInfo = {};
+  if (now >= 1700000000) localtime_r(&now, &timeInfo);
+  else {
+    timeInfo.tm_year = 2026 - 1900;
+    timeInfo.tm_mon = 6;
+    timeInfo.tm_mday = 18;
+    timeInfo.tm_hour = 12;
+    timeInfo.tm_min = 0;
+  }
+  int hour12 = timeInfo.tm_hour % 12;
+  if (hour12 == 0) hour12 = 12;
+  bool isPM = timeInfo.tm_hour >= 12;
+
+  makeClockRoller(0, "Year", 8, 176, 44, yearOptions, constrain(timeInfo.tm_year + 1900 - 2024, 0, 75));
+  makeClockRoller(1, "Mon", 58, 176, 30, monthOptions, constrain(timeInfo.tm_mon, 0, 11));
+  makeClockRoller(2, "Day", 94, 176, 30, dayOptions, constrain(timeInfo.tm_mday - 1, 0, 30));
+  makeClockRoller(3, "Hr", 130, 176, 26, hourOptions, constrain(hour12 - 1, 0, 11));
+  makeClockRoller(4, "AM/PM", 162, 176, 34, "AM\nPM", isPM ? 1 : 0);
+  makeClockRoller(5, "Min", 202, 176, 30, minuteOptions, constrain(timeInfo.tm_min, 0, 59));
 
   lv_obj_t *set = makeButton(content, "Set manual time", 8, 250, 224, 24, lvRgb(35, 86, 140));
   lv_obj_add_event_cb(set, setManualClockEvent, LV_EVENT_CLICKED, nullptr);
@@ -12088,7 +15095,8 @@ void displaySliderEvent(lv_event_t *e) {
 }
 
 void makeDisplaySlider(const char *label, int y, int minValue, int maxValue, int value, int setting,
-                       lv_obj_t *parent = nullptr, int x = 10, int width = 220) {
+                       lv_obj_t *parent = nullptr, int x = 10, int width = 220,
+                       bool omoteStyle = false) {
   if (!parent) parent = content;
   makeLabel(parent, label, x, y, &lv_font_montserrat_12, textPrimary());
   char valueText[12];
@@ -12096,14 +15104,19 @@ void makeDisplaySlider(const char *label, int y, int minValue, int maxValue, int
   else if (setting == 2) snprintf(valueText, sizeof(valueText), "%dmin", value);
   else if (setting == 3) snprintf(valueText, sizeof(valueText), "%udeg", motionWakeAngleDegrees());
   else snprintf(valueText, sizeof(valueText), "%d%s", value, setting == 1 ? "s" : "%");
-  lv_obj_t *number = makeLabel(parent, valueText, x + width - 38, y, &lv_font_montserrat_12, lvRgb(95, 180, 255));
+  // OpenRemote_2.0's real accent colour (0x2196F3, LVGL default theme blue)
+  // in Omote mode instead of the OpenRemote-style page's own lighter blue.
+  lv_obj_t *number = makeLabel(parent, valueText, x + width - 38, y, &lv_font_montserrat_12,
+                                omoteStyle ? lvRgb(0x21, 0x96, 0xF3) : lvRgb(95, 180, 255));
   displayValueLabels[setting] = number;
   lv_obj_set_width(number, 38);
   lv_obj_set_style_text_align(number, LV_TEXT_ALIGN_RIGHT, 0);
   lv_obj_t *slider = lv_slider_create(parent);
   lv_obj_set_pos(slider, x, y + 23);
-  lv_obj_set_size(slider, width, 12);
-  styleModernSlider(slider);
+  // OpenRemote_2.0's sliders are 10px tall (lv_obj_set_size(slider, lv_pct(66), 10));
+  // the OpenRemote-style page keeps its own 12px.
+  lv_obj_set_size(slider, width, omoteStyle ? 10 : 12);
+  if (omoteStyle) styleOmoteSlider(slider); else styleModernSlider(slider);
   if (setting == 2) {
     uint8_t index = deepSleepSliderIndex(value);
     lv_slider_set_range(slider, 0, 6);
@@ -12118,6 +15131,15 @@ void makeDisplaySlider(const char *label, int y, int minValue, int maxValue, int
   lv_obj_add_event_cb(slider, displaySliderEvent, LV_EVENT_RELEASED, (void *)(intptr_t)setting);
 }
 
+void wakeModeDropdownEvent(lv_event_t *e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  uint16_t selected = lv_dropdown_get_selected(lv_event_get_target(e));
+  wakeMode = selected == 1 ? WAKE_MODE_BUTTON : WAKE_MODE_MOTION;
+  lastWakeMs = millis();
+  saveSettings();
+  scheduleRuntimeSettingsSave();
+}
+
 void renderDisplayPageOmote() {
   // Row stride for a label+slider block, and how far below the row's start
   // the padded slider knob's bottom edge actually reaches (23px down to the
@@ -12130,23 +15152,26 @@ void renderDisplayPageOmote() {
   int y = 44;
 
   lv_obj_t *screenCard = makeOmoteCard(content, y, 3 * sliderH + 2);
-  makeDisplaySlider("Brightness", 8, 5, 100, brightness, 0, screenCard, 14, 196);
+  makeDisplaySlider("Brightness", 8, 5, 100, brightness, 0, screenCard, 14, 196, true);
   makeOmoteDivider(screenCard, 8 + sliderKnobBottom + 4);
-  makeDisplaySlider("Gamma", sliderH + 8, 50, 250, displayGamma, 4, screenCard, 14, 196);
+  makeDisplaySlider("Gamma", sliderH + 8, 50, 250, displayGamma, 4, screenCard, 14, 196, true);
   makeOmoteDivider(screenCard, sliderH + 8 + sliderKnobBottom + 4);
-  makeDisplaySlider("Saturation", sliderH * 2 + 8, 0, 200, displaySaturation, 5, screenCard, 14, 196);
+  makeDisplaySlider("Saturation", sliderH * 2 + 8, 0, 200, displaySaturation, 5, screenCard, 14, 196, true);
   y += 3 * sliderH + 2 + 12;
 
   lv_obj_t *sleepCard = makeOmoteCard(content, y, 3 * sliderH + 2);
-  makeDisplaySlider("Sleep timer", 8, 5, 120, timeoutSeconds, 1, sleepCard, 14, 196);
+  makeDisplaySlider("Sleep timer", 8, 5, 120, timeoutSeconds, 1, sleepCard, 14, 196, true);
   makeOmoteDivider(sleepCard, 8 + sliderKnobBottom + 4);
-  makeDisplaySlider("Deep Sleep", sliderH + 8, 1, 30, deepSleepMinutes, 2, sleepCard, 14, 196);
+  makeDisplaySlider("Deep Sleep", sliderH + 8, 1, 30, deepSleepMinutes, 2, sleepCard, 14, 196, true);
   makeOmoteDivider(sleepCard, sliderH + 8 + sliderKnobBottom + 4);
-  makeDisplaySlider("Motion sensitivity", sliderH * 2 + 8, 1, 100, wakeSensitivity, 3, sleepCard, 14, 196);
+  makeDisplaySlider("Motion sensitivity", sliderH * 2 + 8, 1, 100, wakeSensitivity, 3, sleepCard, 14, 196, true);
   y += 3 * sliderH + 2 + 12;
 
   lv_obj_t *optionsCard = makeOmoteCard(content, y, 2 * rowH + 1);
-  makeOmoteRow(optionsCard, "Slide to unlock", slideToUnlock ? "Required after sleep" : "Wake directly", 0, rowH, &slideToUnlock);
+  lv_obj_t *wakeDropdown = makeOmoteDropdownRow(optionsCard, "Wake", 0, rowH, 108);
+  lv_dropdown_set_options(wakeDropdown, "Motion\nButton");
+  lv_dropdown_set_selected(wakeDropdown, wakeMode == WAKE_MODE_BUTTON ? 1 : 0);
+  lv_obj_add_event_cb(wakeDropdown, wakeModeDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
   makeOmoteDivider(optionsCard, rowH);
   makeOmoteRow(optionsCard, "Colour Depth", displayRgb666 ? "RGB666 panel transfer" : "RGB565 panel transfer", rowH + 1, rowH, &displayRgb666);
 }
@@ -12170,7 +15195,20 @@ void renderDisplayPage() {
   makeDisplaySlider("Motion sensitivity", 208, 1, 100, wakeSensitivity, 3);
   makeDisplaySlider("Gamma", 262, 50, 250, displayGamma, 4);
   makeDisplaySlider("Saturation", 316, 0, 200, displaySaturation, 5);
-  makeSettingRow("Slide to unlock", slideToUnlock ? "Required after sleep" : "Wake directly", 370, &slideToUnlock);
+  lv_obj_t *wakePanel = lv_obj_create(content);
+  lv_obj_set_pos(wakePanel, 8, 370);
+  lv_obj_set_size(wakePanel, 224, 44);
+  lv_obj_clear_flag(wakePanel, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(wakePanel, LV_OBJ_FLAG_CLICKABLE);
+  stylePanel(wakePanel, lvRgb(34, 35, 39), lvRgb(54, 56, 62));
+  makeLabel(wakePanel, "Wake", 8, 14, &lv_font_montserrat_16, textPrimary());
+  lv_obj_t *wakeDropdown = lv_dropdown_create(wakePanel);
+  lv_obj_set_pos(wakeDropdown, 224 - 108 - 8, 6);
+  lv_obj_set_size(wakeDropdown, 108, 32);
+  styleDebugDropdown(wakeDropdown);
+  lv_dropdown_set_options(wakeDropdown, "Motion\nButton");
+  lv_dropdown_set_selected(wakeDropdown, wakeMode == WAKE_MODE_BUTTON ? 1 : 0);
+  lv_obj_add_event_cb(wakeDropdown, wakeModeDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
   makeSettingRow("Colour Depth", displayRgb666 ? "RGB666 panel transfer" : "RGB565 panel transfer", 420, &displayRgb666);
 }
 
@@ -12201,20 +15239,23 @@ void buttonSliderEvent(lv_event_t *e) {
 }
 
 void makeButtonTimingSlider(const char *label, int y, int minValue,
-                            int maxValue, int value, int setting) {
-  makeLabel(content, label, 10, y, &lv_font_montserrat_12, textPrimary());
+                            int maxValue, int value, int setting,
+                            lv_obj_t *parent = nullptr, int x = 10, int width = 220,
+                            bool omoteStyle = false) {
+  if (!parent) parent = content;
+  makeLabel(parent, label, x, y, &lv_font_montserrat_12, textPrimary());
   char text[16];
   if (setting == 0) snprintf(text, sizeof(text), "%dms", value);
   else snprintf(text, sizeof(text), "%d/s", value);
-  lv_obj_t *number = makeLabel(content, text, 184, y,
-                               &lv_font_montserrat_12, lvRgb(95, 180, 255));
+  lv_obj_t *number = makeLabel(parent, text, x + width - 44, y,
+                               &lv_font_montserrat_12, omoteStyle ? lvRgb(0x21, 0x96, 0xF3) : lvRgb(95, 180, 255));
   buttonValueLabels[setting] = number;
   lv_obj_set_width(number, 44);
   lv_obj_set_style_text_align(number, LV_TEXT_ALIGN_RIGHT, 0);
-  lv_obj_t *slider = lv_slider_create(content);
-  lv_obj_set_pos(slider, 10, y + 23);
-  lv_obj_set_size(slider, 220, 12);
-  styleModernSlider(slider);
+  lv_obj_t *slider = lv_slider_create(parent);
+  lv_obj_set_pos(slider, x, y + 23);
+  lv_obj_set_size(slider, width, omoteStyle ? 10 : 12);
+  if (omoteStyle) styleOmoteSlider(slider); else styleModernSlider(slider);
   int sliderValue = value;
   if (setting == 0) {
     lv_slider_set_range(slider, minValue / 50, maxValue / 50);
@@ -12230,6 +15271,44 @@ void makeButtonTimingSlider(const char *label, int y, int minValue,
                       (void *)(intptr_t)setting);
 }
 
+void renderButtonsPageOmote() {
+  // y=44, not 4 - clears the back button's (8,6)-(50,36) footprint.
+  lv_obj_t *repeatCard = makeOmoteCard(content, 44, 48);
+  makeOmoteRow(repeatCard, "Repeat", physicalRepeatEnabled ? "Repeat while held" : "Send once per press",
+               0, 48, &physicalRepeatEnabled);
+  int y = 44 + 48 + 12;
+
+  if (physicalRepeatEnabled) {
+    lv_obj_t *timingCard = makeOmoteCard(content, y, 2 * 50 + 2);
+    makeButtonTimingSlider("Delay before repeat", 8, BUTTON_REPEAT_DELAY_MIN_MS,
+      BUTTON_REPEAT_DELAY_MAX_MS, physicalRepeatDelayMs, 0, timingCard, 14, 196, true);
+    makeOmoteDivider(timingCard, 8 + 41 + 4);
+    makeButtonTimingSlider("Repeat speed", 58, BUTTON_REPEAT_RATE_MIN_HZ,
+      BUTTON_REPEAT_RATE_MAX_HZ, physicalRepeatRateHz, 1, timingCard, 14, 196, true);
+    y += 2 * 50 + 2 + 12;
+  }
+
+  lv_obj_t *testCard = makeOmoteCard(content, y, 48);
+  makeOmoteRow(testCard, "Test Button", "No commands are transmitted", 0, 48, &buttonTestActive);
+  y += 48 + 12;
+
+  buttonTestPanel = lv_obj_create(content);
+  lv_obj_set_pos(buttonTestPanel, 8, y);
+  lv_obj_set_size(buttonTestPanel, 224, 54);
+  lv_obj_clear_flag(buttonTestPanel, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(buttonTestPanel, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_style_radius(buttonTestPanel, 8, 0);
+  lv_obj_set_style_border_width(buttonTestPanel, 1, 0);
+  buttonTestLabel = makeLabel(buttonTestPanel, "No button pressed", 0, 0,
+                              &lv_font_montserrat_16, lvRgb(150, 150, 160));
+  lv_obj_set_width(buttonTestLabel, 206);
+  lv_obj_set_style_text_align(buttonTestLabel, LV_TEXT_ALIGN_CENTER, 0);
+  // A fixed (8,13) position isn't actually centred in the panel - true
+  // centring regardless of panel size/label height.
+  lv_obj_center(buttonTestLabel);
+  setButtonTestVisual(false);
+}
+
 void renderButtonsPage() {
   setCinematicBackground(false);
   configureContent(42, 278, false);
@@ -12241,6 +15320,10 @@ void renderButtonsPage() {
   lv_obj_set_style_pad_bottom(content, 18, 0);
   renderTopBar("Buttons", false);
   renderSettingsBackButton();
+  if (menuStyle == 1) {
+    renderButtonsPageOmote();
+    return;
+  }
 
   makeSettingRow("Repeat", physicalRepeatEnabled ? "Repeat while held" : "Send once per press",
                  44, &physicalRepeatEnabled);
@@ -12264,10 +15347,13 @@ void renderButtonsPage() {
   lv_obj_clear_flag(buttonTestPanel, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_set_style_radius(buttonTestPanel, 6, 0);
   lv_obj_set_style_border_width(buttonTestPanel, 1, 0);
-  buttonTestLabel = makeLabel(buttonTestPanel, "No button pressed", 8, 13,
+  buttonTestLabel = makeLabel(buttonTestPanel, "No button pressed", 0, 0,
                               &lv_font_montserrat_16, lvRgb(150, 150, 160));
   lv_obj_set_width(buttonTestLabel, 206);
   lv_obj_set_style_text_align(buttonTestLabel, LV_TEXT_ALIGN_CENTER, 0);
+  // A fixed (8,13) position isn't actually centred in the panel - true
+  // centring regardless of panel size/label height.
+  lv_obj_center(buttonTestLabel);
   setButtonTestVisual(false);
 }
 
@@ -12596,6 +15682,139 @@ void makeMenuStyleRow(int y) {
   lv_obj_add_event_cb(dropdown, menuStyleDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
 }
 
+void renderDebugPageOmote() {
+  const int rowH = 48;
+  const int calibRowH = 44;
+  // y=44, not 4 - clears the back button's (8,6)-(50,36) footprint.
+  int y = 44;
+
+  lv_obj_t *togglesCard = makeOmoteCard(content, y, 4 * rowH + 3);
+  makeOmoteRow(togglesCard, "Split Line", "Show live first-row Y position", 0, rowH, &debugSplitEnabled);
+  makeOmoteDivider(togglesCard, rowH);
+  makeOmoteRow(togglesCard, "Touch", "Live reticle, coordinates and trail", rowH + 1, rowH, &debugTouchEnabled);
+  makeOmoteDivider(togglesCard, 2 * rowH + 1);
+  makeOmoteRow(togglesCard, "CPU / RAM", "Processor load and heap used/free", 2 * rowH + 2, rowH, &debugCpuRamEnabled);
+  makeOmoteDivider(togglesCard, 3 * rowH + 2);
+  makeOmoteRow(togglesCard, "FPS", "Display frames per second", 3 * rowH + 3, rowH, &debugFpsEnabled);
+  y += 4 * rowH + 3 + 12;
+
+  lv_obj_t *accelCard = makeOmoteCard(content, y, rowH);
+  makeOmoteRow(accelCard, "Accelerometer", "Live X,Y,Z tilt samples", 0, rowH, &debugAccelerometerEnabled);
+  y += rowH + 12;
+
+  lv_obj_t *rowsLabel = makeLabel(content, "Saved row positions", 8, y, &lv_font_montserrat_12, textPrimary());
+  lv_obj_set_style_text_opa(rowsLabel, LV_OPA_60, 0);
+  y += 22;
+  lv_obj_t *calibCard = makeOmoteCard(content, y, 5 * calibRowH + 4);
+  for (uint8_t row = 0; row < 5; row++) {
+    char title[10];
+    snprintf(title, sizeof(title), "Row %u", row + 1);
+    int minimum = max(0, (int)debugRowPixels[row] - 10);
+    int maximum = min(LCD_H - 1, (int)debugRowPixels[row] + 10);
+    debugRowDropdownMinimums[row] = minimum;
+    String options;
+    for (int value = minimum; value <= maximum; value++) {
+      if (options.length()) options += '\n';
+      options += String(value) + " px";
+    }
+    lv_obj_t *dropdown = makeOmoteDropdownRow(calibCard, title, row * (calibRowH + 1), calibRowH, 92);
+    debugRowDropdowns[row] = dropdown;
+    lv_dropdown_set_options(dropdown, options.c_str());
+    lv_dropdown_set_selected(dropdown, debugRowPixels[row] - minimum);
+    lv_obj_add_event_cb(dropdown, debugRowDropdownEvent, LV_EVENT_VALUE_CHANGED, (void *)(uintptr_t)row);
+    if (row < 4) makeOmoteDivider(calibCard, (row + 1) * (calibRowH + 1) - 1);
+  }
+  y += 5 * calibRowH + 4 + 12;
+
+  lv_obj_t *micCard = makeOmoteCard(content, y, calibRowH);
+  lv_obj_t *micDropdown = makeOmoteDropdownRow(micCard, "Microphone", 0, calibRowH, 104);
+  lv_dropdown_set_options(micDropdown, "I2S Mic\nTest Only");
+  lv_dropdown_set_selected(micDropdown, microphoneTestAudioEnabled ? 1 : 0);
+  lv_obj_add_event_cb(micDropdown, microphoneSourceDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
+  y += calibRowH + 12;
+
+  lv_obj_t *driverLabel = makeLabel(content, "Display driver (reboot required)", 8, y,
+                                    &lv_font_montserrat_12, textPrimary());
+  lv_obj_set_style_text_opa(driverLabel, LV_OPA_60, 0);
+  y += 22;
+
+  int driverRows = displayDriverChoice == 0 ? 5 : 1;
+  lv_obj_t *driverCard = makeOmoteCard(content, y, driverRows * calibRowH + (driverRows - 1));
+  lv_obj_t *driverDropdown = makeOmoteDropdownRow(driverCard, "LCD Driver", 0, calibRowH, 112);
+  lv_dropdown_set_options(driverDropdown, "LovyanGFX\nArduino_GFX");
+  lv_dropdown_set_selected(driverDropdown, displayDriverChoice);
+  lv_obj_add_event_cb(driverDropdown, displayDriverDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
+
+  int rowIndex = 1;
+  if (displayDriverChoice == 0) {
+    makeOmoteDivider(driverCard, rowIndex * (calibRowH + 1) - 1);
+    lv_obj_t *freqDropdown = makeOmoteDropdownRow(driverCard, "LCD Clock", rowIndex * (calibRowH + 1), calibRowH, 112);
+    lv_dropdown_set_options(freqDropdown, "40 MHz\n27 MHz\n20 MHz\n16 MHz\n10 MHz");
+    static const uint32_t freqOptions[] = {40000000UL, 27000000UL, 20000000UL, 16000000UL, 10000000UL};
+    uint16_t selectedFreqIndex = 0;
+    for (uint16_t i = 0; i < 5; i++) if (freqOptions[i] == lcdFreqHz) { selectedFreqIndex = i; break; }
+    lv_dropdown_set_selected(freqDropdown, selectedFreqIndex);
+    lv_obj_add_event_cb(freqDropdown, lcdFreqDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
+    rowIndex++;
+
+    makeOmoteDivider(driverCard, rowIndex * (calibRowH + 1) - 1);
+    lv_obj_t *bufferDropdown = makeOmoteDropdownRow(driverCard, "Buffering", rowIndex * (calibRowH + 1), calibRowH, 112);
+    lv_dropdown_set_options(bufferDropdown, "Single\nDouble");
+    lv_dropdown_set_selected(bufferDropdown, lcdBufferMode ? 1 : 0);
+    lv_obj_add_event_cb(bufferDropdown, lcdBufferDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
+    rowIndex++;
+
+    makeOmoteDivider(driverCard, rowIndex * (calibRowH + 1) - 1);
+    // "Drive Strength" doesn't fit next to a 112px dropdown at this row
+    // width - shortened to "Pressure" per request (this is still the same
+    // GPIO pad drive-strength setting, just a shorter label here).
+    lv_obj_t *driveDropdown = makeOmoteDropdownRow(driverCard, "Pressure", rowIndex * (calibRowH + 1), calibRowH, 112);
+    lv_dropdown_set_options(driveDropdown, "Weakest\nWeak\nDefault\nStrongest");
+    lv_dropdown_set_selected(driveDropdown, lcdDriveStrength);
+    lv_obj_add_event_cb(driveDropdown, lcdDriveStrengthDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
+    rowIndex++;
+
+    makeOmoteDivider(driverCard, rowIndex * (calibRowH + 1) - 1);
+    lv_obj_t *touchDropdown = makeOmoteDropdownRow(driverCard, "Touch", rowIndex * (calibRowH + 1), calibRowH, 112);
+    lv_dropdown_set_options(touchDropdown, "Adafruit\nFT5x06");
+    lv_dropdown_set_selected(touchDropdown, touchDriverChoice ? 1 : 0);
+    lv_obj_add_event_cb(touchDropdown, touchDriverDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
+    rowIndex++;
+  }
+  y += driverRows * calibRowH + (driverRows - 1) + 12;
+
+  lv_obj_t *pwmLabel = makeLabel(content, "Backlight PWM (applies immediately)", 8, y,
+                                 &lv_font_montserrat_12, textPrimary());
+  lv_obj_set_style_text_opa(pwmLabel, LV_OPA_60, 0);
+  y += 22;
+  lv_obj_t *pwmCard = makeOmoteCard(content, y, calibRowH);
+  lv_obj_t *pwmDropdown = makeOmoteDropdownRow(pwmCard, "PWM", 0, calibRowH, 112);
+  lv_dropdown_set_options(pwmDropdown, "640 Hz\n1 kHz\n5 kHz\n25 kHz");
+  uint16_t pwmSelectedIndex = BACKLIGHT_PWM_OPTION_COUNT - 1;
+  for (uint8_t i = 0; i < BACKLIGHT_PWM_OPTION_COUNT; i++) {
+    if (BACKLIGHT_PWM_OPTIONS[i] == backlightPwmHz) { pwmSelectedIndex = i; break; }
+  }
+  lv_dropdown_set_selected(pwmDropdown, pwmSelectedIndex);
+  lv_obj_add_event_cb(pwmDropdown, backlightPwmDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
+  y += calibRowH + 12;
+
+  lv_obj_t *menuLabel = makeLabel(content, "Menu style (applies immediately)", 8, y,
+                                  &lv_font_montserrat_12, textPrimary());
+  lv_obj_set_style_text_opa(menuLabel, LV_OPA_60, 0);
+  y += 22;
+  lv_obj_t *menuCard = makeOmoteCard(content, y, calibRowH);
+  lv_obj_t *menuDropdown = makeOmoteDropdownRow(menuCard, "Menu Style", 0, calibRowH, 112);
+  lv_dropdown_set_options(menuDropdown, "OpenRemote\nOMOTE");
+  lv_dropdown_set_selected(menuDropdown, menuStyle ? 1 : 0);
+  lv_obj_add_event_cb(menuDropdown, menuStyleDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
+  y += calibRowH + 20;
+
+  lv_obj_t *softButton = makeOmoteButton(content, "Soft reboot", 8, y, 108, 42, lvRgb(0x50, 0x50, 0x50));
+  lv_obj_t *hardButton = makeOmoteButton(content, "Hard reboot", 124, y, 108, 42, lvRgb(115, 38, 45));
+  lv_obj_add_event_cb(softButton, debugRebootButtonEvent, LV_EVENT_CLICKED, (void *)(uintptr_t)false);
+  lv_obj_add_event_cb(hardButton, debugRebootButtonEvent, LV_EVENT_CLICKED, (void *)(uintptr_t)true);
+}
+
 void renderDebugPage() {
   setCinematicBackground(false);
   configureContent(42, 278, false);
@@ -12607,6 +15826,10 @@ void renderDebugPage() {
   lv_obj_set_style_pad_bottom(content, 18, 0);
   renderTopBar("Debug", false);
   renderSettingsBackButton();
+  if (menuStyle == 1) {
+    renderDebugPageOmote();
+    return;
+  }
 
   makeSettingRow("Split Line", "Show live first-row Y position", 44,
                  &debugSplitEnabled);
@@ -12726,7 +15949,7 @@ void updateBatteryMetricLabels(BatteryMetrics metrics) {
   }
 }
 
-void makeBatteryMetricRows(int firstY) {
+void makeBatteryMetricRows(int firstY, bool omoteStyle = false) {
   BatteryMetrics metrics = currentBatteryMetrics();
 
   char voltage[20];
@@ -12747,9 +15970,19 @@ void makeBatteryMetricRows(int firstY) {
     "Voltage", "Battery Level", "Rate", "Last hour", "Last 24 hours",
     batteryEstimateLabel(metrics)
   };
-  for (uint8_t i = 0; i < 6; i++) {
-    makeSettingRow(names[i], values[i].c_str(), firstY + i * 50, nullptr, nullptr,
+  if (omoteStyle) {
+    const int rowH = 48;
+    lv_obj_t *card = makeOmoteCard(content, firstY, 6 * rowH + 5);
+    for (uint8_t i = 0; i < 6; i++) {
+      makeOmoteRow(card, names[i], values[i].c_str(), i * (rowH + 1), rowH, nullptr, nullptr,
                    &batteryMetricNameLabels[i], &batteryMetricValueLabels[i]);
+      if (i < 5) makeOmoteDivider(card, (i + 1) * (rowH + 1) - 1);
+    }
+  } else {
+    for (uint8_t i = 0; i < 6; i++) {
+      makeSettingRow(names[i], values[i].c_str(), firstY + i * 50, nullptr, nullptr,
+                     &batteryMetricNameLabels[i], &batteryMetricValueLabels[i]);
+    }
   }
   nextBatteryPageRefreshMs = millis() + 1000UL;
 }
@@ -12762,16 +15995,49 @@ void renderBatteryPage() {
   lv_obj_set_scrollbar_mode(content, LV_SCROLLBAR_MODE_AUTO);
   renderTopBar("Battery", false);
   renderSettingsBackButton();
+  if (menuStyle == 1) {
+    makeBatteryMetricRows(4, true);
+    return;
+  }
 
   makeBatteryMetricRows(44);
 }
 
+// Backup/restore run synchronously on the LVGL/touch core, so there's no
+// background timer to drive a real lv_anim - instead this gets nudged from
+// inside the SD copy/encode loops (copySdTree(), embedSdFilesAsBase64(),
+// restoreEmbeddedFiles()) each time a file is done, which is frequent enough
+// to read as smooth motion for the icon/theme-heavy backups this matters for.
+void stepLcdBackupAnim() {
+  // LVGL is owned exclusively by the Arduino loop on core 1. The same SD
+  // helpers now also run from the HTTP worker on core 0 (WebConfig-triggered
+  // SD restore), where touching LVGL would be a cross-core call into objects
+  // another task is rendering.
+  if (xPortGetCoreID() != 1) return;
+  if (!lcdBackupAnimBar || lv_obj_has_flag(lcdBackupAnimBar, LV_OBJ_FLAG_HIDDEN)) return;
+  const uint32_t periodMs = 1200UL;
+  const int trackWidth = 204;
+  const int barWidth = 36;
+  uint32_t phase = (millis() - lcdBackupAnimStartMs) % periodMs;
+  float ratio = (float)phase / (float)periodMs;
+  float bounce = ratio < 0.5f ? (ratio * 2.0f) : (2.0f - ratio * 2.0f);
+  lv_obj_set_x(lcdBackupAnimBar, 10 + (int)(bounce * (trackWidth - barWidth)));
+  lv_refr_now(nullptr);
+}
+
 void setLcdBackupStatus(const String &message) {
   strlcpy(lcdBackupStatus, message.c_str(), sizeof(lcdBackupStatus));
-  if (lcdBackupStatusLabel) {
-    lv_label_set_text(lcdBackupStatusLabel, lcdBackupStatus);
-    lv_refr_now(nullptr);
+  if (lcdBackupStatusLabel) lv_label_set_text(lcdBackupStatusLabel, lcdBackupStatus);
+  bool inProgress = message.endsWith("...");
+  if (lcdBackupAnimBar) {
+    if (inProgress) {
+      lcdBackupAnimStartMs = millis();
+      lv_obj_clear_flag(lcdBackupAnimBar, LV_OBJ_FLAG_HIDDEN);
+    } else {
+      lv_obj_add_flag(lcdBackupAnimBar, LV_OBJ_FLAG_HIDDEN);
+    }
   }
+  lv_refr_now(nullptr);
 }
 
 void createBackupFromLcd(lv_event_t *e) {
@@ -12812,13 +16078,69 @@ void chooseLcdBackup(lv_event_t *e) {
   strlcpy(lcdPendingBackupName, lcdBackupEntries[index].name,
           sizeof(lcdPendingBackupName));
   static const char *buttons[] = {"Restore", "Cancel", ""};
+  const char *category = lcdBackupEntries[index].category;
+  // A category export merges into the current configuration; only a full
+  // backup replaces it. Say which, because the two are not undoable alike.
+  bool isFull = strcmp(category, "full-backup") == 0;
+  static char title[48];
+  if (isFull) {
+    strlcpy(title, "Restore full backup?", sizeof(title));
+  } else {
+    snprintf(title, sizeof(title), "Merge %s backup?",
+             strcmp(category, "learned-device") == 0 ? "device" : category);
+  }
   lcdBackupConfirmBox = lv_msgbox_create(
-    lv_scr_act(), "Restore full backup?", lcdBackupEntries[index].displayDate,
+    lv_scr_act(), title, lcdBackupEntries[index].displayDate,
     buttons, false);
   lv_obj_set_width(lcdBackupConfirmBox, 220);
   lv_obj_center(lcdBackupConfirmBox);
   lv_obj_add_event_cb(lcdBackupConfirmBox, confirmBackupRestore,
                       LV_EVENT_VALUE_CHANGED, nullptr);
+}
+
+// Thin bouncing bar shown under the backup/restore status line while a
+// backup or restore is in progress (see stepLcdBackupAnim()) - hidden the
+// rest of the time.
+lv_obj_t *makeLcdBackupAnimBar(lv_obj_t *parent, int y) {
+  lv_obj_t *bar = lv_obj_create(parent);
+  lv_obj_remove_style_all(bar);
+  lv_obj_set_size(bar, 36, 3);
+  lv_obj_set_pos(bar, 10, y);
+  lv_obj_set_style_radius(bar, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_color(bar, lvRgb(0x21, 0x96, 0xF3), 0);
+  lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
+  lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(bar, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_flag(bar, LV_OBJ_FLAG_HIDDEN);
+  return bar;
+}
+
+void renderBackupRestorePageOmote() {
+  // y=44, not 4 - clears the back button's (8,6)-(50,36) footprint.
+  lv_obj_t *create = makeOmoteButton(content, "Create full backup", 8, 44, 224, 38,
+                                     lvRgb(0x21, 0x96, 0xF3));
+  lv_obj_add_event_cb(create, createBackupFromLcd, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t *statusLabel = makeLabel(
+    content, lcdBackupStatus[0] ? lcdBackupStatus : "Backups are saved on the SD card",
+    10, 90, &lv_font_montserrat_10, textPrimary());
+  lv_obj_set_style_text_opa(statusLabel, LV_OPA_60, 0);
+  lcdBackupStatusLabel = statusLabel;
+  lcdBackupAnimBar = makeLcdBackupAnimBar(content, 104);
+
+  loadLcdBackupEntries();
+  makeLabel(content, "Restore a backup", 10, 116, &lv_font_montserrat_12, textPrimary());
+  if (!lcdBackupCount) {
+    lv_obj_t *none = makeLabel(content, "No full backups found", 10, 145,
+                               &lv_font_montserrat_12, textPrimary());
+    lv_obj_set_style_text_opa(none, LV_OPA_60, 0);
+    return;
+  }
+  for (uint8_t index = 0; index < lcdBackupCount; index++) {
+    lv_obj_t *backup = makeOmoteButton(content, lcdBackupEntries[index].displayDate,
+                                       8, 140 + index * 42, 224, 36);
+    lv_obj_add_event_cb(backup, chooseLcdBackup, LV_EVENT_CLICKED,
+                        (void *)(intptr_t)index);
+  }
 }
 
 void renderBackupRestorePage() {
@@ -12832,6 +16154,10 @@ void renderBackupRestorePage() {
   lv_obj_set_style_pad_bottom(content, 18, 0);
   renderTopBar("Backup / Restore", false);
   renderSettingsBackButton();
+  if (menuStyle == 1) {
+    renderBackupRestorePageOmote();
+    return;
+  }
 
   lv_obj_t *create = makeButton(content, "Create full backup", 8, 44, 224, 38,
                                 lvRgb(35, 86, 140));
@@ -12839,6 +16165,7 @@ void renderBackupRestorePage() {
   lcdBackupStatusLabel = makeLabel(
     content, lcdBackupStatus[0] ? lcdBackupStatus : "Backups are saved on the SD card",
     10, 90, &lv_font_montserrat_10, lvRgb(160, 170, 185));
+  lcdBackupAnimBar = makeLcdBackupAnimBar(content, 104);
 
   loadLcdBackupEntries();
   makeLabel(content, "Restore a backup", 10, 116, &lv_font_montserrat_12, textPrimary());
@@ -12856,6 +16183,30 @@ void renderBackupRestorePage() {
   }
 }
 
+void renderAboutPageOmote() {
+  lv_obj_t *nameLabel = makeLabel(content, "OpenRemote", 0, 4, &lv_font_montserrat_16, textPrimary());
+  lv_obj_set_width(nameLabel, LCD_W);
+  lv_obj_set_style_text_align(nameLabel, LV_TEXT_ALIGN_CENTER, 0);
+
+  const int rowH = 48;
+  lv_obj_t *infoCard = makeOmoteCard(content, 34, 5 * rowH + 4);
+  String webVersion = installedWebConfigVersion();
+  makeOmoteRow(infoCard, "Firmware", OPENREMOTE_VERSION_TEXT, 0, rowH, nullptr);
+  makeOmoteDivider(infoCard, rowH);
+  makeOmoteRow(infoCard, "Hardware", "OMOTE Rev 5 / ESP32-S3", rowH + 1, rowH, nullptr);
+  makeOmoteDivider(infoCard, 2 * rowH + 1);
+  makeOmoteRow(infoCard, "WebConfig", webVersion.length() ? webVersion.c_str() : "Not installed",
+               2 * rowH + 2, rowH, nullptr);
+  makeOmoteDivider(infoCard, 3 * rowH + 2);
+  makeOmoteRow(infoCard, "Setup network", setupApSsid.c_str(), 3 * rowH + 3, rowH, nullptr);
+  makeOmoteDivider(infoCard, 4 * rowH + 3);
+  makeOmoteRow(infoCard, "SD Card", sdStatusText, 4 * rowH + 4, rowH, nullptr);
+
+  int batteryY = 34 + 5 * rowH + 4 + 16;
+  makeLabel(content, "Battery", 8, batteryY, &lv_font_montserrat_16, textPrimary());
+  makeBatteryMetricRows(batteryY + 34, true);
+}
+
 void renderAboutPage() {
   setCinematicBackground(false);
   configureContent(42, 278, false);
@@ -12864,6 +16215,10 @@ void renderAboutPage() {
   lv_obj_set_scrollbar_mode(content, LV_SCROLLBAR_MODE_AUTO);
   renderTopBar("About", false);
   renderSettingsBackButton();
+  if (menuStyle == 1) {
+    renderAboutPageOmote();
+    return;
+  }
   makeLabel(content, "OpenRemote", 58, 12, &lv_font_montserrat_16, textPrimary());
   makeSettingRow("Firmware", OPENREMOTE_VERSION_TEXT, 52, nullptr);
   makeSettingRow("Hardware", "OMOTE Rev 5 / ESP32-S3", 102, nullptr);
@@ -12957,16 +16312,128 @@ int activitySliderCardPixels(uint8_t thumbSize) {
   return max(44, (int)thumbSize + 6);
 }
 
+// Jumps straight to Settings > Wi-Fi Config from anywhere else in the app -
+// Settings is always pages[0] (see rebuildPages()), so this just points
+// currentPage/pageUi at it directly (LV_ANIM_OFF - no slide, since this is
+// meant to load instantly) and lets openSettingsView()'s own
+// pendingUiRefresh flag render the QR page once currentPage is correct.
+void jumpToWebConfigQr(lv_event_t *e) {
+  Serial.println("jumpToWebConfigQr: button tapped");
+  openSettingsView(SETTINGS_WIFI_QR);
+  currentPage = 0;
+  bindPageUi(currentPage);
+  if (pageStrip) lv_obj_set_tile(pageStrip, pageUi[currentPage].tile, LV_ANIM_OFF);
+  configurePageStripDirections();
+}
+
+// Shown in place of the Activities page while OpenRemote Studio is talking to
+// the remote over USB. Two purposes: it tells the user the link is live, and
+// it makes it obvious the remote is busy rather than idle - a transfer can
+// take minutes and previously looked like nothing was happening at all.
+void renderUsbConnectedScreen() {
+  const int centreX = LCD_W / 2;
+  const int centreY = 118;
+  lv_color_t brandBlue = lvRgb(0x2F, 0x8C, 0xFF);
+
+  // Soft outer glow, then a ring, then the filled disc the symbol sits on -
+  // same construction as makeOpenRemoteLogoEmblem() so the two screens feel
+  // like one family.
+  lv_obj_t *glow = lv_obj_create(content);
+  lv_obj_remove_style_all(glow);
+  lv_obj_set_size(glow, 132, 132);
+  lv_obj_align(glow, LV_ALIGN_TOP_LEFT, centreX - 66, centreY - 66);
+  lv_obj_set_style_radius(glow, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_color(glow, brandBlue, 0);
+  lv_obj_set_style_bg_opa(glow, LV_OPA_20, 0);
+  lv_obj_clear_flag(glow, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(glow, LV_OBJ_FLAG_CLICKABLE);
+
+  lv_obj_t *ring = lv_obj_create(content);
+  lv_obj_remove_style_all(ring);
+  lv_obj_set_size(ring, 96, 96);
+  lv_obj_align(ring, LV_ALIGN_TOP_LEFT, centreX - 48, centreY - 48);
+  lv_obj_set_style_radius(ring, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_opa(ring, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_color(ring, lvRgb(0x64, 0xD2, 0xFF), 0);
+  lv_obj_set_style_border_width(ring, 4, 0);
+  lv_obj_set_style_border_opa(ring, LV_OPA_COVER, 0);
+  lv_obj_clear_flag(ring, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(ring, LV_OBJ_FLAG_CLICKABLE);
+
+  lv_obj_t *disc = lv_obj_create(content);
+  lv_obj_remove_style_all(disc);
+  lv_obj_set_size(disc, 74, 74);
+  lv_obj_align(disc, LV_ALIGN_TOP_LEFT, centreX - 37, centreY - 37);
+  lv_obj_set_style_radius(disc, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_color(disc, brandBlue, 0);
+  lv_obj_set_style_bg_opa(disc, LV_OPA_COVER, 0);
+  lv_obj_clear_flag(disc, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(disc, LV_OBJ_FLAG_CLICKABLE);
+
+  lv_obj_t *icon = makeLabel(content, LV_SYMBOL_USB, 0, centreY - 16,
+                             &lv_font_montserrat_24, lv_color_white());
+  lv_obj_set_width(icon, LCD_W);
+  lv_obj_set_style_text_align(icon, LV_TEXT_ALIGN_CENTER, 0);
+
+  lv_obj_t *heading = makeLabel(content, "USB Connected", 0, 194,
+                                &lv_font_montserrat_20, textPrimary());
+  lv_obj_set_width(heading, LCD_W);
+  lv_obj_set_style_text_align(heading, LV_TEXT_ALIGN_CENTER, 0);
+
+  lv_obj_t *subtitle = makeLabel(content, "Use OpenRemote Studio on your computer", 0, 224,
+                                 &lv_font_montserrat_12, textPrimary());
+  lv_obj_set_width(subtitle, LCD_W);
+  lv_obj_set_style_text_align(subtitle, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_set_style_text_opa(subtitle, LV_OPA_60, 0);
+
+  // Only the transfer warning earns a third line. The idle text that used to
+  // sit here ("Manage this remote from Studio while connected") said nothing
+  // the subtitle above does not already say, and at 240px the subtitle wraps
+  // to two lines, so its second line ran straight through this one at the
+  // fixed y of 246 - two labels drawn over each other on every USB connect
+  // that was not a fresh install.
+  if (usbSdTransferActive()) {
+    lv_obj_t *hint = makeLabel(content, "Transferring files - keep the cable attached",
+                               0, 246, &lv_font_montserrat_10, textPrimary());
+    lv_obj_set_width(hint, LCD_W);
+    lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_opa(hint, LV_OPA_40, 0);
+    // Sit below however many lines the subtitle actually took rather than at
+    // a hard-coded y, so this cannot collide again if the wording changes.
+    lv_obj_update_layout(subtitle);
+    lv_obj_align_to(hint, subtitle, LV_ALIGN_OUT_BOTTOM_MID, 0, 4);
+  }
+}
+
 void renderActivitiesPage() {
   applyRuntimeTheme(activitiesThemePath);
   configureContent(0, LCD_H, true);
   renderTopBar("Activities", true);
 
+  if (usbStudioLinkActive()) {
+    usbConnectedScreenShown = true;
+    renderUsbConnectedScreen();
+    return;
+  }
+  usbConnectedScreenShown = false;
+
   if (ACTIVITY_COUNT == 0) {
-    lv_obj_t *empty = makeLabel(content, "No activities\nSync real activities in WebConfig", 18, 142,
-                                &lv_font_montserrat_12, textPrimary());
-    lv_obj_set_width(empty, 204);
-    lv_obj_set_style_text_align(empty, LV_TEXT_ALIGN_CENTER, 0);
+    makeOpenRemoteLogoEmblem(content, LCD_W / 2, 96, 76);
+
+    lv_obj_t *heading = makeLabel(content, "No Activities Yet", 0, 150,
+                                  &lv_font_montserrat_16, textPrimary());
+    lv_obj_set_width(heading, LCD_W);
+    lv_obj_set_style_text_align(heading, LV_TEXT_ALIGN_CENTER, 0);
+
+    lv_obj_t *subtitle = makeLabel(content, "Set up your activities in WebConfig", 0, 178,
+                                   &lv_font_montserrat_12, textPrimary());
+    lv_obj_set_width(subtitle, LCD_W);
+    lv_obj_set_style_text_align(subtitle, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_opa(subtitle, LV_OPA_60, 0);
+
+    lv_obj_t *qrButton = makeOmoteButton(content, "Open WebConfig", (LCD_W - 168) / 2, 214, 168, 40,
+                                        lvRgb(0x2F, 0x8C, 0xFF));
+    lv_obj_add_event_cb(qrButton, jumpToWebConfigQr, LV_EVENT_CLICKED, nullptr);
     return;
   }
 
@@ -13371,70 +16838,6 @@ void renderButtonDiagnosticPage() {
   }
 }
 
-void completeUnlock(void *unused) {
-  (void)unused;
-  lockActive = false;
-  if (lockOverlay) {
-    lv_obj_del(lockOverlay);
-    lockOverlay = nullptr;
-  }
-  drawDots();
-  lv_refr_now(nullptr);
-}
-
-void unlockSliderEvent(lv_event_t *e) {
-  lv_event_code_t code = lv_event_get_code(e);
-  lv_obj_t *slider = lv_event_get_target(e);
-  if (code == LV_EVENT_RELEASED) {
-    if (lv_slider_get_value(slider) >= 92) {
-      lv_slider_set_value(slider, 100, LV_ANIM_OFF);
-      lv_async_call(completeUnlock, nullptr);
-    } else {
-      lv_slider_set_value(slider, 0, LV_ANIM_ON);
-    }
-  } else if (code == LV_EVENT_PRESS_LOST) {
-    lv_slider_set_value(slider, 0, LV_ANIM_ON);
-  }
-}
-
-void renderUnlockPage() {
-  lockOverlay = lv_obj_create(screenRoot);
-  lv_obj_remove_style_all(lockOverlay);
-  lv_obj_set_pos(lockOverlay, 0, 0);
-  lv_obj_set_size(lockOverlay, LCD_W, LCD_H);
-  lv_obj_set_style_bg_color(lockOverlay, lv_color_black(), 0);
-  lv_obj_set_style_bg_opa(lockOverlay, LV_OPA_COVER, 0);
-  lv_obj_clear_flag(lockOverlay, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_move_foreground(lockOverlay);
-
-  char timeText[12] = "--:--";
-  struct tm timeInfo;
-  if (getLocalTime(&timeInfo, 5)) {
-    strftime(timeText, sizeof(timeText), "%l:%M", &timeInfo);
-    if (timeText[0] == ' ') memmove(timeText, timeText + 1, strlen(timeText));
-  }
-  lv_obj_t *time = makeLabel(lockOverlay, timeText, 0, 66, &lv_font_montserrat_20, textPrimary());
-  lv_obj_set_width(time, LCD_W);
-  lv_obj_set_style_text_align(time, LV_TEXT_ALIGN_CENTER, 0);
-  makeLabel(lockOverlay, "OpenRemote", 79, 96, &lv_font_montserrat_12, lvRgb(190, 205, 220));
-
-  lv_obj_t *slider = lv_slider_create(lockOverlay);
-  lv_obj_set_pos(slider, 20, 246);
-  lv_obj_set_size(slider, 200, 42);
-  lv_slider_set_range(slider, 0, 100);
-  lv_slider_set_value(slider, 0, LV_ANIM_OFF);
-  styleModernSlider(slider, 13);
-  // Track/indicator stay translucent black/blue over the wallpaper behind the
-  // lock overlay, unlike the opaque dark track used on plain Settings pages.
-  lv_obj_set_style_bg_color(slider, lv_color_black(), LV_PART_MAIN);
-  lv_obj_set_style_bg_opa(slider, LV_OPA_60, LV_PART_MAIN);
-  lv_obj_set_style_bg_opa(slider, LV_OPA_70, LV_PART_INDICATOR);
-  lv_obj_add_event_cb(slider, unlockSliderEvent, LV_EVENT_ALL, nullptr);
-  lv_obj_t *hint = makeLabel(lockOverlay, "slide to unlock", 0, 260, &lv_font_montserrat_12, textPrimary());
-  lv_obj_set_width(hint, LCD_W);
-  lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
-  lv_obj_move_background(hint);
-}
 
 void pageTranslateAnimation(void *target, int32_t value) {
   lv_obj_t *obj = static_cast<lv_obj_t *>(target);
@@ -13460,6 +16863,98 @@ void animatePageEntrance(lv_obj_t *obj, int8_t direction) {
   lv_anim_set_time(&slide, 110);
   lv_anim_set_path_cb(&slide, lv_anim_path_ease_out);
   lv_anim_start(&slide);
+}
+
+// iOS-style push/pop transition between settings pages, Omote menu style
+// only. OpenRemote_2.0 has no such navigation (it's one flat scrolling tab),
+// so there's nothing to match here - this recreates the iPhone Settings
+// app's push/pop feel on top of 1.0's existing per-view sub-pages. Snapshots
+// the outgoing content/topBar into temporary images, lets the normal
+// clean-and-rebuild draw the new view at rest, then slides the new view in
+// from the edge while the snapshot slides fully off the opposite edge.
+lv_obj_t *settingsSlideOutgoingContent = nullptr;
+lv_obj_t *settingsSlideOutgoingTopBar = nullptr;
+lv_img_dsc_t *settingsSlideSnapshotContent = nullptr;
+lv_img_dsc_t *settingsSlideSnapshotTopBar = nullptr;
+
+void settingsSlideAnimReady_cb(lv_anim_t *a) {
+  if (settingsSlideOutgoingContent && lv_obj_is_valid(settingsSlideOutgoingContent)) {
+    lv_obj_del(settingsSlideOutgoingContent);
+  }
+  if (settingsSlideOutgoingTopBar && lv_obj_is_valid(settingsSlideOutgoingTopBar)) {
+    lv_obj_del(settingsSlideOutgoingTopBar);
+  }
+  settingsSlideOutgoingContent = nullptr;
+  settingsSlideOutgoingTopBar = nullptr;
+  if (settingsSlideSnapshotContent) {
+    lv_snapshot_free(settingsSlideSnapshotContent);
+    settingsSlideSnapshotContent = nullptr;
+  }
+  if (settingsSlideSnapshotTopBar) {
+    lv_snapshot_free(settingsSlideSnapshotTopBar);
+    settingsSlideSnapshotTopBar = nullptr;
+  }
+}
+
+void startSettingsSlideAnim(lv_obj_t *obj, int32_t from, int32_t to, lv_anim_ready_cb_t readyCb = nullptr) {
+  if (!obj) return;
+  lv_anim_t a;
+  lv_anim_init(&a);
+  lv_anim_set_var(&a, obj);
+  lv_anim_set_exec_cb(&a, pageTranslateAnimation);
+  lv_anim_set_values(&a, from, to);
+  lv_anim_set_time(&a, 220);
+  lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+  if (readyCb) lv_anim_set_ready_cb(&a, readyCb);
+  lv_anim_start(&a);
+}
+
+// Call before lv_obj_clean() destroys the outgoing view's widgets.
+void beginSettingsSlideTransition(int8_t direction) {
+  settingsSlideSnapshotContent = lv_snapshot_take(content, LV_IMG_CF_TRUE_COLOR);
+  if (settingsSlideSnapshotContent) {
+    settingsSlideOutgoingContent = lv_img_create(lv_obj_get_parent(content));
+    lv_img_set_src(settingsSlideOutgoingContent, settingsSlideSnapshotContent);
+    lv_obj_set_pos(settingsSlideOutgoingContent, lv_obj_get_x(content), lv_obj_get_y(content));
+    lv_obj_clear_flag(settingsSlideOutgoingContent, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(settingsSlideOutgoingContent, LV_OBJ_FLAG_SCROLLABLE);
+  }
+  settingsSlideSnapshotTopBar = lv_snapshot_take(topBar, LV_IMG_CF_TRUE_COLOR);
+  if (settingsSlideSnapshotTopBar) {
+    settingsSlideOutgoingTopBar = lv_img_create(lv_obj_get_parent(topBar));
+    lv_img_set_src(settingsSlideOutgoingTopBar, settingsSlideSnapshotTopBar);
+    lv_obj_set_pos(settingsSlideOutgoingTopBar, lv_obj_get_x(topBar), lv_obj_get_y(topBar));
+    lv_obj_clear_flag(settingsSlideOutgoingTopBar, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(settingsSlideOutgoingTopBar, LV_OBJ_FLAG_SCROLLABLE);
+  }
+  // Forward (push): the new, real content should draw over the departing
+  // snapshot. Back (pop): the departing snapshot draws over the page
+  // beneath it as it slides away, matching iOS's stack-based reveal.
+  if (direction > 0) {
+    if (settingsSlideOutgoingContent) lv_obj_move_background(settingsSlideOutgoingContent);
+    if (settingsSlideOutgoingTopBar) lv_obj_move_background(settingsSlideOutgoingTopBar);
+  } else {
+    if (settingsSlideOutgoingContent) lv_obj_move_foreground(settingsSlideOutgoingContent);
+    if (settingsSlideOutgoingTopBar) lv_obj_move_foreground(settingsSlideOutgoingTopBar);
+  }
+}
+
+// Call after the new view has been fully rendered into content/topBar.
+void finishSettingsSlideTransition(int8_t direction) {
+  if (!settingsSlideOutgoingContent && !settingsSlideOutgoingTopBar) return;
+  int32_t offscreen = direction > 0 ? LCD_W : -LCD_W;
+  lv_obj_set_style_translate_x(content, offscreen, 0);
+  lv_obj_set_style_translate_x(topBar, offscreen, 0);
+  bool readyCbAssigned = false;
+  if (settingsSlideOutgoingContent) {
+    startSettingsSlideAnim(settingsSlideOutgoingContent, 0, -offscreen, settingsSlideAnimReady_cb);
+    readyCbAssigned = true;
+  }
+  if (settingsSlideOutgoingTopBar) {
+    startSettingsSlideAnim(settingsSlideOutgoingTopBar, 0, -offscreen, readyCbAssigned ? nullptr : settingsSlideAnimReady_cb);
+  }
+  startSettingsSlideAnim(content, offscreen, 0);
+  startSettingsSlideAnim(topBar, offscreen, 0);
 }
 
 void beginUiMutation() {
@@ -13505,6 +17000,16 @@ void renderCurrentPage() {
   lv_obj_set_style_translate_x(topBar, 0, 0);
   lv_obj_set_style_opa(content, LV_OPA_COVER, 0);
   lv_obj_set_style_opa(topBar, LV_OPA_COVER, 0);
+
+  int8_t settingsSlideDirection = 0;
+  if (pages[currentPage].kind == PAGE_REMOTE_SETTINGS && menuStyle == 1 &&
+      pendingSettingsSlideDirection != 0 &&
+      (lv_obj_get_child_cnt(content) > 0 || lv_obj_get_child_cnt(topBar) > 0)) {
+    settingsSlideDirection = pendingSettingsSlideDirection;
+    beginSettingsSlideTransition(settingsSlideDirection);
+  }
+  pendingSettingsSlideDirection = 0;
+
   lv_obj_clean(topBar);
   lv_obj_clean(content);
   memset(batteryMetricNameLabels, 0, sizeof(batteryMetricNameLabels));
@@ -13527,7 +17032,8 @@ void renderCurrentPage() {
     case PAGE_DEVICE: renderDevicePage(); break;
   }
 
-  if (lockActive) renderUnlockPage();
+  if (settingsSlideDirection != 0) finishSettingsSlideTransition(settingsSlideDirection);
+
   drawDots();
   updateSplitDiagnostic();
   pendingPageTransition = 0;
@@ -13651,6 +17157,18 @@ void servicePageStripChange() {
     currentPage = target;
     renderAllPageSlots();
   } else {
+    if (pages[previous].kind == PAGE_REMOTE_SETTINGS && target != previous) {
+      // Swiping away from Settings to a different top-level page skips all
+      // the "leaving" cleanup backToSettings() normally does, and leaves
+      // settingsView pointing at whatever sub-view was showing (e.g. the
+      // QR page). openSettingsView() only runs its entering-page side
+      // effects (starting the setup AP, connecting to a saved network,
+      // etc.) on a genuine settingsView transition, so coming straight back
+      // to that exact same sub-view later - e.g. the Activities page's
+      // "Open WebConfig" button - silently skipped all of that and just
+      // rendered a stale "Connecting..." state with no AP and no QR code.
+      backToSettings(nullptr);
+    }
     currentPage = target;
     bindPageUi(currentPage);
     configurePageStripDirections();
@@ -13969,7 +17487,7 @@ void restoreDeepSleepRuntimeState(esp_sleep_wakeup_cause_t wakeCause) {
 bool enterDeepPowerSleep(bool allowQrPage) {
   if (!lis3dhReady || !raiseToWake ||
       (webConfigQrPageActive() && !allowQrPage) ||
-      webConfigTransferActive || usbSdTransferActive() || ntpSyncPending ||
+      webConfigTransferActive || usbSdTransferActive() || usbStudioLinkActive() || ntpSyncPending ||
       bluetoothActivitySessionRequired()) {
     Serial.printf(
       "Deep sleep deferred: accelerometer=%s raise=%s qr=%s transfer=%s usb=%s ntp=%s ble=%s\n",
@@ -14073,7 +17591,7 @@ bool configureApplicationPowerMode(bool connectedIdle) {
 void enterBleConnectedIdle() {
   if (bleConnectedIdleActive || !displaySleeping ||
       !bluetoothActivitySessionRequired() || webConfigQrPageActive() ||
-      webConfigTransferActive || usbSdTransferActive() || ntpSyncPending ||
+      webConfigTransferActive || usbSdTransferActive() || usbStudioLinkActive() || ntpSyncPending ||
       wifiConnectPending) return;
 
   // ESP-IDF's Bluetooth controller owns a power-management lock while radio
@@ -14145,7 +17663,7 @@ void leaveBleConnectedIdle() {
 
 void enterLowPowerWait() {
   if (!displaySleeping || webConfigQrPageActive() || webConfigTransferActive ||
-      usbSdTransferActive() || ntpSyncPending || wifiConnectPending ||
+      usbSdTransferActive() || usbStudioLinkActive() || ntpSyncPending || wifiConnectPending ||
       bluetoothActivitySessionRequired()) return;
 
   serviceKeypad(millis());
@@ -14171,6 +17689,15 @@ void enterLowPowerWait() {
   if (accelerometerPinResult == ESP_OK && keypadPinResult == ESP_OK) {
     gpioWakeResult = esp_sleep_enable_gpio_wakeup();
   }
+  // Incoming serial must also wake the remote. Without this the CPU stops
+  // servicing UART the moment the display sleeps, so OpenRemote Studio's
+  // very first ORUSB PING goes unanswered and every transfer fails with
+  // "No OpenRemote USB response" until the remote is woken by hand. The
+  // sleep guards added in 2.77 could not help: they keep the remote awake
+  // once a link exists, but a link can never be established while it is
+  // already asleep. Threshold 3 ignores single-edge line noise.
+  uart_set_wakeup_threshold(UART_NUM_0, 3);
+  esp_sleep_enable_uart_wakeup(UART_NUM_0);
   if (accelerometerPinResult != ESP_OK || keypadPinResult != ESP_OK ||
       gpioWakeResult != ESP_OK) {
     if (accelerometerWake) gpio_wakeup_disable((gpio_num_t)PIN_ACC_INT);
@@ -14227,17 +17754,35 @@ void enterLowPowerWait() {
   if (keypadWake) gpio_wakeup_disable((gpio_num_t)PIN_TCA_INT);
   esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_GPIO);
   esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_UART);
   configureLis3dhAwake();
   Serial.printf("Light sleep wake: result=%d cause=%d acc=%d lis=0x%02X keypad=%d tca=0x%02X\n",
                 (int)result, (int)cause, accelerometerLevel, motionSource,
                 keypadLevel, keypadSource);
 
+  if (cause == ESP_SLEEP_WAKEUP_UART) {
+    Serial.println("Light sleep wake: USB serial");
+    lastUsbStudioActivityMs = millis();
+    wakeDisplay();
+    return;
+  }
   if (cause == ESP_SLEEP_WAKEUP_TIMER) {
     enterDeepPowerSleep();
     // This timer is an internal power-management event, not user activity. If
     // deep sleep is deferred, remain dark and retry instead of lighting the LCD
     // and restarting the user's normal display-sleep timer.
     nextDeepSleepAttemptMs = millis() + 5000UL;
+    return;
+  }
+  bool keypadTriggered = keypadWake && keypadLevel == LOW;
+  bool motionOnlyTriggered = !keypadTriggered && accelerometerWake && accelerometerLevel == HIGH;
+  if (motionOnlyTriggered && wakeMode == WAKE_MODE_BUTTON) {
+    // Stay dark: hold the MCU awake (out of esp_light_sleep_start()) for a
+    // short window instead of lighting the LCD, so a follow-up button press
+    // is serviced at full speed. See awaitingButtonWake's handling in loop().
+    Serial.println("Motion wake held: awaiting a button press (Wake = Button)");
+    awaitingButtonWake = true;
+    buttonWakeWindowEndMs = millis() + BUTTON_WAKE_WINDOW_MS;
     return;
   }
   wakeDisplay();
@@ -14266,7 +17811,7 @@ void enterDisplaySleep() {
   nextDeepSleepAttemptMs = displaySleepStartedMs +
     (uint32_t)deepSleepMinutes * 60UL * 1000UL;
   if (!webConfigQrPageActive() && !ntpSyncPending &&
-      !webConfigTransferActive && !usbSdTransferActive()) {
+      !webConfigTransferActive && !usbSdTransferActive() && !usbStudioLinkActive()) {
     if (bluetoothActivitySessionRequired()) enterBleConnectedIdle();
     else enterLowPowerWait();
   }
@@ -14285,7 +17830,7 @@ void wakeDisplay() {
   displaySleeping = false;
   displaySleepStartedMs = 0;
   nextDeepSleepAttemptMs = 0;
-  lockActive = slideToUnlock;
+  awaitingButtonWake = false;
   lastWakeMs = millis();
   bindPageUi(currentPage);
   refreshStatusPill();
@@ -14497,18 +18042,57 @@ void setupUiRoot() {
   refreshDebugOverlayVisibility();
 }
 
+// Neither esp_reset_reason() nor the wake cause were ever printed at boot,
+// so a genuine crash (panic/watchdog/brownout) looked identical in the log
+// to an intentional deep-sleep wake or a plain power cycle - there was no
+// way to tell them apart after the fact without a WebConfig session already
+// open (the only other place resetReason reaches, via the status JSON).
+const char *resetReasonText(esp_reset_reason_t reason) {
+  switch (reason) {
+    case ESP_RST_POWERON: return "power-on";
+    case ESP_RST_EXT: return "external reset pin";
+    case ESP_RST_SW: return "software (esp_restart)";
+    case ESP_RST_PANIC: return "panic/exception";
+    case ESP_RST_INT_WDT: return "interrupt watchdog";
+    case ESP_RST_TASK_WDT: return "task watchdog";
+    case ESP_RST_WDT: return "other watchdog";
+    case ESP_RST_DEEPSLEEP: return "deep sleep wake";
+    case ESP_RST_BROWNOUT: return "brownout";
+    case ESP_RST_SDIO: return "SDIO";
+    default: return "unknown";
+  }
+}
+
+const char *wakeCauseText(esp_sleep_wakeup_cause_t cause) {
+  switch (cause) {
+    case ESP_SLEEP_WAKEUP_EXT1: return "EXT1 (motion/keypad pin)";
+    case ESP_SLEEP_WAKEUP_TIMER: return "TIMER (scheduled NTP sync)";
+    case ESP_SLEEP_WAKEUP_UNDEFINED: return "UNDEFINED (not a deep-sleep wake - cold boot or reset)";
+    default: return "other";
+  }
+}
+
 void setup() {
   esp_sleep_wakeup_cause_t bootWakeCause = esp_sleep_get_wakeup_cause();
   scheduledNtpWake = bootWakeCause == ESP_SLEEP_WAKEUP_TIMER;
+  // Must precede begin() - setRxBufferSize() is a no-op once the UART driver
+  // is installed. See USB_SERIAL_RX_BUFFER_BYTES for why the default is far
+  // too small for Studio's upload windows.
+  Serial.setRxBufferSize(USB_SERIAL_RX_BUFFER_BYTES);
   Serial.begin(USB_STUDIO_BAUD);
+  Serial.onReceiveError(usbSerialReceiveError);
 #if defined(ARDUINO_USB_CDC_ON_BOOT) && ARDUINO_USB_CDC_ON_BOOT
+  Serial0.setRxBufferSize(USB_SERIAL_RX_BUFFER_BYTES);
   Serial0.begin(USB_STUDIO_BAUD);
+  Serial0.onReceiveError(usbSerialReceiveError);
 #endif
   delay(500);
 
   Serial.println();
   Serial.printf("OpenRemote %s - Rev 5 LVGL Runtime\n", OPENREMOTE_VERSION_TEXT);
   Serial.println(OPENREMOTE_FIRMWARE_MARKER);
+  Serial.printf("Reset reason: %s | Wake cause: %s\n",
+                resetReasonText(esp_reset_reason()), wakeCauseText(bootWakeCause));
   Serial.println("---------------------------------------");
   if (bootWakeCause == ESP_SLEEP_WAKEUP_EXT1) {
     Serial.printf("Deep wake status: 0x%llX\n", esp_sleep_get_ext1_wakeup_status());
@@ -14555,6 +18139,7 @@ void setup() {
   initLIS3DH();
   sdReady = initSdStorage();
   if (sdReady) diagnoseSdCardHealth();
+  recoverWebConfigIfIncomplete();
   loadIrdbMetadata();
   loadRuntimeConfig();
   // Refresh an existing bonded Android TV device immediately so newly added
@@ -14793,15 +18378,30 @@ void loop() {
 
   if (displaySleeping) {
     bool connectedActivityIdle = !webConfigQrPageActive() &&
-      !webConfigTransferActive && !usbSdTransferActive() &&
+      !webConfigTransferActive && !usbSdTransferActive() && !usbStudioLinkActive() &&
       !ntpSyncPending && !wifiConnectPending &&
       bluetoothActivitySessionRequired();
     if (connectedActivityIdle) {
       enterBleConnectedIdle();
     }
     if (!connectedActivityIdle && !webConfigQrPageActive() &&
-        !webConfigTransferActive && !usbSdTransferActive() &&
+        !webConfigTransferActive && !usbSdTransferActive() && !usbStudioLinkActive() &&
         !ntpSyncPending && !wifiConnectPending) {
+      if (awaitingButtonWake) {
+        // A motion-only wake already got the MCU out of light sleep while
+        // Wake = Button; hold off going straight back into
+        // esp_light_sleep_start() for a short window so a follow-up button
+        // press is serviced immediately instead of paying the full sleep/
+        // wake round trip again. serviceKeypad() itself calls wakeDisplay()
+        // (which clears awaitingButtonWake) the moment a real press lands.
+        if ((int32_t)(now - buttonWakeWindowEndMs) >= 0) {
+          awaitingButtonWake = false;
+        } else {
+          serviceKeypad(now);
+          delay(5);
+          return;
+        }
+      }
       enterLowPowerWait();
       return;
     }
@@ -14813,10 +18413,17 @@ void loop() {
         if (bleIdleMotionAboveSinceMs == 0) bleIdleMotionAboveSinceMs = now;
         else if ((uint32_t)(now - bleIdleMotionAboveSinceMs) >=
                  BLE_CONNECTED_IDLE_MOTION_CONFIRM_MS) {
-          Serial.printf("BLE idle motion wake: angle=%.1f threshold=%u deg\n",
-                        angle, motionWakeAngleDegrees());
-          wakeDisplay();
-          return;
+          // BLE-connected idle already keeps the HID link up continuously
+          // regardless of wake mode, so there's no "not ready" gap to close
+          // here - only actually light the LCD for motion when Wake = Motion.
+          if (wakeMode == WAKE_MODE_BUTTON) {
+            bleIdleMotionAboveSinceMs = 0;
+          } else {
+            Serial.printf("BLE idle motion wake: angle=%.1f threshold=%u deg\n",
+                          angle, motionWakeAngleDegrees());
+            wakeDisplay();
+            return;
+          }
         }
       } else {
         bleIdleMotionAboveSinceMs = 0;
@@ -14874,6 +18481,17 @@ void loop() {
     closeBrightnessPanel();
   }
 
+  // Return the Activities page to normal once the USB link goes quiet. The
+  // appearing edge is handled in handleUsbCommand(); this covers the lapse,
+  // which has no event of its own.
+  if (usbConnectedScreenShown != usbStudioLinkActive()) {
+    // Repaint wherever we are: leaving the check to the Activities page meant
+    // unplugging on another screen left the flag stale, so returning to
+    // Activities still showed "USB Connected" until a sleep/wake cycle.
+    if (pages[currentPage].kind == PAGE_ACTIVITIES) pendingUiRefresh = true;
+    else usbConnectedScreenShown = usbStudioLinkActive();
+  }
+
   if (now >= nextStatusRefreshMs) {
     refreshStatusPill();
     nextStatusRefreshMs = now + STATUS_REFRESH_MS;
@@ -14889,9 +18507,13 @@ void loop() {
 
   bool qrPageActive = pages[currentPage].kind == PAGE_REMOTE_SETTINGS &&
                       settingsView == SETTINGS_WIFI_QR;
-  uint32_t activeSleepMs = (uint32_t)timeoutSeconds * 1000UL;
-  if (qrPageActive) activeSleepMs += QR_PAGE_AWAKE_GRACE_MS;
-  if (!activitySequenceActive && !usbSdTransferActive() &&
+  // The QR page ignores the user's normal (usually short) screen timeout -
+  // it should stay lit for as long as the user is looking at it, only
+  // sleeping after a flat 30 minutes of inactivity, not whatever brief
+  // timeout is configured for everyday remote use.
+  uint32_t activeSleepMs = qrPageActive ? QR_PAGE_AWAKE_TIMEOUT_MS
+                                        : (uint32_t)timeoutSeconds * 1000UL;
+  if (!activitySequenceActive && !usbSdTransferActive() && !usbStudioLinkActive() &&
       (uint32_t)(now - lastWakeMs) > activeSleepMs) {
     enterDisplaySleep();
   }
