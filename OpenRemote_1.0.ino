@@ -1,6 +1,46 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  2.95 - 2026-08-16
+    - Battery: the idle BLE connection profile is now actually requested. The
+      constants (BLE_CONN_IDLE_* , 120-150 ms interval, slave latency 3) and
+      requestBluetoothConnectionProfile() have existed for many versions, but
+      nothing ever called it with idle=true - the only call site passed false
+      on connect, and every other reference merely cleared the flag. So the
+      HID link ran permanently at the responsive profile: 15-30 ms interval,
+      latency 0, meaning the radio woke 33-66 times a second for as long as a
+      Chromecast activity was selected. The idle profile makes the worst-case
+      mandatory connection event (1 + latency) * 150 ms = 600 ms, roughly a
+      20x reduction in radio duty while the link stays fully up.
+    - Nothing disconnects, which is the point. 2.93 saved more power but was
+      reverted because dropping the link pauses Chromecast playback and the
+      deep-sleep wake that follows is a ~3 second cold boot. Here only the
+      link's cadence changes, so there is no disconnect, no pause and no cold
+      boot - and slave latency is what makes it safe for a remote: the
+      peripheral may skip connection events it has nothing to send on, but a
+      keypress still goes out at the very next event. Worst-case added input
+      latency is therefore one connection interval (<=150 ms), not the latency
+      window.
+    - Every renegotiation is queued through scheduleBluetoothConnectionProfile()
+      and applied later from loop() by serviceBluetoothConnectionProfile(),
+      never from inside a sleep or wake transition. That is deliberate: the
+      note previously sitting in leaveBleConnectedIdle() recorded that asking
+      Bluedroid to renegotiate at the instant modem sleep starts can block its
+      GAP task. Idle is requested 2.5 s after entering BLE connected idle,
+      responsive 250 ms after leaving it, and a queued request is dropped if
+      the link goes away first.
+    - bleIdleConnectionProfileRequested is no longer cleared blindly on leaving
+      idle. It now tracks what the controller was actually asked for, so a
+      redundant renegotiation is skipped rather than issued.
+    - Whether the Chromecast accepts these parameters is up to the host and is
+      NOT yet confirmed on hardware. The existing onConnParamsUpdate() callback
+      already logs the negotiated values - watch for "BLE HID: params
+      interval=... latency=... timeout=..." on serial after the screen sleeps.
+      If the host refuses, the interval will stay at its old value and this
+      change simply has no effect; it cannot break the link by being refused.
+      Supervision timeout (6 s) is comfortably above the 1.2 s minimum the
+      idle interval and latency require, so the profile is a legal request.
+
   2.94 - 2026-08-16
     - REVERTS 2.93 at the user's request after hardware testing. Releasing the
       BLE activity session did save power, but it cost two things that matter
@@ -2033,7 +2073,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "2.94"
+#define OPENREMOTE_VERSION_STRING "2.95"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -2213,6 +2253,12 @@ static const uint16_t BLE_CONN_IDLE_MIN_INTERVAL = 96;    // 120 ms.
 static const uint16_t BLE_CONN_IDLE_MAX_INTERVAL = 120;   // 150 ms.
 static const uint16_t BLE_CONN_IDLE_LATENCY = 3;
 static const uint16_t BLE_CONN_SUPERVISION_TIMEOUT = 600; // 6 seconds.
+// Both delays exist to keep esp_ble_gap_update_conn_params() away from the
+// instant a sleep or wake transition happens, which is what could block
+// Bluedroid's GAP task. The idle wait is the longer of the two because
+// nothing is waiting on it; the active wait only has to clear the wake path.
+static const uint32_t BLE_CONN_PROFILE_IDLE_DELAY_MS = 2500;
+static const uint32_t BLE_CONN_PROFILE_ACTIVE_DELAY_MS = 250;
 // Default only. The live value is backlightPwmHz below, selectable from
 // Debug > Backlight PWM. The backlight LEDs sit behind the touch sensor on
 // the shared LCD rail, so this frequency's odd harmonics can land inside the
@@ -3071,6 +3117,12 @@ esp_bd_addr_t blePeerAddress = {};
 #endif
 bool blePeerAddressValid = false;
 bool bleIdleConnectionProfileRequested = false;
+// A connection-parameter change is never issued from inside a sleep or wake
+// transition - see scheduleBluetoothConnectionProfile(). These hold the
+// pending request until loop() is back on its normal footing.
+bool bleConnProfilePending = false;
+bool bleConnProfileTargetIdle = false;
+uint32_t bleConnProfileApplyAtMs = 0;
 bool blePairingMode = false;
 unsigned long blePairingUntilMs = 0;
 volatile unsigned long bleKeepAliveUntilMs = 0;
@@ -5302,6 +5354,34 @@ void requestBluetoothConnectionProfile(bool idle) {
 #endif
 }
 
+// Queue a connection-parameter change instead of issuing it immediately.
+//
+// The idle profile is the only lever left that saves radio power without
+// dropping the HID link - which 2.93 proved is not acceptable, because the
+// disconnect pauses Chromecast playback and the deep-sleep wake that follows
+// is a ~3 second cold boot. The link stays up here; only its cadence changes.
+//
+// It is queued rather than applied on the spot because the existing note in
+// leaveBleConnectedIdle() records that asking Bluedroid to renegotiate at the
+// same instant modem sleep starts can block its GAP task. Deferring puts every
+// renegotiation in normal loop() context, clear of both transitions.
+void scheduleBluetoothConnectionProfile(bool idle, uint32_t delayMs) {
+  bleConnProfilePending = true;
+  bleConnProfileTargetIdle = idle;
+  bleConnProfileApplyAtMs = millis() + delayMs;
+}
+
+void serviceBluetoothConnectionProfile(unsigned long now) {
+  if (!bleConnProfilePending) return;
+  if ((int32_t)(now - bleConnProfileApplyAtMs) < 0) return;
+  bleConnProfilePending = false;
+  // A link that dropped or re-formed in the meantime gets its parameters from
+  // whichever path brought it up, not from a request queued for the old one.
+  if (!bleConnected || !bleServer || !blePeerAddressValid) return;
+  if (bleIdleConnectionProfileRequested == bleConnProfileTargetIdle) return;
+  requestBluetoothConnectionProfile(bleConnProfileTargetIdle);
+}
+
 const char *atvvOpcodeName(uint8_t opcode) {
   switch (opcode) {
     case ATVV_AUDIO_STOP: return "AUDIO_STOP";
@@ -5874,6 +5954,10 @@ class OpenRemoteBleServerCallbacks : public BLEServerCallbacks {
     atvvInteractionModel = ATVV_INTERACTION_ON_REQUEST;
     blePeerAddressValid = false;
     bleIdleConnectionProfileRequested = false;
+    // Drop any queued profile change with the link. Otherwise an idle request
+    // queued moments before a drop could land on the next connection - which
+    // may well be the user picking the remote back up.
+    bleConnProfilePending = false;
     atvvRxSubscribed = false;
     atvvCtlSubscribed = false;
     pendingUiRefresh = settingsView == SETTINGS_BLUETOOTH;
@@ -17622,6 +17706,13 @@ void enterBleConnectedIdle() {
                 bleIdleKeypadWake ? "on" : "off");
   Serial.flush();
 
+  // Slow the link down now that nobody is pressing anything. Slave latency is
+  // what makes this safe for a remote: the peripheral may *skip* connection
+  // events it has nothing to send on, but a keypress still goes out at the
+  // very next event, so responsiveness is bounded by the interval (<=150 ms)
+  // rather than by the latency.
+  scheduleBluetoothConnectionProfile(true, BLE_CONN_PROFILE_IDLE_DELAY_MS);
+
   // The BLE controller independently enters modem sleep between its scheduled
   // connection windows. The application uses the proven fixed 80 MHz clock.
   if (!configureApplicationPowerMode(true)) {
@@ -17646,10 +17737,13 @@ void leaveBleConnectedIdle() {
                   (unsigned long)restoreMhz);
   }
   configureLis3dhAwake();
-  // The controller retains the host-negotiated HID interval. Asking Bluedroid
-  // to renegotiate at the same instant modem sleep starts can block its GAP
-  // task; native controller PM already wakes only for scheduled radio events.
-  bleIdleConnectionProfileRequested = false;
+  // Put the responsive profile back now the user is awake and pressing things,
+  // but queue it rather than issuing it here: renegotiating at the instant a
+  // sleep transition happens can block Bluedroid's GAP task, which is the
+  // hazard the previous comment in this spot was warning about. The flag is no
+  // longer cleared blindly - it tracks what the controller was actually asked
+  // for, so serviceBluetoothConnectionProfile() can tell if a change is due.
+  scheduleBluetoothConnectionProfile(false, BLE_CONN_PROFILE_ACTIVE_DELAY_MS);
 
   // Keep both backlights hidden until wakeDisplay() reveals a complete frame.
   lcdBacklight(false);
@@ -18259,6 +18353,7 @@ void loop() {
   serviceCommandFeedback(now);
   serviceButtonTestFeedback(now);
   serviceBluetooth(now);
+  serviceBluetoothConnectionProfile(now);
   now = millis();
   serviceAtvvVoice(now);
   if (microphoneStopPending && !atvvAudioStarted) {
