@@ -1,6 +1,30 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  2.98 - 2026-08-16
+    - Scrolling now stops where the row count is *calibrated* to sit, not
+      wherever the arithmetic happens to land. 2.97 stopped the drag when the
+      last row was flush with the bottom, which put five rows on a 4-row theme
+      at S 44 - but five rows are calibrated to sit at debugRowPixels[4],
+      which the user has set to 39. Flush and calibrated are not the same
+      number and there is no reason they should be. A page scrolled to reveal
+      N rows now ends up exactly where a native N-row theme would have put
+      them, so a scrolled 4-row theme and a real 5-row theme line up.
+    - The floor is read from debugRowPixels[rows - 1], so it follows the Debug
+      menu dropdowns rather than being hard-coded - change the Row 5 value and
+      the scroll limit moves with it. Row counts are counted as the page is
+      built (notePopulatedRemoteRow), so this is the number of rows actually
+      populated, not the theme's own row count.
+    - It can only ever *add* travel, never remove it. Six rows land at S -8,
+      past every calibration entry, so no padding is added and the page still
+      scrolls as far as its content needs; row counts above 5 have no entry at
+      all and always fall back to flush. Pages that fit remain completely
+      static, as 2.96 made them.
+    - Worked examples on a 4-row theme (grid starts at 55): 5 rows overflow by
+      49px giving flush S 44, calibrated 39, so 5px of padding is added and
+      the drag ends at S 39. On a 1-row theme (grid at 208) 4 rows give flush
+      S 96 against a calibrated 93, so 3px is added and it ends at 93.
+
   2.97 - 2026-08-16
     - Scrolling a page that does overflow went 12px too far, clipping the top
       of row 1. Same root cause as 2.96 and the same 12px bottom pad: 2.96
@@ -2129,7 +2153,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "2.97"
+#define OPENREMOTE_VERSION_STRING "2.98"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -16452,6 +16476,15 @@ int activitySliderCardPixels(uint8_t thumbSize) {
   return max(44, (int)thumbSize + 6);
 }
 
+// Highest row index actually populated on the remote page being built, +1.
+// Reset by renderActivityPage()/renderDevicePage(), raised by each tile.
+// finaliseRemotePageScrolling() needs it to pick the right calibration entry.
+uint8_t remotePageRowCount = 0;
+
+void notePopulatedRemoteRow(uint8_t row) {
+  if ((int)row + 1 > (int)remotePageRowCount) remotePageRowCount = row + 1;
+}
+
 // Y of the first control row inside `content`, from the active theme's split.
 //
 // 42 is the canonical 5-row split, so this reads as "how far below the
@@ -16487,10 +16520,32 @@ int themeGridStartY() {
 void finaliseRemotePageScrolling() {
   lv_obj_set_style_pad_bottom(content, 0, 0);
   lv_obj_update_layout(content);
-  if (lv_obj_get_scroll_bottom(content) > 0) return;
-  lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_set_scrollbar_mode(content, LV_SCROLLBAR_MODE_OFF);
-  lv_obj_scroll_to_y(content, 0, LV_ANIM_OFF);
+  int overflow = lv_obj_get_scroll_bottom(content);
+  if (overflow <= 0) {
+    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(content, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_scroll_to_y(content, 0, LV_ANIM_OFF);
+    return;
+  }
+  // Stopping flush leaves the grid wherever the arithmetic happens to land -
+  // 44 for five rows on a 4-row theme, when five rows are calibrated to sit at
+  // debugRowPixels[4]. Scrolling is allowed to continue until the grid reaches
+  // the calibrated position for the number of rows actually on this page, so a
+  // page scrolled to show N rows ends up exactly where a native N-row theme
+  // would have put them. The extra travel is bought with bottom padding, which
+  // is the only thing LVGL counts beyond the children's own extent.
+  //
+  // Only ever *adds* travel: if the content needs more scroll than the
+  // calibrated position (six rows land at S -8, past every entry) the padding
+  // is zero and the page scrolls as far as its content demands. Row counts
+  // above 5 have no calibration entry and always fall back to flush.
+  if (remotePageRowCount < 1 || remotePageRowCount > 5) return;
+  int splitAtFullScroll =
+    lv_obj_get_y(content) + themeGridStartY() - overflow - 4;
+  int calibrated = (int)debugRowPixels[remotePageRowCount - 1];
+  if (splitAtFullScroll > calibrated) {
+    lv_obj_set_style_pad_bottom(content, splitAtFullScroll - calibrated, 0);
+  }
 }
 
 // Jumps straight to Settings > Wi-Fi Config from anywhere else in the app -
@@ -16743,6 +16798,7 @@ void activateMacro(uint8_t index) {
 void makeNestedActivitySlider(const Tile &tile, uint8_t targetActivityIndex,
                               ActivitySliderUi *ui) {
   uint8_t row = tile.slot / 3;
+  notePopulatedRemoteRow(row);
   int gridStart = themeGridStartY();
   int y = gridStart + row * 52;
   uint8_t thumbSize = activitySliderThumbPixels();
@@ -16858,6 +16914,7 @@ void makeTile(uint8_t slot, const char *label, const char *iconPath, bool showTe
               uint8_t boxMode, bool repeat, DeviceCommand *command, Macro *macro) {
   uint8_t col = slot % 3;
   uint8_t row = slot / 3;
+  notePopulatedRemoteRow(row);
   int x = 8 + col * 76;
   int iconPixels = constrain((int)map(buttonIconSize, 20, 64, 16, 40), 16, 40);
   int gridStart = themeGridStartY();
@@ -16910,6 +16967,7 @@ void makeTile(uint8_t slot, const char *label, const char *iconPath, bool showTe
 
 void renderActivityPage() {
   applyRuntimeTheme(activeActivity >= 0 ? activities[activeActivity].themePath : "");
+  remotePageRowCount = 0;
   configureContent(42, LCD_H - 62, true);
   lv_obj_add_flag(content, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_flag(content, LV_OBJ_FLAG_SCROLL_MOMENTUM);
@@ -16950,6 +17008,7 @@ void renderActivityPage() {
 
 void renderDevicePage() {
   applyRuntimeTheme(devices[activeDevice].themePath);
+  remotePageRowCount = 0;
   configureContent(42, LCD_H - 62, true);
   uiCommandBindingCount = 0;
   lv_obj_add_flag(content, LV_OBJ_FLAG_SCROLLABLE);
