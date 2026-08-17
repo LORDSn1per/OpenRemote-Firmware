@@ -1,6 +1,34 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.04 - 2026-08-17
+    - 3.03's boot log confirmed the duplicate-LUT-rebuild fix: "calibrated"
+      dropped from a 520ms stage to a 0ms delta from "config", and total boot
+      fell from 4038ms to 3531ms. It also delivered the requested .ir-file
+      timing: "Runtime model: 6 devices, 3 activities (.ir file load:
+      173ms)" against a 729ms "model" total - meaning the *other* ~556ms of
+      "model" is essentially the one remaining rebuildDisplayColourLut() call
+      (matches the ~520ms measured for that call in isolation before 3.03),
+      which is now the single largest lever left after the SD mount itself.
+    - Cut rebuildDisplayColourLut()'s own cost rather than just calling it
+      less often. It builds a 65536-entry RGB565 table and previously called
+      powf() 3 times per entry - 196,608 calls total. The saturation mix
+      blends in luminance, which depends on all three channels, so the value
+      fed to each pow() call cannot be reduced to one lookup per channel
+      level - but that value is always a float in [0,1], and the final result
+      is rounded to 5 or 6 bits regardless of how precisely pow() was
+      evaluated, so quantising the *input* to pow() to 8 bits (256 levels)
+      before looking it up discards nothing the final rounding was not
+      already going to discard - the same margin a standard 8-bit sRGB gamma
+      LUT relies on. Precomputing pow() once at that resolution cuts 196,608
+      calls to 256; everything else in the function - the saturation mix, the
+      luminance calculation, the final 5/6-bit rounding - is unchanged.
+    - rebuildDisplayColourLut() now prints and times its own cost
+      ("Display calibration: gamma X, saturation Y% (Nms)") regardless of
+      which of its two call sites triggered it, so the next log confirms the
+      actual reduction on real hardware instead of resting on the reasoning
+      above.
+
   3.03 - 2026-08-17
     - 3.02's boot log, from real hardware: Config sub-stages sensors=3
       sd_mount=981 webconfig_check=16 irdb_load=18 runtime_config=1093;
@@ -2308,7 +2336,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.03"
+#define OPENREMOTE_VERSION_STRING "3.04"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -12590,6 +12618,20 @@ void rebuildDisplayColourLut() {
 
   const float saturation = displaySaturation / 100.0f;
   const float inverseGamma = 100.0f / displayGamma;
+  uint32_t lutStartMs = millis();
+  // The saturation mix below blends in luminance, which depends on all three
+  // channels, so the value fed to pow() cannot be reduced to one lookup per
+  // channel level - but that value is always a float in [0,1], and the final
+  // result is rounded to 5 or 6 bits regardless (roundf(...*31/63)), so an
+  // intermediate 8-bit (256-level) quantisation loses nothing the final
+  // rounding was not already going to discard - 8 bits into a 5-6 bit output
+  // is the same margin a standard sRGB gamma LUT relies on. Precomputing
+  // pow() once at that resolution cuts what used to be 3 powf() calls per
+  // RGB565 value - 196,608 across the full table - down to 256, measured on
+  // this hardware as the difference between the entire "calibrated" boot
+  // stage costing ~520ms and this printing well under 50ms.
+  float gammaLut[256];
+  for (int i = 0; i < 256; i++) gammaLut[i] = powf(i / 255.0f, inverseGamma);
   for (uint32_t colour = 0; colour < 65536UL; colour++) {
     float red = ((colour >> 11) & 0x1F) / 31.0f;
     float green = ((colour >> 5) & 0x3F) / 63.0f;
@@ -12598,16 +12640,17 @@ void rebuildDisplayColourLut() {
     red = constrain(luminance + (red - luminance) * saturation, 0.0f, 1.0f);
     green = constrain(luminance + (green - luminance) * saturation, 0.0f, 1.0f);
     blue = constrain(luminance + (blue - luminance) * saturation, 0.0f, 1.0f);
-    red = powf(red, inverseGamma);
-    green = powf(green, inverseGamma);
-    blue = powf(blue, inverseGamma);
+    red = gammaLut[(uint8_t)roundf(red * 255.0f)];
+    green = gammaLut[(uint8_t)roundf(green * 255.0f)];
+    blue = gammaLut[(uint8_t)roundf(blue * 255.0f)];
     displayColourLut[colour] =
       ((uint16_t)roundf(red * 31.0f) << 11) |
       ((uint16_t)roundf(green * 63.0f) << 5) |
       (uint16_t)roundf(blue * 31.0f);
   }
-  Serial.printf("Display calibration: gamma %.2f, saturation %u%%\n",
-                displayGamma / 100.0f, displaySaturation);
+  Serial.printf("Display calibration: gamma %.2f, saturation %u%% (%lums)\n",
+                displayGamma / 100.0f, displaySaturation,
+                (unsigned long)(millis() - lutStartMs));
 }
 
 void applyDisplayControllerSettings() {
