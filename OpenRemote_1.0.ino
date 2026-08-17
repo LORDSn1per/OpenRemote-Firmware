@@ -1,6 +1,37 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.01 - 2026-08-17
+    - 3.00's boot log, from real hardware: config=2489 lcd_init=2659
+      ui_built=3203 first_frame=3673, setup finished at 4038ms. Taking
+      differences: config alone cost 2489ms - 61.6% of the entire boot - and
+      dwarfs every other stage (lcd_init +170ms, ui_built +544ms, first_frame
+      +470ms, Wi-Fi/NTP after that +365ms). The "config" stage was still one
+      number covering TCA8418/LIS3DH probing, the SD mount handshake, and
+      three SD-reading calls (recoverWebConfigIfIncomplete, loadIrdbMetadata,
+      loadRuntimeConfig) - structurally unrelated costs (I2C timing vs. SPI
+      mount negotiation vs. file I/O vs. JSON parsing) bundled into one figure
+      that could not say which to fix.
+    - Cross-referencing the 3.00 log's wall-clock timestamps against the code
+      already narrows it: runtime.json's own read measured 44ms (from the
+      existing SD health diagnostic), yet the gap between that diagnostic
+      finishing and the first "Display calibration" line printing (inside
+      loadRuntimeConfig(), by way of loadRuntimeModel()) was ~1170ms - by far
+      the single largest identified block in the whole boot. loadRuntimeModel
+      only walks small fixed arrays (MAX_RUNTIME_DEVICES/ACTIVITIES/THEMES are
+      12/12/24) with no further SD I/O visible in it, which makes ArduinoJson's
+      PSRAM-allocator deserialize the leading suspect - JsonDocument(&
+      psramJsonAllocator) routes every one of the many small allocations a
+      69KB document's worth of parsing makes through ps_malloc(), and PSRAM
+      access latency on this board is real, unlike internal SRAM.
+    - Added two rounds of sub-splitting so the next boot log can confirm or
+      rule that out directly instead of needing a third round of inference:
+      setup() now prints "Config sub-stages" (sensors / sd_mount /
+      webconfig_check / irdb_load / runtime_config), and loadRuntimeConfig()
+      itself now prints "Runtime config timing" (read / parse / model),
+      isolating the SD read, the deserializeJson() call, and
+      loadRuntimeModel()'s own work as three separate numbers.
+
   3.00 - 2026-08-17
     - 2.99's boot-time log gave a first real number: 4039 ms on real hardware.
       The bracketed ESP-IDF timestamp on the Wi-Fi STA log line ([3723]) showed
@@ -2201,7 +2232,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.00"
+#define OPENREMOTE_VERSION_STRING "3.01"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -8326,6 +8357,7 @@ void loadRuntimeModel(JsonDocument &doc) {
 
 bool loadRuntimeConfig() {
   if (!sdReady || !SD.exists(RUNTIME_CONFIG_PATH)) return false;
+  uint32_t readStartMs = millis();
   File file = SD.open(RUNTIME_CONFIG_PATH, FILE_READ);
   if (!file) return false;
   size_t rawSize = 0;
@@ -8335,6 +8367,7 @@ bool loadRuntimeConfig() {
     Serial.println("Runtime config read failed");
     return false;
   }
+  uint32_t parseStartMs = millis();
   JsonDocument doc(&psramJsonAllocator);
   DeserializationError error = deserializeJson(doc, raw, rawSize);
   free(raw);
@@ -8342,7 +8375,17 @@ bool loadRuntimeConfig() {
     Serial.printf("Runtime config parse failed: %s\n", error.c_str());
     return false;
   }
+  uint32_t modelStartMs = millis();
   loadRuntimeModel(doc);
+  // Splits loadRuntimeConfig() into its three real costs so a slow boot can be
+  // traced to a specific one instead of guessing between "the SD read is
+  // slow" (I/O), "ArduinoJson's PSRAM allocator is slow for a tree this size"
+  // (parse), and "loadRuntimeModel()'s own work is slow" (model), which have
+  // completely different fixes.
+  Serial.printf("Runtime config timing: read=%lums parse=%lums model=%lums\n",
+                (unsigned long)(parseStartMs - readStartMs),
+                (unsigned long)(modelStartMs - parseStartMs),
+                (unsigned long)(millis() - modelStartMs));
   return true;
 }
 
@@ -18438,12 +18481,17 @@ void setup() {
   } else {
     touchFound = i2cDevicePresent(ADDR_TOUCH);
   }
+  uint32_t sensorsStartMs = millis();
   initTca8418();
   initLIS3DH();
+  uint32_t sdMountStartMs = millis();
   sdReady = initSdStorage();
   if (sdReady) diagnoseSdCardHealth();
+  uint32_t webConfigCheckStartMs = millis();
   recoverWebConfigIfIncomplete();
+  uint32_t irdbLoadStartMs = millis();
   loadIrdbMetadata();
+  uint32_t runtimeConfigStartMs = millis();
   loadRuntimeConfig();
   // Refresh an existing bonded Android TV device immediately so newly added
   // HID commands are visible in WebConfig without first opening a BLE page.
@@ -18452,6 +18500,19 @@ void setup() {
   Serial.printf("Touch 0x38: %s\n", touchFound ? "found" : "not found");
   Serial.printf("LIS3DH 0x19: %s\n", lis3dhReady ? "ready" : "not found");
   Serial.printf("SD storage: %s\n", sdReady ? "ready" : "unavailable");
+  // Sub-splits the "config" figure in the "Boot stages" line below, which
+  // 3.00 could only report as one number. TCA8418/LIS3DH probing, the SD
+  // mount handshake and card init, and the three SD-reading calls that follow
+  // it are structurally very different costs (I2C bus timing vs. SPI mount
+  // negotiation vs. file I/O + JSON work), so bundling them hid which one a
+  // slow boot should actually be blamed on.
+  Serial.printf("Config sub-stages (ms): sensors=%lu sd_mount=%lu webconfig_check=%lu "
+                "irdb_load=%lu runtime_config=%lu\n",
+                (unsigned long)(sdMountStartMs - sensorsStartMs),
+                (unsigned long)(webConfigCheckStartMs - sdMountStartMs),
+                (unsigned long)(irdbLoadStartMs - webConfigCheckStartMs),
+                (unsigned long)(runtimeConfigStartMs - irdbLoadStartMs),
+                (unsigned long)(millis() - runtimeConfigStartMs));
   uint32_t configLoadedMs = millis();
 
   applyClockMode();
