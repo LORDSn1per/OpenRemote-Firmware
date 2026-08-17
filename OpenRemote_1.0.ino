@@ -1,6 +1,45 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.03 - 2026-08-17
+    - 3.02's boot log, from real hardware: Config sub-stages sensors=3
+      sd_mount=981 webconfig_check=16 irdb_load=18 runtime_config=1093;
+      Runtime config timing read=69 parse=289 model=728; Boot stages
+      panel_black=548 config=2664 calibrated=3184 (a 520ms jump on its own)
+      ui_built=3207 (only 23ms after calibrated) first_frame=3678.
+    - ROOT CAUSE of the 520ms "calibrated" stage: rebuildDisplayColourLut()
+      was called twice per boot with provably identical inputs. It builds a
+      65536-entry RGB565 gamma/saturation lookup table using six powf() calls
+      per entry - about 393,000 transcendental calls, once inside
+      loadRuntimeModel() (by way of applySettingsJson(doc["settings"]), which
+      it ends with unconditionally) and again explicitly in setup() right
+      after applyClockMode(), with nothing in between able to change
+      displayGamma or displaySaturation. setup()'s "calibrated" stage was
+      ensureDisplayFlushBuffers() + this call + applyDisplayControllerSettings()
+      and nothing else, which is why its cost (520ms) reads as almost entirely
+      one redundant LUT rebuild. loadRuntimeConfig()'s return value is now
+      captured, and the setup()-level call only fires when it was false (no SD
+      card, no runtime.json, or a parse failure) - the one path where the
+      config-load call never ran at all and this remains the only place the
+      LUT is ever built from the NVS-loaded values.
+    - rebuildPages(), also called from inside applySettingsJson() at boot
+      (before setupLvgl()/setupUiRoot() have even run) was investigated as a
+      second possible duplicate-work source and ruled out: it only writes a
+      few entries into a small pages[] array and calls
+      configurePageStripDirections() - no LVGL objects, trivially cheap
+      regardless of how many times it runs. It is not part of this fix.
+    - loadIrDeviceFilesIntoRuntime(), called from loadRuntimeModel() just
+      before the "model" timing bucket closes, opens and line-parses every
+      .ir file in /devices via String-based readStringUntil() - real SD I/O
+      hidden inside what looks like pure struct population, and a plausible
+      second large cost inside the 728ms "model" figure. It is NOT touched
+      here: it does correctness-critical parsing of the user's actual
+      devices, and rewriting it blind risks silently breaking a device rather
+      than just being slow. It is now timed separately and reported as
+      "Runtime model: N devices, M activities (.ir file load: Xms)" so the
+      next log says definitively whether it is worth the more careful rewrite
+      warranted for code this important.
+
   3.02 - 2026-08-17
     - The user reported seeing the panel flash black, then white for a
       noticeable while, then black again, before the real UI finally painted.
@@ -2269,7 +2308,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.02"
+#define OPENREMOTE_VERSION_STRING "3.03"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -8086,7 +8125,17 @@ void loadRuntimeModel(JsonDocument &doc) {
     theme.glassOpacity = (uint8_t)((opacityPercent * 255L) / 100L);
   }
 
+  // Reads and line-parses every .ir file in /devices via String-based
+  // readStringUntil() calls - real, per-file SD I/O buried inside what looks
+  // from the outside like pure in-memory struct population. Timed separately
+  // because it is a plausible second large cost inside the "model" figure in
+  // the "Runtime config timing" line, alongside applySettingsJson()'s
+  // rebuildDisplayColourLut() call further down - but unlike that one, this
+  // does correctness-critical parsing of the user's actual devices, so it is
+  // measured here rather than rewritten blind.
+  uint32_t irFilesStartMs = millis();
   loadIrDeviceFilesIntoRuntime();
+  uint32_t irFilesMs = millis() - irFilesStartMs;
 
   for (JsonObjectConst source : doc["devices"].as<JsonArrayConst>()) {
     if (DEVICE_COUNT >= MAX_RUNTIME_DEVICES) break;
@@ -8389,7 +8438,8 @@ void loadRuntimeModel(JsonDocument &doc) {
   applyRuntimeThemeRowCalibration();
   rebuildPages();
   requestPageStripRebuild();
-  Serial.printf("Runtime model: %u devices, %u activities\n", DEVICE_COUNT, ACTIVITY_COUNT);
+  Serial.printf("Runtime model: %u devices, %u activities (.ir file load: %lums)\n",
+                DEVICE_COUNT, ACTIVITY_COUNT, (unsigned long)irFilesMs);
 }
 
 bool loadRuntimeConfig() {
@@ -18570,7 +18620,7 @@ void setup() {
   uint32_t irdbLoadStartMs = millis();
   loadIrdbMetadata();
   uint32_t runtimeConfigStartMs = millis();
-  loadRuntimeConfig();
+  bool runtimeConfigLoaded = loadRuntimeConfig();
   // Refresh an existing bonded Android TV device immediately so newly added
   // HID commands are visible in WebConfig without first opening a BLE page.
   if (bleBonded) bleDeviceProvisionPending = true;
@@ -18596,7 +18646,17 @@ void setup() {
   applyClockMode();
 
   ensureDisplayFlushBuffers();
-  rebuildDisplayColourLut();
+  // A successful loadRuntimeConfig() already built this: loadRuntimeModel()
+  // unconditionally ends with applySettingsJson(doc["settings"]), which reads
+  // displayGamma/displaySaturation and calls rebuildDisplayColourLut() itself.
+  // Nothing between that call and this one can change either value, so
+  // calling it again here recomputed an identical 65536-entry table - roughly
+  // 393,000 powf() calls - for no reason, and measured as effectively the
+  // entire ~520ms "calibrated" stage in the 3.00-3.02 boot logs. Only build it
+  // here on the path where loadRuntimeModel() never ran at all (no SD card,
+  // no runtime.json, or a parse failure), where this is the sole place left
+  // that will ever build it from the NVS-loaded values.
+  if (!runtimeConfigLoaded) rebuildDisplayColourLut();
   applyDisplayControllerSettings();
   uint32_t calibratedMs = millis();
 
