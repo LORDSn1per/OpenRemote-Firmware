@@ -1,0 +1,13 @@
+{
+	"folders": [
+		{
+			"name": "OpenRemote_1.0 (Firmware)",
+			"path": "."
+		},
+		{
+			"name": "OpenRemote Studio",
+			"path": "../../../OpenRemote Studio"
+		}
+	],
+	"settings": {}
+}
