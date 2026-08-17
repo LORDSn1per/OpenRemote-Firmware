@@ -1,6 +1,28 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  2.99 - 2026-08-17
+    - Two small changes following a comparison against OMOTE-Community's stock
+      firmware (OpenRemote_2.0 in this repo, an earlier fork set aside as a
+      read-only reference), which boots visibly faster on the same hardware.
+      Neither of these is that gap - OMOTE's real speed comes from having no
+      SD card, no runtime.json to parse and a fixed-size compiled UI instead
+      of a config-driven one, which is the actual cost of this firmware's
+      flexibility and isn't something to chase away. But both were free wins
+      spotted along the way.
+    - Setup now logs "Setup finished in %lu ms." at the very end of setup(),
+      matching OMOTE's own line at the same point, so the two are directly
+      comparable and boot time is a measured number instead of a guess. Runs
+      after applyBluetoothState() - if the resumed activity/device needs BLE,
+      that call can itself block for a few hundred ms bringing up Bluedroid,
+      so this is "time to fully ready", not "time to visible frame" (the LCD
+      is already lit earlier, by lv_refr_now()/lcdBacklight()).
+    - The delay(500) immediately after Serial.begin() existed only so a
+      monitor attached after the fact could still catch the boot banner - pure
+      dead time on every cold boot and deep-sleep wake, no functional purpose.
+      Reduced to 10ms, enough for the CDC/UART line to settle without
+      meaningfully reintroducing the delay it existed to avoid.
+
   2.98 - 2026-08-16
     - Scrolling now stops where the row count is *calibrated* to sit, not
       wherever the arithmetic happens to land. 2.97 stopped the drag when the
@@ -2153,7 +2175,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "2.98"
+#define OPENREMOTE_VERSION_STRING "2.99"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -18323,6 +18345,7 @@ const char *wakeCauseText(esp_sleep_wakeup_cause_t cause) {
 }
 
 void setup() {
+  uint32_t bootStartMs = millis();
   esp_sleep_wakeup_cause_t bootWakeCause = esp_sleep_get_wakeup_cause();
   scheduledNtpWake = bootWakeCause == ESP_SLEEP_WAKEUP_TIMER;
   // Must precede begin() - setRxBufferSize() is a no-op once the UART driver
@@ -18336,7 +18359,11 @@ void setup() {
   Serial0.begin(USB_STUDIO_BAUD);
   Serial0.onReceiveError(usbSerialReceiveError);
 #endif
-  delay(500);
+  // Was 500ms, purely so a serial monitor attached after the fact could still
+  // catch the boot banner. That was pure dead time on every cold boot and
+  // deep-sleep wake. 10ms is enough for the CDC/UART line to settle without
+  // meaningfully reintroducing the delay it existed to avoid.
+  delay(10);
 
   Serial.println();
   Serial.printf("OpenRemote %s - Rev 5 LVGL Runtime\n", OPENREMOTE_VERSION_TEXT);
@@ -18469,6 +18496,13 @@ void setup() {
     lastWakeMs = millis() - (uint32_t)deepSleepMinutes * 60UL * 1000UL;
     enterDisplaySleep();
   }
+  // Matches OMOTE's own "Setup finished in %lu ms." line, at the same point
+  // (the very end of setup()), so the two are directly comparable. Note this
+  // is after applyBluetoothState() above - if the last activity/device needs
+  // BLE, that call can itself block for a few hundred ms bringing up
+  // Bluedroid, so this number is "time to fully ready", not "time to visible
+  // frame" (the LCD is already lit by lv_refr_now()/lcdBacklight() earlier).
+  Serial.printf("Setup finished in %lu ms.\n", (unsigned long)(millis() - bootStartMs));
 }
 
 void loop() {
