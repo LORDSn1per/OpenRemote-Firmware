@@ -1,6 +1,35 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.05 - 2026-08-17
+    - Added a "Bluetooth Sleep" switch to Settings > Debug, on both menu
+      styles. Off (the default, and the only behaviour this firmware has had
+      since 2.94) keeps 2.95's idle BLE connection profile: the link never
+      disconnects, it just requests a slower cadence once idle. On brings
+      back the 2.93 mechanism that was reverted in 2.94 - releasing the BLE
+      session once the screen has been off for the Deep Sleep interval, which
+      lets the remote reach real light/deep sleep instead of sitting in
+      modem-sleep for as long as a Chromecast activity stays selected. That
+      trade-off was judged unacceptable as a *default* in 2.94 (it pauses
+      Chromecast playback for about half a second on every disconnect, and
+      the deep-sleep wake that follows is an unavoidable ~3s cold boot - both
+      documented at length in the 2.94 entry) - but the code was correct and
+      some users may prefer the extra battery life over the reconnect cost,
+      so it returns here as an explicit opt-in rather than being deleted.
+    - Reintroduces bleActivitySessionReleased and
+      releaseBleActivitySessionForSleep() essentially unchanged from 2.93,
+      gated behind the new bluetoothSleepEnabled flag at both the trigger
+      site in loop() and inside bluetoothActivitySessionRequired() itself, so
+      every other sleep guard that already consults that function - light
+      sleep, deep sleep, BLE connected idle - is unaffected when the switch
+      is off. wakeDisplay() clears the release before applyBluetoothState()
+      runs, same as 2.93, so any button or motion brings the link straight
+      back regardless of the switch position.
+    - Persisted in NVS ("bleSleep") and runtime.json
+      ("bluetoothSleepEnabled"), and preserved across a factory reset
+      alongside the other Debug menu toggles.
+    - Not verified on hardware.
+
   3.04 - 2026-08-17
     - 3.03's boot log confirmed the duplicate-LUT-rebuild fix: "calibrated"
       dropped from a 520ms stage to a 0ms delta from "config", and total boot
@@ -2336,7 +2365,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.04"
+#define OPENREMOTE_VERSION_STRING "3.05"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -3387,6 +3416,21 @@ bool bleConnProfilePending = false;
 bool bleConnProfileTargetIdle = false;
 uint32_t bleConnProfileApplyAtMs = 0;
 bool blePairingMode = false;
+// Settings > Debug "Bluetooth Sleep". Off (default) keeps the idle
+// connection profile from requestBluetoothConnectionProfile()/2.95 - the
+// link stays connected the whole time, just quieter. On brings back the
+// 2.93 behaviour that was reverted in 2.94: release the BLE session after
+// the screen has been idle for the Deep Sleep interval so the remote can
+// reach real light/deep sleep, at the cost of a disconnect that pauses
+// Chromecast playback and a ~3s cold boot to reconnect on wake. Exposed as
+// an explicit opt-in rather than the default because that trade-off was
+// judged unacceptable as a default in 2.94 - some users may still want it.
+bool bluetoothSleepEnabled = false;
+// Set when a BLE activity has been idle long enough (with Bluetooth Sleep
+// on) that holding its link open is no longer worth the standby cost.
+// Cleared by wakeDisplay(), so any button or motion brings the link
+// straight back.
+bool bleActivitySessionReleased = false;
 unsigned long blePairingUntilMs = 0;
 volatile unsigned long bleKeepAliveUntilMs = 0;
 volatile bool bleBondStateSavePending = false;
@@ -3662,6 +3706,7 @@ void enterDisplaySleep();
 void wakeDisplay();
 void enterBleConnectedIdle();
 void leaveBleConnectedIdle();
+void releaseBleActivitySessionForSleep();
 bool configureApplicationPowerMode(bool connectedIdle);
 void neutraliseRev5DisplayBusForDeepSleep();
 void suspendBacklightPwmForSleep();
@@ -5275,6 +5320,7 @@ void loadSettings() {
     (int)preferences.getUChar("btnRate", 9),
     (int)BUTTON_REPEAT_RATE_MIN_HZ, (int)BUTTON_REPEAT_RATE_MAX_HZ);
   debugSplitEnabled = preferences.getBool("dbgSplit", false);
+  bluetoothSleepEnabled = preferences.getBool("bleSleep", false);
   debugTouchEnabled = preferences.getBool("dbgTouch", false);
   debugCpuRamEnabled = preferences.getBool("dbgCpu", false);
   debugAccelerometerEnabled = preferences.getBool("dbgAccel", false);
@@ -5389,6 +5435,7 @@ void saveSettings() {
   preferences.putUShort("btnDelay", physicalRepeatDelayMs);
   preferences.putUChar("btnRate", physicalRepeatRateHz);
   preferences.putBool("dbgSplit", debugSplitEnabled);
+  preferences.putBool("bleSleep", bluetoothSleepEnabled);
   preferences.putBool("dbgTouch", debugTouchEnabled);
   preferences.putBool("dbgCpu", debugCpuRamEnabled);
   preferences.putBool("dbgAccel", debugAccelerometerEnabled);
@@ -6289,6 +6336,11 @@ bool runtimeDeviceNeedsBluetooth(uint8_t index) {
 }
 
 bool bluetoothActivitySessionRequired() {
+  // A released session is treated as "no BLE activity" so every existing
+  // sleep guard that consults this - light sleep, deep sleep, BLE connected
+  // idle - stops being vetoed at once, rather than each having to learn
+  // about the release separately. Only reachable with Bluetooth Sleep on.
+  if (bleActivitySessionReleased) return false;
   if (activeDevice >= 0 && runtimeDeviceNeedsBluetooth((uint8_t)activeDevice)) {
     return true;
   }
@@ -6968,6 +7020,7 @@ void applySettingsJson(JsonVariantConst settings) {
     (int)(settings["physicalRepeatRateHz"] | physicalRepeatRateHz),
     (int)BUTTON_REPEAT_RATE_MIN_HZ, (int)BUTTON_REPEAT_RATE_MAX_HZ);
   debugSplitEnabled = settings["debugSplit"] | debugSplitEnabled;
+  bluetoothSleepEnabled = settings["bluetoothSleepEnabled"] | bluetoothSleepEnabled;
   debugTouchEnabled = settings["debugTouch"] | debugTouchEnabled;
   debugCpuRamEnabled = settings["debugCpuRam"] | debugCpuRamEnabled;
   debugAccelerometerEnabled =
@@ -8568,6 +8621,7 @@ bool persistSettingsToRuntimeConfig() {
   settings["physicalRepeatDelayMs"] = physicalRepeatDelayMs;
   settings["physicalRepeatRateHz"] = physicalRepeatRateHz;
   settings["debugSplit"] = debugSplitEnabled;
+  settings["bluetoothSleepEnabled"] = bluetoothSleepEnabled;
   settings["debugTouch"] = debugTouchEnabled;
   settings["debugCpuRam"] = debugCpuRamEnabled;
   settings["debugAccelerometer"] = debugAccelerometerEnabled;
@@ -11399,6 +11453,7 @@ bool performFactoryReset() {
   uint32_t savedBacklightPwmHz = preferences.getULong("blPwmHz", BACKLIGHT_PWM_HZ);
   uint8_t savedMenuStyle = preferences.getUChar("menuStyle", 0);
   bool savedDbgSplit = preferences.getBool("dbgSplit", false);
+  bool savedBleSleep = preferences.getBool("bleSleep", false);
   bool savedDbgTouch = preferences.getBool("dbgTouch", false);
   bool savedDbgCpu = preferences.getBool("dbgCpu", false);
   bool savedDbgAccel = preferences.getBool("dbgAccel", false);
@@ -11413,6 +11468,7 @@ bool performFactoryReset() {
   preferences.putULong("blPwmHz", savedBacklightPwmHz);
   preferences.putUChar("menuStyle", savedMenuStyle);
   preferences.putBool("dbgSplit", savedDbgSplit);
+  preferences.putBool("bleSleep", savedBleSleep);
   preferences.putBool("dbgTouch", savedDbgTouch);
   preferences.putBool("dbgCpu", savedDbgCpu);
   preferences.putBool("dbgAccel", savedDbgAccel);
@@ -16087,6 +16143,11 @@ void renderDebugPageOmote() {
   makeOmoteRow(accelCard, "Accelerometer", "Live X,Y,Z tilt samples", 0, rowH, &debugAccelerometerEnabled);
   y += rowH + 12;
 
+  lv_obj_t *bleSleepCard = makeOmoteCard(content, y, rowH);
+  makeOmoteRow(bleSleepCard, "Bluetooth Sleep", "On disconnects BLE - may pause casting",
+              0, rowH, &bluetoothSleepEnabled);
+  y += rowH + 12;
+
   lv_obj_t *rowsLabel = makeLabel(content, "Saved row positions", 8, y, &lv_font_montserrat_12, textPrimary());
   lv_obj_set_style_text_opa(rowsLabel, LV_OPA_60, 0);
   y += 22;
@@ -16228,11 +16289,13 @@ void renderDebugPage() {
   makeSettingRow("Accelerometer", "Live X,Y,Z tilt samples", 452,
                  &debugAccelerometerEnabled);
   makeSettingRow("FPS", "Display frames per second", 502, &debugFpsEnabled);
-  makeMicrophoneSourceRow(552);
+  makeSettingRow("Bluetooth Sleep", "On disconnects BLE - may pause casting", 552,
+                 &bluetoothSleepEnabled);
+  makeMicrophoneSourceRow(602);
 
-  makeLabel(content, "Display driver (reboot required)", 10, 604,
+  makeLabel(content, "Display driver (reboot required)", 10, 654,
             &lv_font_montserrat_12, lvRgb(170, 178, 190));
-  int driverSectionY = 626;
+  int driverSectionY = 676;
   makeDisplayDriverRow(driverSectionY);
   driverSectionY += 50;
   if (displayDriverChoice == 0) {
@@ -18132,6 +18195,28 @@ void leaveBleConnectedIdle() {
                 (unsigned long)getCpuFrequencyMhz());
 }
 
+// Give up a BLE activity's link once the remote has been sitting idle with
+// the screen off for the user's Deep Sleep interval. Only reachable when
+// Settings > Debug "Bluetooth Sleep" is on - see the flag's own comment for
+// why this exists as an opt-in rather than the default.
+//
+// The link is dropped rather than the sleep skipped. The remote is bonded,
+// so wakeDisplay() clears the flag and applyBluetoothState() reconnects; the
+// cost is a reconnect delay on the first keypress after a long idle, which
+// is why this is tied to the Deep Sleep slider the user already controls
+// instead of being a fixed timeout. Raise Deep Sleep to hold the link
+// longer.
+void releaseBleActivitySessionForSleep() {
+  if (bleActivitySessionReleased) return;
+  bleActivitySessionReleased = true;
+  leaveBleConnectedIdle();
+  // bluetoothActivitySessionRequired() now reports false, so this tears the
+  // radio down instead of leaving it advertising or connected.
+  applyBluetoothState();
+  Serial.printf("BLE activity session released after %u min idle; normal sleep resumes\n",
+                (unsigned)deepSleepMinutes);
+}
+
 void enterLowPowerWait() {
   if (!displaySleeping || webConfigQrPageActive() || webConfigTransferActive ||
       usbSdTransferActive() || usbStudioLinkActive() || ntpSyncPending || wifiConnectPending ||
@@ -18290,6 +18375,11 @@ void enterDisplaySleep() {
 
 void wakeDisplay() {
   Serial.println("Movement wake");
+  // Clear this before applyBluetoothState() runs later in this function -
+  // with it still set, bluetoothActivitySessionRequired() would keep
+  // reporting false and the link the user is about to need would not come
+  // back. No-op unless Bluetooth Sleep is on and a session was released.
+  bleActivitySessionReleased = false;
   // Restore full application speed before touching the LCD bus or beginning
   // an IR command from the physical key that caused this wake.
   leaveBleConnectedIdle();
@@ -18918,6 +19008,21 @@ void loop() {
   }
 
   if (displaySleeping) {
+    // Settings > Debug "Bluetooth Sleep": once the screen has been off for
+    // the Deep Sleep interval, stop letting a selected BLE activity hold the
+    // remote out of sleep. Off by default - see bluetoothSleepEnabled's own
+    // comment. Pairing and an in-flight voice capture are real work and are
+    // left alone.
+    if (bluetoothSleepEnabled && !bleActivitySessionReleased &&
+        displaySleepStartedMs && !blePairingMode && !atvvAudioStarted &&
+        !webConfigQrPageActive() && !webConfigTransferActive &&
+        !usbSdTransferActive() && !usbStudioLinkActive() && !ntpSyncPending &&
+        !wifiConnectPending && bluetoothActivitySessionRequired() &&
+        (uint32_t)(now - displaySleepStartedMs) >=
+          (uint32_t)deepSleepMinutes * 60UL * 1000UL) {
+      releaseBleActivitySessionForSleep();
+      now = millis();
+    }
     bool connectedActivityIdle = !webConfigQrPageActive() &&
       !webConfigTransferActive && !usbSdTransferActive() && !usbStudioLinkActive() &&
       !ntpSyncPending && !wifiConnectPending &&
