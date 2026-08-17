@@ -1,6 +1,43 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.02 - 2026-08-17
+    - The user reported seeing the panel flash black, then white for a
+      noticeable while, then black again, before the real UI finally painted.
+      The existing code already tries to hide this: the backlight is held off
+      by lcdPowerOn()/initBacklightPwm() until lcdBacklight(true) runs at the
+      very end of setup(), with a comment on that line reading "The LCD
+      controller may power up white. Keep its backlight off until LVGL has
+      restored and flushed the real first frame." That the user is seeing
+      white at all is direct evidence that guard is not fully effective on
+      this hardware, whatever the exact electrical reason (backlight gating,
+      light bleed, or the ILI9341's own reset behaviour) - the fix does not
+      need to know which, only to shrink the window during which it matters.
+    - The panel driver bring-up (agfx->begin()/tft.init() plus the immediate
+      fillScreen(black)) previously ran after the entire SD-card-and-
+      runtime.json load - the single most expensive stage measured in 3.00/
+      3.01, at ~2.5 of ~4 seconds. That placement was never load-bearing:
+      every setting it reads (displayDriverChoice, lcdFreqHz, lcdBufferMode,
+      lcdDriveStrength, touchDriverChoice) comes from NVS via loadSettings(),
+      which already runs at the very top of setup(), not from runtime.json.
+      The panel bring-up now runs immediately after lcdPowerOn()/
+      initBacklightPwm(), before IR, I2C, SD or config work of any kind, so
+      the panel is solid black within tens of milliseconds of power-on instead
+      of ~2.5 seconds later - whatever was visible during that wait before,
+      it no longer has time to be.
+    - This does not change the calibration or the theme, and does not make
+      the real UI appear any sooner - that is still gated by the same config
+      load and LVGL build this session's diagnostics are actively narrowing.
+      rebuildDisplayColourLut()/applyDisplayControllerSettings() still run
+      after runtime.json loads, exactly as before, and still calibrate the
+      *next* frame LVGL draws - moving only the raw fillScreen(0x0000) earlier
+      is safe regardless, since black is black under any gamma curve.
+    - Boot stage naming changed to match: "lcd_init" is replaced by a new,
+      much earlier "panel_black" checkpoint (right after the panel goes black)
+      and a new "calibrated" checkpoint (after runtime.json's theme settings
+      are applied to the controller, where "lcd_init" used to be measured).
+      "config", "ui_built" and "first_frame" are unchanged in meaning.
+
   3.01 - 2026-08-17
     - 3.00's boot log, from real hardware: config=2489 lcd_init=2659
       ui_built=3203 first_frame=3673, setup finished at 4038ms. Taking
@@ -2232,7 +2269,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.01"
+#define OPENREMOTE_VERSION_STRING "3.02"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -18463,6 +18500,47 @@ void setup() {
   }
   lcdPowerOn();
   initBacklightPwm();
+  // Bring the panel up and fill it solid black before anything else in
+  // setup() runs, not after the SD card and runtime.json have loaded. Every
+  // display setting used here (displayDriverChoice, lcdFreqHz, lcdBufferMode,
+  // lcdDriveStrength, touchDriverChoice) already comes from NVS via
+  // loadSettings() above, not from runtime.json, so nothing later in setup()
+  // needs to run first. The backlight is still held off by lcdPowerOn()/
+  // initBacklightPwm() until lcdBacklight(true) near the end of this
+  // function, same as before - moving this earlier does not change when the
+  // panel becomes visible, only how long it sits fully powered with
+  // undefined GRAM content and (on hardware where the backlight isn't
+  // perfectly gated) a chance of showing it. A raw fillScreen(0x0000) is
+  // black under any gamma curve, so doing this before rebuildDisplayColourLut()
+  // has applied the real theme's calibration (still done later, unchanged)
+  // cannot show the wrong colour - black has no colour to get wrong.
+  if (displayDriverChoice == 1) {
+    if (!agfx->begin()) {
+      Serial.println("LCD init failed (Arduino_GFX)");
+    } else {
+      lcdControllerReady = true;
+    }
+    agfx->fillScreen(0x0000);
+  } else {
+    tft.setBusFrequency(lcdFreqHz);
+    tft.attachLgfxTouch(touchDriverChoice == 1);
+    tft.init();
+    applyLcdDriveStrength();
+    tft.initDMA();
+    tft.setSwapBytes(true);
+    tft.fillScreen(TFT_BLACK);
+    lcdControllerReady = true;
+  }
+  Serial.printf("LCD driver: %s%s\n",
+                displayDriverChoice == 1 ? "Arduino_GFX (synchronous)" : "LovyanGFX (DMA)",
+                displayDriverChoice == 1 ? "" :
+                  (String(", ") + String(lcdFreqHz / 1000000UL) + "MHz, " +
+                   (lcdBufferMode ? "double buffer" : "single buffer") +
+                   ", drive=" + String(lcdDriveStrength)).c_str());
+  Serial.printf("Touch driver: %s\n",
+                (touchDriverChoice == 1 && displayDriverChoice == 0)
+                  ? "FT5x06 (LovyanGFX, no Wire)" : "Adafruit (Wire)");
+  uint32_t panelBlackMs = millis();
   IrSender.begin();
   IrReceiver.begin(PIN_IR_RX, DISABLE_LED_FEEDBACK);
   IrReceiver.stop();
@@ -18517,36 +18595,10 @@ void setup() {
 
   applyClockMode();
 
-  if (displayDriverChoice == 1) {
-    if (!agfx->begin()) {
-      Serial.println("LCD init failed (Arduino_GFX)");
-    } else {
-      lcdControllerReady = true;
-    }
-    agfx->fillScreen(0x0000);
-  } else {
-    tft.setBusFrequency(lcdFreqHz);
-    tft.attachLgfxTouch(touchDriverChoice == 1);
-    tft.init();
-    applyLcdDriveStrength();
-    tft.initDMA();
-    tft.setSwapBytes(true);
-    tft.fillScreen(TFT_BLACK);
-    lcdControllerReady = true;
-  }
-  Serial.printf("LCD driver: %s%s\n",
-                displayDriverChoice == 1 ? "Arduino_GFX (synchronous)" : "LovyanGFX (DMA)",
-                displayDriverChoice == 1 ? "" :
-                  (String(", ") + String(lcdFreqHz / 1000000UL) + "MHz, " +
-                   (lcdBufferMode ? "double buffer" : "single buffer") +
-                   ", drive=" + String(lcdDriveStrength)).c_str());
-  Serial.printf("Touch driver: %s\n",
-                (touchDriverChoice == 1 && displayDriverChoice == 0)
-                  ? "FT5x06 (LovyanGFX, no Wire)" : "Adafruit (Wire)");
-  uint32_t lcdInitMs = millis();
   ensureDisplayFlushBuffers();
   rebuildDisplayColourLut();
   applyDisplayControllerSettings();
+  uint32_t calibratedMs = millis();
 
   setupLvgl();
   setupUiRoot();
@@ -18564,15 +18616,19 @@ void setup() {
   // physical hold, displaying it requires no heap allocation or object tree
   // construction in Chromecast's time-sensitive MIC_OPEN handshake window.
   createPhysicalVoiceOverlay();
-  // The LCD controller may power up white. Keep its backlight off until LVGL
-  // has restored and flushed the real first frame after cold or deep sleep.
+  // The LCD controller may power up white, which is why the panel is now
+  // brought up and filled black at the very start of setup() (see the
+  // panelBlackMs comment above) rather than here. The backlight itself is
+  // still kept off until LVGL has flushed the real first frame after cold or
+  // deep sleep - that part is unchanged.
   lv_refr_now(nullptr);
   uint32_t firstFrameMs = millis();
   if (!scheduledNtpWake) lcdBacklight(true);
-  Serial.printf("Boot stages (ms from start): config=%lu lcd_init=%lu ui_built=%lu "
-                "first_frame=%lu\n",
+  Serial.printf("Boot stages (ms from start): panel_black=%lu config=%lu calibrated=%lu "
+                "ui_built=%lu first_frame=%lu\n",
+                (unsigned long)(panelBlackMs - bootStartMs),
                 (unsigned long)(configLoadedMs - bootStartMs),
-                (unsigned long)(lcdInitMs - bootStartMs),
+                (unsigned long)(calibratedMs - bootStartMs),
                 (unsigned long)(uiBuiltMs - bootStartMs),
                 (unsigned long)(firstFrameMs - bootStartMs));
   // Deferred past the first rendered frame: BLEDevice::init() is a
