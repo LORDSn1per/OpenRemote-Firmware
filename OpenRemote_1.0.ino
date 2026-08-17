@@ -1,6 +1,32 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.00 - 2026-08-17
+    - 2.99's boot-time log gave a first real number: 4039 ms on real hardware.
+      The bracketed ESP-IDF timestamp on the Wi-Fi STA log line ([3723]) showed
+      Wi-Fi hadn't even started until 3.7 of those 4.0 seconds had already
+      elapsed - and Wi-Fi/NTP only begin after lv_refr_now()+lcdBacklight(true)
+      in this function, so the screen is already lit before that point. Wi-Fi
+      is not the bottleneck; something in SD/config load, LCD/touch init, or
+      LVGL page construction is, and the single end-of-setup total can't say
+      which. Rather than guess further, this adds four checkpoints so the next
+      boot log localizes it directly instead of needing another round of
+      inference from a single number:
+        config=...     NVS + SD mount + runtime.json load, ends where the
+                       "SD storage: ready" line already was
+        lcd_init=...   + display driver begin()/fillScreen() and touch driver
+                       selection
+        ui_built=...   + colour LUT, display controller settings, setupLvgl(),
+                       setupUiRoot(), rebuildPages() (the config-sized part -
+                       this is the stage most likely to explain the gap, since
+                       it scales with device/activity/icon count and none of
+                       the others do)
+        first_frame=... + renderAllPageSlots(), the physical voice overlay,
+                       and the actual lv_refr_now() flush - this is closest to
+                       true "time to visible screen"
+      All four are cumulative from bootStartMs, printed on one line, so each
+      stage's own cost is the difference between consecutive numbers.
+
   2.99 - 2026-08-17
     - Two small changes following a comparison against OMOTE-Community's stock
       firmware (OpenRemote_2.0 in this repo, an earlier fork set aside as a
@@ -2175,7 +2201,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "2.99"
+#define OPENREMOTE_VERSION_STRING "3.00"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -18426,6 +18452,7 @@ void setup() {
   Serial.printf("Touch 0x38: %s\n", touchFound ? "found" : "not found");
   Serial.printf("LIS3DH 0x19: %s\n", lis3dhReady ? "ready" : "not found");
   Serial.printf("SD storage: %s\n", sdReady ? "ready" : "unavailable");
+  uint32_t configLoadedMs = millis();
 
   applyClockMode();
 
@@ -18455,6 +18482,7 @@ void setup() {
   Serial.printf("Touch driver: %s\n",
                 (touchDriverChoice == 1 && displayDriverChoice == 0)
                   ? "FT5x06 (LovyanGFX, no Wire)" : "Adafruit (Wire)");
+  uint32_t lcdInitMs = millis();
   ensureDisplayFlushBuffers();
   rebuildDisplayColourLut();
   applyDisplayControllerSettings();
@@ -18469,6 +18497,7 @@ void setup() {
   lastTickMs = millis();
   nextStatusRefreshMs = millis() + STATUS_REFRESH_MS;
   nextBatteryHistoryCheckMs = millis() + 1000UL;
+  uint32_t uiBuiltMs = millis();
   renderAllPageSlots();
   // Allocate the Voice Search overlay before any BLE interaction. During a
   // physical hold, displaying it requires no heap allocation or object tree
@@ -18477,7 +18506,14 @@ void setup() {
   // The LCD controller may power up white. Keep its backlight off until LVGL
   // has restored and flushed the real first frame after cold or deep sleep.
   lv_refr_now(nullptr);
+  uint32_t firstFrameMs = millis();
   if (!scheduledNtpWake) lcdBacklight(true);
+  Serial.printf("Boot stages (ms from start): config=%lu lcd_init=%lu ui_built=%lu "
+                "first_frame=%lu\n",
+                (unsigned long)(configLoadedMs - bootStartMs),
+                (unsigned long)(lcdInitMs - bootStartMs),
+                (unsigned long)(uiBuiltMs - bootStartMs),
+                (unsigned long)(firstFrameMs - bootStartMs));
   // Deferred past the first rendered frame: BLEDevice::init() is a
   // synchronous, blocking Bluedroid stack bring-up (commonly a few hundred
   // ms) that previously ran before the LCD panel was even initialized,
