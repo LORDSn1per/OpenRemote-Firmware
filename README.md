@@ -44,6 +44,14 @@ actually matter:**
 Your remote never phones home, because there's no home to phone. Everything —
 your devices, your activities, your layouts — lives on the SD card in your hand.
 
+<p align="center">
+  <img src="images/openremote-demo.gif" alt="OpenRemote in use — swiping between activities on the remote" width="270">
+</p>
+
+<p align="center">
+  <sub><em>Slide to activate — activities on the real hardware.</em></sub>
+</p>
+
 ---
 
 ## No programming required. Ever.
