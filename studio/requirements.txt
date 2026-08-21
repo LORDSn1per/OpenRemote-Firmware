@@ -1,0 +1,34 @@
+# OpenRemote Studio - Python dependencies
+#
+# Third-party packages are not committed to this repo (only source is
+# tracked here - see the repo README). Install these into a "vendor"
+# folder next to openremote_studio.py before running it, matching how the
+# PyInstaller builds are produced:
+#
+#   pip install --target vendor esptool pyserial certifi pywebview
+#
+# On macOS, pywebview also needs the PyObjC bridge for its native
+# WKWebView backend:
+#
+#   pip install --target vendor pyobjc-core pyobjc-framework-Cocoa \
+#     pyobjc-framework-WebKit pyobjc-framework-Quartz \
+#     pyobjc-framework-security pyobjc-framework-UniformTypeIdentifiers
+#
+# On Windows, pywebview's WebView2 backend needs pythonnet (untested in
+# this project so far - no Windows machine has been available to verify
+# it end-to-end; the app falls back to opening a plain browser tab if the
+# native window backend fails to start for any reason):
+#
+#   pip install --target vendor pythonnet
+
+esptool
+pyserial
+certifi
+pywebview
+pyobjc-core; sys_platform == "darwin"
+pyobjc-framework-Cocoa; sys_platform == "darwin"
+pyobjc-framework-WebKit; sys_platform == "darwin"
+pyobjc-framework-Quartz; sys_platform == "darwin"
+pyobjc-framework-security; sys_platform == "darwin"
+pyobjc-framework-UniformTypeIdentifiers; sys_platform == "darwin"
+pythonnet; sys_platform == "win32"
