@@ -1,6 +1,66 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.07 - 2026-08-22
+    - Added ESP-NOW as a new command transport, spelled "ESP-NOW" throughout
+      (Espressif's own spelling) rather than "Espnow"/"ESPNow"/"Esp-Now" -
+      user-visible strings, function names and settings keys all follow it.
+      Lets a command be sent to a paired ESP-NOW peer (a future IR/433MHz
+      "blaster dock", not built yet - deliberately out of scope this round)
+      instead of, or as well as, the remote's own IR LED, without needing
+      the two devices to share a Wi-Fi network beyond both being STA-joined
+      to the same AP for channel agreement (Espressif's own coexistence
+      table rates ESP-NOW TX as stable alongside a connected BLE link in
+      every state; RX is only rated stable in STA mode, which is why
+      pairing/discovery - the only time this firmware listens - requires
+      Wi-Fi STA already being up, same as sending does).
+    - New DeviceCommand::Kind::ESPNOW, dispatched from sendDeviceCommand()
+      alongside the existing PARSED/RAW/BLE_HID/HOMEBRIDGE branches. The
+      envelope (buildEspNowPayload()) reuses whatever the command already
+      resolved to - protocol/address/command for PARSED, rawTimings/
+      frequencyKhz for RAW - so Pronto, Global Cache, learned and raw codes
+      all reach a peer exactly as they'd reach the local IR LED, with no
+      second decode path. Classic ESP-NOW's 250-byte payload cap means a
+      long raw-timing capture can be too big for one packet; rather than
+      silently truncating it (the exact failure class fixed in 3.06's
+      Global Cache bug), buildEspNowPayload() refuses to send and logs
+      the timing count and byte size so the failure is visible.
+    - Peers are TX-only in normal use. The recv callback is only armed
+      during an explicit, user-initiated pairing window
+      (espNowScanActive), which is what a dock is expected to answer with
+      a broadcast announce packet (EspNowAnnouncePacket, magic-tagged so
+      random 2.4GHz noise can't be mistaken for one). Outside that window
+      incoming ESP-NOW frames are ignored entirely.
+    - Paired devices (MAC + friendly name, up to MAX_ESPNOW_DEVICES) and
+      the espNowEnabled switch live inside settings{} in runtime.json -
+      "espNowDevices" as an array, "espNowEnabled" as a bool - so they
+      round-trip through applySettingsJson()/persistSettingsToRuntimeConfig()
+      the same way every other setting does, and are therefore already
+      included in every backup/restore and the USB recovery path with no
+      separate mechanism needed, per feature request.
+    - Radio lifecycle (startEspNow()/stopEspNow()) is gated behind
+      networkStackActive && !setupApActive, so ESP-NOW is unconditionally
+      off while the QR setup page or WebConfig's AP is being served - it
+      never competes with that radio state, per explicit instruction.
+    - New HTTP API for WebConfig: GET/POST/DELETE /api/espnow/devices to
+      list, manually add (name+MAC) and remove a paired device, and POST
+      /api/espnow/scan/start, GET .../scan/status, POST .../scan/cancel for
+      a 20s pairing window, mirroring the existing async start/status/cancel
+      shape already used by /api/ir/learn/*.
+    - New on-device flow: a "Search for devices" button inside a new
+      "ESP-NOW Devices" screen (opened from Settings > Debug, mirroring
+      showDevicePicker()'s modal/list construction) runs the same scan
+      state machine directly rather than through HTTP, listing discovered
+      candidates as tappable rows to add, and existing paired devices as
+      rows with a delete button each.
+    - Command authoring (which paired device a given command targets, and
+      IR vs 433MHz transport) is a WebConfig-side change tracked in that
+      changelog, not this one - this entry only covers what the remote
+      itself needed to receive and act on an ESP-NOW-kind command.
+    - Not verified on hardware - no dock firmware exists yet (explicitly
+      out of scope this round), so nothing has answered a real pairing
+      broadcast or received a real command packet. Builds clean.
+
   3.06 - 2026-08-21
     - Added Pronto Hex IR code support: a new "pronto" command type,
       decoded by loadProntoTimings() - a sibling to the existing
@@ -2397,7 +2457,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.06"
+#define OPENREMOTE_VERSION_STRING "3.07"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -2429,6 +2489,7 @@ static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
 #include <SPI.h>
 #include <SD.h>
 #include <WiFi.h>
+#include <esp_now.h>
 #include <HTTPClient.h>
 #include <WebServer.h>
 #include <DNSServer.h>
@@ -2954,8 +3015,15 @@ struct DeviceCommand {
   uint8_t boxMode;
   bool showText;
   bool repeatDefault;
-  enum Kind : uint8_t { NONE, PARSED, RAW, BLE_HID, HOMEBRIDGE } kind;
+  uint8_t espNowDeviceIndex;
+  uint8_t espNowTransport;
+  enum Kind : uint8_t { NONE, PARSED, RAW, BLE_HID, HOMEBRIDGE, ESPNOW } kind;
 };
+
+// ESP-NOW transport values for DeviceCommand::espNowTransport - what the
+// paired peer is expected to do with the payload once it arrives.
+static const uint8_t ESPNOW_TRANSPORT_IR = 0;
+static const uint8_t ESPNOW_TRANSPORT_RF433 = 1;
 
 struct PhysicalBinding {
   uint8_t deviceIndex;
@@ -3464,6 +3532,42 @@ bool bluetoothSleepEnabled = false;
 // straight back.
 bool bleActivitySessionReleased = false;
 unsigned long blePairingUntilMs = 0;
+
+// ---------------------------------------------------------------------------
+// ESP-NOW paired devices (blaster docks) - see 3.07 changelog entry.
+// ---------------------------------------------------------------------------
+static const uint8_t MAX_ESPNOW_DEVICES = 8;
+static const uint32_t ESPNOW_ANNOUNCE_MAGIC = 0x4F52454EUL;  // "OREN"
+static const uint32_t ESPNOW_SCAN_TIMEOUT_MS = 20000UL;
+static const size_t ESPNOW_MAX_PAYLOAD_BYTES = 250;
+
+struct EspNowPairedDevice {
+  uint8_t mac[6];
+  char name[24];
+};
+
+struct EspNowCandidate {
+  uint8_t mac[6];
+  char name[24];
+};
+
+// Wire format broadcast by a dock in pairing mode - magic-tagged so stray
+// 2.4GHz traffic during the scan window can't be mistaken for a real dock.
+struct __attribute__((packed)) EspNowAnnouncePacket {
+  uint32_t magic;
+  char name[24];
+};
+
+bool espNowEnabled = false;
+bool espNowRadioActive = false;
+EspNowPairedDevice espNowDevices[MAX_ESPNOW_DEVICES];
+uint8_t espNowDeviceCount = 0;
+
+bool espNowScanActive = false;
+unsigned long espNowScanStartedMs = 0;
+EspNowCandidate espNowCandidates[MAX_ESPNOW_DEVICES];
+uint8_t espNowCandidateCount = 0;
+bool espNowDevicesModalDirty = false;
 volatile unsigned long bleKeepAliveUntilMs = 0;
 volatile bool bleBondStateSavePending = false;
 volatile bool bleDeviceProvisionPending = false;
@@ -3558,6 +3662,7 @@ lv_obj_t *splitDiagnosticAnchor = nullptr;
 int16_t splitDiagnosticAnchorY = INT16_MAX;
 int16_t splitDiagnosticLastY = INT16_MIN;
 lv_obj_t *deviceModal = nullptr;
+lv_obj_t *espNowDevicesModal = nullptr;
 lv_obj_t *brightnessOverlay = nullptr;
 lv_obj_t *physicalVoiceOverlay = nullptr;
 lv_obj_t *physicalVoicePulse = nullptr;
@@ -3759,6 +3864,22 @@ void applyClockMode();
 void startNetworkStack();
 void stopNetworkStack();
 void parkNetworkStackForBle();
+String formatMacAddress(const uint8_t mac[6]);
+bool parseMacAddress(const char *text, uint8_t mac[6]);
+int findEspNowDeviceIndexByMac(const uint8_t mac[6]);
+int findEspNowCandidateIndexByMac(const uint8_t mac[6]);
+void espNowRegisterAllPeers();
+void startEspNow();
+void stopEspNow();
+void serviceEspNow(unsigned long now);
+bool startEspNowScan();
+void cancelEspNowScan();
+bool addEspNowDevice(const uint8_t mac[6], const char *name);
+bool removeEspNowDevice(const uint8_t mac[6]);
+bool sendEspNowCommand(const DeviceCommand &command);
+void showEspNowDevicesModal();
+void toggleEspNowDevicesModal(lv_event_t *e);
+void serviceEspNowDevicesModal(unsigned long now);
 void startSetupAccessPoint();
 void stopSetupAccessPoint(bool resumeStation = true);
 void configureWebServer();
@@ -6762,6 +6883,8 @@ String buildStatusJson() {
   doc["bluetoothPaired"] = (bool)bleBonded;
   doc["bluetoothPairing"] = blePairingMode;
   doc["bluetoothName"] = BLE_HID_NAME;
+  doc["espNowEnabled"] = espNowEnabled;
+  doc["espNowDeviceCount"] = espNowDeviceCount;
   doc["clockEnabled"] = clockEnabled;
   doc["clockUseInternetTime"] = clockUseInternetTime;
   doc["clockCity"] = clockCityName;
@@ -7053,6 +7176,21 @@ void applySettingsJson(JsonVariantConst settings) {
     (int)BUTTON_REPEAT_RATE_MIN_HZ, (int)BUTTON_REPEAT_RATE_MAX_HZ);
   debugSplitEnabled = settings["debugSplit"] | debugSplitEnabled;
   bluetoothSleepEnabled = settings["bluetoothSleepEnabled"] | bluetoothSleepEnabled;
+  espNowEnabled = settings["espNowEnabled"] | espNowEnabled;
+  JsonArrayConst espNowDevicesIn = settings["espNowDevices"].as<JsonArrayConst>();
+  if (!espNowDevicesIn.isNull()) {
+    espNowDeviceCount = 0;
+    for (JsonObjectConst entry : espNowDevicesIn) {
+      if (espNowDeviceCount >= MAX_ESPNOW_DEVICES) break;
+      uint8_t mac[6];
+      if (!parseMacAddress(entry["mac"] | "", mac)) continue;
+      EspNowPairedDevice &device = espNowDevices[espNowDeviceCount++];
+      memcpy(device.mac, mac, 6);
+      strlcpy(device.name, entry["name"] | "ESP-NOW Device", sizeof(device.name));
+    }
+    if (espNowRadioActive) espNowRegisterAllPeers();
+    espNowDevicesModalDirty = true;
+  }
   debugTouchEnabled = settings["debugTouch"] | debugTouchEnabled;
   debugCpuRamEnabled = settings["debugCpuRam"] | debugCpuRamEnabled;
   debugAccelerometerEnabled =
@@ -8100,6 +8238,10 @@ bool transmitIrCommand(const DeviceCommand &command) {
     }
     return false;
   }
+  if (command.kind == DeviceCommand::ESPNOW) {
+    flashCommandFeedback();
+    return sendEspNowCommand(command);
+  }
   if (command.kind == DeviceCommand::RAW && command.rawTimings && command.rawCount) {
     flashCommandFeedback();
     IrSender.sendRaw(command.rawTimings, command.rawCount,
@@ -8404,6 +8546,27 @@ void loadRuntimeModel(JsonDocument &doc) {
         // nor Studio needs its own copy of this decode logic.
         if (loadProntoTimings(runtimeCommand, ir["data"] | "")) {
           runtimeCommand.kind = DeviceCommand::RAW;
+        }
+      }
+      // ESP-NOW is a routing overlay, not a fourth ir.type: the command's
+      // underlying encoding above (raw/parsed/pronto) is left completely
+      // unchanged and is exactly what buildEspNowPayload() sends - only
+      // where the command goes changes. A command["espNow"] entry pointing
+      // at a MAC that isn't currently paired is left as local IR rather
+      // than silently becoming a dead button.
+      JsonObjectConst espNow = command["espNow"].as<JsonObjectConst>();
+      if (!espNow.isNull() &&
+          (runtimeCommand.kind == DeviceCommand::RAW ||
+           runtimeCommand.kind == DeviceCommand::PARSED)) {
+        uint8_t targetMac[6];
+        int targetIndex = parseMacAddress(espNow["mac"] | "", targetMac)
+          ? findEspNowDeviceIndexByMac(targetMac) : -1;
+        if (targetIndex >= 0) {
+          const char *transportText = espNow["transport"] | "ir";
+          runtimeCommand.espNowDeviceIndex = (uint8_t)targetIndex;
+          runtimeCommand.espNowTransport = strcmp(transportText, "rf433") == 0
+            ? ESPNOW_TRANSPORT_RF433 : ESPNOW_TRANSPORT_IR;
+          runtimeCommand.kind = DeviceCommand::ESPNOW;
         }
       }
       JsonObjectConst hid = command["hid"].as<JsonObjectConst>();
@@ -8758,6 +8921,13 @@ bool persistSettingsToRuntimeConfig() {
   settings["physicalRepeatRateHz"] = physicalRepeatRateHz;
   settings["debugSplit"] = debugSplitEnabled;
   settings["bluetoothSleepEnabled"] = bluetoothSleepEnabled;
+  settings["espNowEnabled"] = espNowEnabled;
+  JsonArray espNowDevicesOut = settings["espNowDevices"].to<JsonArray>();
+  for (uint8_t i = 0; i < espNowDeviceCount; i++) {
+    JsonObject entry = espNowDevicesOut.add<JsonObject>();
+    entry["mac"] = formatMacAddress(espNowDevices[i].mac);
+    entry["name"] = espNowDevices[i].name;
+  }
   settings["debugTouch"] = debugTouchEnabled;
   settings["debugCpuRam"] = debugCpuRamEnabled;
   settings["debugAccelerometer"] = debugAccelerometerEnabled;
@@ -11868,6 +12038,123 @@ void handleIrLearnCancel() {
   sendJson(200, "{\"ok\":true,\"state\":\"idle\"}");
 }
 
+// ---------------------------------------------------------------------------
+// ESP-NOW device management - WebConfig's counterpart to the on-device
+// "ESP-NOW Devices" screen. Mirrors the async start/status/cancel shape the
+// IR-learn endpoints above already use for the pairing window.
+// ---------------------------------------------------------------------------
+
+void appendEspNowDeviceListJson(JsonArray target) {
+  for (uint8_t i = 0; i < espNowDeviceCount; i++) {
+    JsonObject entry = target.add<JsonObject>();
+    entry["mac"] = formatMacAddress(espNowDevices[i].mac);
+    entry["name"] = espNowDevices[i].name;
+  }
+}
+
+void handleEspNowDevicesList() {
+  if (!requestAuthorized()) {
+    sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
+    return;
+  }
+  JsonDocument doc;
+  doc["ok"] = true;
+  appendEspNowDeviceListJson(doc["devices"].to<JsonArray>());
+  String body;
+  serializeJson(doc, body);
+  sendJson(200, body);
+}
+
+void handleEspNowDeviceAdd() {
+  if (!requestAuthorized()) {
+    sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
+    return;
+  }
+  JsonDocument doc;
+  DeserializationError parseError = deserializeJson(doc, webServer.arg("plain"));
+  uint8_t mac[6];
+  if (parseError || !parseMacAddress(doc["mac"] | "", mac)) {
+    sendJson(400, "{\"ok\":false,\"error\":\"A valid MAC address is required\"}");
+    return;
+  }
+  const char *name = doc["name"] | "";
+  if (!addEspNowDevice(mac, name)) {
+    sendJson(409, "{\"ok\":false,\"error\":\"Paired device list is full\"}");
+    return;
+  }
+  JsonDocument response;
+  response["ok"] = true;
+  appendEspNowDeviceListJson(response["devices"].to<JsonArray>());
+  String body;
+  serializeJson(response, body);
+  sendJson(200, body);
+}
+
+void handleEspNowDeviceDelete() {
+  if (!requestAuthorized()) {
+    sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
+    return;
+  }
+  JsonDocument doc;
+  DeserializationError parseError = deserializeJson(doc, webServer.arg("plain"));
+  uint8_t mac[6];
+  if (parseError || !parseMacAddress(doc["mac"] | "", mac)) {
+    sendJson(400, "{\"ok\":false,\"error\":\"A valid MAC address is required\"}");
+    return;
+  }
+  removeEspNowDevice(mac);
+  JsonDocument response;
+  response["ok"] = true;
+  appendEspNowDeviceListJson(response["devices"].to<JsonArray>());
+  String body;
+  serializeJson(response, body);
+  sendJson(200, body);
+}
+
+void handleEspNowScanStartApi() {
+  if (!requestAuthorized()) {
+    sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
+    return;
+  }
+  if (!startEspNowScan()) {
+    sendJson(409, "{\"ok\":false,\"error\":\"ESP-NOW is disabled, or Wi-Fi station "
+                  "isn't available right now (e.g. the setup AP is active)\"}");
+    return;
+  }
+  char body[80];
+  snprintf(body, sizeof(body), "{\"ok\":true,\"state\":\"listening\",\"timeoutMs\":%lu}",
+           (unsigned long)ESPNOW_SCAN_TIMEOUT_MS);
+  sendJson(202, body);
+}
+
+void handleEspNowScanStatusApi() {
+  if (!requestAuthorized()) {
+    sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
+    return;
+  }
+  JsonDocument doc;
+  doc["ok"] = true;
+  doc["state"] = espNowScanActive ? "listening" : "idle";
+  JsonArray candidates = doc["candidates"].to<JsonArray>();
+  for (uint8_t i = 0; i < espNowCandidateCount; i++) {
+    JsonObject entry = candidates.add<JsonObject>();
+    entry["mac"] = formatMacAddress(espNowCandidates[i].mac);
+    entry["name"] = espNowCandidates[i].name;
+  }
+  String body;
+  serializeJson(doc, body);
+  sendJson(200, body);
+}
+
+void handleEspNowScanCancelApi() {
+  if (!requestAuthorized()) {
+    sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
+    return;
+  }
+  cancelEspNowScan();
+  sendJson(200, "{\"ok\":true,\"state\":\"idle\"}");
+}
+
 String sanitizeIconFileName(String name) {
   int slash = max(name.lastIndexOf('/'), name.lastIndexOf('\\'));
   if (slash >= 0) name = name.substring(slash + 1);
@@ -12416,6 +12703,12 @@ void configureWebServer() {
   webServer.on("/api/ir/learn/start", HTTP_POST, handleIrLearnStart);
   webServer.on("/api/ir/learn/status", HTTP_GET, handleIrLearnStatus);
   webServer.on("/api/ir/learn/cancel", HTTP_POST, handleIrLearnCancel);
+  webServer.on("/api/espnow/devices", HTTP_GET, handleEspNowDevicesList);
+  webServer.on("/api/espnow/devices", HTTP_POST, handleEspNowDeviceAdd);
+  webServer.on("/api/espnow/devices", HTTP_DELETE, handleEspNowDeviceDelete);
+  webServer.on("/api/espnow/scan/start", HTTP_POST, handleEspNowScanStartApi);
+  webServer.on("/api/espnow/scan/status", HTTP_GET, handleEspNowScanStatusApi);
+  webServer.on("/api/espnow/scan/cancel", HTTP_POST, handleEspNowScanCancelApi);
   webServer.on("/api/icons", HTTP_GET, handleIconList);
   webServer.on("/api/icons/custom", HTTP_POST, []() {
     if (!requestAuthorized()) webServer.send(403, "application/json", "{\"ok\":false}");
@@ -12759,7 +13052,250 @@ void stopNetworkStack() {
     WiFi.mode(WIFI_OFF);
   }
   networkStackActive = false;
+  stopEspNow();
   Serial.println("Wi-Fi: off");
+}
+
+// ---------------------------------------------------------------------------
+// ESP-NOW - paired blaster docks. TX-only in normal use; the recv callback
+// only does anything during an explicit pairing window (espNowScanActive).
+// See the 3.07 changelog entry for the coexistence and payload-size reasoning.
+// ---------------------------------------------------------------------------
+
+String formatMacAddress(const uint8_t mac[6]) {
+  char text[18];
+  snprintf(text, sizeof(text), "%02X:%02X:%02X:%02X:%02X:%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  return String(text);
+}
+
+bool parseMacAddress(const char *text, uint8_t mac[6]) {
+  if (!text) return false;
+  unsigned int bytes[6];
+  if (sscanf(text, "%2x:%2x:%2x:%2x:%2x:%2x", &bytes[0], &bytes[1], &bytes[2],
+             &bytes[3], &bytes[4], &bytes[5]) != 6) {
+    return false;
+  }
+  for (uint8_t i = 0; i < 6; i++) mac[i] = (uint8_t)bytes[i];
+  return true;
+}
+
+int findEspNowDeviceIndexByMac(const uint8_t mac[6]) {
+  for (uint8_t i = 0; i < espNowDeviceCount; i++) {
+    if (memcmp(espNowDevices[i].mac, mac, 6) == 0) return (int)i;
+  }
+  return -1;
+}
+
+int findEspNowCandidateIndexByMac(const uint8_t mac[6]) {
+  for (uint8_t i = 0; i < espNowCandidateCount; i++) {
+    if (memcmp(espNowCandidates[i].mac, mac, 6) == 0) return (int)i;
+  }
+  return -1;
+}
+
+void espNowRegisterAllPeers() {
+  for (uint8_t i = 0; i < espNowDeviceCount; i++) {
+    if (esp_now_is_peer_exist(espNowDevices[i].mac)) continue;
+    esp_now_peer_info_t peer = {};
+    memcpy(peer.peer_addr, espNowDevices[i].mac, 6);
+    peer.channel = 0;  // Use whatever channel the STA connection is already on.
+    peer.ifidx = WIFI_IF_STA;
+    peer.encrypt = false;
+    esp_now_add_peer(&peer);
+  }
+}
+
+// Only armed while espNowScanActive - outside a pairing window incoming
+// ESP-NOW frames are ignored entirely, so this never touches command traffic.
+void onEspNowDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+  if (!espNowScanActive || !info || !info->src_addr || !data) return;
+  if ((size_t)len < sizeof(EspNowAnnouncePacket)) return;
+  EspNowAnnouncePacket packet;
+  memcpy(&packet, data, sizeof(packet));
+  if (packet.magic != ESPNOW_ANNOUNCE_MAGIC) return;
+  packet.name[sizeof(packet.name) - 1] = '\0';
+  if (findEspNowCandidateIndexByMac(info->src_addr) >= 0) return;
+  if (espNowCandidateCount >= MAX_ESPNOW_DEVICES) return;
+  EspNowCandidate &candidate = espNowCandidates[espNowCandidateCount++];
+  memcpy(candidate.mac, info->src_addr, 6);
+  strlcpy(candidate.name, packet.name[0] ? packet.name : "ESP-NOW Device",
+          sizeof(candidate.name));
+  espNowDevicesModalDirty = true;
+  Serial.printf("ESP-NOW: pairing candidate %s (%s)\n", candidate.name,
+                formatMacAddress(candidate.mac).c_str());
+}
+
+void startEspNow() {
+  if (espNowRadioActive) return;
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW: init failed");
+    return;
+  }
+  esp_now_register_recv_cb(onEspNowDataRecv);
+  espNowRegisterAllPeers();
+  espNowRadioActive = true;
+  Serial.println("ESP-NOW: ready");
+}
+
+void stopEspNow() {
+  if (!espNowRadioActive) return;
+  espNowScanActive = false;
+  esp_now_unregister_recv_cb();
+  esp_now_deinit();
+  espNowRadioActive = false;
+  Serial.println("ESP-NOW: stopped");
+}
+
+// Called every loop() tick: brings the radio up/down to track espNowEnabled
+// and the same networkStackActive/setupApActive gate Wi-Fi itself already
+// uses, and times out an open pairing window.
+void serviceEspNow(unsigned long now) {
+  bool shouldBeActive = espNowEnabled && networkStackActive && !setupApActive &&
+                        WiFi.getMode() != WIFI_OFF;
+  if (shouldBeActive && !espNowRadioActive) {
+    startEspNow();
+  } else if (!shouldBeActive && espNowRadioActive) {
+    stopEspNow();
+  }
+  if (espNowScanActive && now - espNowScanStartedMs >= ESPNOW_SCAN_TIMEOUT_MS) {
+    espNowScanActive = false;
+    espNowDevicesModalDirty = true;
+    Serial.println("ESP-NOW: pairing window closed (timeout)");
+  }
+}
+
+bool startEspNowScan() {
+  if (!espNowEnabled) {
+    Serial.println("ESP-NOW: cannot scan, feature disabled in Settings");
+    return false;
+  }
+  if (!networkStackActive || setupApActive) {
+    Serial.println("ESP-NOW: cannot scan while Wi-Fi station is unavailable");
+    return false;
+  }
+  if (!espNowRadioActive) startEspNow();
+  if (!espNowRadioActive) return false;
+  espNowCandidateCount = 0;
+  espNowScanActive = true;
+  espNowScanStartedMs = millis();
+  espNowDevicesModalDirty = true;
+  Serial.println("ESP-NOW: pairing window open");
+  return true;
+}
+
+void cancelEspNowScan() {
+  espNowScanActive = false;
+  espNowDevicesModalDirty = true;
+}
+
+bool addEspNowDevice(const uint8_t mac[6], const char *name) {
+  const char *safeName = (name && name[0]) ? name : "ESP-NOW Device";
+  int existing = findEspNowDeviceIndexByMac(mac);
+  if (existing >= 0) {
+    strlcpy(espNowDevices[existing].name, safeName, sizeof(espNowDevices[existing].name));
+  } else {
+    if (espNowDeviceCount >= MAX_ESPNOW_DEVICES) {
+      Serial.println("ESP-NOW: paired device list is full");
+      return false;
+    }
+    EspNowPairedDevice &device = espNowDevices[espNowDeviceCount++];
+    memcpy(device.mac, mac, 6);
+    strlcpy(device.name, safeName, sizeof(device.name));
+  }
+  if (espNowRadioActive) espNowRegisterAllPeers();
+  espNowDevicesModalDirty = true;
+  scheduleRuntimeSettingsSave();
+  return true;
+}
+
+bool removeEspNowDevice(const uint8_t mac[6]) {
+  int index = findEspNowDeviceIndexByMac(mac);
+  if (index < 0) return false;
+  if (espNowRadioActive) esp_now_del_peer(espNowDevices[index].mac);
+  for (uint8_t i = (uint8_t)index; i < espNowDeviceCount - 1; i++) {
+    espNowDevices[i] = espNowDevices[i + 1];
+  }
+  espNowDeviceCount--;
+  espNowDevicesModalDirty = true;
+  scheduleRuntimeSettingsSave();
+  return true;
+}
+
+// Classic ESP-NOW caps a single packet at 250 bytes. Rather than silently
+// truncating a raw-timing capture that doesn't fit (the exact failure class
+// fixed in 3.06's Global Cache bug), this refuses to send and logs the
+// timing count and byte size so the failure is visible instead of a command
+// that quietly does nothing at the far end.
+struct __attribute__((packed)) EspNowCommandHeader {
+  uint32_t magic;
+  uint8_t transport;
+  uint8_t encoding;  // 0 = PARSED (protocol/address/command), 1 = RAW (timings)
+  uint16_t frequencyKhz;
+  uint32_t address;
+  uint32_t command;
+  uint8_t sonyBits;
+  char protocol[16];
+  uint16_t rawCount;
+};
+static const uint32_t ESPNOW_COMMAND_MAGIC = 0x4F52434DUL;  // "ORCM"
+
+bool buildEspNowPayload(const DeviceCommand &command, uint8_t *buf, size_t bufCap,
+                        size_t &outLen) {
+  EspNowCommandHeader header = {};
+  header.magic = ESPNOW_COMMAND_MAGIC;
+  header.transport = command.espNowTransport;
+  if (command.kind == DeviceCommand::RAW && command.rawTimings && command.rawCount) {
+    header.encoding = 1;
+    header.frequencyKhz = command.frequencyKhz ? command.frequencyKhz : 38;
+    header.rawCount = command.rawCount;
+  } else if (command.kind == DeviceCommand::PARSED) {
+    header.encoding = 0;
+    header.address = command.address;
+    header.command = command.command;
+    header.sonyBits = command.sonyBits;
+    strlcpy(header.protocol, command.protocol, sizeof(header.protocol));
+  } else {
+    Serial.println("ESP-NOW: command has no IR data to send");
+    return false;
+  }
+  size_t payloadLen = sizeof(EspNowCommandHeader) +
+                      (header.encoding == 1 ? (size_t)header.rawCount * sizeof(uint16_t) : 0);
+  if (payloadLen > bufCap) {
+    Serial.printf("ESP-NOW: command too large to send (%u raw timing(s), "
+                  "%u bytes exceeds the %u byte ESP-NOW payload limit)\n",
+                  (unsigned)header.rawCount, (unsigned)payloadLen, (unsigned)bufCap);
+    return false;
+  }
+  memcpy(buf, &header, sizeof(header));
+  if (header.encoding == 1) {
+    memcpy(buf + sizeof(header), command.rawTimings,
+           (size_t)header.rawCount * sizeof(uint16_t));
+  }
+  outLen = payloadLen;
+  return true;
+}
+
+bool sendEspNowCommand(const DeviceCommand &command) {
+  if (command.espNowDeviceIndex >= espNowDeviceCount) {
+    Serial.println("ESP-NOW: command has no valid paired device");
+    return false;
+  }
+  if (!espNowRadioActive) {
+    Serial.println("ESP-NOW: send skipped, radio not active");
+    return false;
+  }
+  uint8_t payload[ESPNOW_MAX_PAYLOAD_BYTES];
+  size_t payloadLen = 0;
+  if (!buildEspNowPayload(command, payload, sizeof(payload), payloadLen)) return false;
+  const uint8_t *mac = espNowDevices[command.espNowDeviceIndex].mac;
+  esp_err_t result = esp_now_send(mac, payload, payloadLen);
+  if (result != ESP_OK) {
+    Serial.printf("ESP-NOW: send failed (%d) to %s\n", (int)result,
+                  formatMacAddress(mac).c_str());
+    return false;
+  }
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -16284,6 +16820,16 @@ void renderDebugPageOmote() {
               0, rowH, &bluetoothSleepEnabled);
   y += rowH + 12;
 
+  char espNowStatusText[24];
+  snprintf(espNowStatusText, sizeof(espNowStatusText), "%u paired", (unsigned)espNowDeviceCount);
+  lv_obj_t *espNowCard = makeOmoteCard(content, y, 2 * rowH + 1);
+  makeOmoteRow(espNowCard, "ESP-NOW", "Send commands to a paired blaster dock",
+              0, rowH, &espNowEnabled);
+  makeOmoteDivider(espNowCard, rowH);
+  makeOmoteRow(espNowCard, "ESP-NOW Devices", espNowStatusText, rowH + 1, rowH,
+              nullptr, toggleEspNowDevicesModal);
+  y += 2 * rowH + 1 + 12;
+
   lv_obj_t *rowsLabel = makeLabel(content, "Saved row positions", 8, y, &lv_font_montserrat_12, textPrimary());
   lv_obj_set_style_text_opa(rowsLabel, LV_OPA_60, 0);
   y += 22;
@@ -16427,11 +16973,17 @@ void renderDebugPage() {
   makeSettingRow("FPS", "Display frames per second", 502, &debugFpsEnabled);
   makeSettingRow("Bluetooth Sleep", "On disconnects BLE - may pause casting", 552,
                  &bluetoothSleepEnabled);
-  makeMicrophoneSourceRow(602);
+  makeSettingRow("ESP-NOW", "Send commands to a paired blaster dock", 602,
+                 &espNowEnabled);
+  char espNowStatusText[24];
+  snprintf(espNowStatusText, sizeof(espNowStatusText), "%u paired", (unsigned)espNowDeviceCount);
+  makeSettingRow("ESP-NOW Devices", espNowStatusText, 652, nullptr,
+                 toggleEspNowDevicesModal);
+  makeMicrophoneSourceRow(702);
 
-  makeLabel(content, "Display driver (reboot required)", 10, 654,
+  makeLabel(content, "Display driver (reboot required)", 10, 754,
             &lv_font_montserrat_12, lvRgb(170, 178, 190));
-  int driverSectionY = 676;
+  int driverSectionY = 776;
   makeDisplayDriverRow(driverSectionY);
   driverSectionY += 50;
   if (displayDriverChoice == 0) {
@@ -17893,6 +18445,140 @@ void showDevicePicker() {
   lv_obj_move_foreground(deviceModal);
 }
 
+// ---------------------------------------------------------------------------
+// ESP-NOW Devices modal (Settings > Debug). Search/add/remove counterpart to
+// the WebConfig panel and the HTTP API above - both drive the exact same
+// espNowDevices[]/espNowCandidates[] state and startEspNowScan()/
+// addEspNowDevice()/removeEspNowDevice() functions, so a pairing started from
+// one surface shows up on the other. See the 3.07 changelog entry.
+// ---------------------------------------------------------------------------
+
+void espNowDeviceDeleteEvent(lv_event_t *e) {
+  int index = (int)(intptr_t)lv_event_get_user_data(e);
+  if (index < 0 || index >= espNowDeviceCount) return;
+  removeEspNowDevice(espNowDevices[index].mac);
+  showEspNowDevicesModal();
+}
+
+void espNowCandidateAddEvent(lv_event_t *e) {
+  int index = (int)(intptr_t)lv_event_get_user_data(e);
+  if (index < 0 || index >= espNowCandidateCount) return;
+  addEspNowDevice(espNowCandidates[index].mac, espNowCandidates[index].name);
+  showEspNowDevicesModal();
+}
+
+void espNowScanButtonEvent(lv_event_t *e) {
+  startEspNowScan();
+  showEspNowDevicesModal();
+}
+
+// (Re)builds the modal in place - safe to call repeatedly while it's open,
+// which is how add/remove/candidate-found/scan-timeout all refresh it.
+void showEspNowDevicesModal() {
+  if (espNowDevicesModal) {
+    lv_obj_del(espNowDevicesModal);
+    espNowDevicesModal = nullptr;
+  }
+
+  const int modalY = 44;
+  const int pageDotsTop = 292;
+  const int rowHeight = 32;
+  const int actionRowHeight = 34;
+  int candidateCount = espNowScanActive ? espNowCandidateCount : 0;
+  int listRows = espNowDeviceCount + candidateCount;
+  int desiredHeight = 44 + max(listRows, 1) * rowHeight + actionRowHeight + 12;
+  int modalHeight = min(pageDotsTop - modalY, desiredHeight);
+
+  espNowDevicesModal = lv_obj_create(screenRoot);
+  lv_obj_set_pos(espNowDevicesModal, 8, modalY);
+  lv_obj_set_size(espNowDevicesModal, 224, modalHeight);
+  stylePanel(espNowDevicesModal, lvRgb(18, 22, 30), lvRgb(60, 180, 220), LV_OPA_COVER);
+  lv_obj_clear_flag(espNowDevicesModal, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_scroll_dir(espNowDevicesModal, LV_DIR_NONE);
+  makeLabel(espNowDevicesModal, "ESP-NOW Devices", 8, 4, &lv_font_montserrat_16, textPrimary());
+
+  int listAreaHeight = modalHeight - 42 - actionRowHeight;
+  lv_obj_t *list = lv_obj_create(espNowDevicesModal);
+  lv_obj_remove_style_all(list);
+  lv_obj_set_pos(list, 8, 30);
+  lv_obj_set_size(list, 204, listAreaHeight);
+  lv_obj_set_scroll_dir(list, LV_DIR_VER);
+  lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_AUTO);
+  lv_obj_set_style_pad_all(list, 0, 0);
+  if (listRows * rowHeight > listAreaHeight) {
+    lv_obj_add_flag(list, LV_OBJ_FLAG_SCROLLABLE);
+  } else {
+    lv_obj_clear_flag(list, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_OFF);
+  }
+
+  int row = 0;
+  if (espNowDeviceCount == 0 && candidateCount == 0) {
+    lv_obj_t *empty = makeLabel(list, "No paired devices yet", 0, 4,
+                                &lv_font_montserrat_12, textPrimary());
+    lv_obj_set_style_text_opa(empty, LV_OPA_60, 0);
+  }
+  for (uint8_t i = 0; i < espNowDeviceCount; i++, row++) {
+    lv_obj_t *rowObj = lv_obj_create(list);
+    lv_obj_remove_style_all(rowObj);
+    lv_obj_set_pos(rowObj, 0, row * rowHeight);
+    lv_obj_set_size(rowObj, 204, rowHeight - 2);
+    lv_obj_clear_flag(rowObj, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *nameLabel = makeLabel(rowObj, espNowDevices[i].name, 0, 6,
+                                    &lv_font_montserrat_12, textPrimary());
+    lv_obj_set_width(nameLabel, 160);
+    lv_label_set_long_mode(nameLabel, LV_LABEL_LONG_DOT);
+    lv_obj_t *delBtn = makeButton(rowObj, LV_SYMBOL_TRASH, 176, 0, 28, 26, lvRgb(60, 30, 30));
+    lv_obj_add_event_cb(delBtn, espNowDeviceDeleteEvent, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+  }
+  for (uint8_t i = 0; i < candidateCount; i++, row++) {
+    lv_obj_t *rowObj = lv_obj_create(list);
+    lv_obj_remove_style_all(rowObj);
+    lv_obj_set_pos(rowObj, 0, row * rowHeight);
+    lv_obj_set_size(rowObj, 204, rowHeight - 2);
+    lv_obj_clear_flag(rowObj, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *nameLabel = makeLabel(rowObj, espNowCandidates[i].name, 0, 6,
+                                    &lv_font_montserrat_12, lvRgb(120, 220, 160));
+    lv_obj_set_width(nameLabel, 160);
+    lv_label_set_long_mode(nameLabel, LV_LABEL_LONG_DOT);
+    lv_obj_t *addBtn = makeButton(rowObj, LV_SYMBOL_PLUS, 176, 0, 28, 26, lvRgb(30, 60, 40));
+    lv_obj_add_event_cb(addBtn, espNowCandidateAddEvent, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+  }
+
+  int actionY = modalHeight - actionRowHeight - 4;
+  if (espNowScanActive) {
+    lv_obj_t *listening = makeLabel(espNowDevicesModal, "Listening for nearby devices...",
+                                    8, actionY + 6, &lv_font_montserrat_10, textPrimary());
+    lv_obj_set_style_text_opa(listening, LV_OPA_70, 0);
+  } else {
+    lv_obj_t *scanBtn = makeButton(espNowDevicesModal, "Search for devices", 8, actionY,
+                                   204, actionRowHeight - 4, lvRgb(34, 42, 56));
+    lv_obj_add_event_cb(scanBtn, espNowScanButtonEvent, LV_EVENT_CLICKED, nullptr);
+  }
+  espNowDevicesModalDirty = false;
+  lv_obj_move_foreground(espNowDevicesModal);
+}
+
+void toggleEspNowDevicesModal(lv_event_t *e) {
+  if (espNowDevicesModal) {
+    cancelEspNowScan();
+    lv_obj_del(espNowDevicesModal);
+    espNowDevicesModal = nullptr;
+    return;
+  }
+  showEspNowDevicesModal();
+}
+
+// Called from loop(): rebuilds the modal only when it's open and something
+// changed (a candidate arrived, a scan timed out, a device was added or
+// removed from the WebConfig side of the same state).
+void serviceEspNowDevicesModal(unsigned long now) {
+  static unsigned long lastCheckMs = 0;
+  if (now - lastCheckMs < 400UL) return;
+  lastCheckMs = now;
+  if (espNowDevicesModal && espNowDevicesModalDirty) showEspNowDevicesModal();
+}
+
 void brightnessEvent(lv_event_t *e) {
   brightness = lv_slider_get_value(lv_event_get_target(e));
   applyBrightness();
@@ -19026,6 +19712,8 @@ void loop() {
   serviceButtonTestFeedback(now);
   serviceBluetooth(now);
   serviceBluetoothConnectionProfile(now);
+  serviceEspNow(now);
+  serviceEspNowDevicesModal(now);
   now = millis();
   serviceAtvvVoice(now);
   if (microphoneStopPending && !atvvAudioStarted) {
