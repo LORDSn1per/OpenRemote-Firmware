@@ -12176,7 +12176,92 @@
       /\.(?:txt|gc|gcir)$/i.test(String(fileName || ""));
   }
 
+  /*
+    Pronto Hex: a space-separated list of 4-digit hex words. Only validated
+    structurally here (header shape, word count, hex digits) - the actual
+    carrier-cycle-to-microsecond conversion happens once, on the remote, in
+    loadProntoTimings() (OpenRemote_1.0.ino), which a .ir file containing
+    "type: pronto" also goes through when Studio copies one to the SD card.
+    Duplicating that conversion here would mean two implementations of the
+    same math to keep in sync forever, for zero benefit - the pasted text is
+    passed straight through as ir.data unchanged, and the remote is the only
+    thing that ever needs to actually decode it. Validating here exists only
+    to catch a malformed paste immediately, instead of silently saving a
+    string the remote will simply reject as "did not parse" days later.
+  */
+  function looksLikeProntoHexText(raw,fileName){
+    var text=String(raw || "").trim();
+    return /^0000(\s+[0-9a-fA-F]{4}){5,}$/.test(text) ||
+      /\.(?:prn|pronto)$/i.test(String(fileName || ""));
+  }
+
+  function validateProntoHex(text){
+    var words=String(text || "").trim().split(/\s+/);
+    if(words.length<6) throw new Error("Pronto Hex code is too short.");
+    if(!words.every(function(word){ return /^[0-9a-fA-F]{4}$/.test(word); })){
+      throw new Error("Pronto Hex code contains a value that is not a 4-digit hex word.");
+    }
+    var header=words.slice(0,4).map(function(word){ return parseInt(word,16); });
+    if(header[0]!==0x0000){
+      throw new Error("Only Pronto's raw/learned format (starting 0000) is supported - "+
+        "preset-carrier codes (starting "+words[0]+") are not.");
+    }
+    if(header[1]===0){
+      throw new Error("Pronto Hex code has an invalid (zero) carrier frequency divisor.");
+    }
+    /* Math.floor, not Math.round: matches the remote's own integer division
+       (4145146UL / header[1] in loadProntoTimings(), OpenRemote_1.0.ino)
+       exactly, so this preview never disagrees with what actually gets
+       decoded. The difference is at most 1 Hz - inconsequential for IR
+       reception either way - but there is no reason for the two to differ
+       even by that much when one exists purely to preview the other. */
+    var carrierHz=Math.floor(4145146/header[1]);
+    if(carrierHz<20000 || carrierHz>60000){
+      throw new Error("Pronto Hex code's carrier frequency ("+carrierHz+" Hz) is outside "+
+        "the 20-60 kHz range this remote's IR sender supports.");
+    }
+    var onceCount=header[2]*2;
+    var repeatCount=header[3]*2;
+    if(!onceCount){
+      throw new Error("Pronto Hex code has no burst pairs in its \"once\" sequence.");
+    }
+    var expectedWords=4+onceCount+repeatCount;
+    if(words.length!==expectedWords){
+      throw new Error("Pronto Hex code has "+words.length+" word(s), expected exactly "+
+        expectedWords+" for its declared burst-pair counts.");
+    }
+    return {carrierHz:carrierHz,normalised:words.join(" ")};
+  }
+
+  function parseProntoHexText(raw,fileName,commandName){
+    var info=validateProntoHex(raw);
+    var baseName=(fileName ? fileName.replace(/\.[^.]+$/,"") : "") || "Pronto IR Device";
+    var deviceId="pronto_"+sanitiseImportedId(baseName)+"_"+Date.now();
+    return {
+      id:deviceId,
+      name:baseName,
+      source:"Learned",
+      transport:"ir",
+      type:"Custom IR device",
+      protocol:"Pronto Hex",
+      commands:[{
+        id:deviceId+"_cmd_0",
+        name:commandName || "IR Command",
+        protocol:"Pronto Hex",
+        ir:{type:"pronto",data:info.normalised},
+        importedFrom:fileName || "Pronto Hex paste"
+      }],
+      powerTracking:{enabled:false,onCommandId:"",offCommandId:""}
+    };
+  }
+
   function detectAndStageSingleBackup(raw,fileName){
+    if(looksLikeProntoHexText(raw,fileName)){
+      clearRestoreStaging();
+      var prontoDevice=parseProntoHexText(raw,fileName);
+      restoreStaging.learned=[prontoDevice];
+      return "Pronto Hex code · "+prontoDevice.name;
+    }
     if(looksLikeGlobalCacheText(raw,fileName)){
       clearRestoreStaging();
       var importedDevice=parseGlobalCacheText(raw,fileName);
@@ -12213,8 +12298,24 @@
 
     var allIr=files.every(function(file){ return /\.ir$/i.test(file.name || ""); });
     var allGlobalCacheText=files.every(function(file){ return /\.(?:txt|gc|gcir)$/i.test(file.name || ""); });
-    if(files.length>1 && !allIr && !allGlobalCacheText){
-      showUnifiedRestoreError("Select one backup/code file, multiple learned-device .ir files, or multiple Global Caché text files.");
+    var allProntoText=files.every(function(file){ return /\.(?:prn|pronto)$/i.test(file.name || ""); });
+    if(files.length>1 && !allIr && !allGlobalCacheText && !allProntoText){
+      showUnifiedRestoreError("Select one backup/code file, multiple learned-device .ir files, multiple Pronto Hex files, or multiple Global Caché text files.");
+      return;
+    }
+
+    if(allProntoText){
+      Promise.all(files.map(function(file){
+        return readTextFile(file).then(function(raw){
+          return parseProntoHexText(raw,file.name);
+        });
+      })).then(function(devices){
+        clearRestoreStaging();
+        restoreStaging.learned=devices;
+        renderRestoreDetected(files.length+" Pronto Hex custom IR device"+(files.length===1?"":"s"));
+      }).catch(function(err){
+        showUnifiedRestoreError(err && err.message ? err.message : "One or more Pronto Hex files could not be parsed.");
+      });
       return;
     }
 

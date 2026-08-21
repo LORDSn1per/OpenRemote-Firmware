@@ -1,6 +1,38 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.06 - 2026-08-21
+    - Added Pronto Hex IR code support: a new "pronto" command type,
+      decoded by loadProntoTimings() - a sibling to the existing
+      loadRawTimings() - into the same rawTimings/frequencyKhz fields every
+      other RAW command already uses, so nothing downstream (transmit,
+      held-repeat, WebConfig, Studio) needs to know a command originated as
+      Pronto at all.
+    - Wired into both places that already parse IR commands, not just one:
+      loadRuntimeModel()'s JSON devices loop (ir.type=="pronto") for
+      commands added through WebConfig, and loadIrDeviceFileIntoRuntime()'s
+      .ir line parser (type: pronto) for .ir files Studio copies to the SD
+      card over USB. Decoding in only one of the two would have silently
+      missed the other - a .ir file's own on-device parser is firmware code,
+      not something WebConfig's or Studio's JavaScript/Python ever sees.
+    - Format: word[0] must be 0x0000 (the raw/learned format - the only one
+      interpreted; 0100+ preset-carrier codes use a completely different,
+      protocol-specific meaning for the remaining words and are rejected
+      outright rather than silently mis-decoded). word[1] is a carrier
+      divisor (Hz = 4145146 / word[1]); word[2]/word[3] are once/repeat
+      burst-pair counts. Only the "once" section is kept - this firmware's
+      held-button repeat already just re-sends the same array for every
+      raw-timing command regardless of source, so a distinct repeat section
+      has no home in the data model without a larger change, not attempted
+      here. The repeat section is still walked and range-checked (values
+      discarded) so a code that claims repeat pairs but is truncated before
+      supplying them is rejected as malformed rather than silently loading
+      an incomplete "once" section as if it were whole.
+    - appendIrDeviceFileSummary() (the .ir listing/summary builder used for
+      display, not runtime loading) also gained a "pronto" case so a Pronto
+      command shows as "Pronto Hex" rather than the generic default.
+    - Not verified on hardware.
+
   3.05 - 2026-08-17
     - Added a "Bluetooth Sleep" switch to Settings > Debug, on both menu
       styles. Off (the default, and the only behaviour this firmware has had
@@ -2365,7 +2397,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.05"
+#define OPENREMOTE_VERSION_STRING "3.06"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -7186,6 +7218,80 @@ bool loadRawTimings(DeviceCommand &target, const char *text) {
   return true;
 }
 
+// Pronto Hex: a space-separated list of 4-digit hex words. word[0] must be
+// 0x0000 (the "raw, learned" format - the only one interpreted here; the
+// 0100+ preset-carrier formats use a completely different, protocol-specific
+// meaning for the remaining words, so they are rejected outright rather than
+// silently mis-decoded as burst-pair timings, which is what would happen if
+// this just treated every format the same). word[1] is a carrier-frequency
+// divisor (Hz = 4145146 / word[1]); word[2]/word[3] are the once/repeat
+// burst-pair counts, and every remaining word is a burst duration in carrier
+// cycles, not microseconds - that conversion happens here so the result is
+// indistinguishable from any other raw-timing command once loaded, and
+// nothing downstream (transmit, held-repeat, WebConfig, Studio) needs to
+// know a command originated as Pronto at all.
+//
+// Only the "once" section is kept. This firmware's held-button repeat
+// already just re-sends the same array for every raw-timing command
+// regardless of source, so a Pronto code's distinct repeat section has no
+// home in the data model without a larger change - not attempted here.
+// The repeat section is still walked and range-checked below (its own
+// values discarded) purely so a code that claims N2 repeat pairs but is
+// truncated before actually supplying them is rejected as malformed,
+// instead of loading a half-complete "once" section as if it were whole.
+bool loadProntoTimings(DeviceCommand &target, const char *text) {
+  if (!text || !text[0]) return false;
+  const char *cursor = text;
+  uint16_t header[4];
+  for (uint8_t i = 0; i < 4; i++) {
+    while (*cursor == ' ') cursor++;
+    if (!*cursor) return false;
+    char *end = nullptr;
+    unsigned long value = strtoul(cursor, &end, 16);
+    if (end == cursor || value > 0xFFFFUL) return false;
+    header[i] = (uint16_t)value;
+    cursor = end;
+  }
+  if (header[0] != 0x0000 || header[1] == 0) return false;
+  uint32_t carrierHz = 4145146UL / header[1];
+  if (carrierHz < 20000UL || carrierHz > 60000UL) return false;
+
+  uint32_t onceCount = (uint32_t)header[2] * 2UL;
+  uint32_t repeatCount = (uint32_t)header[3] * 2UL;
+  if (!onceCount || onceCount > 1024UL) return false;
+
+  size_t bytes = onceCount * sizeof(uint16_t);
+  uint16_t *timings = (uint16_t *)ps_malloc(bytes);
+  if (!timings) timings = (uint16_t *)malloc(bytes);
+  if (!timings) return false;
+
+  for (uint32_t i = 0; i < onceCount; i++) {
+    while (*cursor == ' ') cursor++;
+    if (!*cursor) { free(timings); return false; }
+    char *end = nullptr;
+    unsigned long cycles = strtoul(cursor, &end, 16);
+    if (end == cursor) { free(timings); return false; }
+    uint32_t microseconds =
+      (uint32_t)(((uint64_t)cycles * 1000000ULL + carrierHz / 2) / carrierHz);
+    timings[i] = (uint16_t)min(microseconds, (uint32_t)65535);
+    cursor = end;
+  }
+  for (uint32_t i = 0; i < repeatCount; i++) {
+    while (*cursor == ' ') cursor++;
+    if (!*cursor) { free(timings); return false; }
+    char *end = nullptr;
+    strtoul(cursor, &end, 16);
+    if (end == cursor) { free(timings); return false; }
+    cursor = end;
+  }
+
+  free(target.rawTimings);
+  target.rawTimings = timings;
+  target.rawCount = (uint16_t)onceCount;
+  target.frequencyKhz = (uint16_t)constrain((int)(carrierHz / 1000UL), 20, 60);
+  return true;
+}
+
 Device *findRuntimeDevice(const char *id) {
   if (!id || !id[0]) return nullptr;
   for (uint8_t i = 0; i < DEVICE_COUNT; i++) {
@@ -7317,6 +7423,12 @@ bool loadIrDeviceFileIntoRuntime(const String &rawPath) {
 
   DeviceCommand *command = nullptr;
   String signalName;
+  // Tracked separately from command->kind because, unlike "parsed", a
+  // "pronto" type line has nothing to record until the data: line actually
+  // arrives - this just remembers which decoder that data: line should use.
+  // Reset on every new name: line so one malformed/missing type: line on a
+  // later command can't leak the previous command's format.
+  bool commandIsPronto = false;
   while (file.available()) {
     String line = file.readStringUntil('\n');
     line.trim();
@@ -7332,10 +7444,12 @@ bool loadIrDeviceFileIntoRuntime(const String &rawPath) {
       strlcpy(command->label, label.c_str(), sizeof(command->label));
       strlcpy(command->id, commandId.c_str(), sizeof(command->id));
       command->showText = true;
+      commandIsPronto = false;
     } else if (command && line.startsWith("type:")) {
       String type = line.substring(5);
       type.trim();
       if (type == "parsed") command->kind = DeviceCommand::PARSED;
+      else if (type == "pronto") commandIsPronto = true;
     } else if (command && line.startsWith("protocol:")) {
       String protocol = line.substring(9);
       protocol.trim();
@@ -7357,7 +7471,15 @@ bool loadIrDeviceFileIntoRuntime(const String &rawPath) {
     } else if (command && line.startsWith("data:")) {
       String timings = line.substring(5);
       timings.trim();
-      if (loadRawTimings(*command, timings.c_str())) command->kind = DeviceCommand::RAW;
+      // loadProntoTimings() sets frequencyKhz itself (decoded from the Pronto
+      // header), overriding whatever an earlier frequency: line in this file
+      // set - the Pronto code's own carrier is authoritative for a Pronto
+      // command, same as it would be if the file had no frequency: line at
+      // all.
+      bool loaded = commandIsPronto
+        ? loadProntoTimings(*command, timings.c_str())
+        : loadRawTimings(*command, timings.c_str());
+      if (loaded) command->kind = DeviceCommand::RAW;
     }
   }
   file.close();
@@ -7458,6 +7580,9 @@ bool appendIrDeviceFileSummary(JsonArray target, const String &rawPath) {
       if (type == "raw") {
         command["protocol"] = "Raw IR";
         if (String(device["protocol"] | "IR") == "IR") device["protocol"] = "Raw IR";
+      } else if (type == "pronto") {
+        command["protocol"] = "Pronto Hex";
+        if (String(device["protocol"] | "IR") == "IR") device["protocol"] = "Pronto Hex";
       }
     }
   }
@@ -8269,6 +8394,17 @@ void loadRuntimeModel(JsonDocument &doc) {
           : (uint32_t)(ir["commandValue"] | 0U);
         runtimeCommand.sonyBits = ir["bits"] | 0;
         runtimeCommand.kind = DeviceCommand::PARSED;
+      } else if (strcmp(type, "pronto") == 0) {
+        // WebConfig writes the pasted Pronto Hex text through unchanged as
+        // ir.data - the decode (carrier frequency + burst-pair timings) all
+        // happens in loadProntoTimings() below, not in WebConfig's JS. This
+        // is the one place every entry point converges - the same function
+        // is also called from loadIrDeviceFileIntoRuntime() for a Pronto
+        // line inside a .ir file copied over by Studio - so neither WebConfig
+        // nor Studio needs its own copy of this decode logic.
+        if (loadProntoTimings(runtimeCommand, ir["data"] | "")) {
+          runtimeCommand.kind = DeviceCommand::RAW;
+        }
       }
       JsonObjectConst hid = command["hid"].as<JsonObjectConst>();
       if (!hid.isNull()) {
