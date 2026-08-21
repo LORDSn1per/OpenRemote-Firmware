@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Version-2.41-2f8cff?style=flat-square" alt="v2.41">
+  <img src="https://img.shields.io/badge/Version-2.42-2f8cff?style=flat-square" alt="v2.42">
   <img src="https://img.shields.io/badge/Install-Nothing-30d158?style=flat-square" alt="No install">
   <img src="https://img.shields.io/badge/Cloud-None-30d158?style=flat-square" alt="No cloud">
   <img src="https://img.shields.io/badge/Single-HTML%20file-2f8cff?style=flat-square" alt="Single HTML file">

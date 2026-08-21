@@ -1,6 +1,49 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.08 - 2026-08-22
+    - Added RF433 code learning, relayed through a paired ESP-NOW dock -
+      the remote itself has no RF433 receiver, only the dock will, so this
+      is a request/response relay rather than a local capture like IR
+      learn. Two new packet types on top of 3.07's ESP-NOW link:
+      EspNowRfLearnStartPacket (remote -> dock, "open a 15s RF433 receive
+      window") and EspNowRfLearnResultHeader + trailing timings (dock ->
+      remote, "here's what was captured", or ok=0 for nothing seen). Both
+      are magic-tagged (ORLS/ORLR) distinctly from the pairing announce
+      (OREN) and outbound command (ORCM) packets already in place, so
+      onEspNowDataRecv() can tell all four apart.
+    - The captured code's rawCount/timings layout is identical to
+      EspNowCommandHeader's RAW encoding on purpose - a learned RF code and
+      a command about to be sent are the same shape on the wire, so no
+      separate RF command path was needed anywhere else in the firmware.
+      Once captured, WebConfig tags the resulting command with
+      command.espNow={mac,transport:"rf433"}, which loadRuntimeModel()
+      already understands from 3.07 - RF retransmission needed zero new
+      firmware code beyond the learn relay itself.
+    - onEspNowDataRecv() is now armed during either espNowScanActive
+      (pairing) or rfLearnActive (this), never both meaning anything at
+      once, and a learn result is only accepted from the specific paired
+      MAC that session actually asked - a stray or spoofed packet from
+      elsewhere can't complete a learn with garbage data.
+    - New /api/rf/learn/start (POST, optional {mac} - auto-selects the sole
+      paired device if only one exists), /api/rf/learn/status (GET) and
+      /api/rf/learn/cancel (POST), deliberately shaped identically to the
+      existing /api/ir/learn/* endpoints (same state names: listening/
+      captured/error/idle) so WebConfig's JS is a close copy rather than a
+      new design.
+    - Fixed a real gap found while wiring this up, same failure class as
+      3.06's Global Cache bug: WebConfig's buildRuntimePayload() explicitly
+      passed command.ir/.hid/.homebridge through to the sync payload but
+      had no command.espNow case, so a learned RF command's routing would
+      have silently vanished on sync. Also fixed in two more places that
+      copy a command's fields - openLearnModal()'s edit-existing-device
+      rehydration and finishLearnDevice()'s draft-to-device conversion -
+      both dropped it too before this entry.
+    - Per user instruction, dock firmware is not part of this round - these
+      endpoints and the wire protocol exist and build clean, but nothing
+      currently answers a learn request or a paired dock's RF433 receiver
+      exists yet. Not verified on hardware.
+
   3.07 - 2026-08-22
     - Added ESP-NOW as a new command transport, spelled "ESP-NOW" throughout
       (Espressif's own spelling) rather than "Espnow"/"ESPNow"/"Esp-Now" -
@@ -2457,7 +2500,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.07"
+#define OPENREMOTE_VERSION_STRING "3.08"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -3538,7 +3581,10 @@ unsigned long blePairingUntilMs = 0;
 // ---------------------------------------------------------------------------
 static const uint8_t MAX_ESPNOW_DEVICES = 8;
 static const uint32_t ESPNOW_ANNOUNCE_MAGIC = 0x4F52454EUL;  // "OREN"
+static const uint32_t ESPNOW_RF_LEARN_START_MAGIC = 0x4F524C53UL;  // "ORLS"
+static const uint32_t ESPNOW_RF_LEARN_RESULT_MAGIC = 0x4F524C52UL;  // "ORLR"
 static const uint32_t ESPNOW_SCAN_TIMEOUT_MS = 20000UL;
+static const uint32_t ESPNOW_RF_LEARN_TIMEOUT_MS = 15000UL;
 static const size_t ESPNOW_MAX_PAYLOAD_BYTES = 250;
 
 struct EspNowPairedDevice {
@@ -3558,6 +3604,25 @@ struct __attribute__((packed)) EspNowAnnouncePacket {
   char name[24];
 };
 
+// Sent remote -> dock to open an RF433 receive window - dock firmware
+// doesn't exist yet, so this is only ever transmitted, never answered, until
+// it does. See the 3.08 changelog entry.
+struct __attribute__((packed)) EspNowRfLearnStartPacket {
+  uint32_t magic;
+  uint32_t timeoutMs;
+};
+
+// Sent dock -> remote once a signal is captured (or the window times out
+// with nothing seen). rawCount uint16_t timings (microseconds) follow this
+// header - same layout as EspNowCommandHeader's RAW encoding, deliberately,
+// so a captured code and a to-be-sent command are structurally the same
+// thing on the wire.
+struct __attribute__((packed)) EspNowRfLearnResultHeader {
+  uint32_t magic;
+  uint8_t ok;
+  uint16_t rawCount;
+};
+
 bool espNowEnabled = false;
 bool espNowRadioActive = false;
 EspNowPairedDevice espNowDevices[MAX_ESPNOW_DEVICES];
@@ -3568,6 +3633,15 @@ unsigned long espNowScanStartedMs = 0;
 EspNowCandidate espNowCandidates[MAX_ESPNOW_DEVICES];
 uint8_t espNowCandidateCount = 0;
 bool espNowDevicesModalDirty = false;
+
+// RF433 learn session state - mirrors irLearningActive/irLearningResult's
+// shape closely on purpose, so the HTTP handlers and WebConfig JS below are
+// near copies of the existing IR-learn ones rather than a new design.
+bool rfLearnActive = false;
+unsigned long rfLearnStartedMs = 0;
+uint8_t rfLearnTargetIndex = 0;
+String rfLearnResultJson;
+String rfLearnError;
 volatile unsigned long bleKeepAliveUntilMs = 0;
 volatile bool bleBondStateSavePending = false;
 volatile bool bleDeviceProvisionPending = false;
@@ -3877,6 +3951,8 @@ void cancelEspNowScan();
 bool addEspNowDevice(const uint8_t mac[6], const char *name);
 bool removeEspNowDevice(const uint8_t mac[6]);
 bool sendEspNowCommand(const DeviceCommand &command);
+bool startRfLearn(uint8_t deviceIndex);
+void cancelRfLearn();
 void showEspNowDevicesModal();
 void toggleEspNowDevicesModal(lv_event_t *e);
 void serviceEspNowDevicesModal(unsigned long now);
@@ -12155,6 +12231,80 @@ void handleEspNowScanCancelApi() {
   sendJson(200, "{\"ok\":true,\"state\":\"idle\"}");
 }
 
+// ---------------------------------------------------------------------------
+// RF433 learning, relayed through a paired dock over ESP-NOW. Deliberately
+// shaped just like /api/ir/learn/* above so the WebConfig JS is close to a
+// copy, not a new design. Dock firmware doesn't exist yet (see 3.08
+// changelog), so these endpoints work but nothing currently answers them.
+// ---------------------------------------------------------------------------
+
+void handleRfLearnStartApi() {
+  if (!requestAuthorized()) {
+    sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
+    return;
+  }
+  JsonDocument doc;
+  deserializeJson(doc, webServer.arg("plain"));
+  const char *macText = doc["mac"] | "";
+  int deviceIndex = -1;
+  if (macText[0]) {
+    uint8_t mac[6];
+    if (parseMacAddress(macText, mac)) deviceIndex = findEspNowDeviceIndexByMac(mac);
+  } else if (espNowDeviceCount == 1) {
+    deviceIndex = 0;
+  }
+  if (deviceIndex < 0) {
+    sendJson(400, "{\"ok\":false,\"error\":\"Choose which paired ESP-NOW device to learn from\"}");
+    return;
+  }
+  if (!startRfLearn((uint8_t)deviceIndex)) {
+    JsonDocument response;
+    response["ok"] = false;
+    response["error"] = rfLearnError;
+    String body;
+    serializeJson(response, body);
+    sendJson(409, body);
+    return;
+  }
+  char body[96];
+  snprintf(body, sizeof(body), "{\"ok\":true,\"state\":\"listening\",\"timeoutMs\":%lu}",
+           (unsigned long)ESPNOW_RF_LEARN_TIMEOUT_MS);
+  sendJson(202, body);
+}
+
+void handleRfLearnStatusApi() {
+  if (!requestAuthorized()) {
+    sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
+    return;
+  }
+  if (rfLearnActive) {
+    sendJson(200, "{\"ok\":true,\"state\":\"listening\"}");
+  } else if (rfLearnResultJson.length()) {
+    sendJson(200, String("{\"ok\":true,\"state\":\"captured\",\"ir\":") + rfLearnResultJson + "}");
+  } else if (rfLearnError.length()) {
+    JsonDocument response;
+    response["ok"] = true;
+    response["state"] = "error";
+    response["error"] = rfLearnError;
+    String body;
+    serializeJson(response, body);
+    sendJson(200, body);
+  } else {
+    sendJson(200, "{\"ok\":true,\"state\":\"idle\"}");
+  }
+}
+
+void handleRfLearnCancelApi() {
+  if (!requestAuthorized()) {
+    sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
+    return;
+  }
+  cancelRfLearn();
+  rfLearnResultJson = "";
+  rfLearnError = "";
+  sendJson(200, "{\"ok\":true,\"state\":\"idle\"}");
+}
+
 String sanitizeIconFileName(String name) {
   int slash = max(name.lastIndexOf('/'), name.lastIndexOf('\\'));
   if (slash >= 0) name = name.substring(slash + 1);
@@ -12709,6 +12859,9 @@ void configureWebServer() {
   webServer.on("/api/espnow/scan/start", HTTP_POST, handleEspNowScanStartApi);
   webServer.on("/api/espnow/scan/status", HTTP_GET, handleEspNowScanStatusApi);
   webServer.on("/api/espnow/scan/cancel", HTTP_POST, handleEspNowScanCancelApi);
+  webServer.on("/api/rf/learn/start", HTTP_POST, handleRfLearnStartApi);
+  webServer.on("/api/rf/learn/status", HTTP_GET, handleRfLearnStatusApi);
+  webServer.on("/api/rf/learn/cancel", HTTP_POST, handleRfLearnCancelApi);
   webServer.on("/api/icons", HTTP_GET, handleIconList);
   webServer.on("/api/icons/custom", HTTP_POST, []() {
     if (!requestAuthorized()) webServer.send(403, "application/json", "{\"ok\":false}");
@@ -13106,24 +13259,65 @@ void espNowRegisterAllPeers() {
   }
 }
 
-// Only armed while espNowScanActive - outside a pairing window incoming
-// ESP-NOW frames are ignored entirely, so this never touches command traffic.
+// Armed while espNowScanActive (pairing) or rfLearnActive (RF433 capture) -
+// outside those two explicit, user-initiated windows incoming ESP-NOW
+// frames are ignored entirely, so this never touches command traffic.
 void onEspNowDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
-  if (!espNowScanActive || !info || !info->src_addr || !data) return;
-  if ((size_t)len < sizeof(EspNowAnnouncePacket)) return;
-  EspNowAnnouncePacket packet;
-  memcpy(&packet, data, sizeof(packet));
-  if (packet.magic != ESPNOW_ANNOUNCE_MAGIC) return;
-  packet.name[sizeof(packet.name) - 1] = '\0';
-  if (findEspNowCandidateIndexByMac(info->src_addr) >= 0) return;
-  if (espNowCandidateCount >= MAX_ESPNOW_DEVICES) return;
-  EspNowCandidate &candidate = espNowCandidates[espNowCandidateCount++];
-  memcpy(candidate.mac, info->src_addr, 6);
-  strlcpy(candidate.name, packet.name[0] ? packet.name : "ESP-NOW Device",
-          sizeof(candidate.name));
-  espNowDevicesModalDirty = true;
-  Serial.printf("ESP-NOW: pairing candidate %s (%s)\n", candidate.name,
-                formatMacAddress(candidate.mac).c_str());
+  if (!info || !info->src_addr || !data) return;
+
+  if (espNowScanActive && (size_t)len >= sizeof(EspNowAnnouncePacket)) {
+    EspNowAnnouncePacket packet;
+    memcpy(&packet, data, sizeof(packet));
+    if (packet.magic == ESPNOW_ANNOUNCE_MAGIC) {
+      packet.name[sizeof(packet.name) - 1] = '\0';
+      if (findEspNowCandidateIndexByMac(info->src_addr) < 0 &&
+          espNowCandidateCount < MAX_ESPNOW_DEVICES) {
+        EspNowCandidate &candidate = espNowCandidates[espNowCandidateCount++];
+        memcpy(candidate.mac, info->src_addr, 6);
+        strlcpy(candidate.name, packet.name[0] ? packet.name : "ESP-NOW Device",
+                sizeof(candidate.name));
+        espNowDevicesModalDirty = true;
+        Serial.printf("ESP-NOW: pairing candidate %s (%s)\n", candidate.name,
+                      formatMacAddress(candidate.mac).c_str());
+      }
+      return;
+    }
+  }
+
+  // Only accepted from the specific dock this session asked, so a stray or
+  // spoofed packet from elsewhere can't complete a learn with garbage data.
+  if (rfLearnActive && rfLearnTargetIndex < espNowDeviceCount &&
+      memcmp(espNowDevices[rfLearnTargetIndex].mac, info->src_addr, 6) == 0 &&
+      (size_t)len >= sizeof(EspNowRfLearnResultHeader)) {
+    EspNowRfLearnResultHeader header;
+    memcpy(&header, data, sizeof(header));
+    if (header.magic != ESPNOW_RF_LEARN_RESULT_MAGIC) return;
+    rfLearnActive = false;
+    if (!header.ok || header.rawCount == 0) {
+      rfLearnError = "No usable RF433 signal was captured. Try again.";
+      return;
+    }
+    size_t expectedLen = sizeof(header) + (size_t)header.rawCount * sizeof(uint16_t);
+    if ((size_t)len < expectedLen) {
+      rfLearnError = "RF433 capture arrived incomplete.";
+      return;
+    }
+    const uint16_t *timings = (const uint16_t *)(data + sizeof(header));
+    String timingsText;
+    timingsText.reserve((size_t)header.rawCount * 6U);
+    for (uint16_t i = 0; i < header.rawCount; i++) {
+      if (i) timingsText += ' ';
+      timingsText += String(timings[i]);
+    }
+    JsonDocument capture(&psramJsonAllocator);
+    capture["type"] = "raw";
+    capture["data"] = timingsText;
+    capture["timingCount"] = header.rawCount;
+    serializeJson(capture, rfLearnResultJson);
+    rfLearnError = "";
+    Serial.printf("ESP-NOW: RF433 capture received, %u timing(s)\n",
+                  (unsigned)header.rawCount);
+  }
 }
 
 void startEspNow() {
@@ -13141,6 +13335,7 @@ void startEspNow() {
 void stopEspNow() {
   if (!espNowRadioActive) return;
   espNowScanActive = false;
+  rfLearnActive = false;
   esp_now_unregister_recv_cb();
   esp_now_deinit();
   espNowRadioActive = false;
@@ -13163,6 +13358,43 @@ void serviceEspNow(unsigned long now) {
     espNowDevicesModalDirty = true;
     Serial.println("ESP-NOW: pairing window closed (timeout)");
   }
+  if (rfLearnActive && now - rfLearnStartedMs >= ESPNOW_RF_LEARN_TIMEOUT_MS) {
+    rfLearnActive = false;
+    rfLearnError = "No usable RF433 signal was captured. Try again.";
+    Serial.println("ESP-NOW: RF433 learn window closed (timeout)");
+  }
+}
+
+// deviceIndex identifies which paired dock to ask - WebConfig resolves a MAC
+// to an index the same way addEspNowDevice()/removeEspNowDevice() do.
+bool startRfLearn(uint8_t deviceIndex) {
+  if (deviceIndex >= espNowDeviceCount) {
+    rfLearnError = "That device isn't paired";
+    return false;
+  }
+  if (!espNowRadioActive) {
+    rfLearnError = "ESP-NOW is disabled, or Wi-Fi station isn't available right now";
+    return false;
+  }
+  EspNowRfLearnStartPacket packet = {};
+  packet.magic = ESPNOW_RF_LEARN_START_MAGIC;
+  packet.timeoutMs = ESPNOW_RF_LEARN_TIMEOUT_MS;
+  esp_err_t result = esp_now_send(espNowDevices[deviceIndex].mac,
+                                  (const uint8_t *)&packet, sizeof(packet));
+  if (result != ESP_OK) {
+    rfLearnError = "Could not reach the paired dock";
+    return false;
+  }
+  rfLearnActive = true;
+  rfLearnStartedMs = millis();
+  rfLearnTargetIndex = deviceIndex;
+  rfLearnResultJson = "";
+  rfLearnError = "";
+  return true;
+}
+
+void cancelRfLearn() {
+  rfLearnActive = false;
 }
 
 bool startEspNowScan() {
