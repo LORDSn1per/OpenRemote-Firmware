@@ -12,7 +12,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Firmware-v3.08-2f8cff?style=flat-square" alt="Firmware v3.08">
   <img src="https://img.shields.io/badge/Studio-v2.67-2f8cff?style=flat-square" alt="Studio v2.67">
-  <img src="https://img.shields.io/badge/WebConfig-v2.45-2f8cff?style=flat-square" alt="WebConfig v2.45">
+  <img src="https://img.shields.io/badge/WebConfig-v2.46-2f8cff?style=flat-square" alt="WebConfig v2.46">
   <img src="https://img.shields.io/badge/100%25-Local-30d158?style=flat-square" alt="100% Local">
   <img src="https://img.shields.io/badge/Cloud-None-30d158?style=flat-square" alt="No Cloud">
 </p>
