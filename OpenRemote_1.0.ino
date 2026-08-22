@@ -1,6 +1,19 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.21 - 2026-08-22
+    - Fixed a second, separate source of BuyDisplay touch latency left over
+      after 3.20 - confirmed still present on real hardware today.
+      lvTouchRead()'s own "require one confirming read at a similar
+      position before accepting a new touch-down" debounce (a ghost-touch
+      guard against electrical noise, distinct from readTouchSample()'s
+      double-read match loop fixed in 3.20) was still running
+      unconditionally for every panel - it costs one full LVGL indev poll
+      cycle of latency on every touch-down, on top of whatever
+      readTouchSample() itself takes. Now also gated on
+      displayModuleChoice == 0 (Adafruit only), matching 3.20's fix -
+      BuyDisplay's first touch-down read is accepted immediately.
+
   3.20 - 2026-08-22
     - Removed the "Touch Driver" dropdown (Adafruit/FT5x06/BuyDisplay) and
       the touchDriverChoice setting entirely, along with its NVS key
@@ -2883,7 +2896,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.20"
+#define OPENREMOTE_VERSION_STRING "3.21"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -14662,12 +14675,15 @@ void lvTouchRead(lv_indev_drv_t *drv, lv_indev_data_t *data) {
   }
 
   if (touchFound && readTouch(x, y)) {
-    if (!touchWasDown) {
-      // A single spurious sample with otherwise-valid, in-range coordinates
-      // is the signature of electrical/capacitive noise (worst right after a
-      // sleep/wake power transition), not a real finger, which stays down for
-      // many consecutive poll cycles. Require one confirming read at a
-      // similar position before treating this as a genuine new touch-down.
+    if (!touchWasDown && displayModuleChoice == 0) {
+      // Adafruit panel only: a single spurious sample with otherwise-valid,
+      // in-range coordinates is the signature of electrical/capacitive
+      // noise (worst right after a sleep/wake power transition) on this
+      // panel, not a real finger, which stays down for many consecutive
+      // poll cycles. Require one confirming read at a similar position
+      // before treating this as a genuine new touch-down - costs one poll
+      // cycle of latency, which is why it's skipped entirely on BuyDisplay
+      // below (no ghost-touch symptom there to guard against).
       if (touchPendingConfirmCount == 0 ||
           abs((int)x - (int)touchPendingX) > 12 ||
           abs((int)y - (int)touchPendingY) > 12) {
