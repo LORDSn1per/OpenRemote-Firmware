@@ -1,6 +1,22 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.12 - 2026-08-22
+    - Fixed the physical Settings navigation focus indicator (3.11) not
+      being visible once the focused row scrolled past the bottom of the
+      list - confirmed on real hardware today. LVGL does not auto-scroll a
+      newly-focused object into view on its own; the outline was moving
+      correctly, just off-screen. Added physicalNavFocusChanged(), wired
+      via lv_group_set_focus_cb() on physicalNavGroup (set up in setup()
+      alongside the group itself), which calls
+      lv_obj_scroll_to_view_recursive() on whatever the group focuses -
+      every D-pad Up/Down move, and the initial auto-focus when a screen's
+      rows are first registered. Recursive because a row sits inside a
+      card inside the scrollable content panel on the Omote menu style,
+      not just one scroll container deep.
+    - Not independently re-verified beyond compiling - reported back as
+      still not visible if this doesn't fix it.
+
   3.11 - 2026-08-22
     - Fixed 3.10's physical Settings navigation having no visible focus
       indicator - confirmed on real hardware today. Root cause:
@@ -2595,7 +2611,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.11"
+#define OPENREMOTE_VERSION_STRING "3.12"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -3516,6 +3532,20 @@ void addPhysicalNavFocusable(lv_obj_t *obj) {
   ensurePhysicalNavFocusStyle();
   lv_obj_add_style(obj, &physicalNavFocusStyle, LV_STATE_FOCUSED);
   lv_group_add_obj(physicalNavGroup, obj);
+}
+
+// The visible focus outline (3.11) was still no help once the focused row
+// scrolled off the bottom of the settings list - LVGL does not auto-scroll
+// a newly-focused object into view on its own. lv_group_set_focus_cb()
+// fires on every focus change (D-pad Up/Down, and the initial auto-focus
+// when a screen's rows are first added to the group), so this is the one
+// place that needs to handle it rather than doing it inline wherever focus
+// might change. "Recursive" because a row sits inside a card inside the
+// scrollable content panel on the Omote menu style - one level of
+// scroll-into-view isn't enough there.
+void physicalNavFocusChanged(lv_group_t *group) {
+  lv_obj_t *focused = lv_group_get_focused(group);
+  if (focused) lv_obj_scroll_to_view_recursive(focused, LV_ANIM_ON);
 }
 Preferences preferences;
 WebServer webServer(80);
@@ -19820,6 +19850,7 @@ void setupLvgl() {
   touchInputDevice = lv_indev_drv_register(&touchDrv);
 
   physicalNavGroup = lv_group_create();
+  lv_group_set_focus_cb(physicalNavGroup, physicalNavFocusChanged);
   lv_indev_drv_init(&physicalNavDrv);
   physicalNavDrv.type = LV_INDEV_TYPE_KEYPAD;
   physicalNavDrv.read_cb = physicalNavReadCb;
