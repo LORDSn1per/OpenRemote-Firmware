@@ -1,6 +1,32 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.22 - 2026-08-22
+    - Fixed the red physical-nav focus outline showing up on the settings
+      menu even when it was reached by a normal touch tap/swipe, not the
+      Stop+Forward physical combo - confirmed on real hardware today.
+      renderSettingsPage() was unconditionally treating "a settings screen
+      just appeared" as activity, resetting physicalNavLastKeyMs to now and
+      forcing physicalNavOutlineHidden false on every single render - touch
+      entry included. physicalNavFocusChanged() then compounded it: LVGL
+      auto-focuses the first row the instant it's added to the group during
+      that same render, and the focus callback started the breathing
+      animation unconditionally on every focus change, again with no
+      distinction between a genuine physical D-pad move and that automatic
+      first-row focus.
+    - Fixed by removing the forced reset in renderSettingsPage() entirely -
+      physicalNavLastKeyMs is already kept current by serviceKeypad()'s
+      existing "if (pressed) physicalNavLastKeyMs = now" on every physical
+      button press while Settings is showing (that already covers the
+      Stop+Forward combo that enters it and any D-pad/OK/Back press
+      afterwards), so no separate reset was actually needed - and by making
+      physicalNavFocusChanged() check that same recency before starting the
+      breathing animation, rather than starting it unconditionally on every
+      focus change. A focus change with no physical button pressed in the
+      last 2s (touch tap/swipe into Settings, or a same-screen rebuild
+      triggered by a touch toggle) now sets the newly-focused row's outline
+      width straight to 0 instead of ever animating it visible.
+
   3.21 - 2026-08-22
     - Fixed a second, separate source of BuyDisplay touch latency left over
       after 3.20 - confirmed still present on real hardware today.
@@ -2896,7 +2922,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.21"
+#define OPENREMOTE_VERSION_STRING "3.22"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -3902,7 +3928,24 @@ void servicePhysicalNavIdleHide(unsigned long now) {
 void physicalNavFocusChanged(lv_group_t *group) {
   lv_obj_t *focused = lv_group_get_focused(group);
   if (focused) lv_obj_scroll_to_view_recursive(focused, LV_ANIM_ON);
-  physicalNavStartBreathing(focused);
+  // Focus changes for two very different reasons: real D-pad/OK use (should
+  // show the outline), and LVGL's own automatic first-row focus the moment a
+  // screen's rows are registered into the group - which fires just as much
+  // when Settings was reached by touch tap/swipe as by the physical combo,
+  // and must NOT show the outline. physicalNavLastKeyMs is only ever touched
+  // by an actual physical button press (see serviceKeypad()), so recency of
+  // that is what decides it, not merely "a settings screen is showing".
+  if ((uint32_t)(millis() - physicalNavLastKeyMs) < PHYSICAL_NAV_IDLE_HIDE_MS) {
+    physicalNavOutlineHidden = false;
+    physicalNavStartBreathing(focused);
+  } else {
+    physicalNavOutlineHidden = true;
+    physicalNavBreatheTarget = focused;
+    if (focused) {
+      lv_obj_set_style_outline_width(focused, 0, LV_PART_MAIN | LV_STATE_FOCUSED);
+      lv_obj_set_style_outline_width(focused, 0, LV_PART_INDICATOR | LV_STATE_FOCUSED);
+    }
+  }
 }
 
 // LVGL 8's lv_msgbox has no public accessor for its internal button matrix
@@ -18353,11 +18396,18 @@ void renderAboutPage() {
 }
 
 void renderSettingsPage() {
-  // Any settings screen appearing - fresh navigation or a same-screen
-  // rebuild - counts as activity, so the outline (and its 2s idle-hide
-  // timer) starts visible rather than possibly already hidden.
-  physicalNavLastKeyMs = millis();
-  physicalNavOutlineHidden = false;
+  // Deliberately does NOT unconditionally mark this as "activity" any more
+  // (that used to force physicalNavLastKeyMs/physicalNavOutlineHidden to
+  // show the outline on every screen appearing, including reaching Settings
+  // by a normal touch tap or swipe). The outline must only ever appear from
+  // physical D-pad/OK/Back use - physicalNavLastKeyMs is already kept fresh
+  // by the "if (pressed) physicalNavLastKeyMs = now;" line in serviceKeypad()
+  // for every physical button press while Settings is showing, including the
+  // Stop+Forward combo that enters it, so no separate reset is needed here.
+  // physicalNavFocusChanged() below reads that same recency to decide
+  // whether the initial auto-focus on this screen's first row should be
+  // visible or start hidden.
+  //
   // Every settings screen is rebuilt from scratch on each visit (fresh LVGL
   // objects), so the D-pad/OK focus group from the previous screen would
   // otherwise be left holding pointers to deleted widgets. makeSettingRow()/
