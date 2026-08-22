@@ -1,6 +1,30 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.15 - 2026-08-22
+    - Fixed selecting "BuyDisplay" in Display Module (3.09) not actually
+      fixing the inverted colours after reboot - confirmed on real
+      hardware today. Root cause: displayInverted is persisted in two
+      places, not one. NVS ("invert"), which 3.09's
+      displayModuleDropdownEvent() correctly wrote; and settings{} inside
+      runtime.json on the SD card, which WebConfig's own Display page
+      toggle reads/writes and which applySettingsJson() treats as
+      authoritative on every boot - it reads the SD copy, then
+      unconditionally calls saveSettings(), which writes whatever it just
+      read straight back over NVS. Since the SD copy was never touched by
+      the Display Module dropdown, the very next boot silently reverted
+      the NVS fix back to the stale SD value before rebuildDisplayColourLut()
+      ever ran. dispDrv/touchDrv, which the Display Module row was modelled
+      on, don't have this problem - they're NVS-only hardware config with
+      no SD-side counterpart, so nothing overwrites them at boot.
+    - Fixed by also calling persistSettingsToRuntimeConfig() from
+      displayModuleDropdownEvent(), writing the current in-memory
+      displayInverted to the SD copy immediately - before the reboot
+      confirmation prompt can even be answered - so both copies agree by
+      the time the remote actually restarts.
+    - Not independently re-verified beyond compiling - reported back as
+      still wrong if this doesn't hold up on hardware.
+
   3.14 - 2026-08-22
     - Fixed D-pad Up/Down doing nothing inside an open dropdown - moving
       the row focus behind it and closing the dropdown instead - confirmed
@@ -2690,7 +2714,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.14"
+#define OPENREMOTE_VERSION_STRING "3.15"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -17267,6 +17291,19 @@ void displayModuleDropdownEvent(lv_event_t *e) {
   preferences.putBool("invert", invertDefault);
   preferences.end();
   displayInverted = invertDefault;
+  // displayInverted is also synced through settings{} in runtime.json on
+  // the SD card (WebConfig's Display page toggle writes/reads it there),
+  // unlike dispDrv/touchDrv above which are NVS-only hardware config. At
+  // boot, applySettingsJson() reads that SD copy and treats it as
+  // authoritative - including calling saveSettings(), which writes
+  // whatever it just read straight back over the NVS value above. Setting
+  // NVS alone here left the SD copy stale, so the very next boot's
+  // applySettingsJson() silently reverted this to whatever was already
+  // saved there (confirmed on real hardware: BuyDisplay stayed inverted
+  // after reboot). persistSettingsToRuntimeConfig() writes the current
+  // in-memory displayInverted to the SD copy immediately, before the
+  // reboot prompt below can be confirmed, so both copies agree.
+  persistSettingsToRuntimeConfig();
   lastWakeMs = millis();
   showDebugRebootConfirmation(true);
 }
