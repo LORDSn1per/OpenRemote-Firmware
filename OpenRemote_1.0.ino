@@ -1,6 +1,23 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.17 - 2026-08-22
+    - Changed the physical-nav focus outline from the cyan/blue modal
+      accent (60,180,220) to red (255,69,58) per request - the same red
+      WebConfig already uses as its own system accent, not a new colour.
+    - Added "BuyDisplay" as a third Touch Driver option (Adafruit/FT5x06/
+      BuyDisplay, both menu styles) per request. Every branch that reads
+      touchDriverChoice already tests specifically for == 1 (FT5x06's
+      native LovyanGFX attach), so value 2 falls through to the same
+      Wire-based 0x38/register-0x02 read path as Adafruit with no new
+      read code - this is deliberate, not an oversight: the actual
+      BuyDisplay touch IC still isn't confirmed (see 3.09's changelog -
+      their site blocked automated fetches), so "BuyDisplay" behaves
+      identically to "Adafruit" today. It exists as a selectable, labelled
+      option and a place to put a real distinction later if testing shows
+      one is needed (e.g. rotated/mirrored coordinates), not as evidence a
+      different chip has been confirmed or implemented.
+
   3.16 - 2026-08-22
     - Simplified physical Settings navigation per request: Menu and Return
       no longer do anything special - Back alone does both jobs. One press
@@ -2763,7 +2780,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.16"
+#define OPENREMOTE_VERSION_STRING "3.17"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -3695,7 +3712,9 @@ void ensurePhysicalNavFocusStyle() {
   if (physicalNavFocusStyleReady) return;
   lv_style_init(&physicalNavFocusStyle);
   lv_style_set_outline_width(&physicalNavFocusStyle, 4);
-  lv_style_set_outline_color(&physicalNavFocusStyle, lvRgb(60, 180, 220));
+  // 255,69,58 - the same red (#ff453a) WebConfig already uses as its
+  // system red accent, reused here rather than inventing a new one.
+  lv_style_set_outline_color(&physicalNavFocusStyle, lvRgb(255, 69, 58));
   lv_style_set_outline_opa(&physicalNavFocusStyle, LV_OPA_COVER);
   lv_style_set_outline_pad(&physicalNavFocusStyle, 1);
   physicalNavFocusStyleReady = true;
@@ -17544,8 +17563,8 @@ void makeTouchDriverRow(int y) {
   lv_obj_set_pos(dropdown, 104, 1);
   lv_obj_set_size(dropdown, 112, 32);
   styleDebugDropdown(dropdown);
-  lv_dropdown_set_options(dropdown, "Adafruit\nFT5x06");
-  lv_dropdown_set_selected(dropdown, touchDriverChoice ? 1 : 0);
+  lv_dropdown_set_options(dropdown, "Adafruit\nFT5x06\nBuyDisplay");
+  lv_dropdown_set_selected(dropdown, touchDriverChoice);
   lv_obj_add_event_cb(dropdown, touchDriverDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
   addPhysicalNavFocusable(dropdown);
 }
@@ -17734,8 +17753,8 @@ void renderDebugPageOmote() {
 
     makeOmoteDivider(driverCard, rowIndex * (calibRowH + 1) - 1);
     lv_obj_t *touchDropdown = makeOmoteDropdownRow(driverCard, "Touch", rowIndex * (calibRowH + 1), calibRowH, 112);
-    lv_dropdown_set_options(touchDropdown, "Adafruit\nFT5x06");
-    lv_dropdown_set_selected(touchDropdown, touchDriverChoice ? 1 : 0);
+    lv_dropdown_set_options(touchDropdown, "Adafruit\nFT5x06\nBuyDisplay");
+    lv_dropdown_set_selected(touchDropdown, touchDriverChoice);
     lv_obj_add_event_cb(touchDropdown, touchDriverDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
     rowIndex++;
   }
@@ -20469,7 +20488,9 @@ void setup() {
                    ", drive=" + String(lcdDriveStrength)).c_str());
   Serial.printf("Touch driver: %s\n",
                 (touchDriverChoice == 1 && displayDriverChoice == 0)
-                  ? "FT5x06 (LovyanGFX, no Wire)" : "Adafruit (Wire)");
+                  ? "FT5x06 (LovyanGFX, no Wire)"
+                  : (touchDriverChoice == 2 ? "BuyDisplay (Wire, same protocol as Adafruit)"
+                                            : "Adafruit (Wire)"));
   uint32_t panelBlackMs = millis();
   IrSender.begin();
   IrReceiver.begin(PIN_IR_RX, DISABLE_LED_FEEDBACK);
