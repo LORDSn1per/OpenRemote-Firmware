@@ -1,6 +1,30 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.20 - 2026-08-22
+    - Removed the "Touch Driver" dropdown (Adafruit/FT5x06/BuyDisplay) and
+      the touchDriverChoice setting entirely, along with its NVS key
+      ("touchDrv") and the now-dead LovyanGFX Touch_FT5x06 attach path
+      (attachLgfxTouch()/lgfxTouch member). With the BuyDisplay panel now
+      confirmed working over Wire, both remaining code paths under this
+      dropdown (Adafruit and BuyDisplay) had been byte-for-byte identical
+      since 3.09/3.17 - the option never did anything. FT5x06 was a
+      genuinely different code path (bypassed Wire via LovyanGFX's own
+      driver) but nothing in this project's hardware history since 2.09 has
+      used it, so it goes too rather than leaving unreachable dead code
+      behind. readTouchSample() no longer branches on it at all - one Wire-
+      based read path, used unconditionally.
+    - Fixed the multi-millisecond delay before a BuyDisplay touch registers.
+      readTouchSample()'s 5x back-to-back double-read match loop (added in
+      2.38 specifically to filter ghost touches reported on the Adafruit
+      panel) was still running for every touch regardless of which panel is
+      fitted - each retry is a real I2C round-trip, so genuine BuyDisplay
+      touches were being held for several extra reads before being
+      accepted, even though BuyDisplay has shown no ghost-touch symptoms.
+      Now gated on displayModuleChoice == 0 (Adafruit only, via the
+      existing Settings > Debug > Module dropdown) - BuyDisplay accepts a
+      touch on the very first matching read.
+
   3.19 - 2026-08-22
     - Fixed keypad-adjusted sliders on the Display and Buttons pages
       visibly moving their number label but never actually applying or
@@ -2859,7 +2883,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.19"
+#define OPENREMOTE_VERSION_STRING "3.20"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -3213,7 +3237,6 @@ class OpenRemoteDisplay : public lgfx::LGFX_Device {
  private:
   lgfx::Panel_ILI9341 panel;
   lgfx::Bus_Parallel8 bus;
-  lgfx::Touch_FT5x06 lgfxTouch;
 
  public:
   OpenRemoteDisplay() {
@@ -3254,27 +3277,6 @@ class OpenRemoteDisplay : public lgfx::LGFX_Device {
     bus.config(busConfig);
   }
 
-  // Called from setup() before init(), only when the "FT5x06" touch driver
-  // option is selected - the same LovyanGFX Touch_FT5x06 driver the official
-  // OMOTE firmware uses, which bypasses the Arduino Wire library entirely
-  // (direct I2C register access) and does its own internal back-to-back
-  // double-read validation. Left unattached otherwise so this project's own
-  // Wire-based reads have the FT5x06 fully to themselves.
-  void attachLgfxTouch(bool enable) {
-    if (!enable) return;
-    auto touchConfig = lgfxTouch.config();
-    touchConfig.i2c_addr = ADDR_TOUCH;
-    touchConfig.i2c_port = 0;
-    touchConfig.pin_sda = PIN_I2C_SDA;
-    touchConfig.pin_scl = PIN_I2C_SCL;
-    touchConfig.freq = 400000;
-    touchConfig.x_min = 0;
-    touchConfig.x_max = LCD_W - 1;
-    touchConfig.y_min = 0;
-    touchConfig.y_max = LCD_H - 1;
-    lgfxTouch.config(touchConfig);
-    panel.setTouch(&lgfxTouch);
-  }
 };
 
 OpenRemoteDisplay tft;
@@ -3349,14 +3351,6 @@ void applyLcdDriveStrength() {
   };
   for (int pin : busPins) gpio_set_drive_capability((gpio_num_t)pin, cap);
 }
-
-// 0 = "Adafruit" (this project's own Wire-based FT5x06 reads), 1 = "FT5x06"
-// (LovyanGFX's own Touch_FT5x06 driver, the same one the official OMOTE
-// firmware uses - bypasses the Arduino Wire library entirely via direct
-// I2C register access, and only takes effect when displayDriverChoice is
-// LovyanGFX, since it attaches through tft.init()). Loaded from Preferences
-// at boot; changing it requires a reboot to take effect.
-uint8_t touchDriverChoice = 0;
 
 // 0 = "OpenRemote" (this project's existing bordered-row list style), 1 =
 // "OMOTE" (dark rounded cards grouped under section headers, with chevron
@@ -5445,48 +5439,37 @@ enum TouchSampleStatus : int8_t {
 };
 
 TouchSampleStatus readTouchSample(uint16_t &x, uint16_t &y) {
-  if (touchDriverChoice == 1 && displayDriverChoice == 0) {
-    // "FT5x06" driver: the same LovyanGFX Touch_FT5x06 the official OMOTE
-    // firmware uses. It bypasses Wire entirely (direct I2C register access)
-    // and already performs its own internal back-to-back double-read
-    // validation and rotation/calibration matching the panel, so its result
-    // is trusted directly here.
-    uint16_t lx = 0, ly = 0;
-    if (tft.getTouch(&lx, &ly)) {
-      x = lx;
-      y = ly;
-      return TOUCH_SAMPLE_PRESSED;
-    }
-    return TOUCH_SAMPLE_RELEASED;
-  }
-
   uint8_t bufA[5];
-  uint8_t bufB[5];
   if (!readBytes(ADDR_TOUCH, 0x02, bufA, 5)) return TOUCH_SAMPLE_INVALID;
   uint8_t pointCount = bufA[0] & 0x0F;
   if (pointCount == 0) return TOUCH_SAMPLE_RELEASED;
   if (pointCount != 1) return TOUCH_SAMPLE_INVALID;
 
-  // "Adafruit" driver: match LovyanGFX's own FT5x06 driver's validation. A
-  // single 5-byte read can be corrupted by a brief electrical glitch
-  // elsewhere on the shared bus. Re-read immediately (microseconds later,
-  // not the next LVGL poll) and only accept the sample once two consecutive
-  // reads match byte-for-byte, retrying up to 5 times. A real finger can't
-  // move meaningfully in that gap, so genuine touches (including drags)
-  // match easily; a corrupted read essentially never reproduces itself
-  // bit-for-bit on an immediate re-read.
   uint8_t *current = bufA;
-  uint8_t *previous = bufB;
-  bool matched = false;
-  for (uint8_t attempt = 0; attempt < 5 && !matched; attempt++) {
-    memcpy(previous, current, 5);
-    if (!readBytes(ADDR_TOUCH, 0x02, current, 5)) return TOUCH_SAMPLE_INVALID;
-    uint8_t retryPointCount = current[0] & 0x0F;
-    if (retryPointCount == 0) return TOUCH_SAMPLE_RELEASED;
-    if (retryPointCount != 1) continue;
-    matched = memcmp(current, previous, 5) == 0;
+  if (displayModuleChoice == 0) {
+    // Adafruit panel only: a single 5-byte read can be corrupted by a brief
+    // electrical glitch elsewhere on the shared bus. Re-read immediately
+    // (microseconds later, not the next LVGL poll) and only accept the
+    // sample once two consecutive reads match byte-for-byte, retrying up to
+    // 5 times. A real finger can't move meaningfully in that gap, so
+    // genuine touches (including drags) match easily; a corrupted read
+    // essentially never reproduces itself bit-for-bit on an immediate
+    // re-read. Not needed on the BuyDisplay panel - its touch controller
+    // hasn't shown the same glitch, and this guard was the cause of the
+    // few-millisecond delay before a BuyDisplay touch registered.
+    uint8_t bufB[5];
+    uint8_t *previous = bufB;
+    bool matched = false;
+    for (uint8_t attempt = 0; attempt < 5 && !matched; attempt++) {
+      memcpy(previous, current, 5);
+      if (!readBytes(ADDR_TOUCH, 0x02, current, 5)) return TOUCH_SAMPLE_INVALID;
+      uint8_t retryPointCount = current[0] & 0x0F;
+      if (retryPointCount == 0) return TOUCH_SAMPLE_RELEASED;
+      if (retryPointCount != 1) continue;
+      matched = memcmp(current, previous, 5) == 0;
+    }
+    if (!matched) return TOUCH_SAMPLE_INVALID;
   }
-  if (!matched) return TOUCH_SAMPLE_INVALID;
 
   uint16_t rawX = ((uint16_t)(current[1] & 0x0F) << 8) | current[2];
   uint16_t rawY = ((uint16_t)(current[3] & 0x0F) << 8) | current[4];
@@ -6190,7 +6173,6 @@ void loadSettings() {
   lcdFreqHz = preferences.getULong("lcdFreqHz", 40000000UL);
   lcdBufferMode = preferences.getUChar("lcdBufMode", 1);
   lcdDriveStrength = constrain((int)preferences.getUChar("lcdDriveStr", 2), 0, 3);
-  touchDriverChoice = preferences.getUChar("touchDrv", 0);
   backlightPwmHz = preferences.getULong("blPwmHz", BACKLIGHT_PWM_HZ);
   if (!backlightPwmFrequencyValid(backlightPwmHz)) backlightPwmHz = BACKLIGHT_PWM_HZ;
   menuStyle = preferences.getUChar("menuStyle", 0);
@@ -12486,7 +12468,6 @@ bool performFactoryReset() {
   uint32_t savedLcdFreqHz = preferences.getULong("lcdFreqHz", 40000000UL);
   uint8_t savedLcdBufferMode = preferences.getUChar("lcdBufMode", 1);
   uint8_t savedLcdDriveStrength = preferences.getUChar("lcdDriveStr", 2);
-  uint8_t savedTouchDriverChoice = preferences.getUChar("touchDrv", 0);
   uint32_t savedBacklightPwmHz = preferences.getULong("blPwmHz", BACKLIGHT_PWM_HZ);
   uint8_t savedMenuStyle = preferences.getUChar("menuStyle", 0);
   bool savedDbgSplit = preferences.getBool("dbgSplit", false);
@@ -12502,7 +12483,6 @@ bool performFactoryReset() {
   preferences.putULong("lcdFreqHz", savedLcdFreqHz);
   preferences.putUChar("lcdBufMode", savedLcdBufferMode);
   preferences.putUChar("lcdDriveStr", savedLcdDriveStrength);
-  preferences.putUChar("touchDrv", savedTouchDriverChoice);
   preferences.putULong("blPwmHz", savedBacklightPwmHz);
   preferences.putUChar("menuStyle", savedMenuStyle);
   preferences.putBool("dbgSplit", savedDbgSplit);
@@ -12533,8 +12513,8 @@ void handleFactoryReset() {
   }
   sendJson(200, "{\"ok\":true,\"restarting\":true,\"sdFormatted\":false}");
   // A plain ESP.restart() (restartPending) leaves touch dead until a real
-  // physical reset - the exact same reason displayDriverDropdownEvent() /
-  // touchDriverDropdownEvent() etc. already request hardRestartPending
+  // physical reset - the exact same reason displayDriverDropdownEvent() and
+  // the other Display Driver row handlers already request hardRestartPending
   // (esp_rom_software_reset_system()) instead for any change that needs a
   // genuine peripheral reinit, not just an app-level restart. Factory Reset
   // rewrites Preferences and rebuilds SD folders the running firmware has
@@ -17637,16 +17617,6 @@ void lcdDriveStrengthDropdownEvent(lv_event_t *e) {
   showDebugRebootConfirmation(true);
 }
 
-void touchDriverDropdownEvent(lv_event_t *e) {
-  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
-  uint16_t selected = lv_dropdown_get_selected(lv_event_get_target(e));
-  preferences.begin(PREFERENCES_NAMESPACE, false);
-  preferences.putUChar("touchDrv", (uint8_t)selected);
-  preferences.end();
-  lastWakeMs = millis();
-  showDebugRebootConfirmation(true);
-}
-
 void makeDisplayDriverRow(int y) {
   lv_obj_t *panel = lv_obj_create(content);
   lv_obj_set_pos(panel, 8, y);
@@ -17721,24 +17691,6 @@ void makeLcdDriveStrengthRow(int y) {
   lv_dropdown_set_options(dropdown, "Weakest\nWeak\nDefault\nStrongest");
   lv_dropdown_set_selected(dropdown, lcdDriveStrength);
   lv_obj_add_event_cb(dropdown, lcdDriveStrengthDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
-  addPhysicalNavFocusable(dropdown);
-}
-
-void makeTouchDriverRow(int y) {
-  lv_obj_t *panel = lv_obj_create(content);
-  lv_obj_set_pos(panel, 8, y);
-  lv_obj_set_size(panel, 224, 44);
-  lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_clear_flag(panel, LV_OBJ_FLAG_CLICKABLE);
-  stylePanel(panel, lvRgb(34, 35, 39), lvRgb(54, 56, 62));
-  makeLabel(panel, "Touch Driver", 8, 8, &lv_font_montserrat_14, textPrimary());
-  lv_obj_t *dropdown = lv_dropdown_create(panel);
-  lv_obj_set_pos(dropdown, 104, 1);
-  lv_obj_set_size(dropdown, 112, 32);
-  styleDebugDropdown(dropdown);
-  lv_dropdown_set_options(dropdown, "Adafruit\nFT5x06\nBuyDisplay");
-  lv_dropdown_set_selected(dropdown, touchDriverChoice);
-  lv_obj_add_event_cb(dropdown, touchDriverDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
   addPhysicalNavFocusable(dropdown);
 }
 
@@ -17882,7 +17834,7 @@ void renderDebugPageOmote() {
   lv_obj_set_style_text_opa(driverLabel, LV_OPA_60, 0);
   y += 22;
 
-  int driverRows = displayDriverChoice == 0 ? 6 : 2;
+  int driverRows = displayDriverChoice == 0 ? 5 : 2;
   lv_obj_t *driverCard = makeOmoteCard(content, y, driverRows * calibRowH + (driverRows - 1));
   lv_obj_t *moduleDropdown = makeOmoteDropdownRow(driverCard, "Module", 0, calibRowH, 112);
   lv_dropdown_set_options(moduleDropdown, "Adafruit\nBuyDisplay");
@@ -17922,13 +17874,6 @@ void renderDebugPageOmote() {
     lv_dropdown_set_options(driveDropdown, "Weakest\nWeak\nDefault\nStrongest");
     lv_dropdown_set_selected(driveDropdown, lcdDriveStrength);
     lv_obj_add_event_cb(driveDropdown, lcdDriveStrengthDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
-    rowIndex++;
-
-    makeOmoteDivider(driverCard, rowIndex * (calibRowH + 1) - 1);
-    lv_obj_t *touchDropdown = makeOmoteDropdownRow(driverCard, "Touch", rowIndex * (calibRowH + 1), calibRowH, 112);
-    lv_dropdown_set_options(touchDropdown, "Adafruit\nFT5x06\nBuyDisplay");
-    lv_dropdown_set_selected(touchDropdown, touchDriverChoice);
-    lv_obj_add_event_cb(touchDropdown, touchDriverDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
     rowIndex++;
   }
   y += driverRows * calibRowH + (driverRows - 1) + 12;
@@ -18018,10 +17963,6 @@ void renderDebugPage() {
     makeLcdBufferRow(driverSectionY);
     driverSectionY += 50;
     makeLcdDriveStrengthRow(driverSectionY);
-    driverSectionY += 50;
-    // FT5x06 only attaches via tft.attachLgfxTouch()/tft.init(), so it only
-    // works with the LovyanGFX LCD driver - not shown otherwise.
-    makeTouchDriverRow(driverSectionY);
     driverSectionY += 50;
   }
 
@@ -20630,7 +20571,7 @@ void setup() {
   // Bring the panel up and fill it solid black before anything else in
   // setup() runs, not after the SD card and runtime.json have loaded. Every
   // display setting used here (displayDriverChoice, lcdFreqHz, lcdBufferMode,
-  // lcdDriveStrength, touchDriverChoice) already comes from NVS via
+  // lcdDriveStrength) already comes from NVS via
   // loadSettings() above, not from runtime.json, so nothing later in setup()
   // needs to run first. The backlight is still held off by lcdPowerOn()/
   // initBacklightPwm() until lcdBacklight(true) near the end of this
@@ -20650,7 +20591,6 @@ void setup() {
     agfx->fillScreen(0x0000);
   } else {
     tft.setBusFrequency(lcdFreqHz);
-    tft.attachLgfxTouch(touchDriverChoice == 1);
     tft.init();
     applyLcdDriveStrength();
     tft.initDMA();
@@ -20664,11 +20604,7 @@ void setup() {
                   (String(", ") + String(lcdFreqHz / 1000000UL) + "MHz, " +
                    (lcdBufferMode ? "double buffer" : "single buffer") +
                    ", drive=" + String(lcdDriveStrength)).c_str());
-  Serial.printf("Touch driver: %s\n",
-                (touchDriverChoice == 1 && displayDriverChoice == 0)
-                  ? "FT5x06 (LovyanGFX, no Wire)"
-                  : (touchDriverChoice == 2 ? "BuyDisplay (Wire, same protocol as Adafruit)"
-                                            : "Adafruit (Wire)"));
+  Serial.printf("Touch: %s (Wire)\n", displayModuleChoice == 1 ? "BuyDisplay" : "Adafruit");
   uint32_t panelBlackMs = millis();
   IrSender.begin();
   IrReceiver.begin(PIN_IR_RX, DISABLE_LED_FEEDBACK);
@@ -20680,14 +20616,7 @@ void setup() {
   // Match firmware 2.09's proven touch startup. The controller comes up with
   // the shared LCD rail and needs only an address probe; writing FT5x06 mode
   // registers here can preserve/replay stale contacts on this Rev 5 panel.
-  // Skipped for the FT5x06/LovyanGFX touch driver - it probes and attaches
-  // the chip itself via tft.attachLgfxTouch()/tft.init() below, using its
-  // own I2C implementation rather than this Wire-based check.
-  if (displayDriverChoice == 0 && touchDriverChoice == 1) {
-    touchFound = true;
-  } else {
-    touchFound = i2cDevicePresent(ADDR_TOUCH);
-  }
+  touchFound = i2cDevicePresent(ADDR_TOUCH);
   uint32_t sensorsStartMs = millis();
   initTca8418();
   initLIS3DH();
