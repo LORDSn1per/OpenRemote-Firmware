@@ -1,6 +1,57 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.13 - 2026-08-22
+    - Fixed physical Settings navigation wrapping back to the top after the
+      ESP-NOW row in Debug - confirmed on real hardware today. Root cause:
+      only makeSettingRow()/makeOmoteRow()'s clickable rows and switches
+      were ever added to physicalNavGroup (3.10). Every dropdown and every
+      settings-page slider - both menu styles - was built directly with
+      lv_dropdown_create()/lv_slider_create() outside those two helpers, so
+      none of them were in the group at all; D-pad Down at the last
+      registered row had nothing left to reach and LVGL's default group
+      wrap took it back to the first item. Per the request to cover
+      "switches, dropdowns, sliders, EVERYTHING": wired
+      addPhysicalNavFocusable() into makeOmoteDropdownRow() (the shared
+      Omote dropdown-row helper - covers Module/LCD Driver/LCD Clock/
+      Buffering/Pressure/Touch/Wake in one place), makeDebugRowDropdown()
+      (the 5 row-calibration dropdowns), makeMicrophoneSourceRow(), the 8
+      classic-style single-dropdown debug rows (Display Module through
+      Menu Style), the classic Wake dropdown, and both shared slider
+      builders behind the Display and Buttons pages' sliders. The
+      standalone brightness overlay slider (a touch-only popup outside the
+      Settings page entirely) was deliberately left out - it isn't part of
+      the Settings D-pad tree this feature covers.
+    - Added D-pad/OK navigation to the reboot-confirmation popup (shown
+      after changing a driver/module dropdown) per request - "so I can hit
+      Cancel or Reboot". LVGL's lv_msgbox already handles Left/Right
+      between buttons and OK/ENTER to activate once its internal button
+      matrix is keypad-focused; the only work needed was finding that
+      matrix (no public accessor in this LVGL version - found by checking
+      each child's type against lv_btnmatrix_class) and giving it
+      somewhere to be focused. Given its own group,
+      physicalNavModalGroup, swapped onto physicalNavInputDevice while the
+      popup is open and back to physicalNavGroup when it closes (either
+      button) - added to the same page-level group instead, the settings
+      row underneath a just-opened popup would also still be reachable by
+      D-pad, which doesn't make sense while a modal is up.
+    - Added a "breathing" idle animation to the focus outline per request -
+      its width animates 2px to 6px and back (900ms each way, ease-in-out,
+      infinite) via a local per-object style, which always wins over the
+      shared physicalNavFocusStyle's fixed 3px so the two don't fight.
+      Runs via the same lv_group_set_focus_cb() callback already handling
+      scroll-into-view, on whichever object is currently focused - both
+      physicalNavGroup and physicalNavModalGroup share it, so it follows
+      focus into and out of the reboot popup too. Explicitly stopped
+      (physicalNavStopBreathing(), deleting the anim and clearing the
+      tracked target) at the same point the group itself is cleared in
+      renderSettingsPage(), since the animation's target object is about to
+      be deleted by the next screen's rebuild and leaving a dangling
+      pointer around for the anim to tick against next would be a real
+      use-after-free, not just a cosmetic glitch.
+    - Not independently re-verified beyond compiling - reported back as
+      still wrong if any of this doesn't hold up on hardware.
+
   3.12 - 2026-08-22
     - Fixed the physical Settings navigation focus indicator (3.11) not
       being visible once the focused row scrolled past the bottom of the
@@ -2611,7 +2662,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.12"
+#define OPENREMOTE_VERSION_STRING "3.13"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -3501,6 +3552,12 @@ bool physicalNavTouchLocked = false;
 bool physicalStopHeld = false;
 bool physicalForwardHeld = false;
 lv_group_t *physicalNavGroup = nullptr;
+// A modal (currently just the reboot confirmation msgbox) swaps
+// physicalNavInputDevice onto this separate group while it's open, instead
+// of adding its buttons to physicalNavGroup alongside the page underneath -
+// otherwise D-pad Up/Down would cycle through both the modal and the
+// settings rows behind it at once. Swapped back on close.
+lv_group_t *physicalNavModalGroup = nullptr;
 lv_indev_drv_t physicalNavDrv;
 lv_indev_t *physicalNavInputDevice = nullptr;
 uint32_t physicalNavCurrentKey = 0;
@@ -3543,9 +3600,62 @@ void addPhysicalNavFocusable(lv_obj_t *obj) {
 // might change. "Recursive" because a row sits inside a card inside the
 // scrollable content panel on the Omote menu style - one level of
 // scroll-into-view isn't enough there.
+lv_obj_t *physicalNavBreatheTarget = nullptr;
+
+void physicalNavBreatheAnimExec(void *obj, int32_t value) {
+  lv_obj_set_style_outline_width((lv_obj_t *)obj, value, LV_PART_MAIN | LV_STATE_FOCUSED);
+}
+
+// A local style (set directly on the object) always wins over the shared
+// physicalNavFocusStyle's fixed 3px outline, so this animates smoothly
+// without fighting it. Stopped and reset on the previous target before
+// switching so a row navigated away from doesn't keep mid-breath.
+void physicalNavStartBreathing(lv_obj_t *obj) {
+  if (physicalNavBreatheTarget && physicalNavBreatheTarget != obj) {
+    lv_anim_del(physicalNavBreatheTarget, physicalNavBreatheAnimExec);
+    lv_obj_set_style_outline_width(physicalNavBreatheTarget, 3, LV_PART_MAIN | LV_STATE_FOCUSED);
+  }
+  physicalNavBreatheTarget = obj;
+  if (!obj) return;
+  lv_anim_t animation;
+  lv_anim_init(&animation);
+  lv_anim_set_var(&animation, obj);
+  lv_anim_set_exec_cb(&animation, physicalNavBreatheAnimExec);
+  lv_anim_set_values(&animation, 2, 6);
+  lv_anim_set_time(&animation, 900);
+  lv_anim_set_playback_time(&animation, 900);
+  lv_anim_set_repeat_count(&animation, LV_ANIM_REPEAT_INFINITE);
+  lv_anim_set_path_cb(&animation, lv_anim_path_ease_in_out);
+  lv_anim_start(&animation);
+}
+
+// Stops and forgets any breathing animation - called before the group it
+// was running against gets cleared (renderSettingsPage()), since the
+// animation's target object is about to be deleted and a dangling pointer
+// here would be a use-after-free the next time the anim ticks.
+void physicalNavStopBreathing() {
+  if (!physicalNavBreatheTarget) return;
+  lv_anim_del(physicalNavBreatheTarget, physicalNavBreatheAnimExec);
+  physicalNavBreatheTarget = nullptr;
+}
+
 void physicalNavFocusChanged(lv_group_t *group) {
   lv_obj_t *focused = lv_group_get_focused(group);
   if (focused) lv_obj_scroll_to_view_recursive(focused, LV_ANIM_ON);
+  physicalNavStartBreathing(focused);
+}
+
+// LVGL 8's lv_msgbox has no public accessor for its internal button matrix
+// (mbox->btns is a private struct field), so it's found the same way the
+// widget itself would report its own children's types.
+lv_obj_t *findMsgboxButtonMatrix(lv_obj_t *msgbox) {
+  if (!msgbox) return nullptr;
+  uint32_t childCount = lv_obj_get_child_cnt(msgbox);
+  for (uint32_t i = 0; i < childCount; i++) {
+    lv_obj_t *child = lv_obj_get_child(msgbox, i);
+    if (lv_obj_check_type(child, &lv_btnmatrix_class)) return child;
+  }
+  return nullptr;
 }
 Preferences preferences;
 WebServer webServer(80);
@@ -15292,6 +15402,7 @@ lv_obj_t *makeOmoteDropdownRow(lv_obj_t *card, const char *name, int y, int heig
   lv_obj_set_pos(dropdown, 224 - dropdownWidth - 8, (height - 32) / 2);
   lv_obj_set_size(dropdown, dropdownWidth, 32);
   styleOmoteDropdown(dropdown);
+  addPhysicalNavFocusable(dropdown);
   return dropdown;
 }
 
@@ -16707,6 +16818,7 @@ void makeDisplaySlider(const char *label, int y, int minValue, int maxValue, int
   // the OpenRemote-style page keeps its own 12px.
   lv_obj_set_size(slider, width, omoteStyle ? 10 : 12);
   if (omoteStyle) styleOmoteSlider(slider); else styleModernSlider(slider);
+  addPhysicalNavFocusable(slider);
   if (setting == 2) {
     uint8_t index = deepSleepSliderIndex(value);
     lv_slider_set_range(slider, 0, 6);
@@ -16799,6 +16911,7 @@ void renderDisplayPage() {
   lv_dropdown_set_options(wakeDropdown, "Motion\nButton");
   lv_dropdown_set_selected(wakeDropdown, wakeMode == WAKE_MODE_BUTTON ? 1 : 0);
   lv_obj_add_event_cb(wakeDropdown, wakeModeDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
+  addPhysicalNavFocusable(wakeDropdown);
   makeSettingRow("Colour Depth", displayRgb666 ? "RGB666 panel transfer" : "RGB565 panel transfer", 420, &displayRgb666);
 }
 
@@ -16846,6 +16959,7 @@ void makeButtonTimingSlider(const char *label, int y, int minValue,
   lv_obj_set_pos(slider, x, y + 23);
   lv_obj_set_size(slider, width, omoteStyle ? 10 : 12);
   if (omoteStyle) styleOmoteSlider(slider); else styleModernSlider(slider);
+  addPhysicalNavFocusable(slider);
   int sliderValue = value;
   if (setting == 0) {
     lv_slider_set_range(slider, minValue / 50, maxValue / 50);
@@ -17000,6 +17114,7 @@ void makeDebugRowDropdown(uint8_t row, int y) {
   lv_dropdown_set_selected(dropdown, debugRowPixels[row] - minimum);
   lv_obj_add_event_cb(dropdown, debugRowDropdownEvent, LV_EVENT_VALUE_CHANGED,
                       (void *)(uintptr_t)row);
+  addPhysicalNavFocusable(dropdown);
 }
 
 void microphoneSourceDropdownEvent(lv_event_t *e) {
@@ -17025,6 +17140,7 @@ void makeMicrophoneSourceRow(int y) {
   lv_dropdown_set_selected(dropdown, microphoneTestAudioEnabled ? 1 : 0);
   lv_obj_add_event_cb(dropdown, microphoneSourceDropdownEvent,
                       LV_EVENT_VALUE_CHANGED, nullptr);
+  addPhysicalNavFocusable(dropdown);
 }
 
 void confirmDebugReboot(lv_event_t *e) {
@@ -17033,6 +17149,12 @@ void confirmDebugReboot(lv_event_t *e) {
   bool confirmed = choice && strcmp(choice, "Reboot") == 0;
   lv_msgbox_close(lcdRebootConfirmBox);
   lcdRebootConfirmBox = nullptr;
+  // Restore D-pad/OK navigation to the settings page underneath, regardless
+  // of which button was chosen - this modal is the only thing that puts the
+  // indev on physicalNavModalGroup, so closing it always means going back.
+  if (physicalNavInputDevice && physicalNavGroup) {
+    lv_indev_set_group(physicalNavInputDevice, physicalNavGroup);
+  }
   if (!confirmed) return;
   if (lcdRebootConfirmHard) hardRestartPending = true;
   else restartPending = true;
@@ -17051,6 +17173,19 @@ void showDebugRebootConfirmation(bool hard) {
   lv_obj_center(lcdRebootConfirmBox);
   lv_obj_add_event_cb(lcdRebootConfirmBox, confirmDebugReboot,
                       LV_EVENT_VALUE_CHANGED, nullptr);
+  // D-pad Left/Right already move between a focused btnmatrix's buttons and
+  // OK/ENTER already activates the selected one - LVGL's own keypad handling
+  // for this widget, no new key mapping needed. Swapped onto its own group
+  // (not added to physicalNavGroup) so the settings page underneath isn't
+  // also reachable while this is open - see physicalNavModalGroup's comment.
+  if (physicalNavModalGroup) {
+    lv_group_remove_all_objs(physicalNavModalGroup);
+    lv_obj_t *buttonMatrix = findMsgboxButtonMatrix(lcdRebootConfirmBox);
+    if (buttonMatrix) lv_group_add_obj(physicalNavModalGroup, buttonMatrix);
+    if (physicalNavInputDevice) {
+      lv_indev_set_group(physicalNavInputDevice, physicalNavModalGroup);
+    }
+  }
 }
 
 void debugRebootButtonEvent(lv_event_t *e) {
@@ -17095,6 +17230,7 @@ void makeDisplayModuleRow(int y) {
   lv_dropdown_set_options(dropdown, "Adafruit\nBuyDisplay");
   lv_dropdown_set_selected(dropdown, displayModuleChoice);
   lv_obj_add_event_cb(dropdown, displayModuleDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
+  addPhysicalNavFocusable(dropdown);
 }
 
 void displayDriverDropdownEvent(lv_event_t *e) {
@@ -17165,6 +17301,7 @@ void makeDisplayDriverRow(int y) {
   lv_dropdown_set_options(dropdown, "LovyanGFX\nArduino_GFX");
   lv_dropdown_set_selected(dropdown, displayDriverChoice);
   lv_obj_add_event_cb(dropdown, displayDriverDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
+  addPhysicalNavFocusable(dropdown);
 }
 
 void makeLcdFrequencyRow(int y) {
@@ -17187,6 +17324,7 @@ void makeLcdFrequencyRow(int y) {
   }
   lv_dropdown_set_selected(dropdown, selectedIndex);
   lv_obj_add_event_cb(dropdown, lcdFreqDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
+  addPhysicalNavFocusable(dropdown);
 }
 
 void makeLcdBufferRow(int y) {
@@ -17204,6 +17342,7 @@ void makeLcdBufferRow(int y) {
   lv_dropdown_set_options(dropdown, "Single\nDouble");
   lv_dropdown_set_selected(dropdown, lcdBufferMode ? 1 : 0);
   lv_obj_add_event_cb(dropdown, lcdBufferDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
+  addPhysicalNavFocusable(dropdown);
 }
 
 void makeLcdDriveStrengthRow(int y) {
@@ -17221,6 +17360,7 @@ void makeLcdDriveStrengthRow(int y) {
   lv_dropdown_set_options(dropdown, "Weakest\nWeak\nDefault\nStrongest");
   lv_dropdown_set_selected(dropdown, lcdDriveStrength);
   lv_obj_add_event_cb(dropdown, lcdDriveStrengthDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
+  addPhysicalNavFocusable(dropdown);
 }
 
 void makeTouchDriverRow(int y) {
@@ -17238,6 +17378,7 @@ void makeTouchDriverRow(int y) {
   lv_dropdown_set_options(dropdown, "Adafruit\nFT5x06");
   lv_dropdown_set_selected(dropdown, touchDriverChoice ? 1 : 0);
   lv_obj_add_event_cb(dropdown, touchDriverDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
+  addPhysicalNavFocusable(dropdown);
 }
 
 // Unlike the LCD driver/clock/buffer options, this retunes the live LEDC
@@ -17274,6 +17415,7 @@ void makeBacklightPwmRow(int y) {
   }
   lv_dropdown_set_selected(dropdown, selectedIndex);
   lv_obj_add_event_cb(dropdown, backlightPwmDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
+  addPhysicalNavFocusable(dropdown);
 }
 
 // Menu Style is a pure rendering choice (menuStyle global, read live by every
@@ -17305,6 +17447,7 @@ void makeMenuStyleRow(int y) {
   lv_dropdown_set_options(dropdown, "OpenRemote\nOMOTE");
   lv_dropdown_set_selected(dropdown, menuStyle ? 1 : 0);
   lv_obj_add_event_cb(dropdown, menuStyleDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
+  addPhysicalNavFocusable(dropdown);
 }
 
 void renderDebugPageOmote() {
@@ -17893,6 +18036,7 @@ void renderSettingsPage() {
   // otherwise be left holding pointers to deleted widgets. makeSettingRow()/
   // makeOmoteRow() repopulate it as the new screen's rows are created.
   if (physicalNavGroup) lv_group_remove_all_objs(physicalNavGroup);
+  physicalNavStopBreathing();
   switch (settingsView) {
     case SETTINGS_WIFI: renderWifiPage(); break;
     case SETTINGS_WIFI_PASSWORD: renderWifiPasswordPage(); break;
@@ -19851,6 +19995,8 @@ void setupLvgl() {
 
   physicalNavGroup = lv_group_create();
   lv_group_set_focus_cb(physicalNavGroup, physicalNavFocusChanged);
+  physicalNavModalGroup = lv_group_create();
+  lv_group_set_focus_cb(physicalNavModalGroup, physicalNavFocusChanged);
   lv_indev_drv_init(&physicalNavDrv);
   physicalNavDrv.type = LV_INDEV_TYPE_KEYPAD;
   physicalNavDrv.read_cb = physicalNavReadCb;
