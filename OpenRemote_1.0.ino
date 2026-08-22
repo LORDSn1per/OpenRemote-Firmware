@@ -1,6 +1,55 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.16 - 2026-08-22
+    - Simplified physical Settings navigation per request: Menu and Return
+      no longer do anything special - Back alone does both jobs. One press
+      steps a subpage back to Settings Home; a second press, from Home
+      itself, exits to Activities (what Return used to do alone). Menu (4)
+      is now an unbound key while Settings is showing, same as any other
+      button that isn't part of navigation.
+    - Fixed the sleep timer not resetting on physical button presses once
+      the display was already awake. lastWakeMs (the sleep-timeout
+      reference point) was previously only touched inside wakeDisplay(),
+      which only runs when the display was asleep - pressing buttons on an
+      already-awake remote did nothing to defer the timeout, so the screen
+      could sleep during active use. Now set unconditionally on every
+      press in serviceKeypad().
+    - Fixed the focused row's position (both which row, and the page's
+      scroll offset) being lost back to the top of the screen on a
+      same-screen rebuild - toggling a switch, moving a slider, the
+      ESP-NOW device list refreshing, anything that calls
+      renderSettingsPage() again for the screen already showing.
+      renderSettingsPage() now distinguishes that from a genuine
+      navigation to a different screen (settingsView vs.
+      physicalNavLastRenderedView): only on a same-screen rebuild does it
+      capture which registered object (by index, via a new
+      physicalNavRegisteredObjs[]/physicalNavRegisteredCount pair
+      addPhysicalNavFocusable() now maintains alongside the group itself)
+      was focused and the content panel's scroll_y before clearing, then
+      re-focuses the same index and restores the scroll position once the
+      new rows finish registering. A real navigation still lands on the
+      first row at the top, as before.
+    - Thickened the focus outline (3px base / 2-6px breathing -> 4px base
+      / 3-9px breathing) and extended it to the Soft/Hard reboot buttons on
+      both menu styles, which were built with plain makeButton()/
+      makeOmoteButton() outside makeSettingRow()/makeOmoteRow() and so were
+      never reachable by D-pad at all before this - not just thin, entirely
+      unfocusable. The ESP-NOW device modal's buttons remain unwired for
+      now - it wants the same separate-group treatment given to the reboot
+      confirmation popup (3.13), not a quick add to the page-level group,
+      and that's a large enough piece to do properly rather than rushed.
+    - Not fixed this round: D-pad Left/Right still not adjusting a focused
+      slider. Traced through LVGL's actual source (lv_indev.c,
+      lv_slider.c) and structurally it should already work the same way
+      the dropdown fix (3.14) did - LV_KEY_LEFT/RIGHT are sent unconditionally
+      to the focused object, and lv_slider.c's own LV_EVENT_KEY handler
+      responds to exactly those keys with no gating found. No blocking
+      mechanism was found by reading the source, so nothing was changed
+      here rather than ship a guess - needs more detail from hardware
+      (does the value visibly change at all, even slightly?) to root-cause
+      correctly instead of guessing.
+
   3.15 - 2026-08-22
     - Fixed selecting "BuyDisplay" in Display Module (3.09) not actually
       fixing the inverted colours after reboot - confirmed on real
@@ -2714,7 +2763,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.15"
+#define OPENREMOTE_VERSION_STRING "3.16"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -3613,6 +3662,22 @@ lv_group_t *physicalNavModalGroup = nullptr;
 lv_indev_drv_t physicalNavDrv;
 lv_indev_t *physicalNavInputDevice = nullptr;
 uint32_t physicalNavCurrentKey = 0;
+// Tracks every object addPhysicalNavFocusable() has registered on the
+// current screen, in registration order, so a same-screen rebuild (a
+// switch toggling, a slider moving, the ESP-NOW list changing - anything
+// that calls renderSettingsPage() again for the SAME settingsView) can
+// restore which one was focused and how far the page had scrolled,
+// instead of every rebuild snapping back to the first row and the top of
+// the screen. Only restored when settingsView matches
+// physicalNavLastRenderedView - a genuine navigation to a different
+// screen starts fresh at the top as normal.
+static const uint8_t PHYSICAL_NAV_MAX_REGISTERED = 64;
+lv_obj_t *physicalNavRegisteredObjs[PHYSICAL_NAV_MAX_REGISTERED];
+uint8_t physicalNavRegisteredCount = 0;
+int16_t physicalNavPendingRefocusIndex = -1;
+lv_coord_t physicalNavPendingScrollY = 0;
+bool physicalNavPendingScrollValid = false;
+SettingsView physicalNavLastRenderedView = SETTINGS_UNLOCK;
 bool physicalNavCurrentPressed = false;
 lv_style_t physicalNavFocusStyle;
 bool physicalNavFocusStyleReady = false;
@@ -3629,7 +3694,7 @@ lv_color_t lvRgb(uint8_t r, uint8_t g, uint8_t b);
 void ensurePhysicalNavFocusStyle() {
   if (physicalNavFocusStyleReady) return;
   lv_style_init(&physicalNavFocusStyle);
-  lv_style_set_outline_width(&physicalNavFocusStyle, 3);
+  lv_style_set_outline_width(&physicalNavFocusStyle, 4);
   lv_style_set_outline_color(&physicalNavFocusStyle, lvRgb(60, 180, 220));
   lv_style_set_outline_opa(&physicalNavFocusStyle, LV_OPA_COVER);
   lv_style_set_outline_pad(&physicalNavFocusStyle, 1);
@@ -3641,6 +3706,9 @@ void addPhysicalNavFocusable(lv_obj_t *obj) {
   ensurePhysicalNavFocusStyle();
   lv_obj_add_style(obj, &physicalNavFocusStyle, LV_STATE_FOCUSED);
   lv_group_add_obj(physicalNavGroup, obj);
+  if (physicalNavRegisteredCount < PHYSICAL_NAV_MAX_REGISTERED) {
+    physicalNavRegisteredObjs[physicalNavRegisteredCount++] = obj;
+  }
 }
 
 // The visible focus outline (3.11) was still no help once the focused row
@@ -3665,7 +3733,7 @@ void physicalNavBreatheAnimExec(void *obj, int32_t value) {
 void physicalNavStartBreathing(lv_obj_t *obj) {
   if (physicalNavBreatheTarget && physicalNavBreatheTarget != obj) {
     lv_anim_del(physicalNavBreatheTarget, physicalNavBreatheAnimExec);
-    lv_obj_set_style_outline_width(physicalNavBreatheTarget, 3, LV_PART_MAIN | LV_STATE_FOCUSED);
+    lv_obj_set_style_outline_width(physicalNavBreatheTarget, 4, LV_PART_MAIN | LV_STATE_FOCUSED);
   }
   physicalNavBreatheTarget = obj;
   if (!obj) return;
@@ -3673,7 +3741,7 @@ void physicalNavStartBreathing(lv_obj_t *obj) {
   lv_anim_init(&animation);
   lv_anim_set_var(&animation, obj);
   lv_anim_set_exec_cb(&animation, physicalNavBreatheAnimExec);
-  lv_anim_set_values(&animation, 2, 6);
+  lv_anim_set_values(&animation, 3, 9);
   lv_anim_set_time(&animation, 900);
   lv_anim_set_playback_time(&animation, 900);
   lv_anim_set_repeat_count(&animation, LV_ANIM_REPEAT_INFINITE);
@@ -4933,13 +5001,14 @@ void serviceKeypad(unsigned long now) {
         case 8: physicalNavCurrentKey = LV_KEY_LEFT; physicalNavCurrentPressed = pressed; break;    // D-pad Left
         case 9: physicalNavCurrentKey = LV_KEY_RIGHT; physicalNavCurrentPressed = pressed; break;   // D-pad Right
         case 10: physicalNavCurrentKey = LV_KEY_ENTER; physicalNavCurrentPressed = pressed; break;  // OK
-        case 4:   // Menu - back to the Settings root list
-        case 11:  // Back - Settings has no deeper hierarchy than one level
-                  // today, so this is currently identical to Menu.
-          if (pressed && settingsView != SETTINGS_HOME) openSettingsView(SETTINGS_HOME);
-          break;
-        case 12:  // Return - leaves Settings entirely, restores touch
-          if (pressed) exitPhysicalSettingsNav();
+        // Menu and Return are deliberately not wired to anything special -
+        // Back alone does both jobs: one press per level, subpage -> Home,
+        // then a second press from Home itself exits to Activities.
+        case 11:
+          if (pressed) {
+            if (settingsView != SETTINGS_HOME) openSettingsView(SETTINGS_HOME);
+            else exitPhysicalSettingsNav();
+          }
           break;
         default: break;
       }
@@ -4957,6 +5026,13 @@ void serviceKeypad(unsigned long now) {
       command = &devices[binding->deviceIndex].commands[binding->commandIndex];
     }
     if (pressed) {
+      // Every physical button press resets the sleep countdown, not just
+      // ones that actually wake an already-sleeping display - previously
+      // lastWakeMs (the sleep-timeout reference point) was only touched
+      // inside wakeDisplay(), so pressing buttons on an already-awake
+      // remote did nothing to defer the timeout and it could sleep out
+      // from under active use.
+      lastWakeMs = now;
       if (displaySleeping) wakeDisplay();
       // Only the START of a new command is gated on settingsPageShowing -
       // the release side below always runs, so a command whose press fired
@@ -17695,6 +17771,8 @@ void renderDebugPageOmote() {
   lv_obj_t *hardButton = makeOmoteButton(content, "Hard reboot", 124, y, 108, 42, lvRgb(115, 38, 45));
   lv_obj_add_event_cb(softButton, debugRebootButtonEvent, LV_EVENT_CLICKED, (void *)(uintptr_t)false);
   lv_obj_add_event_cb(hardButton, debugRebootButtonEvent, LV_EVENT_CLICKED, (void *)(uintptr_t)true);
+  addPhysicalNavFocusable(softButton);
+  addPhysicalNavFocusable(hardButton);
 }
 
 void renderDebugPage() {
@@ -17779,6 +17857,8 @@ void renderDebugPage() {
                       (void *)(uintptr_t)false);
   lv_obj_add_event_cb(hardButton, debugRebootButtonEvent, LV_EVENT_CLICKED,
                       (void *)(uintptr_t)true);
+  addPhysicalNavFocusable(softButton);
+  addPhysicalNavFocusable(hardButton);
 }
 
 String signedBatteryValue(float value, const char *suffix) {
@@ -18128,6 +18208,35 @@ void renderSettingsPage() {
   // objects), so the D-pad/OK focus group from the previous screen would
   // otherwise be left holding pointers to deleted widgets. makeSettingRow()/
   // makeOmoteRow() repopulate it as the new screen's rows are created.
+  //
+  // A rebuild happens for two very different reasons: a genuine navigation
+  // to a different screen (Home -> Debug, Back, etc.) - which should land
+  // on the first row at the top, as before - and a same-screen rebuild
+  // triggered by something on THIS screen changing (a switch toggling, a
+  // slider moving, the ESP-NOW device list refreshing), which should not
+  // be visible to the user as navigation at all. Only the latter restores
+  // the previously focused row and scroll position, decided by comparing
+  // settingsView against what was last rendered.
+  bool sameScreenRebuild = physicalNavGroup && settingsView == physicalNavLastRenderedView;
+  physicalNavPendingRefocusIndex = -1;
+  physicalNavPendingScrollValid = false;
+  if (sameScreenRebuild) {
+    lv_obj_t *focused = lv_group_get_focused(physicalNavGroup);
+    if (focused) {
+      for (uint8_t i = 0; i < physicalNavRegisteredCount; i++) {
+        if (physicalNavRegisteredObjs[i] == focused) {
+          physicalNavPendingRefocusIndex = (int16_t)i;
+          break;
+        }
+      }
+    }
+    if (content) {
+      physicalNavPendingScrollY = lv_obj_get_scroll_y(content);
+      physicalNavPendingScrollValid = true;
+    }
+  }
+  physicalNavLastRenderedView = settingsView;
+  physicalNavRegisteredCount = 0;
   if (physicalNavGroup) lv_group_remove_all_objs(physicalNavGroup);
   physicalNavStopBreathing();
   switch (settingsView) {
@@ -18144,6 +18253,13 @@ void renderSettingsPage() {
     case SETTINGS_BACKUP: renderBackupRestorePage(); break;
     case SETTINGS_ABOUT: renderAboutPage(); break;
     default: renderSettingsHome(); break;
+  }
+  if (physicalNavPendingRefocusIndex >= 0 &&
+      physicalNavPendingRefocusIndex < physicalNavRegisteredCount) {
+    lv_group_focus_obj(physicalNavRegisteredObjs[physicalNavPendingRefocusIndex]);
+  }
+  if (physicalNavPendingScrollValid && content) {
+    lv_obj_scroll_to_y(content, physicalNavPendingScrollY, LV_ANIM_OFF);
   }
 }
 
