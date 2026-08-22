@@ -1,6 +1,23 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.23 - 2026-08-22
+    - Added face-down auto-sleep: placing the remote screen-down for more
+      than 800ms now puts the display into light sleep immediately, rather
+      than waiting for the normal screen-timeout to elapse. Entering light
+      sleep this way also arms the existing deep-sleep countdown exactly as
+      the normal timeout path does - enterDisplaySleep() already sets
+      nextDeepSleepAttemptMs from deepSleepMinutes, so no separate timer
+      was needed for that half of the request.
+    - The Z-axis threshold (+700) was set from real hardware readings, not
+      guessed: Settings > Debug > Accelerometer's existing live overlay was
+      used to confirm this unit reads Z ~ -900 screen-up and Z ~ +900
+      screen-down at rest, before picking a threshold with margin either
+      side of on-edge/vertical orientations. serviceFaceDownSleep() samples
+      the LIS3DH every 50ms (not every loop() tick) while awake, and resets
+      its sustained-orientation timer immediately on any reading below the
+      threshold, on a failed read, or once already asleep.
+
   3.22 - 2026-08-22
     - Fixed the red physical-nav focus outline showing up on the settings
       menu even when it was reached by a normal touch tap/swipe, not the
@@ -2922,7 +2939,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.22"
+#define OPENREMOTE_VERSION_STRING "3.23"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -4329,6 +4346,14 @@ unsigned long irOffAtMs = 0;
 int16_t sleepBaseX = 0;
 int16_t sleepBaseY = 0;
 int16_t sleepBaseZ = 0;
+// Face-down auto-sleep (serviceFaceDownSleep()): Z reads roughly +900 lying
+// screen-down and roughly -900 screen-up on this hardware - confirmed on
+// real hardware via the Debug > Accelerometer live overlay, not assumed.
+// +700 gives a safe margin either side of vertical/on-edge orientations.
+static const int16_t FACE_DOWN_Z_THRESHOLD = 700;
+static const uint32_t FACE_DOWN_SLEEP_MS = 800UL;
+unsigned long faceDownSinceMs = 0;
+unsigned long nextFaceDownCheckMs = 0;
 
 struct BatteryHistorySample {
   uint32_t epoch;
@@ -5810,6 +5835,39 @@ bool readLIS3DH(int16_t &x, int16_t &y, int16_t &z) {
   y = ((int16_t)((uint16_t)data[3] << 8 | data[2])) >> 4;
   z = ((int16_t)((uint16_t)data[5] << 8 | data[4])) >> 4;
   return true;
+}
+
+// Called from loop() while awake. Puts the display straight into light
+// sleep (which also arms the existing deep-sleep countdown -
+// enterDisplaySleep() already sets nextDeepSleepAttemptMs from
+// deepSleepMinutes, so nothing extra is needed for that half of the
+// request) once the remote has read screen-down for FACE_DOWN_SLEEP_MS
+// continuously. Sampled every 50ms rather than every loop() tick - fast
+// enough to keep the 800ms window tight, without adding an extra I2C
+// transaction to every single ~5ms loop iteration.
+void serviceFaceDownSleep(unsigned long now) {
+  if (displaySleeping || !lis3dhReady) {
+    faceDownSinceMs = 0;
+    return;
+  }
+  if ((int32_t)(now - nextFaceDownCheckMs) < 0) return;
+  nextFaceDownCheckMs = now + 50UL;
+
+  int16_t x, y, z;
+  if (!readLIS3DH(x, y, z) || z < FACE_DOWN_Z_THRESHOLD) {
+    faceDownSinceMs = 0;
+    return;
+  }
+  if (faceDownSinceMs == 0) {
+    faceDownSinceMs = now;
+    return;
+  }
+  if (activitySequenceActive || usbSdTransferActive() || usbStudioLinkActive()) return;
+  if ((uint32_t)(now - faceDownSinceMs) >= FACE_DOWN_SLEEP_MS) {
+    Serial.println("Face-down sleep: screen-down orientation held, sleeping now");
+    enterDisplaySleep();
+    faceDownSinceMs = 0;
+  }
 }
 
 uint16_t movementDelta() {
@@ -20834,6 +20892,7 @@ void loop() {
   serviceEspNow(now);
   serviceEspNowDevicesModal(now);
   servicePhysicalNavIdleHide(now);
+  serviceFaceDownSleep(now);
   now = millis();
   serviceAtvvVoice(now);
   if (microphoneStopPending && !atvvAudioStarted) {
