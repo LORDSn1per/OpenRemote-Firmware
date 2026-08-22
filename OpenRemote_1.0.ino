@@ -1,6 +1,51 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.10 - 2026-08-22
+    - Added physical-button Settings navigation. Holding Stop+Forward
+      together, from anywhere, jumps straight into Settings > Home and
+      locks touch out (lvTouchRead()'s new physicalNavTouchLocked check,
+      same early-return shape as the existing pageStripRendering guard).
+      While the Settings page is on screen - reached via the combo, or a
+      normal touch tap into it, touch is NOT disabled in the latter case -
+      D-pad Up/Down/Left/Right and OK drive a real LVGL keypad indev
+      (physicalNavGroup/physicalNavInputDevice, LV_INDEV_TYPE_KEYPAD) bound
+      to a group that makeSettingRow()/makeOmoteRow() now auto-populate
+      with every clickable row and switch they create. Physical Menu and
+      Back both jump to Settings Home - currently identical, because
+      Settings has no multi-level stack today (backToSettings() already
+      only ever goes to SETTINGS_HOME, touch included). Physical Return
+      leaves Settings entirely for the Activities landing page and
+      restores touch (exitPhysicalSettingsNav(), reusing the same
+      backToSettings()-then-page-switch shape servicePageStripChange()
+      already uses when swiping away from Settings).
+    - No physical button starts a new IR/BLE/RF command while the Settings
+      page is showing, regardless of how it was entered - the press-side
+      beginHeldIrCommand()/voice-search-start block in serviceKeypad() is
+      now gated on !settingsPageShowing. The release side is deliberately
+      NOT gated: a command whose press fired immediately before Settings
+      opened (Stop and Forward's own presses, which trigger the combo but
+      are not suppressed - see below) still gets a clean endHeldIrCommand()
+      release, rather than being left permanently "held".
+    - The combo does not delay or buffer Stop/Forward's individual presses
+      to detect the combo before acting - both still fire their normal
+      bound command immediately, exactly as if pressed separately, in
+      addition to triggering entry once both are down. Buffering to
+      suppress that would add real latency to every ordinary Stop or
+      Forward press just to serve a rarely-used combo; documented here as
+      a deliberate tradeoff, not an oversight.
+    - Scope: the root Settings menu (renderSettingsHome/Omote) is fully
+      wired and is what was actually exercised while building this. Every
+      other settings screen built from makeSettingRow()/makeOmoteRow() gets
+      the same focus/group registration "for free" since it's the same
+      shared helper, but none of those screens have been individually
+      walked - dropdowns, sliders and anything not built from those two
+      helpers (e.g. the ESP-NOW/RF433 modals, ir/backup pickers) are not
+      wired at all yet. Expect this to need real per-screen iteration once
+      tested on hardware, same as every other UI feature in this project's
+      history.
+    - Not verified on hardware yet.
+
   3.09 - 2026-08-22
     - Added a "Display Module" dropdown to Settings > Debug (both menu
       styles), Adafruit/BuyDisplay, alongside the existing LCD Driver/Touch
@@ -2530,7 +2575,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.09"
+#define OPENREMOTE_VERSION_STRING "3.10"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -3407,6 +3452,23 @@ enum SettingsView {
 };
 
 SettingsView settingsView = SETTINGS_HOME;
+
+// ---------------------------------------------------------------------------
+// Physical-button Settings navigation. Holding Stop+Forward together jumps
+// straight into Settings and locks touch out; while the Settings page is on
+// screen (however it was reached - the combo, or a normal touch tap), the
+// D-pad/OK/Back/Menu/Return buttons navigate it and no physical button
+// starts a new IR/BLE/RF command. See serviceKeypad() for the actual key
+// handling and the 3.10 changelog entry for the full design.
+// ---------------------------------------------------------------------------
+bool physicalNavTouchLocked = false;
+bool physicalStopHeld = false;
+bool physicalForwardHeld = false;
+lv_group_t *physicalNavGroup = nullptr;
+lv_indev_drv_t physicalNavDrv;
+lv_indev_t *physicalNavInputDevice = nullptr;
+uint32_t physicalNavCurrentKey = 0;
+bool physicalNavCurrentPressed = false;
 Preferences preferences;
 WebServer webServer(80);
 DNSServer dnsServer;
@@ -4004,6 +4066,10 @@ bool requestWebServerStopAndWait(uint32_t timeoutMs = 1800UL);
 bool recoverWifiRadio(wifi_mode_t targetMode, const char *reason);
 void renderSettingsHome();
 void backToSettings(lv_event_t *e);
+bool physicalSettingsPageActive();
+void enterPhysicalSettingsNav();
+void exitPhysicalSettingsNav();
+void physicalNavReadCb(lv_indev_drv_t *drv, lv_indev_data_t *data);
 void openSettingsView(SettingsView view);
 void renderWifiPage();
 void renderWifiPasswordPage();
@@ -4571,6 +4637,46 @@ void serviceKeypad(unsigned long now) {
       continue;
     }
 
+    // Stop (0) + Forward (3) held together, from anywhere, jumps straight
+    // into Settings and locks touch out - see enterPhysicalSettingsNav().
+    // This does not delay or suppress either button's own normal press
+    // below: holding both together still fires whatever Stop and Forward
+    // are each individually bound to, exactly as if pressed separately, in
+    // addition to triggering the combo. Buffering the individual presses to
+    // avoid that would add latency to every ordinary Stop/Forward press,
+    // which is worse than the combo also firing two harmless commands.
+    if (buttonIndex == 0) physicalStopHeld = pressed;
+    if (buttonIndex == 3) physicalForwardHeld = pressed;
+    if (pressed && physicalStopHeld && physicalForwardHeld && !physicalSettingsPageActive()) {
+      enterPhysicalSettingsNav();
+    }
+
+    bool settingsPageShowing = physicalSettingsPageActive();
+
+    // While Settings is on screen - reached via the combo above, or a normal
+    // touch tap into it - D-pad/OK/Back/Menu/Return navigate it instead.
+    // This does not `continue`: it runs alongside the normal binding lookup
+    // below, which is what stops these same buttons from also firing a
+    // bound command - see the settingsPageShowing guard further down.
+    if (settingsPageShowing) {
+      switch (buttonIndex) {
+        case 6: physicalNavCurrentKey = LV_KEY_PREV; physicalNavCurrentPressed = pressed; break;    // D-pad Up
+        case 7: physicalNavCurrentKey = LV_KEY_NEXT; physicalNavCurrentPressed = pressed; break;    // D-pad Down
+        case 8: physicalNavCurrentKey = LV_KEY_LEFT; physicalNavCurrentPressed = pressed; break;    // D-pad Left
+        case 9: physicalNavCurrentKey = LV_KEY_RIGHT; physicalNavCurrentPressed = pressed; break;   // D-pad Right
+        case 10: physicalNavCurrentKey = LV_KEY_ENTER; physicalNavCurrentPressed = pressed; break;  // OK
+        case 4:   // Menu - back to the Settings root list
+        case 11:  // Back - Settings has no deeper hierarchy than one level
+                  // today, so this is currently identical to Menu.
+          if (pressed && settingsView != SETTINGS_HOME) openSettingsView(SETTINGS_HOME);
+          break;
+        case 12:  // Return - leaves Settings entirely, restores touch
+          if (pressed) exitPhysicalSettingsNav();
+          break;
+        default: break;
+      }
+    }
+
     PhysicalBinding *binding = nullptr;
     if (activeDevice >= 0 && activeDevice < DEVICE_COUNT) {
       binding = &devices[activeDevice].physicalBindings[buttonIndex];
@@ -4584,17 +4690,23 @@ void serviceKeypad(unsigned long now) {
     }
     if (pressed) {
       if (displaySleeping) wakeDisplay();
-      if (heldVoiceSearchCommand && !heldVoiceSearchFromTouch &&
-          heldVoiceSearchPhysicalKey && heldVoiceSearchPhysicalKey != key) {
-        Serial.printf("Voice Search: physical key %u replaced by key %u\n",
-                      heldVoiceSearchPhysicalKey, key);
-        endVoiceSearchHold();
-      }
-      beginHeldIrCommand(command, physicalRepeatEnabled);
-      if (heldVoiceSearchCommand == command && !heldVoiceSearchFromTouch) {
-        heldVoiceSearchPhysicalKey = key;
-        physicalVoiceOverlayShowAfterMs = now + 180UL;
-        Serial.printf("Voice Search: physical key %u pressed\n", key);
+      // Only the START of a new command is gated on settingsPageShowing -
+      // the release side below always runs, so a command whose press fired
+      // just before Settings opened (the combo's own Stop/Forward press,
+      // above) still gets a clean release instead of being left "held".
+      if (!settingsPageShowing) {
+        if (heldVoiceSearchCommand && !heldVoiceSearchFromTouch &&
+            heldVoiceSearchPhysicalKey && heldVoiceSearchPhysicalKey != key) {
+          Serial.printf("Voice Search: physical key %u replaced by key %u\n",
+                        heldVoiceSearchPhysicalKey, key);
+          endVoiceSearchHold();
+        }
+        beginHeldIrCommand(command, physicalRepeatEnabled);
+        if (heldVoiceSearchCommand == command && !heldVoiceSearchFromTouch) {
+          heldVoiceSearchPhysicalKey = key;
+          physicalVoiceOverlayShowAfterMs = now + 180UL;
+          Serial.printf("Voice Search: physical key %u pressed\n", key);
+        }
       }
     } else {
       if (heldVoiceSearchCommand && !heldVoiceSearchFromTouch &&
@@ -14006,6 +14118,14 @@ void lvTouchRead(lv_indev_drv_t *drv, lv_indev_data_t *data) {
   uint16_t y = 0;
   unsigned long now = millis();
 
+  if (physicalNavTouchLocked) {
+    data->state = LV_INDEV_STATE_REL;
+    lvTouchDown = false;
+    touchWasDown = false;
+    touchPendingConfirmCount = 0;
+    return;
+  }
+
   if (pageStripRendering) {
     data->state = LV_INDEV_STATE_REL;
     lvTouchDown = false;
@@ -14982,6 +15102,9 @@ lv_obj_t *makeSettingRow(const char *name, const char *sub, int y, bool *switchT
     styleModernSwitch(sw);
     if (*switchTarget) lv_obj_add_state(sw, LV_STATE_CHECKED);
     lv_obj_add_event_cb(sw, switchEvent, LV_EVENT_VALUE_CHANGED, switchTarget);
+    if (physicalNavGroup) lv_group_add_obj(physicalNavGroup, sw);
+  } else if (clickCallback && physicalNavGroup) {
+    lv_group_add_obj(physicalNavGroup, row);
   }
   return row;
 }
@@ -15067,9 +15190,11 @@ lv_obj_t *makeOmoteRow(lv_obj_t *card, const char *name, const char *value, int 
     styleOmoteSwitch(sw);
     if (*switchTarget) lv_obj_add_state(sw, LV_STATE_CHECKED);
     lv_obj_add_event_cb(sw, switchEvent, LV_EVENT_VALUE_CHANGED, switchTarget);
+    if (physicalNavGroup) lv_group_add_obj(physicalNavGroup, sw);
   } else if (clickCallback) {
     lv_obj_t *chevron = makeLabel(row, LV_SYMBOL_RIGHT, 200, height / 2 - 6, &lv_font_montserrat_12, lvRgb(110, 114, 122));
     lv_obj_set_style_text_opa(chevron, LV_OPA_70, 0);
+    if (physicalNavGroup) lv_group_add_obj(physicalNavGroup, row);
   }
   return row;
 }
@@ -17685,6 +17810,11 @@ void renderAboutPage() {
 }
 
 void renderSettingsPage() {
+  // Every settings screen is rebuilt from scratch on each visit (fresh LVGL
+  // objects), so the D-pad/OK focus group from the previous screen would
+  // otherwise be left holding pointers to deleted widgets. makeSettingRow()/
+  // makeOmoteRow() repopulate it as the new screen's rows are created.
+  if (physicalNavGroup) lv_group_remove_all_objs(physicalNavGroup);
   switch (settingsView) {
     case SETTINGS_WIFI: renderWifiPage(); break;
     case SETTINGS_WIFI_PASSWORD: renderWifiPasswordPage(); break;
@@ -17849,6 +17979,43 @@ void jumpToWebConfigQr(lv_event_t *e) {
   bindPageUi(currentPage);
   if (pageStrip) lv_obj_set_tile(pageStrip, pageUi[currentPage].tile, LV_ANIM_OFF);
   configurePageStripDirections();
+}
+
+bool physicalSettingsPageActive() {
+  return pages[currentPage].kind == PAGE_REMOTE_SETTINGS;
+}
+
+// Same instant-jump shape as jumpToWebConfigQr() above, triggered by the
+// Stop+Forward physical combo instead of a touch event. Also locks touch out
+// - see lvTouchRead()'s physicalNavTouchLocked check - until
+// exitPhysicalSettingsNav() (the physical Return button) restores it.
+void enterPhysicalSettingsNav() {
+  Serial.println("Physical Settings nav: Stop+Forward combo, entering");
+  openSettingsView(SETTINGS_HOME);
+  currentPage = 0;
+  bindPageUi(currentPage);
+  if (pageStrip) lv_obj_set_tile(pageStrip, pageUi[currentPage].tile, LV_ANIM_OFF);
+  configurePageStripDirections();
+  physicalNavTouchLocked = true;
+}
+
+// The physical Return button - leaves Settings entirely for the Activities
+// landing page, mirroring what a swipe away from Settings already does in
+// servicePageStripChange() (backToSettings() first, for its Wi-Fi/QR
+// cleanup, then the page switch), rather than a second copy of that cleanup.
+void exitPhysicalSettingsNav() {
+  Serial.println("Physical Settings nav: Return, exiting to Activities");
+  backToSettings(nullptr);
+  currentPage = min((uint8_t)1, (uint8_t)(pageCount - 1));
+  bindPageUi(currentPage);
+  if (pageStrip) lv_obj_set_tile(pageStrip, pageUi[currentPage].tile, LV_ANIM_OFF);
+  configurePageStripDirections();
+  physicalNavTouchLocked = false;
+}
+
+void physicalNavReadCb(lv_indev_drv_t *drv, lv_indev_data_t *data) {
+  data->key = physicalNavCurrentKey;
+  data->state = physicalNavCurrentPressed ? LV_INDEV_STATE_PR : LV_INDEV_STATE_REL;
 }
 
 // Shown in place of the Activities page while OpenRemote Studio is talking to
@@ -19603,6 +19770,13 @@ void setupLvgl() {
   touchDrv.scroll_limit = LV_INDEV_DEF_SCROLL_LIMIT;
   touchDrv.scroll_throw = LV_INDEV_DEF_SCROLL_THROW;
   touchInputDevice = lv_indev_drv_register(&touchDrv);
+
+  physicalNavGroup = lv_group_create();
+  lv_indev_drv_init(&physicalNavDrv);
+  physicalNavDrv.type = LV_INDEV_TYPE_KEYPAD;
+  physicalNavDrv.read_cb = physicalNavReadCb;
+  physicalNavInputDevice = lv_indev_drv_register(&physicalNavDrv);
+  lv_indev_set_group(physicalNavInputDevice, physicalNavGroup);
 }
 
 void setupUiRoot() {
