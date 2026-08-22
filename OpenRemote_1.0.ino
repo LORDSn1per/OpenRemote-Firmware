@@ -1,6 +1,25 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.24 - 2026-08-22 - Diagnostic build only
+    - Investigating a reported "click, hold, slide" symptom: a quick
+      tap-and-drag isn't recognised as a slide, but pressing, pausing, then
+      sliding works. Debug > Touch's live overlay showed a visible gap
+      between the trail's first and second dot, tight spacing after that -
+      but addTouchTrailPoint() throttles its dots to one every 70ms
+      specifically for the visual overlay, so that spacing doesn't actually
+      reflect real touch-read cadence and isn't reliable evidence either
+      way.
+    - Added unthrottled Serial logging of every accepted touch PR/REL
+      sample with its millis() timestamp and delta from the previous
+      sample (gated on the same Debug > Touch toggle, so it stays silent
+      normally). This will show whether a real gap exists in the raw touch
+      reads right after touch-down specifically, or whether reads are
+      arriving at a normal steady rate and the "click, hold, slide" feel is
+      coming from somewhere else (LVGL's own scroll-start threshold, a
+      redraw stall, etc). No behavioural change in this build - logging
+      only.
+
   3.23 - 2026-08-22
     - Added face-down auto-sleep: placing the remote screen-down for more
       than 800ms now puts the display into light sleep immediately, rather
@@ -2939,7 +2958,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.23"
+#define OPENREMOTE_VERSION_STRING "3.24"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -4408,6 +4427,7 @@ struct TouchTrailPoint {
 TouchTrailPoint touchTrail[TOUCH_TRAIL_POINT_COUNT] = {};
 uint8_t nextTouchTrailPoint = 0;
 unsigned long lastTouchTrailPointMs = 0;
+unsigned long lastTouchDiagnosticLogMs = 0;  // Diagnostic only (3.24)
 unsigned long touchDiagnosticHoldUntilMs = 0;
 lv_obj_t *clockLabel = nullptr;
 lv_obj_t *batteryFill = nullptr;
@@ -14813,6 +14833,17 @@ void lvTouchRead(lv_indev_drv_t *drv, lv_indev_data_t *data) {
     touchLastY = y;
 
     if (brightnessOverlay) brightnessLastActivityMs = millis();
+    // Diagnostic only (3.24) - addTouchTrailPoint()'s trail dots are
+    // throttled to one every 70ms for the visual overlay, which makes the
+    // dot spacing useless for judging real read cadence during a fast
+    // slide. This logs every accepted sample, unthrottled, so the actual
+    // gap between raw touch reads can be measured directly against a
+    // reported "click, hold, slide" symptom.
+    if (debugTouchEnabled) {
+      Serial.printf("Touch: PR %u,%u @ %lums (dt=%ldms)\n", x, y, now,
+                    (long)(now - lastTouchDiagnosticLogMs));
+      lastTouchDiagnosticLogMs = now;
+    }
     showLiveTouchDiagnostic(x, y, now);
     if (touchMoved) lastWakeMs = millis();
   } else {
@@ -14820,6 +14851,12 @@ void lvTouchRead(lv_indev_drv_t *drv, lv_indev_data_t *data) {
     data->state = LV_INDEV_STATE_REL;
     lvTouchDown = false;
     if (touchWasDown) {
+      // Diagnostic only (3.24) - see the matching PR log above.
+      if (debugTouchEnabled) {
+        Serial.printf("Touch: REL @ %lums (dt=%ldms)\n", now,
+                      (long)(now - lastTouchDiagnosticLogMs));
+        lastTouchDiagnosticLogMs = now;
+      }
       holdReleasedTouchDiagnostic(touchLastX, touchLastY, now);
       touchWasDown = false;
       // A left-to-right swipe anywhere in a nested Settings view does exactly
