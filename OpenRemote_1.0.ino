@@ -1,6 +1,34 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.25 - 2026-08-22
+    - Root-caused and fixed the activity slide-to-open thumb not "grabbing"
+      on a fast swipe, using 3.24's diagnostic touch log against real
+      hardware: touch reads land roughly every 62ms in practice (LVGL's own
+      indev default is 30ms - loop() isn't keeping up with it), and every
+      failed grab's first captured touch sample was already 10-30px past
+      the ~22-40px icon on X (Y barely moved) - the actual touch-down was
+      almost certainly on the icon, but by the time the coarse polling
+      caught up, the finger had already slid past it, so LVGL never saw a
+      PRESS land on the thumb and the drag never started at all.
+    - Fixed with a new invisible "grabZone" object per activity row,
+      thumbSize+70 wide but exactly thumbSize tall (matching the visible
+      thumb's height, not more) - carries the click/drag/release handling
+      instead of the small visible thumb. Deliberately not
+      lv_obj_set_ext_click_area(): that pads all 4 sides equally, and these
+      cards sit only ~6-8px apart, so a same padding generous enough to
+      cover the ~30px horizontal overshoot would have bled vertically into
+      the row above/below and let a touch intended for a neighbouring
+      activity graze this one's thumb instead. grabZone only widens
+      horizontally, where the overshoot actually happens.
+    - activitySliderEvent() already computes the thumb's position from the
+      live touch point on every PRESSING event via lv_indev_get_point(),
+      not from the object that was clicked, so redirecting the event
+      source to grabZone (thumb itself no longer clickable) doesn't change
+      the drag feel at all once it's grabbed - only makes it reachable by a
+      fast swipe. Applied to both activity slider builders
+      (renderActivitiesPage() and the nested-tile variant).
+
   3.24 - 2026-08-22 - Diagnostic build only
     - Investigating a reported "click, hold, slide" symptom: a quick
       tap-and-drag isn't recognised as a slide, but pressing, pausing, then
@@ -2958,7 +2986,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.24"
+#define OPENREMOTE_VERSION_STRING "3.25"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -18900,9 +18928,32 @@ void renderActivitiesPage() {
     lv_obj_set_style_bg_opa(thumb, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_opa(thumb, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(thumb, 0, 0);
-    lv_obj_add_flag(thumb, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_flag(thumb, LV_OBJ_FLAG_PRESS_LOCK);
+    lv_obj_clear_flag(thumb, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_clear_flag(thumb, LV_OBJ_FLAG_SCROLLABLE);
+
+    // Confirmed via 3.24's touch-read logging: real touch reads land roughly
+    // 62ms apart (LVGL's own indev default is 30ms - loop() isn't keeping up
+    // with it), not the single-digit ms most swipes need to be caught by a
+    // ~30x30px thumb. A fast swipe's first captured sample was consistently
+    // already 10-30px past the icon in the logs (Y barely moved, only X),
+    // so LVGL never saw a PRESS land on the thumb at all and the drag never
+    // started. grabZone is an invisible object covering a wider horizontal
+    // strip at the SAME height as the thumb (not taller - cards are only
+    // ~6-8px apart, so lv_obj_set_ext_click_area()'s uniform all-sides
+    // padding would have bled into the row above/below). It carries the
+    // click/drag handling instead of the visible thumb; activitySliderEvent()
+    // already computes the thumb's position from the live touch point on
+    // every PRESSING event, so widening only where the actual touch lands
+    // doesn't change the drag feel once grabbed.
+    lv_obj_t *grabZone = lv_obj_create(card);
+    lv_obj_remove_style_all(grabZone);
+    lv_obj_set_pos(grabZone, 4, 3);
+    lv_obj_set_size(grabZone, thumbSize + 70, thumbSize);
+    lv_obj_set_style_bg_opa(grabZone, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_opa(grabZone, LV_OPA_TRANSP, 0);
+    lv_obj_add_flag(grabZone, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(grabZone, LV_OBJ_FLAG_PRESS_LOCK);
+    lv_obj_clear_flag(grabZone, LV_OBJ_FLAG_SCROLLABLE);
 
     if (activities[i].iconPath && activities[i].iconPath[0]) {
       lv_obj_t *icon = lv_img_create(thumb);
@@ -18920,7 +18971,7 @@ void renderActivitiesPage() {
     }
 
     activitySliderUi[i] = {card, thumb, i};
-    lv_obj_add_event_cb(thumb, activitySliderEvent, LV_EVENT_ALL, &activitySliderUi[i]);
+    lv_obj_add_event_cb(grabZone, activitySliderEvent, LV_EVENT_ALL, &activitySliderUi[i]);
 
     int textX = thumbSize + 14;
     int nameY = max(3, (cardHeight - 36) / 2);
@@ -19025,9 +19076,21 @@ void makeNestedActivitySlider(const Tile &tile, uint8_t targetActivityIndex,
   lv_obj_set_style_bg_opa(thumb, LV_OPA_TRANSP, 0);
   lv_obj_set_style_border_opa(thumb, LV_OPA_TRANSP, 0);
   lv_obj_set_style_border_width(thumb, 0, 0);
-  lv_obj_add_flag(thumb, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_add_flag(thumb, LV_OBJ_FLAG_PRESS_LOCK);
+  lv_obj_clear_flag(thumb, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_clear_flag(thumb, LV_OBJ_FLAG_SCROLLABLE);
+
+  // See the sibling grabZone in renderActivitiesPage() - same 3.24
+  // touch-log finding, same fix (a wider same-height invisible object
+  // carries the click/drag handling instead of the small visible thumb).
+  lv_obj_t *grabZone = lv_obj_create(card);
+  lv_obj_remove_style_all(grabZone);
+  lv_obj_set_pos(grabZone, 4, 3);
+  lv_obj_set_size(grabZone, thumbSize + 70, thumbSize);
+  lv_obj_set_style_bg_opa(grabZone, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_opa(grabZone, LV_OPA_TRANSP, 0);
+  lv_obj_add_flag(grabZone, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_flag(grabZone, LV_OBJ_FLAG_PRESS_LOCK);
+  lv_obj_clear_flag(grabZone, LV_OBJ_FLAG_SCROLLABLE);
 
   const char *iconPath = tile.iconPath && tile.iconPath[0]
     ? tile.iconPath : activities[targetActivityIndex].iconPath;
@@ -19047,7 +19110,7 @@ void makeNestedActivitySlider(const Tile &tile, uint8_t targetActivityIndex,
   }
 
   *ui = {card, thumb, targetActivityIndex};
-  lv_obj_add_event_cb(thumb, activitySliderEvent, LV_EVENT_ALL, ui);
+  lv_obj_add_event_cb(grabZone, activitySliderEvent, LV_EVENT_ALL, ui);
 
   if (tile.showText) {
     int textX = thumbSize + 14;
