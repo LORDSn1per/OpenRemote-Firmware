@@ -1,6 +1,32 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.19 - 2026-08-22
+    - Fixed keypad-adjusted sliders on the Display and Buttons pages
+      visibly moving their number label but never actually applying or
+      saving - confirmed on real hardware today via Gamma specifically,
+      same bug class in both places. displaySliderEvent()/buttonSliderEvent()
+      both gated their real work (rebuildDisplayColourLut() for Gamma/
+      Saturation, and saveSettings()/scheduleRuntimeSettingsSave() for
+      every slider on both pages) behind LV_EVENT_RELEASED - correct for a
+      touch drag, which fires VALUE_CHANGED continuously and RELEASED only
+      once when the finger lifts, but LVGL's keypad indev never sends
+      RELEASED for anything except LV_KEY_ENTER (confirmed directly in
+      indev_keypad_proc - only ENTER's release branch calls
+      lv_event_send(..., LV_EVENT_RELEASED, ...)). A D-pad Left/Right press
+      was moving the underlying variable and the label (both driven by the
+      unconditional VALUE_CHANGED branch above), then silently never
+      reaching the RELEASED-gated commit at all.
+    - Fixed by also checking lv_indev_get_type(lv_indev_get_act()) ==
+      LV_INDEV_TYPE_KEYPAD in both handlers and running the same commit
+      logic immediately when true. This does not touch touch behaviour at
+      all - a keypad press has no drag-vs-final-value distinction the way
+      a touch drag does (each press is already one complete, atomic
+      adjustment), so there is no equivalent of "wait for the drag to
+      finish" to preserve, and no risk of the LUT rebuild running dozens
+      of times per interaction the way it would if this fired on every
+      touch-drag VALUE_CHANGED too.
+
   3.18 - 2026-08-22
     - Root-caused and fixed D-pad Left/Right not adjusting a focused
       slider - confirmed on real hardware today, and it was never a
@@ -2833,7 +2859,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.18"
+#define OPENREMOTE_VERSION_STRING "3.19"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -17087,7 +17113,20 @@ void displaySliderEvent(lv_event_t *e) {
     else snprintf(valueText, sizeof(valueText), "%d%s", value, setting == 1 ? "s" : "%");
     lv_label_set_text(displayValueLabels[setting], valueText);
   }
-  if (lv_event_get_code(e) == LV_EVENT_RELEASED) {
+  // A touch drag fires VALUE_CHANGED continuously and only RELEASED once,
+  // when the finger lifts - committing (LUT rebuild, save) on every
+  // VALUE_CHANGED there would rebuild the gamma LUT dozens of times per
+  // drag for no benefit. A D-pad Left/Right press has no such stream: each
+  // press is already one complete, atomic adjustment, and LVGL's keypad
+  // indev never sends RELEASED for anything but LV_KEY_ENTER (confirmed in
+  // indev_keypad_proc - only ENTER's release branch sends it), so a
+  // keypad-driven gamma/saturation change was visibly moving the number
+  // label but never actually reaching rebuildDisplayColourLut() or
+  // saveSettings() at all - not applied, and not even persisted.
+  lv_indev_t *sliderActiveIndev = lv_indev_get_act();
+  bool sliderKeypadDriven = sliderActiveIndev &&
+    lv_indev_get_type(sliderActiveIndev) == LV_INDEV_TYPE_KEYPAD;
+  if (lv_event_get_code(e) == LV_EVENT_RELEASED || sliderKeypadDriven) {
     if (setting == 4 || setting == 5) {
       rebuildDisplayColourLut();
       lv_obj_invalidate(lv_scr_act());
@@ -17237,7 +17276,13 @@ void buttonSliderEvent(lv_event_t *e) {
     else snprintf(text, sizeof(text), "%d/s", value);
     lv_label_set_text(buttonValueLabels[setting], text);
   }
-  if (lv_event_get_code(e) == LV_EVENT_RELEASED) {
+  // See displaySliderEvent()'s comment: LVGL's keypad indev never sends
+  // RELEASED for anything but LV_KEY_ENTER, so a D-pad-adjusted slider
+  // never reached this save at all without also checking for keypad origin.
+  lv_indev_t *sliderActiveIndev = lv_indev_get_act();
+  bool sliderKeypadDriven = sliderActiveIndev &&
+    lv_indev_get_type(sliderActiveIndev) == LV_INDEV_TYPE_KEYPAD;
+  if (lv_event_get_code(e) == LV_EVENT_RELEASED || sliderKeypadDriven) {
     saveSettings();
     scheduleRuntimeSettingsSave();
   }
