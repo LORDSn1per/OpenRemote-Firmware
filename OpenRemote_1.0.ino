@@ -1,6 +1,34 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.14 - 2026-08-22
+    - Fixed D-pad Up/Down doing nothing inside an open dropdown - moving
+      the row focus behind it and closing the dropdown instead - confirmed
+      on real hardware today. Root cause, found by reading LVGL's actual
+      indev source rather than guessing: the keypad indev
+      (indev_keypad_proc in lv_indev.c) only ever calls
+      lv_group_focus_next()/lv_group_focus_prev() for LV_KEY_NEXT/
+      LV_KEY_PREV specifically - literally every other key, LV_KEY_UP/DOWN
+      included, is sent straight to whatever object is currently focused
+      via lv_group_send_data() and never touches focus. D-pad Up/Down were
+      mapped to NEXT/PREV (3.10) so ordinary row-to-row scrolling would
+      work, which meant they could never reach lv_dropdown.c's own
+      LV_KEY_UP/DOWN handling (confirmed in its source: exactly those keys
+      move the highlighted option when the list is open) - the indev's
+      NEXT/PREV branch moved focus to the next row before the dropdown
+      ever saw the keypress.
+    - Fixed with physicalNavFocusedDropdownOpen(): checks whether the
+      group's currently focused object is a dropdown (lv_obj_check_type()
+      against lv_dropdown_class) that lv_dropdown_is_open() says is
+      actually open right now. Only then does D-pad Up/Down send true
+      LV_KEY_UP/LV_KEY_DOWN instead of NEXT/PREV - every other case (a
+      closed dropdown, a switch, a plain row) is completely unaffected and
+      still scrolls between rows exactly as before. Re-evaluated on every
+      single keypress, so it self-corrects the moment the dropdown closes
+      again (a selection made, or Menu/Back pressed).
+    - Not independently re-verified beyond compiling - reported back as
+      still wrong if this doesn't hold up on hardware.
+
   3.13 - 2026-08-22
     - Fixed physical Settings navigation wrapping back to the top after the
       ESP-NOW row in Debug - confirmed on real hardware today. Root cause:
@@ -2662,7 +2690,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.13"
+#define OPENREMOTE_VERSION_STRING "3.14"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -3656,6 +3684,25 @@ lv_obj_t *findMsgboxButtonMatrix(lv_obj_t *msgbox) {
     if (lv_obj_check_type(child, &lv_btnmatrix_class)) return child;
   }
   return nullptr;
+}
+
+// LVGL's keypad indev only ever moves group focus on LV_KEY_NEXT/LV_KEY_PREV
+// (see indev_keypad_proc in lv_indev.c) - every other key, including
+// LV_KEY_UP/DOWN, goes straight to lv_group_send_data() -> the focused
+// object's LV_EVENT_KEY handler and never touches focus at all. D-pad
+// Up/Down were mapped to NEXT/PREV so ordinary row-to-row movement works,
+// which meant they could never reach an open dropdown's own LV_KEY_UP/DOWN
+// handling (lv_dropdown.c moves its highlighted option on exactly those
+// keys) - focus just moved to the next row instead, closing the dropdown
+// as a side effect. This checks whether the currently focused object is a
+// dropdown that's actually open right now, and only then sends true
+// LV_KEY_UP/DOWN instead of NEXT/PREV, so the same D-pad Up/Down still
+// scrolls between rows everywhere else.
+bool physicalNavFocusedDropdownOpen() {
+  if (!physicalNavGroup) return false;
+  lv_obj_t *focused = lv_group_get_focused(physicalNavGroup);
+  if (!focused || !lv_obj_check_type(focused, &lv_dropdown_class)) return false;
+  return lv_dropdown_is_open(focused);
 }
 Preferences preferences;
 WebServer webServer(80);
@@ -4848,8 +4895,17 @@ void serviceKeypad(unsigned long now) {
     // bound command - see the settingsPageShowing guard further down.
     if (settingsPageShowing) {
       switch (buttonIndex) {
-        case 6: physicalNavCurrentKey = LV_KEY_PREV; physicalNavCurrentPressed = pressed; break;    // D-pad Up
-        case 7: physicalNavCurrentKey = LV_KEY_NEXT; physicalNavCurrentPressed = pressed; break;    // D-pad Down
+        // See physicalNavFocusedDropdownOpen()'s comment: an open dropdown
+        // needs true LV_KEY_UP/DOWN to scroll its own list; everywhere else
+        // NEXT/PREV moves between rows as normal.
+        case 6:
+          physicalNavCurrentKey = physicalNavFocusedDropdownOpen() ? LV_KEY_UP : LV_KEY_PREV;
+          physicalNavCurrentPressed = pressed;
+          break;  // D-pad Up
+        case 7:
+          physicalNavCurrentKey = physicalNavFocusedDropdownOpen() ? LV_KEY_DOWN : LV_KEY_NEXT;
+          physicalNavCurrentPressed = pressed;
+          break;  // D-pad Down
         case 8: physicalNavCurrentKey = LV_KEY_LEFT; physicalNavCurrentPressed = pressed; break;    // D-pad Left
         case 9: physicalNavCurrentKey = LV_KEY_RIGHT; physicalNavCurrentPressed = pressed; break;   // D-pad Right
         case 10: physicalNavCurrentKey = LV_KEY_ENTER; physicalNavCurrentPressed = pressed; break;  // OK
