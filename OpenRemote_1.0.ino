@@ -1,6 +1,59 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.18 - 2026-08-22
+    - Root-caused and fixed D-pad Left/Right not adjusting a focused
+      slider - confirmed on real hardware today, and it was never a
+      transport problem (3.17's slider/dropdown key routing was correct).
+      scrollSafeSliderEvent() - built to tell a real slider drag apart from
+      a touch-scroll gesture that happens to start on top of a slider -
+      listens for LV_EVENT_VALUE_CHANGED and reverts the slider straight
+      back to its last committed value unless state->tracking/horizontal
+      (both only ever set by a real LV_EVENT_PRESSED+drag) are true. A
+      keypad LEFT/RIGHT press changes the value and fires that same event
+      directly, with no press/drag ever seen first, so every keypad-driven
+      change was landing in the "not a confirmed drag" branch and being
+      undone immediately - the value visibly changed for a fraction of a
+      frame and then silently reverted. Fixed by checking
+      lv_indev_get_type(lv_indev_get_act())==LV_INDEV_TYPE_KEYPAD in that
+      handler and accepting the change outright when true: a discrete
+      keypress has no scroll-vs-adjust ambiguity to resolve the way a
+      touch drag does, so there's nothing to gate.
+    - Fixed D-pad Left/Right doing nothing when focused on a plain button
+      with no built-in meaning for those keys - confirmed via the
+      Soft/Hard reboot buttons sitting side by side, where LEFT/RIGHT was
+      the natural thing to try and silently did nothing. New
+      physicalNavFocusedWantsLeftRight() (an open dropdown, or now also a
+      slider - lv_obj_check_type() against lv_slider_class) decides
+      whether LEFT/RIGHT go to the focused widget itself or fall back to
+      LV_KEY_PREV/NEXT, the same group-navigation keys Up/Down already
+      use - so on anything that doesn't want them for itself, Left/Right
+      become a second way to move between rows.
+    - Simplified Back/Menu/Return to Back alone (3.16) is unaffected by
+      the above - Back was never mapped through this fallback.
+    - Fixed the focus outline still rendering LVGL's own default-theme
+      blue on switches and sliders despite 3.17's colour change. The
+      default theme (lv_theme_default_init, blue primary - see
+      styleOmoteSwitch()'s existing comment on it) applies its own built-in
+      LV_STATE_FOCUSED outline on LV_PART_INDICATOR for those widgets - a
+      different part than the LV_PART_MAIN this style targeted by
+      default - so both were rendering at once, and the theme's own blue
+      one was what showed. addPhysicalNavFocusable() and the breathing
+      animation now both apply to LV_PART_INDICATOR as well as
+      LV_PART_MAIN, so red wins regardless of which part a given widget's
+      theme style happens to use.
+    - Reduced the outline back to its original size (3px base, 2-6px
+      breathing) - now red, it doesn't need the extra thickness 3.16 added
+      to stand out.
+    - Added a 2s idle timeout: with no physical button pressed for that
+      long, the outline (and its breathing animation) hides - zero width,
+      animation stopped - until the next press brings it straight back by
+      simply restarting the breathing animation. Tracked in
+      physicalNavLastKeyMs, updated on every keypress while the settings
+      page is showing and whenever a settings screen appears at all
+      (renderSettingsPage()), and checked every loop() tick in the new
+      servicePhysicalNavIdleHide().
+
   3.17 - 2026-08-22
     - Changed the physical-nav focus outline from the cyan/blue modal
       accent (60,180,220) to red (255,69,58) per request - the same red
@@ -2780,7 +2833,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.17"
+#define OPENREMOTE_VERSION_STRING "3.18"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -3667,6 +3720,12 @@ SettingsView settingsView = SETTINGS_HOME;
 // handling and the 3.10 changelog entry for the full design.
 // ---------------------------------------------------------------------------
 bool physicalNavTouchLocked = false;
+// Hides the focus outline after 2s of no physical button activity, so it
+// doesn't sit there distracting when the remote isn't actively being
+// navigated - see servicePhysicalNavIdleHide().
+static const uint32_t PHYSICAL_NAV_IDLE_HIDE_MS = 2000UL;
+unsigned long physicalNavLastKeyMs = 0;
+bool physicalNavOutlineHidden = false;
 bool physicalStopHeld = false;
 bool physicalForwardHeld = false;
 lv_group_t *physicalNavGroup = nullptr;
@@ -3711,7 +3770,7 @@ lv_color_t lvRgb(uint8_t r, uint8_t g, uint8_t b);
 void ensurePhysicalNavFocusStyle() {
   if (physicalNavFocusStyleReady) return;
   lv_style_init(&physicalNavFocusStyle);
-  lv_style_set_outline_width(&physicalNavFocusStyle, 4);
+  lv_style_set_outline_width(&physicalNavFocusStyle, 3);
   // 255,69,58 - the same red (#ff453a) WebConfig already uses as its
   // system red accent, reused here rather than inventing a new one.
   lv_style_set_outline_color(&physicalNavFocusStyle, lvRgb(255, 69, 58));
@@ -3723,7 +3782,16 @@ void ensurePhysicalNavFocusStyle() {
 void addPhysicalNavFocusable(lv_obj_t *obj) {
   if (!physicalNavGroup || !obj) return;
   ensurePhysicalNavFocusStyle();
+  // LVGL's default theme (lv_theme_default_init, blue primary colour - see
+  // styleOmoteSwitch()'s own comment on that) applies its own built-in blue
+  // LV_STATE_FOCUSED outline to switches/sliders on LV_PART_INDICATOR, a
+  // different part than the LV_PART_MAIN this style targets by default -
+  // both were rendering at once, and the theme's blue one was the visible
+  // result. Applying the same style to both parts guarantees red wins on
+  // whichever one the theme happened to use, on every widget type, without
+  // needing to know which part that is for each one.
   lv_obj_add_style(obj, &physicalNavFocusStyle, LV_STATE_FOCUSED);
+  lv_obj_add_style(obj, &physicalNavFocusStyle, LV_PART_INDICATOR | LV_STATE_FOCUSED);
   lv_group_add_obj(physicalNavGroup, obj);
   if (physicalNavRegisteredCount < PHYSICAL_NAV_MAX_REGISTERED) {
     physicalNavRegisteredObjs[physicalNavRegisteredCount++] = obj;
@@ -3743,6 +3811,7 @@ lv_obj_t *physicalNavBreatheTarget = nullptr;
 
 void physicalNavBreatheAnimExec(void *obj, int32_t value) {
   lv_obj_set_style_outline_width((lv_obj_t *)obj, value, LV_PART_MAIN | LV_STATE_FOCUSED);
+  lv_obj_set_style_outline_width((lv_obj_t *)obj, value, LV_PART_INDICATOR | LV_STATE_FOCUSED);
 }
 
 // A local style (set directly on the object) always wins over the shared
@@ -3752,7 +3821,8 @@ void physicalNavBreatheAnimExec(void *obj, int32_t value) {
 void physicalNavStartBreathing(lv_obj_t *obj) {
   if (physicalNavBreatheTarget && physicalNavBreatheTarget != obj) {
     lv_anim_del(physicalNavBreatheTarget, physicalNavBreatheAnimExec);
-    lv_obj_set_style_outline_width(physicalNavBreatheTarget, 4, LV_PART_MAIN | LV_STATE_FOCUSED);
+    lv_obj_set_style_outline_width(physicalNavBreatheTarget, 3, LV_PART_MAIN | LV_STATE_FOCUSED);
+    lv_obj_set_style_outline_width(physicalNavBreatheTarget, 3, LV_PART_INDICATOR | LV_STATE_FOCUSED);
   }
   physicalNavBreatheTarget = obj;
   if (!obj) return;
@@ -3760,7 +3830,7 @@ void physicalNavStartBreathing(lv_obj_t *obj) {
   lv_anim_init(&animation);
   lv_anim_set_var(&animation, obj);
   lv_anim_set_exec_cb(&animation, physicalNavBreatheAnimExec);
-  lv_anim_set_values(&animation, 3, 9);
+  lv_anim_set_values(&animation, 2, 6);
   lv_anim_set_time(&animation, 900);
   lv_anim_set_playback_time(&animation, 900);
   lv_anim_set_repeat_count(&animation, LV_ANIM_REPEAT_INFINITE);
@@ -3776,6 +3846,24 @@ void physicalNavStopBreathing() {
   if (!physicalNavBreatheTarget) return;
   lv_anim_del(physicalNavBreatheTarget, physicalNavBreatheAnimExec);
   physicalNavBreatheTarget = nullptr;
+}
+
+// Called every loop() tick. Hides the outline (zero width, animation
+// stopped) once physicalNavLastKeyMs is more than 2s old, and brings it
+// straight back - by simply restarting the breathing animation, which sets
+// both parts' width again - the moment a physical button is pressed.
+void servicePhysicalNavIdleHide(unsigned long now) {
+  if (!physicalNavBreatheTarget) return;
+  bool shouldHide = (uint32_t)(now - physicalNavLastKeyMs) >= PHYSICAL_NAV_IDLE_HIDE_MS;
+  if (shouldHide && !physicalNavOutlineHidden) {
+    physicalNavOutlineHidden = true;
+    lv_anim_del(physicalNavBreatheTarget, physicalNavBreatheAnimExec);
+    lv_obj_set_style_outline_width(physicalNavBreatheTarget, 0, LV_PART_MAIN | LV_STATE_FOCUSED);
+    lv_obj_set_style_outline_width(physicalNavBreatheTarget, 0, LV_PART_INDICATOR | LV_STATE_FOCUSED);
+  } else if (!shouldHide && physicalNavOutlineHidden) {
+    physicalNavOutlineHidden = false;
+    physicalNavStartBreathing(physicalNavBreatheTarget);
+  }
 }
 
 void physicalNavFocusChanged(lv_group_t *group) {
@@ -3814,6 +3902,24 @@ bool physicalNavFocusedDropdownOpen() {
   lv_obj_t *focused = lv_group_get_focused(physicalNavGroup);
   if (!focused || !lv_obj_check_type(focused, &lv_dropdown_class)) return false;
   return lv_dropdown_is_open(focused);
+}
+
+// D-pad Left/Right were sent to the focused widget unconditionally (like
+// Up/Down originally were - see 3.14's fix for the same problem with
+// dropdowns). That is correct for a slider, which has its own LV_EVENT_KEY
+// handling for exactly those keys, but a plain object like the Soft/Hard
+// reboot buttons has no built-in meaning for LEFT/RIGHT at all - pressing
+// them on a focused button did nothing, which is what "can't move the
+// chooser from softboot to hardboot" was: those two sit side by side, so
+// LEFT/RIGHT was the natural thing to try, and it was silently a no-op.
+// Only a slider (or an open dropdown, handled separately above) actually
+// wants LEFT/RIGHT for itself; everywhere else it now falls back to being
+// a second way to move between rows, same as Up/Down already does.
+bool physicalNavFocusedWantsLeftRight() {
+  if (physicalNavFocusedDropdownOpen()) return true;
+  if (!physicalNavGroup) return false;
+  lv_obj_t *focused = lv_group_get_focused(physicalNavGroup);
+  return focused && lv_obj_check_type(focused, &lv_slider_class);
 }
 Preferences preferences;
 WebServer webServer(80);
@@ -5005,6 +5111,7 @@ void serviceKeypad(unsigned long now) {
     // below, which is what stops these same buttons from also firing a
     // bound command - see the settingsPageShowing guard further down.
     if (settingsPageShowing) {
+      if (pressed) physicalNavLastKeyMs = now;
       switch (buttonIndex) {
         // See physicalNavFocusedDropdownOpen()'s comment: an open dropdown
         // needs true LV_KEY_UP/DOWN to scroll its own list; everywhere else
@@ -5017,8 +5124,14 @@ void serviceKeypad(unsigned long now) {
           physicalNavCurrentKey = physicalNavFocusedDropdownOpen() ? LV_KEY_DOWN : LV_KEY_NEXT;
           physicalNavCurrentPressed = pressed;
           break;  // D-pad Down
-        case 8: physicalNavCurrentKey = LV_KEY_LEFT; physicalNavCurrentPressed = pressed; break;    // D-pad Left
-        case 9: physicalNavCurrentKey = LV_KEY_RIGHT; physicalNavCurrentPressed = pressed; break;   // D-pad Right
+        case 8:
+          physicalNavCurrentKey = physicalNavFocusedWantsLeftRight() ? LV_KEY_LEFT : LV_KEY_PREV;
+          physicalNavCurrentPressed = pressed;
+          break;  // D-pad Left
+        case 9:
+          physicalNavCurrentKey = physicalNavFocusedWantsLeftRight() ? LV_KEY_RIGHT : LV_KEY_NEXT;
+          physicalNavCurrentPressed = pressed;
+          break;  // D-pad Right
         case 10: physicalNavCurrentKey = LV_KEY_ENTER; physicalNavCurrentPressed = pressed; break;  // OK
         // Menu and Return are deliberately not wired to anything special -
         // Back alone does both jobs: one press per level, subpage -> Home,
@@ -16908,7 +17021,22 @@ void scrollSafeSliderEvent(lv_event_t *e) {
     }
     state->lastPoint = point;
   } else if (code == LV_EVENT_VALUE_CHANGED) {
-    if (!state->tracking || !state->horizontal) {
+    // This whole mechanism exists to tell "dragging the slider" apart from
+    // "a touch that started on the slider but turns out to be scrolling
+    // the list" - state->tracking/horizontal only ever get set from a real
+    // touch press+drag (above). A D-pad Left/Right key press goes through
+    // neither: LVGL's own slider key handling changes the value and fires
+    // this event directly, with no LV_EVENT_PRESSED/PRESSING ever seen
+    // here first - so every keypad-driven change was landing in the
+    // "wasn't a confirmed horizontal drag" branch below and being
+    // reverted straight back, immediately undoing it. There is no
+    // scroll-vs-adjust ambiguity to resolve for a discrete keypress the
+    // way there is for a touch drag, so it's accepted unconditionally.
+    lv_indev_t *activeIndev = lv_indev_get_act();
+    bool keypadDriven = activeIndev && lv_indev_get_type(activeIndev) == LV_INDEV_TYPE_KEYPAD;
+    if (keypadDriven) {
+      state->committedValue = lv_slider_get_value(slider);
+    } else if (!state->tracking || !state->horizontal) {
       restoreScrollSafeSlider(slider, state);
     }
   } else if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
@@ -18223,6 +18351,11 @@ void renderAboutPage() {
 }
 
 void renderSettingsPage() {
+  // Any settings screen appearing - fresh navigation or a same-screen
+  // rebuild - counts as activity, so the outline (and its 2s idle-hide
+  // timer) starts visible rather than possibly already hidden.
+  physicalNavLastKeyMs = millis();
+  physicalNavOutlineHidden = false;
   // Every settings screen is rebuilt from scratch on each visit (fresh LVGL
   // objects), so the D-pad/OK focus group from the previous screen would
   // otherwise be left holding pointers to deleted widgets. makeSettingRow()/
@@ -20660,6 +20793,7 @@ void loop() {
   serviceBluetoothConnectionProfile(now);
   serviceEspNow(now);
   serviceEspNowDevicesModal(now);
+  servicePhysicalNavIdleHide(now);
   now = millis();
   serviceAtvvVoice(now);
   if (microphoneStopPending && !atvvAudioStarted) {
