@@ -1,6 +1,36 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.09 - 2026-08-22
+    - Added a "Display Module" dropdown to Settings > Debug (both menu
+      styles), Adafruit/BuyDisplay, alongside the existing LCD Driver/Touch
+      Driver dropdowns. Confirmed on real hardware today: BuyDisplay's 2.8"
+      240x320 capacitive panel comes up with colours inverted relative to
+      the Adafruit panel this firmware was originally built against.
+      Selecting BuyDisplay sets a matching default for the existing manual
+      "Invert Colours" switch on the Display page (persisted separately as
+      "invert" in NVS, unchanged) - it does not lock that switch, so it can
+      still be overridden afterwards if a particular panel needs something
+      different. Reboot required, same as every other panel-init choice in
+      this section. Persisted as "dispMod" in NVS, preserved across a
+      factory reset alongside "dispDrv"/"touchDrv".
+    - The requested "BuyDisplay" option for the Touch Driver dropdown is
+      deliberately NOT added yet. The existing "Adafruit" touch driver
+      already speaks the standard FocalTech FT5x06/FT6206/FT6236 register
+      protocol (address 0x38, register 0x02, 5-byte point/X/Y read - see
+      readTouchSample()), and circumstantial evidence points at this
+      BuyDisplay panel using an FT6206-family chip, but this was not
+      confirmed against BuyDisplay's own documentation - their site blocked
+      automated fetches. Writing a distinct touch driver for an unconfirmed
+      chip would be a guess wired to real hardware, not a fix. Try the
+      existing "Adafruit" driver as-is first (it may already work, given
+      the address/protocol match); if touches are mirrored/rotated only,
+      that is a coordinate-math fix in readTouchSample(), not a new driver.
+      Only build a genuinely distinct driver once a real symptom (wrong
+      chip entirely, no response at 0x38, etc.) confirms it's needed.
+    - Not verified beyond the colour-inversion fix - no confirmation yet
+      that touch works via the existing driver.
+
   3.08 - 2026-08-22
     - Added RF433 code learning, relayed through a paired ESP-NOW dock -
       the remote itself has no RF433 receiver, only the dock will, so this
@@ -2500,7 +2530,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.08"
+#define OPENREMOTE_VERSION_STRING "3.09"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -2936,6 +2966,15 @@ Arduino_GFX *agfx = agfxLcd;
 // 0 = LovyanGFX (DMA), 1 = Arduino_GFX (synchronous, no DMA). Loaded from
 // Preferences at boot; changing it requires a reboot to take effect.
 uint8_t displayDriverChoice = 0;
+// Settings > Debug "Module": which physical LCD panel is fitted, not which
+// driver renders to it (displayDriverChoice, above). 0 = Adafruit (this
+// firmware's original hardware). 1 = BuyDisplay's 2.8" 240x320 capacitive
+// panel, which reports colours inverted relative to Adafruit's on real
+// hardware (confirmed 2026-08-22) - selecting it sets a matching default for
+// the existing manual "Invert Colours" switch, which still overrides it
+// afterwards if needed. Reboot required, like every other panel-init choice
+// in this section.
+uint8_t displayModuleChoice = 0;
 // LovyanGFX parallel-bus write clock in Hz. Arduino_GFX has no equivalent
 // setting (its ESP32 8-bit parallel bus runs at a fixed rate).
 uint32_t lcdFreqHz = 40000000;
@@ -5533,6 +5572,7 @@ void loadSettings() {
   // synchronous driver is what a remote should come up with unless the user
   // deliberately selects otherwise in Settings > Debug.
   displayDriverChoice = preferences.getUChar("dispDrv", 1);
+  displayModuleChoice = preferences.getUChar("dispMod", 0);
   lcdFreqHz = preferences.getULong("lcdFreqHz", 40000000UL);
   lcdBufferMode = preferences.getUChar("lcdBufMode", 1);
   lcdDriveStrength = constrain((int)preferences.getUChar("lcdDriveStr", 2), 0, 3);
@@ -11828,6 +11868,7 @@ bool performFactoryReset() {
   // credentials, Homebridge, clock settings, etc.) is cleared as before.
   preferences.begin(PREFERENCES_NAMESPACE, false);
   uint8_t savedDisplayDriverChoice = preferences.getUChar("dispDrv", 1);
+  uint8_t savedDisplayModuleChoice = preferences.getUChar("dispMod", 0);
   uint32_t savedLcdFreqHz = preferences.getULong("lcdFreqHz", 40000000UL);
   uint8_t savedLcdBufferMode = preferences.getUChar("lcdBufMode", 1);
   uint8_t savedLcdDriveStrength = preferences.getUChar("lcdDriveStr", 2);
@@ -11843,6 +11884,7 @@ bool performFactoryReset() {
   bool savedPrefMig1 = preferences.getBool("prefMig1", false);
   preferences.clear();
   preferences.putUChar("dispDrv", savedDisplayDriverChoice);
+  preferences.putUChar("dispMod", savedDisplayModuleChoice);
   preferences.putULong("lcdFreqHz", savedLcdFreqHz);
   preferences.putUChar("lcdBufMode", savedLcdBufferMode);
   preferences.putUChar("lcdDriveStr", savedLcdDriveStrength);
@@ -16817,6 +16859,41 @@ void debugRebootButtonEvent(lv_event_t *e) {
 // display bus is configured once in setup()), so each of the three writes
 // its choice to Preferences immediately and then prompts for the same hard-
 // reboot confirmation used by the existing reboot buttons below.
+void displayModuleDropdownEvent(lv_event_t *e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  uint16_t selected = lv_dropdown_get_selected(lv_event_get_target(e));
+  displayModuleChoice = (uint8_t)selected;
+  // BuyDisplay's panel needs Invert Colours on; Adafruit's needs it off.
+  // This sets that default so picking a module is a one-step fix rather
+  // than requiring the separate manual switch to be found and flipped too -
+  // that switch still overrides it afterwards if the user wants to.
+  bool invertDefault = displayModuleChoice == 1;
+  preferences.begin(PREFERENCES_NAMESPACE, false);
+  preferences.putUChar("dispMod", displayModuleChoice);
+  preferences.putBool("invert", invertDefault);
+  preferences.end();
+  displayInverted = invertDefault;
+  lastWakeMs = millis();
+  showDebugRebootConfirmation(true);
+}
+
+void makeDisplayModuleRow(int y) {
+  lv_obj_t *panel = lv_obj_create(content);
+  lv_obj_set_pos(panel, 8, y);
+  lv_obj_set_size(panel, 224, 44);
+  lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(panel, LV_OBJ_FLAG_CLICKABLE);
+  stylePanel(panel, lvRgb(34, 35, 39), lvRgb(54, 56, 62));
+  makeLabel(panel, "Display Module", 8, 8, &lv_font_montserrat_14, textPrimary());
+  lv_obj_t *dropdown = lv_dropdown_create(panel);
+  lv_obj_set_pos(dropdown, 104, 1);
+  lv_obj_set_size(dropdown, 112, 32);
+  styleDebugDropdown(dropdown);
+  lv_dropdown_set_options(dropdown, "Adafruit\nBuyDisplay");
+  lv_dropdown_set_selected(dropdown, displayModuleChoice);
+  lv_obj_add_event_cb(dropdown, displayModuleDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
+}
+
 void displayDriverDropdownEvent(lv_event_t *e) {
   if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
   uint16_t selected = lv_dropdown_get_selected(lv_event_get_target(e));
@@ -17098,14 +17175,20 @@ void renderDebugPageOmote() {
   lv_obj_set_style_text_opa(driverLabel, LV_OPA_60, 0);
   y += 22;
 
-  int driverRows = displayDriverChoice == 0 ? 5 : 1;
+  int driverRows = displayDriverChoice == 0 ? 6 : 2;
   lv_obj_t *driverCard = makeOmoteCard(content, y, driverRows * calibRowH + (driverRows - 1));
-  lv_obj_t *driverDropdown = makeOmoteDropdownRow(driverCard, "LCD Driver", 0, calibRowH, 112);
+  lv_obj_t *moduleDropdown = makeOmoteDropdownRow(driverCard, "Module", 0, calibRowH, 112);
+  lv_dropdown_set_options(moduleDropdown, "Adafruit\nBuyDisplay");
+  lv_dropdown_set_selected(moduleDropdown, displayModuleChoice);
+  lv_obj_add_event_cb(moduleDropdown, displayModuleDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
+
+  makeOmoteDivider(driverCard, calibRowH);
+  lv_obj_t *driverDropdown = makeOmoteDropdownRow(driverCard, "LCD Driver", calibRowH + 1, calibRowH, 112);
   lv_dropdown_set_options(driverDropdown, "LovyanGFX\nArduino_GFX");
   lv_dropdown_set_selected(driverDropdown, displayDriverChoice);
   lv_obj_add_event_cb(driverDropdown, displayDriverDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
 
-  int rowIndex = 1;
+  int rowIndex = 2;
   if (displayDriverChoice == 0) {
     makeOmoteDivider(driverCard, rowIndex * (calibRowH + 1) - 1);
     lv_obj_t *freqDropdown = makeOmoteDropdownRow(driverCard, "LCD Clock", rowIndex * (calibRowH + 1), calibRowH, 112);
@@ -17216,6 +17299,8 @@ void renderDebugPage() {
   makeLabel(content, "Display driver (reboot required)", 10, 754,
             &lv_font_montserrat_12, lvRgb(170, 178, 190));
   int driverSectionY = 776;
+  makeDisplayModuleRow(driverSectionY);
+  driverSectionY += 50;
   makeDisplayDriverRow(driverSectionY);
   driverSectionY += 50;
   if (displayDriverChoice == 0) {
