@@ -1,6 +1,26 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.11 - 2026-08-22
+    - Fixed 3.10's physical Settings navigation having no visible focus
+      indicator - confirmed on real hardware today. Root cause:
+      makeOmoteRow()'s row calls lv_obj_remove_style_all(), which strips
+      LVGL's default theme focus outline along with everything else, and on
+      makeSettingRow()'s row (which doesn't remove_style_all) the theme
+      default wasn't distinct enough against this panel's own styling
+      either way. Added an explicit physicalNavFocusStyle - a 3px outline
+      in the same accent colour (60,180,220) already used for the ESP-NOW/
+      device picker modal borders - applied via a new addPhysicalNavFocusable()
+      helper that both replaces every direct lv_group_add_obj() call in
+      makeSettingRow()/makeOmoteRow() and attaches the outline for
+      LV_STATE_FOCUSED, so anything added to the physical-nav group is
+      guaranteed visible focus regardless of what else that widget's own
+      styling touches. LVGL focuses the first object added to a group
+      automatically, so a row should already be highlighted immediately
+      on entering Settings, before any D-pad press.
+    - Not independently re-verified beyond compiling - reported back as
+      still not visible if this doesn't fix it.
+
   3.10 - 2026-08-22
     - Added physical-button Settings navigation. Holding Stop+Forward
       together, from anywhere, jumps straight into Settings > Home and
@@ -2575,7 +2595,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.10"
+#define OPENREMOTE_VERSION_STRING "3.11"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -3469,6 +3489,34 @@ lv_indev_drv_t physicalNavDrv;
 lv_indev_t *physicalNavInputDevice = nullptr;
 uint32_t physicalNavCurrentKey = 0;
 bool physicalNavCurrentPressed = false;
+lv_style_t physicalNavFocusStyle;
+bool physicalNavFocusStyleReady = false;
+lv_color_t lvRgb(uint8_t r, uint8_t g, uint8_t b);
+
+// LVGL's default theme focus outline turned out to be invisible in practice
+// here - makeOmoteRow()'s row calls lv_obj_remove_style_all() (stripping
+// the theme's focus styling along with everything else), and even on
+// makeSettingRow()'s row it wasn't noticeably visible against this panel
+// styling. An explicit outline, applied to every object added to
+// physicalNavGroup, replaces relying on the theme default. Same accent
+// colour already used for the ESP-NOW/device picker modals' borders, so
+// it reads as "this app's highlight colour" rather than a new one.
+void ensurePhysicalNavFocusStyle() {
+  if (physicalNavFocusStyleReady) return;
+  lv_style_init(&physicalNavFocusStyle);
+  lv_style_set_outline_width(&physicalNavFocusStyle, 3);
+  lv_style_set_outline_color(&physicalNavFocusStyle, lvRgb(60, 180, 220));
+  lv_style_set_outline_opa(&physicalNavFocusStyle, LV_OPA_COVER);
+  lv_style_set_outline_pad(&physicalNavFocusStyle, 1);
+  physicalNavFocusStyleReady = true;
+}
+
+void addPhysicalNavFocusable(lv_obj_t *obj) {
+  if (!physicalNavGroup || !obj) return;
+  ensurePhysicalNavFocusStyle();
+  lv_obj_add_style(obj, &physicalNavFocusStyle, LV_STATE_FOCUSED);
+  lv_group_add_obj(physicalNavGroup, obj);
+}
 Preferences preferences;
 WebServer webServer(80);
 DNSServer dnsServer;
@@ -15102,9 +15150,9 @@ lv_obj_t *makeSettingRow(const char *name, const char *sub, int y, bool *switchT
     styleModernSwitch(sw);
     if (*switchTarget) lv_obj_add_state(sw, LV_STATE_CHECKED);
     lv_obj_add_event_cb(sw, switchEvent, LV_EVENT_VALUE_CHANGED, switchTarget);
-    if (physicalNavGroup) lv_group_add_obj(physicalNavGroup, sw);
-  } else if (clickCallback && physicalNavGroup) {
-    lv_group_add_obj(physicalNavGroup, row);
+    addPhysicalNavFocusable(sw);
+  } else if (clickCallback) {
+    addPhysicalNavFocusable(row);
   }
   return row;
 }
@@ -15190,11 +15238,11 @@ lv_obj_t *makeOmoteRow(lv_obj_t *card, const char *name, const char *value, int 
     styleOmoteSwitch(sw);
     if (*switchTarget) lv_obj_add_state(sw, LV_STATE_CHECKED);
     lv_obj_add_event_cb(sw, switchEvent, LV_EVENT_VALUE_CHANGED, switchTarget);
-    if (physicalNavGroup) lv_group_add_obj(physicalNavGroup, sw);
+    addPhysicalNavFocusable(sw);
   } else if (clickCallback) {
     lv_obj_t *chevron = makeLabel(row, LV_SYMBOL_RIGHT, 200, height / 2 - 6, &lv_font_montserrat_12, lvRgb(110, 114, 122));
     lv_obj_set_style_text_opa(chevron, LV_OPA_70, 0);
-    if (physicalNavGroup) lv_group_add_obj(physicalNavGroup, row);
+    addPhysicalNavFocusable(row);
   }
   return row;
 }
