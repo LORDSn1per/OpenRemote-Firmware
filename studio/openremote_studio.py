@@ -4,8 +4,16 @@ import contextlib, datetime as dt, glob, hashlib, io, json, os, re, select, shut
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-APP_VERSION="2.67"
+APP_VERSION="2.68"
 SERIAL_BAUD=460800
+# 2.68 adds Linux as a third supported platform. Until now every non-Windows
+# branch in this file assumed macOS outright - AppleScript dialogs, diskutil,
+# ~/Library paths, /dev/cu.* port globs. Those are now selected by platform
+# rather than by "not Windows", with Linux equivalents beside them. The macOS
+# and Windows paths are unchanged.
+IS_WINDOWS=os.name=="nt"
+IS_MAC=sys.platform=="darwin"
+IS_LINUX=sys.platform.startswith("linux")
 APP_DIR=Path(getattr(sys,"_MEIPASS",Path(__file__).resolve().parent))
 VENDOR_DIR=APP_DIR/"vendor"
 if VENDOR_DIR.exists(): sys.path.insert(0,str(VENDOR_DIR))
@@ -22,6 +30,17 @@ if os.name=="nt":
         serial=None
     DATA_DIR=Path(os.environ.get("APPDATA",str(Path.home())))/"OpenRemote Studio"
     CACHE_DIR=Path(os.environ.get("LOCALAPPDATA",str(DATA_DIR)))/"OpenRemote Studio"/"Cache"
+elif IS_LINUX:
+    import fcntl
+    # The POSIX serial path below talks to the port through raw termios, not
+    # pyserial, so this stays None on Linux exactly as it does on macOS.
+    # pyserial is still vendored because esptool imports it directly.
+    serial=None
+    # XDG Base Directory spec, with the documented fallbacks. A distro that
+    # sets neither variable still lands on the standard ~/.local/share and
+    # ~/.cache locations.
+    DATA_DIR=Path(os.environ.get("XDG_DATA_HOME") or Path.home()/".local"/"share")/"OpenRemoteStudio"
+    CACHE_DIR=Path(os.environ.get("XDG_CACHE_HOME") or Path.home()/".cache")/"OpenRemoteStudio"
 else:
     import fcntl
     serial=None
@@ -465,7 +484,35 @@ def create_search_index(records, index_path):
                 "irJson":json.dumps(r["ir"],ensure_ascii=False),"search":r["search"]
             }
             f.write(json.dumps(payload,ensure_ascii=False,separators=(",",":"))+"\n")
+def linux_dialog(prompt,directory=False,file_filter=None):
+    # Linux has no single system file dialog the way macOS and Windows do, so
+    # this uses whichever of the two near-universal desktop helpers is present:
+    # zenity (GTK/GNOME) or kdialog (KDE). Both ship as separate packages, so
+    # neither is guaranteed - if the user has neither, that is reported plainly
+    # rather than failing with a bare FileNotFoundError, and the message names
+    # the packages to install.
+    zenity=shutil.which("zenity")
+    if zenity:
+        command=[zenity,"--file-selection","--title",prompt]
+        if directory: command.append("--directory")
+        elif file_filter: command.extend(["--file-filter",file_filter])
+    else:
+        kdialog=shutil.which("kdialog")
+        if not kdialog:
+            raise RuntimeError("No file chooser is available. Install 'zenity' (GNOME/GTK desktops) "
+                               "or 'kdialog' (KDE), then try again.")
+        command=[kdialog,"--title",prompt,
+                 "--getexistingdirectory" if directory else "--getopenfilename",str(Path.home())]
+        if not directory and file_filter: command.append(file_filter)
+    # A cancelled dialog exits non-zero on both tools. That is an ordinary
+    # outcome, not an error, and must come back as "" like the macOS
+    # AppleScript branches do.
+    result=subprocess.run(command,capture_output=True,text=True)
+    return result.stdout.strip() if result.returncode==0 else ""
+
 def choose_folder():
+    if IS_LINUX:
+        return linux_dialog("Choose where to save the OpenRemote.irdb release folder",directory=True)
     if os.name=="nt":
         script=("Add-Type -AssemblyName System.Windows.Forms; "
                 "$dialog=New-Object System.Windows.Forms.FolderBrowserDialog; "
@@ -481,6 +528,8 @@ def choose_folder():
 def choose_setup_file(kind):
     if kind not in ("firmware","webconfig"): raise RuntimeError("Unknown setup file type.")
     title="Choose OpenRemote Firmware" if kind=="firmware" else "Choose OpenRemote WebConfig"
+    if IS_LINUX:
+        return linux_dialog(title,file_filter=("*.bin" if kind=="firmware" else "*.html *.htm"))
     if os.name=="nt":
         file_filter=("ESP32 firmware (*.bin)|*.bin" if kind=="firmware" else
                      "OpenRemote WebConfig (*.html;*.htm)|*.html;*.htm")
@@ -496,6 +545,8 @@ def choose_setup_file(kind):
     return subprocess.check_output(["/usr/bin/osascript","-e",script],text=True).strip()
 
 def choose_sd_folder():
+    if IS_LINUX:
+        return linux_dialog("Choose the OpenRemote SD card (FAT32)",directory=True)
     if os.name=="nt":
         script=("Add-Type -AssemblyName System.Windows.Forms; "
                 "$dialog=New-Object System.Windows.Forms.FolderBrowserDialog; "
@@ -523,6 +574,55 @@ def sd_volume_info(target):
         if not ok: raise RuntimeError("Windows could not inspect the selected SD card.")
         drive_type=ctypes.windll.kernel32.GetDriveTypeW(str(root))
         return {"root":str(root),"filesystem":fs.value,"removable":drive_type==2,"scheme":""}
+    if IS_LINUX:
+        # findmnt reports the filesystem type and backing device for a mount
+        # point; it is part of util-linux, so it is present on effectively
+        # every Linux system without adding a dependency.
+        findmnt=shutil.which("findmnt")
+        if not findmnt:
+            raise RuntimeError("'findmnt' is not available. Install the 'util-linux' package, then try again.")
+        found=subprocess.run([findmnt,"-n","-o","SOURCE,FSTYPE,TARGET","--target",str(target)],
+                             capture_output=True,text=True,timeout=8)
+        if found.returncode or not found.stdout.strip():
+            raise RuntimeError("Linux could not inspect the selected SD card.")
+        fields=found.stdout.split()
+        if len(fields)<3: raise RuntimeError("Linux could not inspect the selected SD card.")
+        source,fstype,mountpoint=fields[0],fields[1],fields[2]
+        # findmnt walks up to the enclosing mount, so a folder inside the card
+        # resolves to the card's own mount point rather than failing. Anything
+        # below that mount point is a folder on the card, not the card itself -
+        # the same mistake the macOS branch rejects via its /Volumes check.
+        if Path(mountpoint).resolve()!=target:
+            raise RuntimeError("Choose the SD card's mount point itself, not a folder inside it.")
+        removable=False
+        # /sys/block/<disk>/removable is the kernel's own flag. The partition
+        # device (e.g. /dev/sdb1) has to be reduced to its parent disk (sdb)
+        # first, since only whole disks carry that attribute.
+        try:
+            name=Path(source).name
+            parent=re.sub(r"p?\d+$","",name)
+            flag=Path("/sys/block")/parent/"removable"
+            if flag.exists(): removable=flag.read_text().strip()=="1"
+        except Exception:
+            pass
+        if not removable:
+            # USB card readers frequently report removable=0 on the disk while
+            # still sitting on a USB bus. Treat a USB-attached device as
+            # removable too rather than rejecting a genuine SD card.
+            try:
+                link=os.path.realpath(Path("/sys/class/block")/Path(source).name)
+                removable="/usb" in link or "usb" in link.split("/devices/")[-1][:40]
+            except Exception:
+                pass
+        scheme=""
+        lsblk=shutil.which("lsblk")
+        if lsblk:
+            try:
+                pt=subprocess.run([lsblk,"-n","-o","PTTYPE",source],capture_output=True,text=True,timeout=8)
+                scheme=pt.stdout.strip().splitlines()[0].strip() if pt.stdout.strip() else ""
+            except Exception:
+                pass
+        return {"root":str(target),"filesystem":fstype,"removable":removable,"scheme":scheme}
     import plistlib
     if not str(target).startswith("/Volumes/") or len(target.parts)!=3:
         raise RuntimeError("Choose the SD card itself under /Volumes, not a folder inside it.")
@@ -884,6 +984,15 @@ def usb_ports():
     if os.name=="nt":
         if serial is None: return []
         return [item.device for item in serial.tools.list_ports.comports()]
+    if IS_LINUX:
+        # The ESP32-S3's native USB CDC enumerates as /dev/ttyACM*; a board
+        # behind a CP210x/CH34x/FTDI bridge appears as /dev/ttyUSB*. There is
+        # no /dev/cu.* callout-device split on Linux, so both are listed
+        # directly with no normalisation step needed afterwards.
+        ports=[]
+        for pat in ("/dev/ttyACM*","/dev/ttyUSB*"):
+            ports.extend(glob.glob(pat))
+        return sorted(dict.fromkeys(ports))
     cu_ports=[]
     for pat in ("/dev/cu.usbmodem*","/dev/cu.usbserial*","/dev/cu.SLAB_USBtoUART*"):
         cu_ports.extend(glob.glob(pat))
@@ -894,15 +1003,23 @@ def usb_ports():
         tty_ports.extend(glob.glob(pat))
     return sorted(dict.fromkeys(tty_ports))
 def normalize_usb_port(port):
-    if os.name!="nt" and port.startswith("/dev/tty."):
+    # macOS only: /dev/tty.* is the dial-in device and blocks on open until
+    # carrier detect, /dev/cu.* is the callout device that does not. Linux
+    # has no such pair, so its port names pass through untouched.
+    if IS_MAC and port.startswith("/dev/tty."):
         cu="/dev/cu."+port[len("/dev/tty."):]
         if Path(cu).exists(): return cu
     return port
 def busy_port_hint(port):
     hint="USB serial port is busy. Close Arduino Serial Monitor, Arduino upload, or any other app using the port, then try again."
     if os.name!="nt":
+        # lsof lives in /usr/sbin on macOS and /usr/bin on most Linux distros,
+        # and is not installed by default on all of them - look it up rather
+        # than hardcoding either path. Its absence just means no owner names in
+        # the hint, which is why the whole block is best-effort already.
+        lsof=shutil.which("lsof") or "/usr/sbin/lsof"
         try:
-            r=subprocess.run(["/usr/sbin/lsof",normalize_usb_port(port)],capture_output=True,text=True,timeout=2)
+            r=subprocess.run([lsof,normalize_usb_port(port)],capture_output=True,text=True,timeout=2)
             lines=[ln for ln in r.stdout.splitlines()[1:] if ln.strip()]
             if lines:
                 owners=[]
@@ -939,6 +1056,20 @@ def open_serial_port(port):
     except OSError as e:
         if getattr(e,"errno",None)==16:
             raise RuntimeError(busy_port_hint(port))
+        # EACCES on Linux almost always means the user is not in the group
+        # that owns /dev/tty*, not that anything is actually wrong. Distros
+        # differ on the name ("dialout" on Debian/Ubuntu, "uucp" on Arch and
+        # Fedora), so the real owning group is read off the device itself
+        # rather than guessed at.
+        if IS_LINUX and getattr(e,"errno",None)==13:
+            group="dialout"
+            try:
+                import grp
+                group=grp.getgrgid(os.stat(port).st_gid).gr_name
+            except Exception:
+                pass
+            raise RuntimeError(f"No permission to open {port}. Add your user to the '{group}' group with: "
+                               f"sudo usermod -aG {group} $USER — then log out and back in.")
         raise
     attrs=termios.tcgetattr(fd)
     attrs[0]=0; attrs[1]=0; attrs[2]=termios.CS8|termios.CLOCAL|termios.CREAD; attrs[3]=0
@@ -946,7 +1077,9 @@ def open_serial_port(port):
     attrs[4]=speed; attrs[5]=speed
     attrs[6][termios.VMIN]=0; attrs[6][termios.VTIME]=0
     termios.tcsetattr(fd,termios.TCSANOW,attrs)
-    if sys.platform=="darwin":
+    # macOS needs IOSSIOSPEED to reach non-standard rates; Linux has a real
+    # B460800 constant (set via termios above), so no ioctl is needed here.
+    if IS_MAC:
         fcntl.ioctl(fd,0x80045402,struct.pack("I",SERIAL_BAUD))
     try:
         termios.tcflush(fd,termios.TCIFLUSH)

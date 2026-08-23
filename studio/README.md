@@ -6,13 +6,14 @@
 
 <p align="center">
   <strong>Build your remote. Keep it local.</strong><br>
-  The desktop companion for OpenRemote — Mac and Windows.
+  The desktop companion for OpenRemote — Mac, Windows and Linux.
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Version-2.67-2f8cff?style=flat-square" alt="v2.67">
+  <img src="https://img.shields.io/badge/Version-2.68-2f8cff?style=flat-square" alt="v2.68">
   <img src="https://img.shields.io/badge/macOS-Universal-30d158?style=flat-square" alt="macOS Universal">
   <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-30d158?style=flat-square" alt="Windows 10/11">
+  <img src="https://img.shields.io/badge/Linux-AppImage-30d158?style=flat-square" alt="Linux AppImage">
   <img src="https://img.shields.io/badge/Python-Bundled-30d158?style=flat-square" alt="Python bundled">
 </p>
 
@@ -84,10 +85,21 @@ Grab the build for your platform from [Releases](../../../releases).
 - **macOS** — universal binary, runs natively on both Apple Silicon and Intel
 - **Windows** — extract the whole folder and run the `.exe`. Keep the `runtime`
   and `app` folders beside it; the `.exe` alone won't start without them.
+- **Linux** — a single `x86_64.AppImage`. Python and every dependency are inside
+  it, so nothing needs installing.
 
 > **macOS note:** builds are ad-hoc signed rather than notarised, so the first
 > launch needs **right-click → Open** (or Privacy & Security → "Open Anyway").
 > Once per copy, then it opens normally.
+
+> **Linux note:** mark the AppImage executable before the first run — right-click
+> → Properties → Permissions → "Allow executing file as program" (or
+> `chmod +x`). Then double-click it. If a serial port won't open, add yourself to
+> the group that owns it: `sudo usermod -aG dialout $USER` on Debian/Ubuntu, or
+> `uucp` on Arch/Fedora, then log out and back in. Studio reads the real owning
+> group off the device and names it in the error, so follow what it reports.
+> **The Linux build has not yet been run on real Linux hardware** — USB flashing
+> and SD card setup are untested there.
 
 ### From source
 
@@ -98,7 +110,8 @@ python3 openremote_studio.py
 
 Studio opens in a native app window using the OS's own web engine — WKWebView on
 macOS, WebView2 on Windows — with an automatic fallback to your default browser if
-that engine isn't available.
+that engine isn't available. Linux has no equivalent guaranteed to be present, so it
+always uses that browser fallback.
 
 ---
 
