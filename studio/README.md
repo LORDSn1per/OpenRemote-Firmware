@@ -70,10 +70,18 @@ the remote:
 - **Load `.IR` file** — push a single device file straight to `/devices`
 - **Restore factory settings** — wipe user data, keep firmware and libraries
 
-### 🩺 Hardware diagnostic
-Installs a bundled Rev 5 sensor-test firmware that exercises the LCD, touch, I²C
-bus, accelerometer, fuel gauge and IR — without touching the SD card. Restore your
-real firmware when you're done.
+### 🩺 Hardware self-test
+Installs a bundled Rev 6 self-test firmware that **measures** the board rather than
+assuming it works — without touching the SD card. Restore your real firmware when
+you're done.
+
+It reads every LCD bus pin back to prove it can actually reach both levels, checks
+for shorts between them, and reports `SCREEN FAIL` naming the pin, its GPIO and its
+J2 connector pad. This catches the case a display driver never can: a shorted or
+open bus pin that still lets `LCD init completed` be printed while the panel shows
+white. It also tests the microSD (power, mount, and a real write/read round-trip),
+the I2S microphone, and still scans I²C for the touch controller, accelerometer and
+fuel gauge. Results print to the USB serial monitor at 460800 baud.
 
 ---
 
