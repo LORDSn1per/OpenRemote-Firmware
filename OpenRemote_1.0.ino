@@ -1,6 +1,37 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.54 - 2026-09-01
+    - Fixes voice on a reconnect for real. The capture showed the remote
+      telling the host one thing and then doing another:
+        ATVV HOST CAPS ...
+        ATVV format: ADPCM 8kHz, 20 byte frames every 5ms (MTU=23 - UNUSABLE)
+        ATVV capabilities: ... codec=0x01 frame=20        <- committed to host
+        BLE HID: MTU negotiated to 247
+        ATVV format: ADPCM 16kHz, 160 byte frames every 20ms   <- changed anyway
+      CAPS_RESP is a commitment about the codec and frame size for the rest of
+      the session. Answering it from a 23 byte MTU and then switching to 160
+      byte 16kHz frames leaves the host decoding against a format nothing is
+      sending.
+    - This is why it only ever failed on reconnects. On the first connection of
+      a session the MTU was already up when GET_CAPS arrived, the two agreed,
+      and voice worked. On a reconnect the host asked first, before 3.53's
+      deferred MTU exchange had run.
+    - GET_CAPS is now held until the MTU and data length exchanges have
+      finished, up to 1500ms, after which it is answered with whatever format
+      is available rather than left unanswered. The hold covers only the
+      capabilities reply; MIC_OPEN and MIC_CLOSE handling still runs.
+    - Link tuning is brought forward to just after encryption completes (150ms
+      from onAuthenticationComplete) instead of waiting out 3.53's fixed 900ms
+      post-connect delay. Encryption finishing is the actual condition that
+      made 3.52 unsafe, so this is both earlier and better founded - and it is
+      what gets the MTU up before the host asks.
+    - onMtuChanged no longer re-picks the format once capabilities have been
+      sent; it says so instead. Silently diverging from the advertised format
+      is the bug above.
+    - The commitment is logged as "ATVV capabilities COMMITTED" so the format
+      the host was actually promised is unambiguous in a capture.
+
   3.53 - 2026-08-31
     - Fixes the regression 3.52 introduced: after ending an activity the remote
       would not reconnect at all, no buttons and no voice. Serial showed the
@@ -3684,7 +3715,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.53"
+#define OPENREMOTE_VERSION_STRING "3.54"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -5132,6 +5163,10 @@ static const uint32_t BLE_LINK_SETUP_DELAY_MS = 900;
 volatile bool bleLinkSetupPending = false;
 volatile bool bleDataLenRequestPending = false;
 unsigned long bleLinkSetupAtMs = 0;
+// How long GET_CAPS may wait for the MTU/DLE exchange before being
+// answered anyway. Better a stale format than no reply at all.
+static const uint32_t ATVV_CAPS_HOLD_MAX_MS = 1500;
+unsigned long atvvCapsHoldUntilMs = 0;
 volatile uint32_t atvvNotifyFailures = 0;
 uint32_t atvvFramesDroppedThisStream = 0;
 volatile bool atvvRxPeerSubscribed = false;
@@ -7763,7 +7798,7 @@ bool atvvSendCapabilities() {
     atvvRememberedInteractionModel = model;
     bleBondStateSavePending = true;
   }
-  Serial.printf("ATVV capabilities: version=%u.%u model=%s codec=0x%02X frame=%u\n",
+  Serial.printf("ATVV capabilities COMMITTED: version=%u.%u model=%s codec=0x%02X frame=%u\n",
                 version >> 8, version & 0xFF,
                 model == ATVV_INTERACTION_HOLD_TO_TALK ? "hold-to-talk" : "on-request",
                 advertisedCodec, (unsigned)atvvFrameBytes);
@@ -8380,9 +8415,30 @@ static OpenRemoteAtvvNotifyCallbacks atvvNotifyCallbacks;
 
 void serviceAtvvVoice(unsigned long now) {
   if (atvvCapsRequestPending) {
-    atvvCapsRequestPending = false;
-    if (!atvvSendCapabilities()) {
-      Serial.println("ATVV capabilities response failed");
+    // Do not answer GET_CAPS until the MTU and data length are settled.
+    //
+    // CAPS_RESP is a commitment: it tells the host the codec and frame size it
+    // should expect for the rest of the session. On a reconnect the host asked
+    // before our deferred MTU exchange had run, so the remote answered from a
+    // 23 byte MTU - "codec=0x01 8kHz, frame=20" - and then, once the MTU came
+    // up to 247, quietly switched itself to 160 byte 16kHz frames. The host was
+    // still expecting 20 byte 8kHz ones. On the first connection of a session
+    // the MTU happened to be up before GET_CAPS arrived, the two agreed, and
+    // voice worked - which is exactly why this only ever failed on reconnects.
+    if (atvvCapsHoldUntilMs == 0) atvvCapsHoldUntilMs = now + ATVV_CAPS_HOLD_MAX_MS;
+    bool linkBusy = bleLinkSetupPending || bleDataLenRequestPending;
+    bool timedOut = (int32_t)(now - atvvCapsHoldUntilMs) >= 0;
+    // Hold only this block; the microphone handling below still has to run.
+    if (!linkBusy || timedOut) {
+      atvvCapsRequestPending = false;
+      atvvCapsHoldUntilMs = 0;
+      if (timedOut && linkBusy) {
+        Serial.println("ATVV capabilities: link tuning did not finish in time, "
+                       "answering with the format available now");
+      }
+      if (!atvvSendCapabilities()) {
+        Serial.println("ATVV capabilities response failed");
+      }
     }
   }
 
@@ -8590,7 +8646,14 @@ class OpenRemoteBleServerCallbacks : public BLEServerCallbacks {
     // Re-pick the framing now the real MTU is known. Skipped mid-stream: the
     // host is decoding against the frame size we advertised in CAPS_RESP, so
     // changing it under an active stream would corrupt it.
-    if (!atvvAudioStarted) atvvChooseStreamFormat();
+    // Only re-pick the framing if the host has not yet been told one. Once
+    // CAPS_RESP has gone out, that frame size is what the host decodes
+    // against, and changing it here is what broke reconnects.
+    if (!atvvAudioStarted && atvvCapsRequestPending) atvvChooseStreamFormat();
+    else if (!atvvAudioStarted) {
+      Serial.println("BLE HID: MTU rose after capabilities were sent - keeping "
+                     "the advertised format for this session");
+    }
   }
 #endif
 
@@ -8611,6 +8674,7 @@ class OpenRemoteBleServerCallbacks : public BLEServerCallbacks {
     bleConnHandleValid = false;
     bleLinkSetupPending = false;
     bleDataLenRequestPending = false;
+    atvvCapsHoldUntilMs = 0;
     atvvRxSubscribed = false;
     atvvCtlSubscribed = false;
     // Per-connection, so they must not survive the link that created them.
@@ -8658,6 +8722,10 @@ class OpenRemoteBleSecurityCallbacks : public BLESecurityCallbacks {
       blePairingMode = false;
       bleKeepAliveUntilMs = millis() + BLE_POST_CONNECT_GRACE_MS;
       bleDeviceProvisionPending = true;
+      // Encryption is done, so the stack is safe to drive now - no need to sit
+      // out the rest of the conservative post-connect delay. Bringing this
+      // forward is what gets the MTU up before the host asks for capabilities.
+      if (bleLinkSetupPending) bleLinkSetupAtMs = millis() + 150;
     }
     bleBondStateSavePending = true;
     if (blePairUiRequest == BLE_PAIR_UI_ADVERTISING ||
