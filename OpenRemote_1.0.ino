@@ -1,6 +1,266 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.36 - 2026-08-31
+    - Validate a staged firmware image BEFORE erasing the OTA partition.
+      "Could Not Activate The Firmware" is what Update reports when every byte
+      was written but esp_ota_set_boot_partition() refused the result, and it
+      names no cause. On hardware it turned out the staged file was 2433116
+      bytes while the .bin being installed (3.35) is 2440208 - 7092 bytes lost
+      silently in transfer. Nothing detected that: the legacy
+      /api/firmware/stage path checks only that the first byte is 0xE9 and the
+      total is under a cap, so a short upload is committed and only fails much
+      later, after a full erase-and-write cycle, with a message that points
+      nowhere.
+    - An ESP32 image describes its own length - a 24-byte header then
+      segment_count records of (load_addr, length, data). Walking that table
+      costs nothing and catches truncation, a wrong-chip binary, or a factory
+      image offered where an app image belongs. A short image is now refused up
+      front with the staged byte count in the message, so the next failure says
+      "the upload was truncated" instead of "could not activate".
+    - Also checks the chip id is 0x0009 (ESP32-S3). A .bin for another target
+      writes perfectly and then cannot be activated, which is indistinguishable
+      from corruption without this check.
+
+  3.35 - 2026-08-31
+    - Fixed Forget pairing not actually emptying the bond store, and the
+      NimBLE "ble_store_config_write_rpa_rec rc=27" that followed from it.
+      rc=27 is BLE_HS_ESTORE_CAP - store capacity exceeded, not a write error.
+      CONFIG_BT_NIMBLE_MAX_BONDS is 3, so a store that is not really being
+      cleared fills after a few pair/forget cycles, and NimBLE can then no
+      longer record a peer's resolvable address.
+    - The cause was in 3.31's own fix. It used
+      Preferences::begin("nimble_bond", false) and treated a true return as
+      proof the namespace existed - but begin() in read-write mode CREATES a
+      missing namespace and always returns true. It could have been clearing
+      nothing and still logging "erased (ok)". The pairing disappeared from the
+      UI only because bleBonded was set false alongside it, which made a
+      cosmetic fix look like a real one.
+    - Now uses the NVS API directly: nvs_open(..., NVS_READONLY) returns
+      ESP_ERR_NVS_NOT_FOUND for a namespace that genuinely is not there, which
+      is a real existence test, then nvs_erase_all() + nvs_commit(), then
+      reopens read-only to confirm. The log reports the actual result and
+      whether the namespace survived, instead of asserting success.
+
+  3.34 - 2026-08-31
+    - Rebuilt the microphone signal chain. Recognition was far worse than a
+      real Chromecast remote, and two defects in the old capture loop explain
+      most of it:
+        * Keeping every second sample is decimation with no anti-alias filter.
+          Everything above 4kHz in the 16kHz capture folded straight back into
+          the 0-4kHz band. Measured on the old chain: a 4/5/6/7kHz tone came
+          through at full amplitude, indistinguishable from real speech.
+          Fricatives - s, sh, f, t - carry most of their energy up there, so
+          the damage landed on exactly the consonants a recogniser depends on,
+          and no later stage can undo it.
+        * ">> 14" on a 24-bit sample left-justified in a 32-bit I2S word is a
+          12dB gain, and constrain() then hard-clipped at a quarter of full
+          scale. Ordinary speech clipped, and clipping makes broadband
+          harmonics which then aliased as well.
+    - New chain per sample: DC blocker (one-pole, ~20Hz - MEMS mics carry a
+      large offset that otherwise eats ADPCM dynamic range), 12dB gain with a
+      soft knee at 75% instead of a wall, then a 23-tap windowed-sinc low-pass
+      at 3.4kHz. Every one of the 80 captured samples is filtered; only then is
+      every second one kept. Filter and DC state are file-scope because they
+      have to run continuously across frames - resetting per 5ms frame would
+      inject a step discontinuity 200 times a second.
+    - Verified against the real fixed-point maths rather than assumed. Speech
+      band unchanged (-0.0dB at 1-2kHz, -2.2dB at 3kHz); alias rejection now
+      -38dB at 4kHz, -43dB at 5kHz, -48dB at 6kHz, -56dB at 7kHz, against 0dB
+      for all of them before. A constant input settles to exactly 0, so the DC
+      blocker works.
+    - Still 8kHz ADPCM. Whether the codec itself can be raised to 16kHz depends
+      on what the host advertises in its GET_CAPS, which the firmware logs but
+      has not been captured yet - the mic already samples at 16kHz, so that
+      change would be a decode-side negotiation, not a capture change.
+
+  3.33 - 2026-08-31
+    - Instrumented the firmware installer after repeated "install failed"
+      reports that carried no usable detail. What is already established: the
+      .bin is structurally valid (7 segments, all in range, correct ESP32-S3
+      chip id, SHA appended - checked byte by byte off the build output), and
+      the upload arrives intact (the chunked path verifies both byte count and
+      CRC-32 end to end, and logged "committed received=2438896", the exact
+      file size). Despite that, esp_ota_end() reports "invalid segment length
+      0xba4707b2" - garbage where a segment header should be.
+    - handleFirmwareInstall() previously reported one generic message at the
+      very end, so a failure in begin(), mid-write or at verification all
+      looked identical. It now logs the staged size and free heap up front,
+      reports Update.begin() failure separately with its error string, detects
+      a short write with its offset, and refuses an image where the bytes that
+      reached flash do not equal the staged size - a silent short read leaves a
+      truncated image that still has a valid header, which is exactly the shape
+      of this failure.
+    - Calls Update.abort() before beginning. Update is a singleton and a
+      previous aborted attempt can leave state that makes begin() misbehave;
+      "tried a lot of times" makes that worth eliminating.
+    - Read buffer 1KB -> 4KB to match the flash sector the OTA writer works in.
+
+  3.32 - 2026-08-31
+    - Fixed the Chromecast cutting Voice Search off part-way through a
+      sentence. When an I2S read missed its window the firmware filled the gap
+      with encoded silence. Silence is real audio content to a speech
+      recogniser - mid-sentence it is indistinguishable from the user going
+      quiet, so Google's endpointer closed the microphone and stopped
+      listening. The stream was being told to stop by its own filler.
+    - Misses were near-inevitable rather than exceptional: the capture buffer
+      was 4 x 80 samples = 20ms at 16kHz, while the audio task consumes 80
+      samples every 5ms. That is exactly real time, leaving 20ms of total slack
+      for BLE notifies, LVGL redraws and SD work. Raised to 8 x 240 = 120ms,
+      and the read timeout from 12ms to 20ms.
+    - A missed read now sends nothing at all instead of fabricated silence. A
+      brief hole in the packet stream is something the decoder rides out; audible
+      silence is not.
+    - Added a capture-underrun counter, reported with the frame count when a
+      stream ends, so how often this happens is now measurable instead of
+      inferred.
+    - Corrected the Forget pairing log line, which still claimed the Bluetooth
+      stack "will be started to clear bonds" - 3.31 erases NVS directly and
+      never starts it.
+
+  3.31 - 2026-08-31
+    - Fixed 3.30's Forget pairing doing nothing at all ("forget pairing
+      abandoned - Bluetooth stack would not start"). 3.30 tried to start BLE so
+      the bond store would exist, but applyBluetoothState() only starts the
+      radio when bluetoothRuntimeRequired() is true - a live BLE activity or an
+      open pairing window - and refuses outright while webConfigPausedBle is
+      set. Wanting to delete a bond satisfies none of those, so it could only
+      ever time out. Starting the stack was the wrong idea entirely.
+    - Bonds are NVS records and outlive the radio, so with the stack down they
+      are now erased in place from NimBLE's "nimble_bond" namespace, and only
+      through ble_store_clear() when the host genuinely exists. The NVS branch
+      reports whether the namespace was even there rather than assuming, since
+      a silent success is the exact failure this whole sequence began with.
+    - Every remaining BLE call on this path is guarded on bleReady, including
+      the trailing stopAdvertising() that produced the original
+      "BLE is not initialized" line.
+
+  3.30 - 2026-08-31
+    - Fixed 3.29's Forget pairing still crashing the ESP32: Guru Meditation
+      LoadProhibited, EXCVADDR 0x44, immediately after "forget pairing
+      requested". The serial log showed the real precondition one line earlier -
+      "BLE is not initialized" from stopAdvertising(). With Bluetooth off, or
+      the radio torn down for a WebConfig session, there is no NimBLE host, so
+      3.29's deferred handler saw bleConnected false, ran on the very next
+      loop() pass, and called ble_store_clear() into a host that does not
+      exist. 3.28 crashed for a context reason and 3.29 for a lifetime one;
+      both looked like "Forget pairing reboots the remote".
+    - The whole path is now guarded on bleReady. Nothing touches the BLE API
+      when the stack is down, and because bonds live in NVS and outlive the
+      radio, the handler starts Bluetooth (once, not per loop pass) and clears
+      on a later pass rather than skipping the request - silently doing nothing
+      is what the original 3.27-and-earlier bug already did. The bound is 6s,
+      enough to cover BLEDevice::init() from cold, after which it gives up
+      loudly instead of retrying forever.
+
+  3.29 - 2026-08-31
+    - Fixed 3.28's Forget pairing rebooting the ESP32. 3.28 called
+      ble_store_clear() directly from forgetBluetoothPairing(), which runs in
+      two contexts that must not touch NimBLE host state: an LVGL event
+      callback on core 1, and the HTTP Bluetooth action handler on core 0. It
+      also blocked that callback in a delay() loop waiting for the disconnect,
+      and tried to delete keys while the link could still be up - NimBLE will
+      not remove a bond an active connection is using.
+    - Split into a request and a completion, matching how bleBondStateSavePending
+      and bleDeviceProvisionPending already defer work out of callback context
+      here. forgetBluetoothPairing() now only stops advertising, drops the link
+      and raises a flag; serviceForgetBluetoothPairing(), called from loop() via
+      serviceBluetooth(), does the actual clear once the disconnect has landed,
+      with a bounded 1.5s wait so a peer that never acknowledges cannot leave
+      the Forget button silently doing nothing.
+
+  3.28 - 2026-08-31
+    - Fixed "Forget pairing" not actually forgetting: the remote disconnected,
+      reported success, and then the peer reconnected using keys that were
+      still in NVS. Same root cause as 3.27's connection-parameter bug -
+      the bond removal was inside #if defined(CONFIG_BLUEDROID_ENABLED) and
+      this is a NimBLE build, so it never compiled. Nothing removed the bond
+      at any point. Replaced with ble_store_clear() under CONFIG_NIMBLE_ENABLED,
+      Bluedroid kept for other builds, and an unrecognised stack is now a hard
+      #error rather than a silent no-op. Advertising is stopped and the link
+      dropped (with a bounded wait for the disconnect to land) BEFORE the keys
+      go, since NimBLE will not delete keys still in use by a live connection.
+      blePeerAddressValid is cleared too.
+    - Moved ESP-NOW out of Settings > Debug into its own Settings > Dock page.
+      It sat under Debug while it was an experiment; it is a real feature now,
+      and burying dock pairing among touch and display diagnostics both hid it
+      and implied it was a developer toggle. Both menu styles updated, and the
+      classic Debug page's driver section moved up 100px to close the gap the
+      two removed rows left.
+    - Fixed the ESP-NOW device picker staying on screen after navigating away.
+      It is parented to screenRoot rather than content so it can float above
+      the page, which also means renderSettingsPage()'s rebuild of content
+      could not remove it and it survived as a panel stuck over whatever page
+      came next. openSettingsView() now closes it on any view change, and
+      cancels the scan behind it so the radio is not left searching invisibly.
+
+  3.27 - 2026-08-30
+    - Fixed Voice Search sending no audio at all to a 2020 "Chromecast with
+      Google TV", while the same build worked on a Google TV Streamer. A
+      serial capture showed every single audio frame failing with
+      ble_gatts_notify_custom rc=6 - BLE_HS_ENOMEM - so the peer genuinely
+      received nothing, which is why even the pre-recorded test phrase
+      produced "nothing was received" there.
+    - Root cause: requestBluetoothConnectionProfile() was wrapped entirely in
+      #if defined(CONFIG_BLUEDROID_ENABLED), with a bare (void)idle in the
+      #else. This firmware builds against NimBLE
+      (CONFIG_BT_NIMBLE_ENABLED=y in the framework sdkconfig), so that branch
+      was never compiled and the remote never requested connection parameters
+      at any point in its life - the link simply ran at whatever interval the
+      peer chose. The Streamer happens to choose something fast enough for a
+      20-byte ATVV frame every 5ms; the older Chromecast chooses a slower one,
+      NimBLE's mbuf pool (MSYS1_BLOCK_COUNT=12) drains, and every notify is
+      refused from then on. Nothing in the ATVV negotiation was wrong.
+    - Rebuilt it as requestBluetoothConnectionProfileMode() with a real NimBLE
+      path (requestConnParams(conn_handle, ...)), keeping the Bluedroid path
+      for any future build, and made an unrecognised stack a hard #error
+      instead of a silent no-op - that silence is what hid this.
+    - Added a third connection profile for voice: 7.5-15ms interval, latency 0,
+      requested on AUDIO_START and released back to the responsive profile in
+      atvvStopAudio(). Latency has to be 0 for a continuous stream, because a
+      non-zero value lets the peer skip connection events entirely.
+    - Fixed live microphone audio arriving with chunks missing (reported as
+      "jumbled", and separate from the above - it affects the Streamer too).
+      The audio task scheduled each frame with millis() + 5ms AFTER sending the
+      previous one, so the true period was 5ms plus the I2S read and BLE notify
+      time. The remote therefore produced audio slower than real time while the
+      microphone kept filling at a fixed rate, overrunning the capture buffer.
+      The schedule now advances from the previous deadline, with a resync if it
+      ever falls more than four frames behind rather than burst-sending a
+      backlog into the same BLE buffers that caused the original failure.
+
+  3.26 - 2026-08-30
+    - Fixed a command added to a file-backed (IRDB) device from WebConfig
+      being sendable from the LCD but not from WebConfig itself, which
+      reported "Device command was not found". The .ir file on the card was
+      written correctly, but the HTTP upload handler never reloaded the
+      runtime model - unlike the USB .ir import path, which has always called
+      loadRuntimeConfig() after writing. So the running model, and the command
+      ids WebConfig tests against, stayed pre-edit until something else
+      happened to reload. handleDeviceFileUploadData() now reloads on success
+      too, so both import routes behave the same.
+    - Raised MAX_DEVICE_COMMANDS from 50 to 200. 50 was not a safe headroom
+      number, it was landing exactly on real hardware: a full ONKYO TX-NR616
+      map is 50 commands, so that device could not take a single added button.
+      Devices live in PSRAM (ps_malloc, 8MB), and this is a fixed array inside
+      Device, so the extra ceiling costs roughly 12 devices * 150 * sizeof
+      (DeviceCommand) - a few hundred KB against 8MB. Changed to uint16_t
+      because 200 no longer reads naturally as a uint8_t bound.
+    - A ceiling still exists because the array is fixed; anything past it is
+      dropped when the file is re-read, so WebConfig 2.49 refuses at the same
+      number rather than appearing to accept commands the firmware will
+      silently discard.
+    - Measured cost, not assumed: internal RAM went 33.7% -> 35.9% (+7,200
+      bytes). That is not the device model, which is in PSRAM - it is the
+      global PageUi pageUi[4], where each slot carries
+      UiCommandBinding commandBindings[MAX_DEVICE_COMMANDS] at 12 bytes each:
+      4 * 150 * 12 = 7,200 exactly. Internal RAM matters here because the
+      Wi-Fi driver needs it (see 1.28's white-screen reboot loop), so it was
+      worth pinning down rather than waving through. ~210KB internal remains
+      free. If Wi-Fi or BLE ever destabilises after this, halving
+      MAX_DEVICE_COMMANDS to 100 halves that 7.2KB and still doubles the old
+      ceiling.
+
   3.25 - 2026-08-22
     - Root-caused and fixed the activity slide-to-open thumb not "grabbing"
       on a fast swipe, using 3.24's diagnostic touch log against real
@@ -2986,7 +3246,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.25"
+#define OPENREMOTE_VERSION_STRING "3.36"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -3070,6 +3330,11 @@ static_assert(ARDUINOJSON_SLOT_ID_SIZE >= 4,
 #include <Arduino_GFX_Library.h>
 #include <lvgl.h>
 #include "cinema_wallpaper_rgb565.h"
+#if defined(CONFIG_NIMBLE_ENABLED)
+#include "host/ble_store.h"
+#include <nvs.h>
+#include <nvs_flash.h>
+#endif
 #include "atvv_test_audio.h"
 
 class PsramJsonAllocator : public ArduinoJson::Allocator {
@@ -3167,6 +3432,14 @@ static const uint16_t BLE_CONN_IDLE_MIN_INTERVAL = 96;    // 120 ms.
 static const uint16_t BLE_CONN_IDLE_MAX_INTERVAL = 120;   // 150 ms.
 static const uint16_t BLE_CONN_IDLE_LATENCY = 3;
 static const uint16_t BLE_CONN_SUPERVISION_TIMEOUT = 600; // 6 seconds.
+// Voice streaming needs its own, much faster profile. ATVV sends a 20-byte
+// frame every 5ms (4 kB/s); at the 15-30ms 'active' interval above the link
+// cannot drain that, NimBLE's mbuf pool (MSYS1_BLOCK_COUNT=12) empties and
+// every notify fails with BLE_HS_ENOMEM. Latency must be 0 - a non-zero
+// latency lets the peer skip connection events entirely, which is fatal for
+// a continuous stream.
+static const uint16_t BLE_CONN_VOICE_MIN_INTERVAL = 6;   // 7.5 ms.
+static const uint16_t BLE_CONN_VOICE_MAX_INTERVAL = 12;  // 15 ms.
 // Both delays exist to keep esp_ble_gap_update_conn_params() away from the
 // instant a sleep or wake transition happens, which is what could block
 // Bluedroid's GAP task. The idle wait is the longer of the two because
@@ -3480,7 +3753,13 @@ static lv_indev_drv_t touchDrv;
 // ---------------------------------------------------------------------------
 
 static const uint8_t MAX_RUNTIME_DEVICES = 12;
-static const uint8_t MAX_DEVICE_COMMANDS = 50;
+// Raised from 50 in 3.26. This is a fixed array inside Device, and devices
+// live in PSRAM (ps_malloc, 8MB available), so the cost of a larger ceiling
+// is ~12 devices * (N-50) * sizeof(DeviceCommand) - a few hundred KB at
+// most, against 8MB. 50 was turning real remotes away: a full AV receiver
+// map hits it exactly, which is what surfaced this. uint16_t because 200
+// no longer fits the uint8_t counters this used to share a type with.
+static const uint16_t MAX_DEVICE_COMMANDS = 200;
 static const uint8_t MAX_RUNTIME_ACTIVITIES = 12;
 static const uint8_t MAX_RUNTIME_MACROS = 24;
 static const uint8_t MAX_ACTIVITY_TILES = 30;
@@ -3826,6 +4105,7 @@ enum SettingsView {
   SETTINGS_DISPLAY,
   SETTINGS_BUTTONS,
   SETTINGS_DEBUG,
+  SETTINGS_DOCK,
   SETTINGS_BATTERY,
   SETTINGS_BACKUP,
   SETTINGS_ABOUT,
@@ -4267,6 +4547,11 @@ bool bluetoothSleepEnabled = false;
 // Cleared by wakeDisplay(), so any button or motion brings the link
 // straight back.
 bool bleActivitySessionReleased = false;
+// Set by forgetBluetoothPairing(), completed in serviceBluetooth().
+uint32_t microphoneUnderrunCount = 0;   // reported when a voice stream ends
+bool bleForgetPairingPending = false;
+bool bleForgetPairingStackRequested = false;
+unsigned long bleForgetPairingDeadlineMs = 0;
 unsigned long blePairingUntilMs = 0;
 
 // ---------------------------------------------------------------------------
@@ -4682,6 +4967,7 @@ void styleDebugDropdown(lv_obj_t *dropdown);
 void renderDisplayPage();
 void renderButtonsPage();
 void renderDebugPage();
+void renderDockPage();
 void renderBatteryPage();
 void renderBackupRestorePage();
 void stepLcdBackupAnim();
@@ -4718,6 +5004,7 @@ void ensureAtvvAudioTask();
 void refreshDebugOverlayVisibility();
 void serviceDebugOverlay(unsigned long now);
 bool startRealMicrophoneCapture();
+void resetMicrophoneSignalChain();
 void stopRealMicrophoneCapture();
 void serviceNetworkPower(unsigned long now);
 bool enterDeepPowerSleep(bool allowQrPage = false);
@@ -6674,21 +6961,53 @@ void advertiseBluetoothHid() {
                 blePairingMode ? " for pairing" : " for reconnect");
 }
 
-void requestBluetoothConnectionProfile(bool idle) {
-#if defined(CONFIG_BLUEDROID_ENABLED)
-  if (!bleConnected || !bleServer || !blePeerAddressValid) return;
-  bleServer->updateConnParams(
-    blePeerAddress,
-    idle ? BLE_CONN_IDLE_MIN_INTERVAL : BLE_CONN_ACTIVE_MIN_INTERVAL,
-    idle ? BLE_CONN_IDLE_MAX_INTERVAL : BLE_CONN_ACTIVE_MAX_INTERVAL,
-    idle ? BLE_CONN_IDLE_LATENCY : 0,
-    BLE_CONN_SUPERVISION_TIMEOUT);
-  bleIdleConnectionProfileRequested = idle;
-  Serial.printf("BLE HID: %s connection profile requested\n",
-                idle ? "idle" : "responsive");
+// Profiles, slowest to fastest: idle (power saving), responsive (normal HID),
+// voice (continuous ATVV audio).
+enum BleConnectionProfile : uint8_t {
+  BLE_PROFILE_IDLE = 0,
+  BLE_PROFILE_RESPONSIVE,
+  BLE_PROFILE_VOICE
+};
+
+void requestBluetoothConnectionProfileMode(BleConnectionProfile profile) {
+  if (!bleConnected || !bleServer) return;
+  uint16_t minInterval = profile == BLE_PROFILE_IDLE ? BLE_CONN_IDLE_MIN_INTERVAL
+                       : profile == BLE_PROFILE_VOICE ? BLE_CONN_VOICE_MIN_INTERVAL
+                       : BLE_CONN_ACTIVE_MIN_INTERVAL;
+  uint16_t maxInterval = profile == BLE_PROFILE_IDLE ? BLE_CONN_IDLE_MAX_INTERVAL
+                       : profile == BLE_PROFILE_VOICE ? BLE_CONN_VOICE_MAX_INTERVAL
+                       : BLE_CONN_ACTIVE_MAX_INTERVAL;
+  uint16_t latency = profile == BLE_PROFILE_IDLE ? BLE_CONN_IDLE_LATENCY : 0;
+  const char *name = profile == BLE_PROFILE_IDLE ? "idle"
+                   : profile == BLE_PROFILE_VOICE ? "voice" : "responsive";
+
+  // This whole function used to be wrapped in #if defined(CONFIG_BLUEDROID_ENABLED),
+  // with a bare (void)idle in the #else. This build is NimBLE
+  // (CONFIG_BT_NIMBLE_ENABLED=y in the framework's sdkconfig), so that guard was
+  // never true and connection-parameter management silently did nothing at all -
+  // the link ran at whatever interval the peer happened to choose. A Google TV
+  // Streamer picks something fast enough that ATVV audio worked by luck; the
+  // 2020 Chromecast with Google TV picks a slower one, and every audio notify
+  // then failed with ble_gatts_notify_custom rc=6 (BLE_HS_ENOMEM), so the peer
+  // received nothing at all. Confirmed from a serial capture on real hardware.
+#if defined(CONFIG_NIMBLE_ENABLED)
+  bleServer->requestConnParams(bleServer->getConnId(), minInterval, maxInterval,
+                               latency, BLE_CONN_SUPERVISION_TIMEOUT);
+#elif defined(CONFIG_BLUEDROID_ENABLED)
+  if (!blePeerAddressValid) return;
+  bleServer->requestConnParams(blePeerAddress, minInterval, maxInterval,
+                               latency, BLE_CONN_SUPERVISION_TIMEOUT);
 #else
-  (void)idle;
+#error "No supported BLE stack: connection parameters cannot be negotiated"
 #endif
+  bleIdleConnectionProfileRequested = (profile == BLE_PROFILE_IDLE);
+  Serial.printf("BLE HID: %s connection profile requested (%u.%u-%u.%u ms, latency %u)\n",
+                name, minInterval * 5 / 4, (minInterval * 5 % 4) * 25,
+                maxInterval * 5 / 4, (maxInterval * 5 % 4) * 25, latency);
+}
+
+void requestBluetoothConnectionProfile(bool idle) {
+  requestBluetoothConnectionProfileMode(idle ? BLE_PROFILE_IDLE : BLE_PROFILE_RESPONSIVE);
 }
 
 // Queue a connection-parameter change instead of issuing it immediately.
@@ -6874,8 +7193,14 @@ bool startRealMicrophoneCapture() {
   delay(20);
 
   i2s_chan_config_t channelConfig = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
-  channelConfig.dma_desc_num = 4;
-  channelConfig.dma_frame_num = 80;
+  // 4 x 80 samples was 20ms of buffering at 16kHz while the audio task consumes
+  // 80 samples every 5ms - i.e. exactly real time, with 20ms of slack for BLE
+  // notifies, LVGL redraws and SD work to fit into. Anything slower than that
+  // missed a read, and the miss used to be filled with fabricated silence,
+  // which Google's endpointer hears as the user stopping - the reported
+  // "Chromecast stops listening half way through". 8 x 240 gives 120ms.
+  channelConfig.dma_desc_num = 8;
+  channelConfig.dma_frame_num = 240;
   esp_err_t error = i2s_new_channel(&channelConfig, nullptr, &microphoneRxChannel);
   if (error == ESP_OK) {
     i2s_std_config_t config = {
@@ -6912,6 +7237,7 @@ bool startRealMicrophoneCapture() {
 
   microphoneAdpcmPredictor = 0;
   microphoneAdpcmStepIndex = 0;
+  resetMicrophoneSignalChain();
   realMicrophoneActive = true;
   Serial.println("I2S microphone: live capture ready");
   return true;
@@ -6934,21 +7260,111 @@ void stopRealMicrophoneCapture() {
                 sdReady ? "restored" : "unavailable");
 }
 
+/*
+  Microphone signal chain, rebuilt in 3.34.
+
+  The old path did this, per output sample:
+
+      int32_t first = samples[i * 4] >> 14;   // keep every 2nd sample, 12dB gain
+      encodeMicrophoneAdpcmSample(constrain(first, -32768, 32767));
+
+  Two defects in that one line, both of which hurt recognition badly:
+
+  1. Dropping every second sample is decimation with no anti-alias filter.
+     Everything above 4kHz in the 16kHz capture folds straight back into the
+     0-4kHz band as noise. Speech energy above 4kHz is mostly fricatives -
+     s, sh, f, t - so the aliasing lands hardest on exactly the consonants a
+     recogniser leans on, and it cannot be undone later.
+
+  2. ">> 14" on a 24-bit sample left-justified in a 32-bit I2S word is a 12dB
+     gain, and constrain() then hard-clips anything above a quarter of full
+     scale. Normal speech clips, and clipping generates broadband harmonics
+     which alias too.
+
+  Now: DC block (MEMS mics carry a large DC offset that otherwise eats ADPCM
+  dynamic range), gain with a soft knee instead of a wall, then a 23-tap
+  windowed-sinc low-pass at 3.4kHz before decimating. Measured response:
+  -0.0dB at 1kHz, -2.2dB at 3kHz, -18dB at 4kHz, below -49dB from 5kHz up.
+
+  Filter and DC state are file-scope on purpose: they must run continuously
+  across frame boundaries. Resetting them every 5ms frame would put a step
+  discontinuity into the signal 200 times a second.
+*/
+static const int16_t MIC_LP_TAPS[23] = {
+  64, 73, -92, -295, 41, 812, 482, -1538,
+  -2217, 2188, 9924, 13884, 9924, 2188, -2217, -1538,
+  482, 812, 41, -295, -92, 73, 64,
+};
+static const uint8_t MIC_LP_TAP_COUNT = 23;
+int16_t micFilterHistory[MIC_LP_TAP_COUNT] = {0};
+int32_t micDcPrevIn = 0;
+int32_t micDcPrevOut = 0;
+
+void resetMicrophoneSignalChain() {
+  memset(micFilterHistory, 0, sizeof(micFilterHistory));
+  micDcPrevIn = 0;
+  micDcPrevOut = 0;
+}
+
+// 32-bit I2S word -> DC-blocked, gained, soft-limited 16-bit sample.
+static inline int16_t micConditionSample(int32_t raw) {
+  int32_t s = raw >> 8;                       // 24-bit signed
+
+  // One-pole DC blocker, corner ~20Hz at 16kHz: y = x - x1 + 0.988*y1.
+  int32_t hp = s - micDcPrevIn + ((micDcPrevOut * 253) >> 8);
+  micDcPrevIn = s;
+  micDcPrevOut = hp;
+
+  int32_t v = hp >> 6;                        // 24-bit -> 16-bit, +12dB
+
+  // Soft knee above 75% instead of a hard wall: loud speech compresses rather
+  // than square-waving, so it stops generating the harmonics that alias.
+  const int32_t knee = 24576;
+  if (v > knee)       v = knee + ((v - knee) >> 2);
+  else if (v < -knee) v = -knee + ((v + knee) >> 2);
+  if (v > 32767)      v = 32767;
+  else if (v < -32768) v = -32768;
+  return (int16_t)v;
+}
+
+// Push one 16kHz sample through the anti-alias filter and return its output.
+static inline int16_t micFilterSample(int16_t sample) {
+  for (uint8_t i = MIC_LP_TAP_COUNT - 1; i > 0; i--) {
+    micFilterHistory[i] = micFilterHistory[i - 1];
+  }
+  micFilterHistory[0] = sample;
+  int32_t acc = 0;
+  for (uint8_t i = 0; i < MIC_LP_TAP_COUNT; i++) {
+    acc += (int32_t)MIC_LP_TAPS[i] * (int32_t)micFilterHistory[i];
+  }
+  acc >>= 15;                                  // Q15 -> linear
+  if (acc > 32767) acc = 32767;
+  else if (acc < -32768) acc = -32768;
+  return (int16_t)acc;
+}
+
 bool readRealMicrophoneAdpcmFrame(uint8_t *frame) {
   if (!frame || !realMicrophoneActive || !microphoneRxChannel || !microphoneMutex) return false;
   int32_t samples[80] = {};
   size_t bytesRead = 0;
   if (xSemaphoreTake(microphoneMutex, pdMS_TO_TICKS(20)) != pdTRUE) return false;
   esp_err_t error = i2s_channel_read(microphoneRxChannel, samples, sizeof(samples),
-                                     &bytesRead, pdMS_TO_TICKS(12));
+                                     &bytesRead, pdMS_TO_TICKS(20));
   if (error == ESP_OK && bytesRead >= sizeof(samples)) {
+    // Every one of the 80 captured samples goes through the filter - that is
+    // what makes it an anti-alias filter rather than decoration. Only every
+    // second FILTERED sample is kept, giving 40 samples at 8kHz.
+    int16_t decimated[ATVV_AUDIO_FRAME_BYTES * 2];
+    uint8_t taken = 0;
+    for (uint8_t i = 0; i < 80; i++) {
+      int16_t filtered = micFilterSample(micConditionSample(samples[i]));
+      if ((i & 1) == 1 && taken < sizeof(decimated) / sizeof(decimated[0])) {
+        decimated[taken++] = filtered;
+      }
+    }
     for (uint8_t i = 0; i < ATVV_AUDIO_FRAME_BYTES; i++) {
-      int32_t first = samples[i * 4] >> 14;
-      int32_t second = samples[i * 4 + 2] >> 14;
-      uint8_t low = encodeMicrophoneAdpcmSample(
-        (int16_t)constrain(first, (int32_t)-32768, (int32_t)32767));
-      uint8_t high = encodeMicrophoneAdpcmSample(
-        (int16_t)constrain(second, (int32_t)-32768, (int32_t)32767));
+      uint8_t low = encodeMicrophoneAdpcmSample(decimated[i * 2]);
+      uint8_t high = encodeMicrophoneAdpcmSample(decimated[i * 2 + 1]);
       frame[i] = low | (high << 4);
     }
   }
@@ -6974,6 +7390,7 @@ bool atvvStartAudio(uint8_t reason, uint8_t streamId) {
     return false;
   }
   atvvStreamId = streamId;
+  microphoneUnderrunCount = 0;
   atvvAudioFrameNumber = 0;
   atvvTestAudioOffset = 0;
   atvvTestAudioFinished = false;
@@ -6981,6 +7398,11 @@ bool atvvStartAudio(uint8_t reason, uint8_t streamId) {
   atvvNextAudioFrameMs = atvvAudioStartedMs;
   atvvAudioStarted = true;
   atvvVoiceState = ATVV_VOICE_STREAMING;
+  // Drop to the shortest connection interval for the duration of the stream.
+  // Without this the peer's own choice governs, and a slow one starves every
+  // audio notify (BLE_HS_ENOMEM). Restored to the responsive profile in
+  // atvvStopAudio().
+  requestBluetoothConnectionProfileMode(BLE_PROFILE_VOICE);
   int16_t initialPredictor = atvvStreamUsesTestAudio
     ? OPENREMOTE_ATVV_TEST_INITIAL_PREDICTOR : microphoneAdpcmPredictor;
   uint8_t initialStep = atvvStreamUsesTestAudio
@@ -7007,7 +7429,16 @@ bool atvvStopAudio(uint8_t reason) {
   atvvAudioStarted = false;
   uint8_t packet[] = {ATVV_AUDIO_STOP, reason};
   bool sent = atvvNotifyControlPacket(packet, sizeof(packet));
-  if (!atvvStreamUsesTestAudio) stopRealMicrophoneCapture();
+  if (!atvvStreamUsesTestAudio) {
+    Serial.printf("ATVV microphone: %lu frame(s) sent, %lu capture underrun(s)\n",
+                  (unsigned long)atvvAudioFrameNumber,
+                  (unsigned long)microphoneUnderrunCount);
+    stopRealMicrophoneCapture();
+  }
+  // Hand the radio back its normal cadence. The voice profile's 7.5-15ms
+  // interval with zero latency is deliberately expensive, and holding it after
+  // the stream ends would cost battery for nothing.
+  requestBluetoothConnectionProfileMode(BLE_PROFILE_RESPONSIVE);
   return sent;
 }
 
@@ -7025,11 +7456,14 @@ void atvvSendAudioFrame() {
       switchToSilence = true;
     }
   } else if (!readRealMicrophoneAdpcmFrame(frame)) {
-    for (uint8_t i = 0; i < sizeof(frame); i++) {
-      uint8_t low = encodeMicrophoneAdpcmSample(0);
-      uint8_t high = encodeMicrophoneAdpcmSample(0);
-      frame[i] = low | (high << 4);
-    }
+    // Deliberately send NOTHING rather than encoded silence. Silence is real
+    // audio content to a speech recogniser: injecting it mid-sentence is
+    // indistinguishable from the user going quiet, and endpointing closes the
+    // microphone. Skipping the frame leaves a brief hole in the stream
+    // instead, which the decoder rides out. With the 120ms capture buffer
+    // above this should now be rare - the counter says how rare.
+    microphoneUnderrunCount++;
+    return;
   }
   if (switchToSilence) {
     if (!atvvSendAudioSync(static_cast<uint16_t>(atvvAudioFrameNumber), 0, 0)) {
@@ -7064,7 +7498,19 @@ void atvvAudioTask(void *parameter) {
     unsigned long now = millis();
     if ((int32_t)(now - atvvNextAudioFrameMs) >= 0) {
       atvvSendAudioFrame();
-      atvvNextAudioFrameMs = millis() + ATVV_AUDIO_FRAME_INTERVAL_MS;
+      // Advance the schedule from the previous deadline, not from "now".
+      // Using millis() after the work made the real period 5ms PLUS however
+      // long the I2S read and BLE notify took, so the remote emitted audio
+      // slower than real time while the microphone kept filling at a fixed
+      // rate - the capture buffer overran and speech arrived with chunks
+      // missing. Deadline-based scheduling keeps the average exact.
+      atvvNextAudioFrameMs += ATVV_AUDIO_FRAME_INTERVAL_MS;
+      // If something stalled long enough that several frames are already due,
+      // do not try to burst-send them: that is what floods the BLE buffers.
+      // Give up the lost time instead and resynchronise on the current frame.
+      if ((int32_t)(millis() - atvvNextAudioFrameMs) > (int32_t)(ATVV_AUDIO_FRAME_INTERVAL_MS * 4)) {
+        atvvNextAudioFrameMs = millis() + ATVV_AUDIO_FRAME_INTERVAL_MS;
+      }
     }
     vTaskDelay(pdMS_TO_TICKS(1));
   }
@@ -7467,26 +7913,129 @@ void startBluetoothPairing() {
 }
 
 void forgetBluetoothPairing() {
+  // This runs from an LVGL event callback (UI task, core 1) and from the HTTP
+  // Bluetooth action handler (web server task, core 0). Neither is a safe place
+  // to touch the NimBLE bond store: 3.28's first attempt called
+  // ble_store_clear() straight from here and the ESP32 rebooted every time.
+  //
+  // The keys also must not be deleted while the link is still up - NimBLE will
+  // not remove a bond that an active connection is using. So this only asks:
+  // stop advertising, drop the link, and let serviceBluetooth() finish the job
+  // from loop() once the disconnect has actually landed. That mirrors how
+  // bleBondStateSavePending and bleDeviceProvisionPending already defer work
+  // out of callback context in this firmware.
   blePairingMode = false;
-  if (bleServer && bleConnected) bleServer->disconnect(bleServer->getConnId());
-#if defined(CONFIG_BLUEDROID_ENABLED)
-  int count = esp_ble_get_bond_device_num();
-  if (count > 0) {
-    esp_ble_bond_dev_t *bonds = new esp_ble_bond_dev_t[count];
-    if (bonds && esp_ble_get_bond_device_list(&count, bonds) == ESP_OK) {
-      for (int i = 0; i < count; i++) esp_ble_remove_bond_device(bonds[i].bd_addr);
-    }
-    delete[] bonds;
+  // Only touch the BLE API at all if the stack is actually up. With Bluetooth
+  // off (or the radio torn down for a WebConfig session) BLEDevice is not
+  // initialised, and calling into it logs "BLE is not initialized" at best.
+  if (bleReady) {
+    BLEDevice::stopAdvertising();
+    if (bleServer && bleConnected) bleServer->disconnect(bleServer->getConnId());
   }
+  bleForgetPairingPending = true;
+  bleForgetPairingStackRequested = false;
+  // Bounded, and generous enough to cover BLEDevice::init() when the stack has
+  // to be started from cold below - 1.5s was not.
+  bleForgetPairingDeadlineMs = millis() + 6000UL;
+  Serial.printf("BLE HID: forget pairing requested (stack %s)\n",
+                bleReady ? "up" : "down - clearing bond records from NVS");
+}
+
+// Completes the request above from loop(). Runs only when the link is really
+// down (or the bounded wait expired).
+void serviceForgetBluetoothPairing(unsigned long now) {
+  if (!bleForgetPairingPending) return;
+  if (bleConnected && (int32_t)(now - bleForgetPairingDeadlineMs) < 0) return;
+
+  bleForgetPairingPending = false;
+
+  // Two ways to remove a bond, chosen by whether the NimBLE host actually
+  // exists right now.
+  //
+  // 3.29 crashed because it always used the first. 3.30 tried to fix that by
+  // starting the stack, which cannot work: applyBluetoothState() only starts
+  // BLE when bluetoothRuntimeRequired() is true - a live BLE activity or an
+  // active pairing window - and refuses outright while webConfigPausedBle is
+  // set. Wanting to delete a bond satisfies none of those, so it timed out and
+  // gave up, which is why Forget appeared to do nothing at all.
+  //
+  // Bonds are NVS records and outlive the radio completely, so with the stack
+  // down they can simply be erased in place. NimBLE's bond store lives in the
+  // "nimble_bond" namespace.
+  bool cleared = false;
+  if (bleReady) {
+#if defined(CONFIG_NIMBLE_ENABLED)
+    int rc = ble_store_clear();
+    cleared = (rc == 0);
+    Serial.printf("BLE HID: bond store cleared through NimBLE (rc=%d)\n", rc);
+#elif defined(CONFIG_BLUEDROID_ENABLED)
+    int count = esp_ble_get_bond_device_num();
+    if (count > 0) {
+      esp_ble_bond_dev_t *bonds = new esp_ble_bond_dev_t[count];
+      if (bonds && esp_ble_get_bond_device_list(&count, bonds) == ESP_OK) {
+        for (int i = 0; i < count; i++) esp_ble_remove_bond_device(bonds[i].bd_addr);
+      }
+      delete[] bonds;
+    }
+    cleared = true;
+#else
+#error "No supported BLE stack: bonds cannot be removed"
 #endif
+  } else {
+    // begin() returning false means the namespace does not exist - either
+    // there was nothing bonded, or this name is wrong on some future core.
+    // Reported either way rather than assumed, because a silent success here
+    // is exactly the failure this whole sequence started with.
+    // Uses the NVS API directly rather than Preferences. Preferences::begin()
+    // in read-write mode CREATES a missing namespace and returns true, so it
+    // can never tell you whether anything was actually there - 3.31 logged
+    // "erased (ok)" on that basis and proved nothing. nvs_open() with
+    // NVS_READONLY returns ESP_ERR_NVS_NOT_FOUND for a namespace that does not
+    // exist, which is a real answer.
+    //
+    // This matters more than it looks: CONFIG_BT_NIMBLE_MAX_BONDS is 3, and a
+    // store that is not really being emptied fills up. Once full, NimBLE
+    // cannot write a peer's RPA record and reports
+    // ble_store_config_write_rpa_rec rc=27 (BLE_HS_ESTORE_CAP), which is
+    // exactly what appeared on hardware after several pair/forget cycles.
+    nvs_handle_t bondHandle;
+    esp_err_t probe = nvs_open("nimble_bond", NVS_READONLY, &bondHandle);
+    if (probe == ESP_ERR_NVS_NOT_FOUND) {
+      Serial.println("BLE HID: no nimble_bond namespace - nothing stored to erase");
+      cleared = true;                       // nothing to remove is a real forget
+    } else if (probe != ESP_OK) {
+      Serial.printf("BLE HID: could not open bond store (%s)\n", esp_err_to_name(probe));
+    } else {
+      nvs_close(bondHandle);
+      esp_err_t rc = nvs_open("nimble_bond", NVS_READWRITE, &bondHandle);
+      if (rc == ESP_OK) {
+        rc = nvs_erase_all(bondHandle);
+        if (rc == ESP_OK) rc = nvs_commit(bondHandle);
+        nvs_close(bondHandle);
+      }
+      // Verify rather than trust: reopen read-only and confirm the namespace
+      // is gone or empty. An erase that silently did nothing is the whole
+      // reason this code has been rewritten three times.
+      esp_err_t after = nvs_open("nimble_bond", NVS_READONLY, &bondHandle);
+      if (after == ESP_OK) nvs_close(bondHandle);
+      cleared = (rc == ESP_OK);
+      Serial.printf("BLE HID: bond store erase %s (%s), namespace now %s\n",
+                    cleared ? "ok" : "FAILED", esp_err_to_name(rc),
+                    after == ESP_ERR_NVS_NOT_FOUND ? "gone" : "present/empty");
+    }
+  }
+  (void)cleared;
+
+  blePeerAddressValid = false;
   bleBonded = false;
   bleBondStateSavePending = true;
-  BLEDevice::stopAdvertising();
+  if (bleReady) BLEDevice::stopAdvertising();
   pendingUiRefresh = settingsView == SETTINGS_BLUETOOTH;
   Serial.println("BLE HID: pairing forgotten");
 }
 
 void serviceBluetooth(unsigned long now) {
+  serviceForgetBluetoothPairing(now);
   if (bleBondStateSavePending) {
     bleBondStateSavePending = false;
     saveSettings();
@@ -12357,7 +12906,15 @@ void handleDeviceFileUploadData() {
     if (deviceFileUploadOk) {
       SD.remove(deviceFileUploadPath);
       deviceFileUploadOk = SD.rename("/tmp/device.upload", deviceFileUploadPath);
-      if (deviceFileUploadOk) rememberSavedIrDeviceFile(deviceFileUploadPath);
+      if (deviceFileUploadOk) {
+        rememberSavedIrDeviceFile(deviceFileUploadPath);
+        // The USB .ir import path has always reloaded here; this HTTP one
+        // never did. That gap is why a command added from WebConfig could be
+        // sent from the LCD but not from WebConfig itself: the file on the
+        // card was correct, but the running model - and therefore the command
+        // ids WebConfig tests against - was still the pre-edit one.
+        loadRuntimeConfig();
+      }
       else Serial.printf("Device file upload: rename to %s failed\n", deviceFileUploadPath.c_str());
     } else {
       SD.remove("/tmp/device.upload");
@@ -12748,22 +13305,131 @@ void handleFirmwareInstall() {
     sendJson(400, "{\"ok\":false,\"error\":\"The staged file is not an ESP32 firmware image\"}");
     return;
   }
-  bool ok = Update.begin(total, U_FLASH);
-  uint8_t buffer[1024];
-  while (ok && file.available()) {
-    size_t count = file.read(buffer, sizeof(buffer));
-    if (!count) break;
-    ok = Update.write(buffer, count) == count;
-    delay(0);
+  // Instrumented because "firmware install failed" told us nothing: the image
+  // on the card is CRC-verified by the chunked upload, and the file is
+  // structurally valid, yet esp_ota_end() reported "invalid segment length".
+  // Each stage now says what it did, so the next failure is locatable rather
+  // than inferred.
+  //
+  // Any leftover state from an earlier aborted attempt is cleared first -
+  // Update is a singleton and a previous partial run can make begin() fail in
+  // ways the old code reported only as a generic failure at the very end.
+  Update.abort();
+  Serial.printf("Firmware install: staged %u bytes, heapFree=%u\n",
+                (unsigned)total, (unsigned)ESP.getFreeHeap());
+
+  /*
+    Validate the staged image BEFORE erasing the OTA partition.
+
+    "Could Not Activate The Firmware" is what Update reports when every byte
+    was written but esp_ota_set_boot_partition() then refused the result - and
+    it says nothing about why. On real hardware the staged file turned out to
+    be a size that matched no build at all, i.e. truncated in transfer, which
+    the legacy upload endpoint cannot detect because it only checks the first
+    byte is 0xE9 and that the total is under a cap.
+    An ESP32 image describes its own length: a 24-byte header, then
+    segment_count records of (load_addr, length, data). Walking those is cheap
+    and catches truncation, the wrong chip, or a factory image being offered in
+    place of an app image - all of which otherwise cost a full erase-and-write
+    cycle before failing with a message that does not name the cause.
+  */
+  {
+    uint8_t head[24];
+    if (file.read(head, sizeof(head)) != sizeof(head) || !file.seek(0)) {
+      file.close();
+      sendJson(400, "{\"ok\":false,\"error\":\"Could not read the firmware header\"}");
+      return;
+    }
+    uint16_t chipId = (uint16_t)head[12] | ((uint16_t)head[13] << 8);
+    uint8_t segments = head[1];
+    // 0x0009 is ESP32-S3. A .bin built for another target writes cleanly and
+    // then cannot be activated, which looks identical to a corrupt upload.
+    if (head[0] != 0xE9 || chipId != 0x0009 || segments == 0 || segments > 16) {
+      file.close();
+      Serial.printf("Firmware install: rejected - magic=0x%02X chip=0x%04X segments=%u\n",
+                    head[0], chipId, segments);
+      sendJson(400, "{\"ok\":false,\"error\":\"Not an ESP32-S3 application image\"}");
+      return;
+    }
+    size_t walk = 24;
+    bool structureOk = true;
+    for (uint8_t i = 0; i < segments && structureOk; i++) {
+      uint8_t segHead[8];
+      if (!file.seek(walk) || file.read(segHead, sizeof(segHead)) != sizeof(segHead)) {
+        structureOk = false;
+        break;
+      }
+      uint32_t segLen = (uint32_t)segHead[4] | ((uint32_t)segHead[5] << 8) |
+                        ((uint32_t)segHead[6] << 16) | ((uint32_t)segHead[7] << 24);
+      walk += 8 + segLen;
+      if (segLen > total || walk > total) structureOk = false;
+    }
+    file.seek(0);
+    if (!structureOk) {
+      file.close();
+      Serial.printf("Firmware install: image is incomplete - segments need more than "
+                    "the %u bytes staged\n", (unsigned)total);
+      sendJson(400, String("{\"ok\":false,\"error\":\"The uploaded firmware is incomplete "
+                           "(") + String((unsigned)total) + " bytes staged, but its segment "
+                           "table describes more). The upload was truncated - try again.\"}");
+      return;
+    }
+    Serial.printf("Firmware install: image valid (%u segments), starting OTA\n", segments);
   }
-  file.close();
-  ok = ok && Update.end(true);
+
+  bool ok = Update.begin(total, U_FLASH);
   if (!ok) {
-    Update.abort();
-    sendJson(500, String("{\"ok\":false,\"error\":\"Firmware installation failed: ") +
+    Serial.printf("Firmware install: Update.begin(%u) FAILED - %s\n",
+                  (unsigned)total, Update.errorString());
+    file.close();
+    sendJson(500, String("{\"ok\":false,\"error\":\"Could not start the update: ") +
                   Update.errorString() + "\"}");
     return;
   }
+
+  // 4KB matches the flash sector size the OTA writer works in; the old 1KB
+  // reads meant four SD transactions per sector for a 2.4MB image.
+  static uint8_t buffer[4096];
+  size_t written = 0;
+  while (ok && file.available()) {
+    size_t count = file.read(buffer, sizeof(buffer));
+    if (!count) break;
+    size_t put = Update.write(buffer, count);
+    if (put != count) {
+      ok = false;
+      Serial.printf("Firmware install: write short at %u (asked %u, wrote %u) - %s\n",
+                    (unsigned)written, (unsigned)count, (unsigned)put, Update.errorString());
+      break;
+    }
+    written += put;
+    delay(0);
+  }
+  file.close();
+
+  // A silent short read leaves a truncated image that still starts with a
+  // valid header - which is exactly the shape of failure being chased here.
+  if (ok && written != total) {
+    ok = false;
+    Serial.printf("Firmware install: only %u of %u bytes reached flash\n",
+                  (unsigned)written, (unsigned)total);
+  }
+  if (ok) {
+    ok = Update.end(true);
+    if (!ok) {
+      Serial.printf("Firmware install: Update.end() FAILED after %u bytes - %s\n",
+                    (unsigned)written, Update.errorString());
+    }
+  }
+  if (!ok) {
+    String reason = Update.errorString();
+    Update.abort();
+    Serial.printf("Firmware install: FAILED (%s)\n", reason.c_str());
+    sendJson(500, String("{\"ok\":false,\"error\":\"Firmware installation failed after ") +
+                  String((unsigned)written) + " of " + String((unsigned)total) +
+                  " bytes: " + reason + "\"}");
+    return;
+  }
+  Serial.printf("Firmware install: OK, %u bytes written and verified\n", (unsigned)written);
   SD.remove(FIRMWARE_STAGE_PATH);
   sendJson(200, "{\"ok\":true,\"restarting\":true}");
   restartPending = true;
@@ -15914,6 +16580,9 @@ void renderSettingsHomeOmote() {
   makeOmoteRow(card, "Buttons", "Repeat timing and button test", y, rowH, nullptr,
     [](lv_event_t *e) { openSettingsView(SETTINGS_BUTTONS); });
   makeOmoteDivider(card, y + rowH); y += rowH + 1;
+  makeOmoteRow(card, "Dock", "Blaster dock pairing over ESP-NOW", y, rowH, nullptr,
+    [](lv_event_t *e) { openSettingsView(SETTINGS_DOCK); });
+  makeOmoteDivider(card, y + rowH); y += rowH + 1;
   makeOmoteRow(card, "Debug", "Touch, display, sensors and microphone", y, rowH, nullptr,
     [](lv_event_t *e) { openSettingsView(SETTINGS_DEBUG); });
   makeOmoteDivider(card, y + rowH); y += rowH + 1;
@@ -15925,6 +16594,16 @@ void renderSettingsHomeOmote() {
 }
 
 void openSettingsView(SettingsView view) {
+  // The ESP-NOW device picker is a child of screenRoot rather than content, so
+  // that it can float above the page. That also means renderSettingsPage()'s
+  // rebuild of content cannot remove it, and it survived navigation as a panel
+  // stuck over whatever page came next. Any view change closes it, and cancels
+  // the scan behind it so the radio is not left searching invisibly.
+  if (espNowDevicesModal && view != settingsView) {
+    cancelEspNowScan();
+    lv_obj_del(espNowDevicesModal);
+    espNowDevicesModal = nullptr;
+  }
   if (view == SETTINGS_WIFI_QR && usbSdTransferActive()) {
     Serial.println("WebConfig QR: ignored, a USB transfer is in progress");
     return;
@@ -16053,11 +16732,13 @@ void renderSettingsHome() {
     [](lv_event_t *e) { openSettingsView(SETTINGS_DISPLAY); });
   makeSettingRow("Buttons", "Repeat timing and button test", 258, nullptr,
     [](lv_event_t *e) { openSettingsView(SETTINGS_BUTTONS); });
-  makeSettingRow("Debug", "Touch, display, sensors and microphone", 308, nullptr,
+  makeSettingRow("Dock", "Blaster dock pairing over ESP-NOW", 308, nullptr,
+    [](lv_event_t *e) { openSettingsView(SETTINGS_DOCK); });
+  makeSettingRow("Debug", "Touch, display, sensors and microphone", 358, nullptr,
     [](lv_event_t *e) { openSettingsView(SETTINGS_DEBUG); });
-  makeSettingRow("Backup / Restore", "Full configuration backups", 358, nullptr,
+  makeSettingRow("Backup / Restore", "Full configuration backups", 408, nullptr,
     [](lv_event_t *e) { openSettingsView(SETTINGS_BACKUP); });
-  makeSettingRow("About", "Version, device and battery information", 408, nullptr,
+  makeSettingRow("About", "Version, device and battery information", 458, nullptr,
     [](lv_event_t *e) { openSettingsView(SETTINGS_ABOUT); });
 }
 
@@ -17970,16 +18651,6 @@ void renderDebugPageOmote() {
               0, rowH, &bluetoothSleepEnabled);
   y += rowH + 12;
 
-  char espNowStatusText[24];
-  snprintf(espNowStatusText, sizeof(espNowStatusText), "%u paired", (unsigned)espNowDeviceCount);
-  lv_obj_t *espNowCard = makeOmoteCard(content, y, 2 * rowH + 1);
-  makeOmoteRow(espNowCard, "ESP-NOW", "Send commands to a paired blaster dock",
-              0, rowH, &espNowEnabled);
-  makeOmoteDivider(espNowCard, rowH);
-  makeOmoteRow(espNowCard, "ESP-NOW Devices", espNowStatusText, rowH + 1, rowH,
-              nullptr, toggleEspNowDevicesModal);
-  y += 2 * rowH + 1 + 12;
-
   lv_obj_t *rowsLabel = makeLabel(content, "Saved row positions", 8, y, &lv_font_montserrat_12, textPrimary());
   lv_obj_set_style_text_opa(rowsLabel, LV_OPA_60, 0);
   y += 22;
@@ -18094,6 +18765,52 @@ void renderDebugPageOmote() {
   addPhysicalNavFocusable(hardButton);
 }
 
+// Settings > Dock. ESP-NOW lived under Debug while it was an experiment; it is
+// a real feature now, and burying dock pairing among touch/display diagnostics
+// made it hard to find and implied it was a developer toggle.
+void renderDockPageOmote() {
+  const int rowH = 48;
+  int y = 44;
+  char espNowStatusText[24];
+  snprintf(espNowStatusText, sizeof(espNowStatusText), "%u paired", (unsigned)espNowDeviceCount);
+
+  lv_obj_t *card = makeOmoteCard(content, y, 2 * rowH + 1);
+  makeOmoteRow(card, "ESP-NOW", "Send commands to a paired blaster dock",
+              0, rowH, &espNowEnabled);
+  makeOmoteDivider(card, rowH);
+  makeOmoteRow(card, "Paired devices", espNowStatusText, rowH + 1, rowH,
+              nullptr, toggleEspNowDevicesModal);
+  y += 2 * rowH + 1 + 14;
+
+  lv_obj_t *hint = makeLabel(content,
+    "A dock relays IR and RF433 commands for devices the remote cannot reach "
+    "directly. Turn ESP-NOW on, then use Paired devices to search for a dock "
+    "in pairing mode.", 10, y, &lv_font_montserrat_12, lvRgb(150, 160, 175));
+  lv_obj_set_width(hint, 216);
+  lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
+}
+
+void renderDockPage() {
+  lv_obj_set_scrollbar_mode(content, LV_SCROLLBAR_MODE_AUTO);
+  renderTopBar("Dock", false);
+  renderSettingsBackButton();
+  if (menuStyle == 1) {
+    renderDockPageOmote();
+    return;
+  }
+  char espNowStatusText[24];
+  snprintf(espNowStatusText, sizeof(espNowStatusText), "%u paired", (unsigned)espNowDeviceCount);
+  makeSettingRow("ESP-NOW", "Send commands to a paired blaster dock", 52, &espNowEnabled);
+  makeSettingRow("Paired devices", espNowStatusText, 102, nullptr,
+                 toggleEspNowDevicesModal);
+  lv_obj_t *hint = makeLabel(content,
+    "A dock relays IR and RF433 commands for devices the remote cannot reach "
+    "directly. Turn ESP-NOW on, then use Paired devices to search for a dock "
+    "in pairing mode.", 10, 164, &lv_font_montserrat_12, lvRgb(150, 160, 175));
+  lv_obj_set_width(hint, 216);
+  lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
+}
+
 void renderDebugPage() {
   setCinematicBackground(false);
   configureContent(42, 278, false);
@@ -18124,17 +18841,11 @@ void renderDebugPage() {
   makeSettingRow("FPS", "Display frames per second", 502, &debugFpsEnabled);
   makeSettingRow("Bluetooth Sleep", "On disconnects BLE - may pause casting", 552,
                  &bluetoothSleepEnabled);
-  makeSettingRow("ESP-NOW", "Send commands to a paired blaster dock", 602,
-                 &espNowEnabled);
-  char espNowStatusText[24];
-  snprintf(espNowStatusText, sizeof(espNowStatusText), "%u paired", (unsigned)espNowDeviceCount);
-  makeSettingRow("ESP-NOW Devices", espNowStatusText, 652, nullptr,
-                 toggleEspNowDevicesModal);
-  makeMicrophoneSourceRow(702);
+  makeMicrophoneSourceRow(602);
 
-  makeLabel(content, "Display driver (reboot required)", 10, 754,
+  makeLabel(content, "Display driver (reboot required)", 10, 654,
             &lv_font_montserrat_12, lvRgb(170, 178, 190));
-  int driverSectionY = 776;
+  int driverSectionY = 676;
   makeDisplayModuleRow(driverSectionY);
   driverSectionY += 50;
   makeDisplayDriverRow(driverSectionY);
@@ -18576,6 +19287,7 @@ void renderSettingsPage() {
     case SETTINGS_DISPLAY: renderDisplayPage(); break;
     case SETTINGS_BUTTONS: renderButtonsPage(); break;
     case SETTINGS_DEBUG: renderDebugPage(); break;
+    case SETTINGS_DOCK: renderDockPage(); break;
     case SETTINGS_BATTERY: renderBatteryPage(); break;
     case SETTINGS_BACKUP: renderBackupRestorePage(); break;
     case SETTINGS_ABOUT: renderAboutPage(); break;
