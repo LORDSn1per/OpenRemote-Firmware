@@ -1,6 +1,37 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.50 - 2026-08-31
+    - 3.49's remembered interaction model did not fix voice on an oval
+      Chromecast reconnect, so this build stops inferring and reads the peer's
+      real subscription state instead of a cached copy.
+    - The cache was lying. atvvRxCccd->getNotifications() returns the BLE2902's
+      own stored value, which is written only when a client writes the
+      descriptor and is never cleared on disconnect. That is how serial could
+      print, with no link at all:
+        ATVV subscriptions: connected=no RX=notify CTL=notify
+      On a warm reconnect that stale "notify" let the audio gate pass, so the
+      remote started a stream and pushed frames at a peer that had never
+      subscribed on this connection - link up, buttons working, no audio. It
+      also explains why the AUDIO_START refusal added in 3.44 never appeared in
+      any log: the gate never refused.
+    - Adds atvvRxPeerSubscribed / atvvCtlPeerSubscribed, set from NimBLE's
+      onSubscribe (the actual GAP subscribe event) and cleared on every
+      disconnect, so they describe the current connection and nothing else.
+      Every subscribe or unsubscribe is logged with its subValue.
+    - Adds an onStatus handler on both notify characteristics, which catches the
+      case the flags cannot: a notification the host stack itself rejects, with
+      its status and code. Rate limited to one line per 500ms with a suppressed
+      count, since audio runs at about 50 frames a second.
+    - Deliberately diagnostic, not corrective: when the cache says subscribed
+      but no subscribe event arrived this connection, the stream still starts
+      and a warning names the discrepancy. This build is meant to identify the
+      fault precisely without changing what goes on the air, since two
+      reasoned-but-unconfirmed fixes in a row did not land.
+    - The periodic subscriptions line now prints the descriptor cache and the
+      real per-connection state side by side, so a disagreement between them is
+      visible at a glance.
+
   3.49 - 2026-08-31
     - Fixes voice being dead after a reconnect on the oval Chromecast while the
       Google TV box was fine. Same firmware, same reconnect, different hosts -
@@ -3572,7 +3603,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.49"
+#define OPENREMOTE_VERSION_STRING "3.50"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -4981,6 +5012,21 @@ volatile bool atvvMicOpenPending = false;
 volatile bool atvvMicClosePending = false;
 volatile uint8_t atvvMicCloseStreamId = 0xFF;
 volatile bool atvvCapsRequestPending = false;
+// The peer's real subscription state, taken from the GAP subscribe event.
+//
+// atvvRxCccd->getNotifications() reads the BLE2902's own stored value, which is
+// only written when a client writes the descriptor - and it is never cleared on
+// disconnect. That is why serial could print
+//   ATVV subscriptions: connected=no RX=notify CTL=notify
+// with no link at all. On a warm reconnect that stale "notify" let the audio
+// gate pass, so the remote started a stream and pushed frames at a peer that
+// had never subscribed on this connection: link up, buttons fine, no audio. It
+// also meant the AUDIO_START refusal path never fired, so nothing was logged.
+//
+// Cleared on every disconnect and set only by an actual subscribe event, so
+// these describe this connection and no other.
+volatile bool atvvRxPeerSubscribed = false;
+volatile bool atvvCtlPeerSubscribed = false;
 // Whether the host asked for our capabilities on *this* connection. A warm
 // reconnect that skips GET_CAPS is the case that used to silently downgrade
 // the interaction model, so it is worth stating outright in the log.
@@ -7873,6 +7919,15 @@ bool atvvStartAudio(uint8_t reason, uint8_t streamId) {
                   bleConnected ? "yes" : "no", bleBonded ? "yes" : "no");
     return false;
   }
+  if (!atvvRxPeerSubscribed) {
+    // The descriptor cache said yes and the peer never actually subscribed on
+    // this connection - the silent reconnect failure. Logged rather than
+    // blocked, so this build reports the fault without changing what is sent.
+    Serial.printf("ATVV WARNING: audio starting with a stale subscription "
+                  "(cccd=notify but no subscribe event this connection; CTL peer=%s). "
+                  "Frames will go nowhere.\n",
+                  atvvCtlPeerSubscribed ? "subscribed" : "not subscribed");
+  }
   atvvStreamUsesTestAudio = microphoneTestAudioEnabled;
   if (!atvvStreamUsesTestAudio && !startRealMicrophoneCapture()) {
     Serial.println("ATVV AUDIO_START not sent: real I2S microphone unavailable");
@@ -8103,6 +8158,59 @@ class OpenRemoteAtvvTxCallbacks : public BLECharacteristicCallbacks {
 
 static OpenRemoteAtvvTxCallbacks atvvTxCallbacks;
 
+// The peer's real subscription state, taken from the GAP subscribe event.
+//
+// atvvRxCccd->getNotifications() reads the BLE2902's own stored value, which is
+// only written when a client writes the descriptor - and it is never cleared on
+// disconnect. That is why serial could print
+//   ATVV subscriptions: connected=no RX=notify CTL=notify
+// with no link at all. On a warm reconnect that stale "notify" made the audio
+// gate pass, so the remote happily started a stream and pushed frames at a peer
+// that had never subscribed on this connection: the link is up, the buttons
+// work, and no audio arrives. It also meant the AUDIO_START refusal path never
+// fired, so nothing was logged.
+//
+// These flags are cleared on every disconnect and set only by an actual
+// subscribe event from the peer, so they describe this connection and no other.
+class OpenRemoteAtvvNotifyCallbacks : public BLECharacteristicCallbacks {
+#if defined(CONFIG_NIMBLE_ENABLED)
+  void onSubscribe(BLECharacteristic *characteristic, ble_gap_conn_desc *desc,
+                   uint16_t subValue) override {
+    (void)desc;
+    bool notify = (subValue & 0x0001) != 0;
+    bool isRx = characteristic == atvvRx;
+    if (isRx) atvvRxPeerSubscribed = notify;
+    else atvvCtlPeerSubscribed = notify;
+    Serial.printf("ATVV peer subscribe: %s -> %s (subValue=0x%04X)\n",
+                  isRx ? "RX/audio" : "CTL", notify ? "notify ON" : "OFF",
+                  subValue);
+  }
+#endif
+
+  // Catches the case the flags above cannot: a notify that the host stack
+  // itself refuses. Rate limited because audio runs at ~50 frames a second.
+  void onStatus(BLECharacteristic *characteristic, Status status,
+                uint32_t code) override {
+    if (status == SUCCESS_NOTIFY || status == SUCCESS_INDICATE) return;
+    static unsigned long lastReportMs = 0;
+    static uint32_t suppressed = 0;
+    unsigned long now = millis();
+    if (lastReportMs && (now - lastReportMs) < 500UL) {
+      suppressed++;
+      return;
+    }
+    Serial.printf("ATVV notify failed on %s: status=%d code=%u",
+                  characteristic == atvvRx ? "RX/audio" : "CTL",
+                  (int)status, (unsigned)code);
+    if (suppressed) Serial.printf(" (+%u more suppressed)", suppressed);
+    Serial.println();
+    suppressed = 0;
+    lastReportMs = now;
+  }
+};
+
+static OpenRemoteAtvvNotifyCallbacks atvvNotifyCallbacks;
+
 void serviceAtvvVoice(unsigned long now) {
   if (atvvCapsRequestPending) {
     atvvCapsRequestPending = false;
@@ -8193,6 +8301,8 @@ bool setupAtvvService(BLEServer *server) {
   if (!atvvTx || !atvvRx || !atvvCtl) return false;
 
   atvvTx->setCallbacks(&atvvTxCallbacks);
+  atvvRx->setCallbacks(&atvvNotifyCallbacks);
+  atvvCtl->setCallbacks(&atvvNotifyCallbacks);
   atvvRxCccd = new BLE2902();
   atvvCtlCccd = new BLE2902();
   atvvRx->addDescriptor(atvvRxCccd);
@@ -8200,6 +8310,8 @@ bool setupAtvvService(BLEServer *server) {
   atvvService->start();
   atvvRxSubscribed = false;
   atvvCtlSubscribed = false;
+  atvvRxPeerSubscribed = false;
+  atvvCtlPeerSubscribed = false;
   nextAtvvDebugMs = millis();
   Serial.println("ATVV: service and TX/RX/CTL characteristics ready");
   return true;
@@ -8214,10 +8326,13 @@ void serviceAtvvDebug(unsigned long now) {
   if (rxSubscribed != atvvRxSubscribed || ctlSubscribed != atvvCtlSubscribed) {
     atvvRxSubscribed = rxSubscribed;
     atvvCtlSubscribed = ctlSubscribed;
-    Serial.printf("ATVV subscriptions: connected=%s RX=%s CTL=%s\n",
+    Serial.printf("ATVV subscriptions: connected=%s RX=%s CTL=%s "
+                  "(peer this connection: RX=%s CTL=%s)\n",
                   bleConnected ? "yes" : "no",
                   atvvRxSubscribed ? "notify" : "off",
-                  atvvCtlSubscribed ? "notify" : "off");
+                  atvvCtlSubscribed ? "notify" : "off",
+                  atvvRxPeerSubscribed ? "yes" : "no",
+                  atvvCtlPeerSubscribed ? "yes" : "no");
   }
 #else
   (void)now;
@@ -8283,6 +8398,9 @@ class OpenRemoteBleServerCallbacks : public BLEServerCallbacks {
     bleConnProfilePending = false;
     atvvRxSubscribed = false;
     atvvCtlSubscribed = false;
+    // Per-connection, so they must not survive the link that created them.
+    atvvRxPeerSubscribed = false;
+    atvvCtlPeerSubscribed = false;
     // Losing the link while the overlay still says CONNECTING means bonding
     // never completed - report it rather than silently returning to the menu.
     if (blePairUiRequest == BLE_PAIR_UI_CONNECTING) {
