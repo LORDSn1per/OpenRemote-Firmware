@@ -1,6 +1,112 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.44 - 2026-08-31
+    - WebConfig after a BLE activity: 3.43 was not enough. The heartbeat came
+      back at heap=8,872 bytes, dipping to 5,140 while serving, so moving the
+      command bindings to PSRAM bought about 9.6kB and BLE plus Wi-Fi took it
+      straight back. The reason is that pausing BLE never released any memory:
+      stopBluetoothRadio() stops advertising and drops the link, but leaves the
+      NimBLE host and the BT controller initialised and still holding their
+      internal-RAM allocations. Wi-Fi and the web server can only allocate from
+      internal RAM, so a suspended-but-initialised stack starves them exactly as
+      much as a busy one.
+    - Entering the WebConfig page now calls the new shutdownBluetoothStack(),
+      which deletes the objects the library does not own (BLEHIDDevice and
+      BLESecurity - the HID destructor is empty and BLESecurity owns nothing, so
+      both are safe, and leaking one of each per session would defeat the
+      point), then calls BLEDevice::deinit(false) to release the host and
+      controller for real. Leaving the page rebuilds everything through the
+      existing applyBluetoothState() path, which already handles bleReady being
+      false by recreating the server, the HID device and the ATVV service.
+    - deinit(false), not deinit(true), and the distinction matters: passing true
+      calls btMemRelease(BT_MODE_BLE), which hands the controller's static
+      region to the heap permanently and blocks re-init until a reboot. Correct
+      for deep sleep, fatal here, because leaving WebConfig has to bring BLE
+      back.
+    - BLEDevice::deinit() deletes the BLEServer, so bleServer, the HID report
+      characteristics and every ATVV pointer dangle the instant it returns. All
+      of them are cleared in one place, along with the per-connection ATVV state
+      (subscriptions and atvvAudioStarted) that is meaningless without them.
+    - The transition now prints free heap before and after the release, so the
+      size of the win is measured rather than assumed, and the WebConfig server
+      prints heap on listen and on stop.
+    - Voice search after a reconnect: the refusal path said only "Chromecast
+      audio notifications are off". It now prints the RX and CTL subscription
+      state along with connected and bonded, because the existing "ATVV
+      subscriptions:" line only logs on a change - so a reconnect that comes up
+      with notifications already off printed nothing at all, which is why the
+      reconnect logs were silent about it. Diagnostic only; no behaviour change
+      on that path yet.
+
+  3.43 - 2026-08-31
+    - Found why WebConfig is unreachable after a BLE activity, using 3.41's
+      heartbeat. It is not Wi-Fi and not a hang: the worker loop was running
+      normally at roughly 500 iterations a second while free internal heap sat
+      at 10,636 bytes. lwIP accepts the TCP connection - port 80 answers in 9ms
+      from outside - but the HTTP server cannot allocate what it needs to read
+      the request and reply, so the socket is accepted and then nothing
+      happens. Same boot had reported 164,652 bytes free before the activity
+      started.
+    - Moved PageUi::commandBindings from internal RAM to PSRAM. As a fixed
+      array it occupied MAX_DEVICE_COMMANDS * 12 bytes in each of the four page
+      slots: 9,600 bytes of the heap the Wi-Fi driver and HTTP server allocate
+      from. 7,200 of those were added by 3.26 raising the command ceiling from
+      50 to 200 - a cost measured and noted at the time as a risk, and this is
+      that risk arriving. The bindings are only read while rendering a page, so
+      PSRAM is the right home; there are 7MB of it free and the internal heap
+      is better spent on the radio. Static internal RAM: 37.5% -> 34.6%.
+    - Allocated with the other runtime tables so a failure is caught there
+      rather than as a null dereference during a render.
+    - Whether ~9.6KB is enough on its own is not yet known: BLE and Wi-Fi
+      running together are what consume the bulk of it. The heartbeat reports
+      free heap every 5 seconds, so the next capture answers that directly
+      rather than by inference.
+
+  3.42 - 2026-08-31
+    - Fixed being unable to re-pair after deleting a pairing. NimBLE stores at
+      most CONFIG_BT_NIMBLE_MAX_BONDS (3) peers; once full it cannot write a
+      new peer's record and reports ble_store_config_write_rpa_rec rc=27
+      (BLE_HS_ESTORE_CAP), seen on hardware. There is no error on screen for
+      this - pairing just never completes, or completes while the voice service
+      never starts.
+    - Two changes so that state is both visible and escapable:
+        * startBluetoothPairing() now counts the stored bonds, logs the count,
+          and clears the store if it is already at the limit - making room
+          before advertising rather than failing part way through a pairing.
+        * The Forget button is no longer hidden when bleBonded is false. That
+          flag is cleared the moment a pairing is deleted, while the NVS
+          records that actually consume the 3-bond limit remain. Hiding the
+          button left those records with no way to be removed, which is
+          precisely how a remote reaches "I deleted it and now I cannot
+          re-pair" with nothing on screen to explain it. It now reads
+          "Clear pairing data" when nothing is bonded.
+
+  3.41 - 2026-08-31
+    - Added a heartbeat to the WebConfig HTTP worker while investigating
+      WebConfig being unreachable after a BLE activity. What the network says
+      about that state, measured against the remote rather than guessed:
+        * ARP resolves, and the MAC is an Espressif one - the remote is on the
+          LAN at layer 2
+        * TCP to port 80 connects in 9ms - the listener is genuinely up, and
+          "WebConfig server: listening on port 80" was truthful
+        * an HTTP request then returns ZERO bytes and hangs indefinitely
+        * ICMP does not answer either
+      So this is not a Wi-Fi failure and not a failure to start the server, as
+      it had appeared from the LCD side. lwIP accepts the connection while the
+      worker loop does not process it.
+    - From outside there is no way to tell whether the task is wedged inside
+      handleClient() or has stopped running, and those need opposite fixes. The
+      loop now counts iterations and reports every 5s with free heap and
+      sdReady, and separately reports any single handleClient() call taking
+      over a second. A counter that keeps climbing while requests hang means
+      handleClient() is the problem; a counter that stops means the task is
+      blocked or gone.
+    - Deliberately no speculative fix here. Raising the worker's priority (it
+      is 1, against the ATVV audio task's 2 on the same core) is the obvious
+      guess, but the audio path only just started working correctly and is not
+      worth destabilising on a hunch that the next log can confirm or kill.
+
   3.40 - 2026-08-31
     - Matched Google's ATVV 1.0 audio format properly, from the spec rather
       than from what happened to work.
@@ -3325,7 +3431,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.40"
+#define OPENREMOTE_VERSION_STRING "3.44"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -4921,7 +5027,17 @@ struct PageUi {
   char themePath[72] = "";
   CachedPageIcon iconCache[MAX_PAGE_ICON_CACHE] = {};
   uint8_t iconCacheCount = 0;
-  UiCommandBinding commandBindings[MAX_DEVICE_COMMANDS] = {};
+  // PSRAM, not internal RAM. As a fixed array this was
+  // MAX_DEVICE_COMMANDS * 12 bytes in EVERY one of the four PageUi slots -
+  // 9,600 bytes of internal heap at the current 200-command ceiling, and it
+  // grew by 7,200 of those when 3.26 raised that ceiling from 50.
+  //
+  // Internal heap is what the Wi-Fi driver and the HTTP server allocate from,
+  // and it was measured at 10,636 bytes free with WebConfig unable to serve a
+  // single request while its loop ran normally. These bindings are only ever
+  // read while rendering a page, so PSRAM is the right home for them and the
+  // internal heap is better spent on the radio.
+  UiCommandBinding *commandBindings = nullptr;
   ActivitySliderUi sliderUi[MAX_ACTIVITY_TILES] = {};
 };
 
@@ -7535,7 +7651,18 @@ bool readRealMicrophoneAdpcmFrame(uint8_t *frame) {
 
 bool atvvStartAudio(uint8_t reason, uint8_t streamId) {
   if (!atvvRx || !atvvRxCccd || !atvvRxCccd->getNotifications()) {
-    Serial.println("ATVV AUDIO_START not sent: Chromecast audio notifications are off");
+    // Reported as "voice works on a new connection but not after the TV is
+    // turned off and back on". HID keeps working because it is a separate
+    // service; ATVV needs the peer to have notifications enabled on the audio
+    // characteristic, and that subscription is per-connection state the client
+    // owns - the remote cannot turn it on for it. Printing the whole picture
+    // here distinguishes "the peer never re-subscribed" from "our
+    // characteristic objects were rebuilt underneath it".
+    Serial.printf("ATVV AUDIO_START refused: RX=%s CTL=%s connected=%s bonded=%s "
+                  "- the peer has not enabled audio notifications on this connection\n",
+                  (atvvRxCccd && atvvRxCccd->getNotifications()) ? "notify" : "off",
+                  (atvvCtlCccd && atvvCtlCccd->getNotifications()) ? "notify" : "off",
+                  bleConnected ? "yes" : "no", bleBonded ? "yes" : "no");
     return false;
   }
   atvvStreamUsesTestAudio = microphoneTestAudioEnabled;
@@ -7981,7 +8108,71 @@ void stopBluetoothRadio(const char *reason) {
   BLEDevice::stopAdvertising();
   if (bleServer && bleConnected) bleServer->disconnect(bleServer->getConnId());
   bleShutdownInProgress = false;
-  Serial.printf("BLE HID: suspended (%s)\n", reason);
+  Serial.printf("BLE HID: suspended (%s) heap=%u\n", reason,
+                (unsigned)ESP.getFreeHeap());
+}
+
+// Fully releases the BLE stack instead of merely parking it.
+//
+// stopBluetoothRadio() stops advertising and drops the link, but the NimBLE
+// host and the BT controller stay initialised and keep their internal-RAM
+// allocations. That is why WebConfig died after a BLE activity: free internal
+// heap sat at ~8.8kB and dipped to ~5.1kB, so lwIP would accept the TCP
+// connection while the HTTP server could not allocate a thing to answer with -
+// the browser saw a socket open and then zero bytes. Wi-Fi and the web server
+// can only allocate from internal RAM, so the memory has to genuinely come
+// back, not just go idle.
+//
+// deinit(false) is deliberate. Passing true calls btMemRelease(BT_MODE_BLE),
+// which hands the controller's static region to the heap permanently and makes
+// re-init impossible until a reboot - fine for deep sleep, fatal here, because
+// leaving the WebConfig page has to bring BLE back.
+//
+// BLEDevice::deinit() deletes the BLEServer, so every pointer hanging off it
+// dangles the moment this returns. They are all cleared below;
+// applyBluetoothState() sees bleReady == false and rebuilds the server, the HID
+// device and the ATVV service from scratch.
+void shutdownBluetoothStack(const char *reason) {
+  if (!bleReady) return;
+  stopBluetoothRadio(reason);
+  unsigned heapBefore = ESP.getFreeHeap();
+
+  // Ours, not the library's: BLEDevice::deinit() never sees these. The HID
+  // destructor is empty and BLESecurity owns nothing, so both are safe to free
+  // once the stack below them is going away - and leaking one of each per
+  // WebConfig session would defeat the point of the exercise.
+  delete bleHid;
+  bleHid = nullptr;
+  delete bleSecurity;
+  bleSecurity = nullptr;
+
+  BLEDevice::deinit(false);
+
+  // Deleted by deinit() (bleServer) or owned by the server it just destroyed
+  // (everything else). Null them together so nothing can dereference freed
+  // memory between here and the rebuild.
+  bleServer = nullptr;
+  bleKeyboardInput = nullptr;
+  bleConsumerInput = nullptr;
+  atvvService = nullptr;
+  atvvTx = nullptr;
+  atvvRx = nullptr;
+  atvvCtl = nullptr;
+  atvvRxCccd = nullptr;
+  atvvCtlCccd = nullptr;
+
+  // Per-connection ATVV state, invalid without the characteristics above.
+  atvvRxSubscribed = false;
+  atvvCtlSubscribed = false;
+  atvvAudioStarted = false;
+
+  bleReady = false;
+  bleSuspended = false;
+  bleConnected = false;
+
+  unsigned heapAfter = ESP.getFreeHeap();
+  Serial.printf("BLE HID: stack released (%s) heap %u -> %u (+%d bytes)\n",
+                reason, heapBefore, heapAfter, (int)heapAfter - (int)heapBefore);
 }
 
 bool runtimeDeviceNeedsBluetooth(uint8_t index) {
@@ -8095,7 +8286,49 @@ void applyBluetoothState() {
   }
 }
 
+// Reports how many bonds NimBLE currently holds, or -1 if the stack is down.
+// CONFIG_BT_NIMBLE_MAX_BONDS is 3 on this build, which is small enough that a
+// few pair/unpair cycles reach it.
+int bluetoothStoredBondCount() {
+#if defined(CONFIG_NIMBLE_ENABLED)
+  if (!bleReady) return -1;
+  int count = 0;
+  if (ble_store_util_count(BLE_STORE_OBJ_TYPE_PEER_SEC, &count) != 0) return -1;
+  return count;
+#else
+  return -1;
+#endif
+}
+
 void startBluetoothPairing() {
+  /*
+    Make room before advertising, rather than discovering there is none
+    half way through a pairing attempt.
+
+    NimBLE holds at most CONFIG_BT_NIMBLE_MAX_BONDS (3) peers. When that fills,
+    a new peer's record cannot be written and the host reports
+    ble_store_config_write_rpa_rec rc=27 (BLE_HS_ESTORE_CAP) - which was seen
+    on hardware. The visible effect is not an error message: HID may still work
+    while the voice service never starts, or pairing simply never completes.
+
+    The old Forget pairing button could not help, because it is only rendered
+    when bleBonded is true. Delete the pairing from the remote's UI and the
+    stale NVS records became unreachable - exactly the state reported as
+    "I deleted it and now I cannot re-pair".
+  */
+  int bonds = bluetoothStoredBondCount();
+  if (bonds >= 0) {
+    Serial.printf("BLE HID: %d bond(s) stored before pairing (max %d)\n",
+                  bonds, 3);
+#if defined(CONFIG_NIMBLE_ENABLED)
+    if (bonds >= 3) {
+      int rc = ble_store_clear();
+      Serial.printf("BLE HID: bond store was full - cleared to make room (rc=%d)\n", rc);
+      bleBonded = false;
+      bleBondStateSavePending = true;
+    }
+#endif
+  }
   bluetoothOn = true;
   blePairingMode = true;
   bleKeepAliveUntilMs = millis() + BLE_PAIRING_WINDOW_MS;
@@ -8881,7 +9114,25 @@ bool allocateRuntimeStorage() {
   activityTiles = static_cast<Tile (*)[MAX_ACTIVITY_TILES]>(
     ps_malloc(sizeof(Tile) * MAX_RUNTIME_ACTIVITIES * MAX_ACTIVITY_TILES));
   activityTileCounts = static_cast<uint8_t *>(ps_malloc(MAX_RUNTIME_ACTIVITIES));
-  if (!devices || !activities || !macros || !activityTiles || !activityTileCounts) {
+  // Each page slot's command bindings, moved out of internal RAM. Allocated
+  // here so a failure is caught with the other runtime tables rather than
+  // surfacing later as a null dereference while rendering.
+  bool pageBindingsOk = true;
+  for (uint8_t slot = 0; slot < PAGE_SLOT_COUNT; slot++) {
+    pageUi[slot].commandBindings = static_cast<UiCommandBinding *>(
+      ps_malloc(sizeof(UiCommandBinding) * MAX_DEVICE_COMMANDS));
+    if (!pageUi[slot].commandBindings) pageBindingsOk = false;
+    else memset(pageUi[slot].commandBindings, 0,
+                sizeof(UiCommandBinding) * MAX_DEVICE_COMMANDS);
+  }
+  if (!devices || !activities || !macros || !activityTiles || !activityTileCounts ||
+      !pageBindingsOk) {
+    for (uint8_t slot = 0; slot < PAGE_SLOT_COUNT; slot++) {
+      if (pageUi[slot].commandBindings) {
+        free(pageUi[slot].commandBindings);
+        pageUi[slot].commandBindings = nullptr;
+      }
+    }
     if (devices) free(devices);
     if (activities) free(activities);
     if (macros) free(macros);
@@ -14618,7 +14869,7 @@ void webServerTask(void *parameter) {
       webServerStarted = false;
       webServerStopRequested = false;
       webConfigTransferActive = false;
-      Serial.println("WebConfig server: stopped");
+      Serial.printf("WebConfig server: stopped (heap=%u)\n", (unsigned)ESP.getFreeHeap());
     }
 
     if (webServerListenRequested && webServerConfigured) {
@@ -14629,11 +14880,40 @@ void webServerTask(void *parameter) {
       webServerRebindRequested = false;
       webServerStopRequested = false;
       webConfigTransferCancelRequested = false;
-      Serial.println("WebConfig server: listening on port 80");
+      Serial.printf("WebConfig server: listening on port 80 (heap=%u, psram=%u)\n",
+                  (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
     }
 
     if (webServerStarted) {
+      /*
+        Heartbeat, because "listening on port 80" is not the same as serving.
+        Observed after a BLE activity: TCP connects to port 80 in 9ms - so the
+        listener is genuinely up - but an HTTP request then returns zero bytes
+        and hangs forever. That means the socket is being accepted by lwIP
+        while this loop is not processing it, and from outside there is no way
+        to tell whether the task is stuck inside handleClient() or has stopped
+        running altogether.
+        The counter distinguishes them: if it keeps climbing while requests
+        hang, the loop is alive and handleClient() is the problem; if it stops,
+        the task is blocked or dead. Also times a single handleClient() call so
+        a long one names itself.
+      */
+      static uint32_t httpLoopCount = 0;
+      static unsigned long nextHttpHeartbeatMs = 0;
+      unsigned long beforeMs = millis();
       webServer.handleClient();
+      unsigned long spentMs = millis() - beforeMs;
+      httpLoopCount++;
+      if (spentMs >= 1000UL) {
+        Serial.printf("WebConfig server: handleClient() took %lums\n",
+                      (unsigned long)spentMs);
+      }
+      if ((int32_t)(millis() - nextHttpHeartbeatMs) >= 0) {
+        nextHttpHeartbeatMs = millis() + 5000UL;
+        Serial.printf("WebConfig server: alive, %lu loops, heap=%u, sdReady=%d\n",
+                      (unsigned long)httpLoopCount, (unsigned)ESP.getFreeHeap(),
+                      (int)sdReady);
+      }
       vTaskDelay(1);
     } else {
       // Consume no scheduler time or battery while WebConfig is unavailable.
@@ -16849,8 +17129,8 @@ void openSettingsView(SettingsView view) {
     wifiConnectPending = false;
     stationFallbackToSetupAp = false;
     webConfigPausedBle = true;
-    if (bleReady && !bleSuspended) {
-      stopBluetoothRadio("WebConfig session");
+    if (bleReady) {
+      shutdownBluetoothStack("WebConfig session");
       delay(120);
     }
     if (wifiOn && hasSelectedWifiProfile()) {
@@ -16980,8 +17260,12 @@ void renderBluetoothPageOmote() {
   lv_obj_add_event_cb(pair, bluetoothPairEvent, LV_EVENT_CLICKED, nullptr);
   y += 50;
 
-  if (bleBonded) {
-    lv_obj_t *forget = makeOmoteButton(content, "Forget pairing", 12, y, 216, 38, lvRgb(115, 38, 45));
+  // See the classic renderer: shown even when bleBonded is false, because the
+  // stored bonds that fill NimBLE's 3-bond limit outlive that flag.
+  {
+    lv_obj_t *forget = makeOmoteButton(content,
+                                       bleBonded ? "Forget pairing" : "Clear pairing data",
+                                       12, y, 216, 38, lvRgb(115, 38, 45));
     lv_obj_add_event_cb(forget, bluetoothForgetEvent, LV_EVENT_CLICKED, nullptr);
   }
 }
@@ -17015,9 +17299,15 @@ void renderBluetoothPage() {
                               12, 138, 216, 42, lvRgb(24, 105, 220));
   lv_obj_add_event_cb(pair, bluetoothPairEvent, LV_EVENT_CLICKED, nullptr);
 
-  if (bleBonded) {
-    lv_obj_t *forget = makeButton(content, "Forget pairing", 12, 188, 216, 38,
-                                  lvRgb(115, 38, 45));
+  // Always offered, not just when bonded. Stored bonds can outlive bleBonded -
+  // the flag is cleared as soon as a pairing is deleted, while the NVS records
+  // are what actually fill NimBLE's 3-bond limit. Hiding this when bleBonded
+  // was false left those records with no way to be removed, which is how a
+  // remote ends up unable to pair with nothing on screen to explain it.
+  {
+    lv_obj_t *forget = makeButton(content,
+                                  bleBonded ? "Forget pairing" : "Clear pairing data",
+                                  12, 188, 216, 38, lvRgb(115, 38, 45));
     lv_obj_add_event_cb(forget, bluetoothForgetEvent, LV_EVENT_CLICKED, nullptr);
   }
   makeLabel(content, "Keyboard and media controls only. No voice.", 12, 238,
