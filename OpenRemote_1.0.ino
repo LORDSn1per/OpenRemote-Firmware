@@ -1,6 +1,40 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.51 - 2026-08-31
+    - Found it. Voice after a reconnect was never a subscription problem, an
+      interaction-model problem or a bond-store problem: the connection was
+      running at the 23 byte default MTU. 3.50's instrumentation showed the
+      whole chain in one capture:
+        ATVV peer subscribe: RX/audio -> notify ON   (the peer DID subscribe)
+        ATVV format: ADPCM 8kHz, 20 byte frames every 5ms (MTU=23)
+        ATVV notify failed on RX/audio: status=4 code=6
+        ble_gatts_notify_custom: rc=6                (BLE_HS_ENOMEM)
+      status=4 is ERROR_GATT and rc=6 is out of memory: at a 23 byte MTU the
+      8kHz stream needs a notification every 5ms - 200 a second - which
+      exhausts NimBLE's mbuf pool, so every audio frame failed. Buttons were
+      unaffected because HID sends a handful of reports, not 200 a second.
+    - Root cause: onMtuChanged was never implemented, for either stack, and
+      onConnect had only a Bluedroid overload. BLEDevice::setMTU(247) sets our
+      *preferred* MTU; the exchange is a procedure someone has to start, and
+      the peer is not obliged to. When it did not, nothing ever noticed - the
+      firmware read 23 at GET_CAPS time and locked the framing to it. Same
+      shape as the CONFIG_BLUEDROID_ENABLED blocks that never compiled: a
+      NimBLE callback that was simply missing.
+    - Adds the NimBLE onConnect and onMtuChanged overloads. onConnect logs the
+      MTU and, when it is still at the default, starts the exchange itself with
+      ble_gattc_exchange_mtu(). onMtuChanged re-picks the framing once the real
+      MTU is known - skipped mid-stream, because the host decodes against the
+      frame size advertised in CAPS_RESP.
+    - 8kHz framing now follows the MTU rather than being fixed at 20 bytes:
+      80 bytes every 20ms (50 notif/s, matching the interval ATVV asks for at
+      16kHz), or 40 bytes every 10ms, falling back to the old 20/5 only when
+      the MTU leaves no choice.
+    - atvvStartAudio() refuses outright when the MTU cannot carry a sustainable
+      frame rate, with one line saying so, instead of emitting 200 failing
+      notifications a second. The format line now prints the resulting
+      notifications per second and flags an unusable format explicitly.
+
   3.50 - 2026-08-31
     - 3.49's remembered interaction model did not fix voice on an oval
       Chromecast reconnect, so this build stops inferring and reads the peer's
@@ -3603,7 +3637,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.50"
+#define OPENREMOTE_VERSION_STRING "3.51"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -3919,7 +3953,14 @@ static const uint8_t ATVV_AUDIO_STOP_OTHER = 0x80;
 // The 8kHz fallback framing. Kept as the maximum for buffer sizing.
 static const size_t ATVV_AUDIO_FRAME_BYTES = 20;
 static const uint16_t ATVV_AUDIO_FRAME_INTERVAL_MS = 5;
+// 8kHz ADPCM is 4000 bytes/second: 80 bytes is 20ms of audio, 40 bytes is
+// 10ms. Both need an MTU above the 23 byte default (payload = MTU - 3).
+static const size_t ATVV_FRAME_BYTES_8K_20MS = 80;
+static const size_t ATVV_FRAME_BYTES_8K_10MS = 40;
 static const size_t ATVV_MAX_FRAME_BYTES = ATVV_FRAME_BYTES_16K;
+// False when the negotiated MTU cannot carry audio at a rate the BLE stack can
+// actually sustain.
+bool atvvFormatUsable = true;
 // Chosen per stream from what the host advertises and the negotiated MTU.
 uint8_t atvvActiveCodec = ATVV_CODEC_ADPCM_8KHZ;
 size_t atvvFrameBytes = ATVV_AUDIO_FRAME_BYTES;
@@ -5025,6 +5066,9 @@ volatile bool atvvCapsRequestPending = false;
 //
 // Cleared on every disconnect and set only by an actual subscribe event, so
 // these describe this connection and no other.
+// NimBLE connection handle, needed to drive an MTU exchange ourselves.
+volatile uint16_t bleConnHandle = 0;
+volatile bool bleConnHandleValid = false;
 volatile bool atvvRxPeerSubscribed = false;
 volatile bool atvvCtlPeerSubscribed = false;
 // Whether the host asked for our capabilities on *this* connection. A warm
@@ -7585,14 +7629,41 @@ void atvvChooseStreamFormat() {
     atvvFrameIntervalMs = ATVV_FRAME_INTERVAL_16K_MS;
   } else {
     atvvActiveCodec = ATVV_CODEC_ADPCM_8KHZ;
-    atvvFrameBytes = ATVV_AUDIO_FRAME_BYTES;
-    atvvFrameIntervalMs = ATVV_AUDIO_FRAME_INTERVAL_MS;
+    // Frame size follows the MTU instead of being fixed at 20 bytes.
+    //
+    // 8kHz ADPCM is 4000 bytes a second, so a 20 byte frame means one
+    // notification every 5ms - 200 a second. NimBLE's mbuf pool cannot sustain
+    // that, and on hardware every single notify came back
+    // ble_gatts_notify_custom rc=6 (BLE_HS_ENOMEM): the link was up, the
+    // buttons worked, and not one audio frame reached the TV. Targeting 20ms
+    // of audio per frame (80 bytes) drops that to 50 notifications a second,
+    // matching the interval ATVV asks for at 16kHz.
+    size_t payload = mtu > 3 ? (size_t)(mtu - 3) : 0;
+    if (payload >= ATVV_FRAME_BYTES_8K_20MS) {
+      atvvFrameBytes = ATVV_FRAME_BYTES_8K_20MS;
+      atvvFrameIntervalMs = 20;
+    } else if (payload >= ATVV_FRAME_BYTES_8K_10MS) {
+      atvvFrameBytes = ATVV_FRAME_BYTES_8K_10MS;
+      atvvFrameIntervalMs = 10;
+    } else {
+      atvvFrameBytes = ATVV_AUDIO_FRAME_BYTES;
+      atvvFrameIntervalMs = ATVV_AUDIO_FRAME_INTERVAL_MS;
+    }
   }
-  Serial.printf("ATVV format: %s, %u byte frames every %ums (host codecs=0x%04X, MTU=%u%s)\n",
+
+  // An un-negotiated 23 byte MTU cannot carry this stream at any sane rate.
+  // Recording it lets atvvStartAudio() refuse with one clear line instead of
+  // emitting 200 failing notifications a second.
+  atvvFormatUsable = atvvFrameIntervalMs >= 10;
+
+  Serial.printf("ATVV format: %s, %u byte frames every %ums = %u notif/s "
+                "(host codecs=0x%04X, MTU=%u%s%s)\n",
                 atvvActiveCodec == ATVV_CODEC_ADPCM_16KHZ ? "ADPCM 16kHz" : "ADPCM 8kHz",
                 (unsigned)atvvFrameBytes, (unsigned)atvvFrameIntervalMs,
+                (unsigned)(1000U / (atvvFrameIntervalMs ? atvvFrameIntervalMs : 1)),
                 atvvHostCodecs, (unsigned)mtu,
-                (hostWants16k && !mtuFits) ? " - 16kHz declined, MTU too small" : "");
+                (hostWants16k && !mtuFits) ? " - 16kHz declined, MTU too small" : "",
+                atvvFormatUsable ? "" : " - UNUSABLE, MTU never negotiated");
 }
 
 bool atvvSendCapabilities() {
@@ -7917,6 +7988,14 @@ bool atvvStartAudio(uint8_t reason, uint8_t streamId) {
                   (atvvRxCccd && atvvRxCccd->getNotifications()) ? "notify" : "off",
                   (atvvCtlCccd && atvvCtlCccd->getNotifications()) ? "notify" : "off",
                   bleConnected ? "yes" : "no", bleBonded ? "yes" : "no");
+    return false;
+  }
+  if (!atvvFormatUsable) {
+    Serial.printf("ATVV AUDIO_START refused: MTU too small for a sustainable "
+                  "frame rate (%u byte frames every %ums). The peer never "
+                  "completed an MTU exchange, so every notification would fail "
+                  "with BLE_HS_ENOMEM.\n",
+                  (unsigned)atvvFrameBytes, (unsigned)atvvFrameIntervalMs);
     return false;
   }
   if (!atvvRxPeerSubscribed) {
@@ -8382,6 +8461,44 @@ class OpenRemoteBleServerCallbacks : public BLEServerCallbacks {
   }
 #endif
 
+#if defined(CONFIG_NIMBLE_ENABLED)
+  // Neither of these existed before. onConnect had a Bluedroid-only overload
+  // and onMtuChanged was never implemented for either stack, so the firmware
+  // never found out what MTU a connection actually settled on.
+  //
+  // That is what killed voice after a reconnect. BLEDevice::setMTU(247) only
+  // sets our *preferred* MTU; the exchange itself is a procedure someone has
+  // to start, and the peer is not obliged to. When it did not, the link stayed
+  // at the 23 byte default, atvvChooseStreamFormat() read 23 at GET_CAPS time
+  // and locked in 20 byte frames every 5ms, and all 200 notifications a second
+  // failed with BLE_HS_ENOMEM. Buttons kept working because HID sends a
+  // handful of reports, not 200 a second.
+  void onConnect(BLEServer *server, ble_gap_conn_desc *desc) override {
+    if (!desc) return;
+    bleConnHandle = desc->conn_handle;
+    bleConnHandleValid = true;
+    uint16_t mtu = ble_att_mtu(desc->conn_handle);
+    Serial.printf("BLE HID: connected, MTU=%u\n", (unsigned)mtu);
+    // Start the exchange ourselves when the peer has not. Harmless if it has:
+    // NimBLE answers BLE_HS_EALREADY and the MTU stands.
+    if (mtu <= BLE_ATT_MTU_DFLT) {
+      int rc = ble_gattc_exchange_mtu(desc->conn_handle, nullptr, nullptr);
+      Serial.printf("BLE HID: MTU still at the %u byte default - requested "
+                    "exchange (rc=%d)\n", (unsigned)BLE_ATT_MTU_DFLT, rc);
+    }
+  }
+
+  void onMtuChanged(BLEServer *server, ble_gap_conn_desc *desc,
+                    uint16_t mtu) override {
+    (void)desc;
+    Serial.printf("BLE HID: MTU negotiated to %u\n", (unsigned)mtu);
+    // Re-pick the framing now the real MTU is known. Skipped mid-stream: the
+    // host is decoding against the frame size we advertised in CAPS_RESP, so
+    // changing it under an active stream would corrupt it.
+    if (!atvvAudioStarted) atvvChooseStreamFormat();
+  }
+#endif
+
   void onDisconnect(BLEServer *server) override {
     bleConnected = false;
     if (realMicrophoneActive) microphoneStopPending = true;
@@ -8396,6 +8513,7 @@ class OpenRemoteBleServerCallbacks : public BLEServerCallbacks {
     // queued moments before a drop could land on the next connection - which
     // may well be the user picking the remote back up.
     bleConnProfilePending = false;
+    bleConnHandleValid = false;
     atvvRxSubscribed = false;
     atvvCtlSubscribed = false;
     // Per-connection, so they must not survive the link that created them.
