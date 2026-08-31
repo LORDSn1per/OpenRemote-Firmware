@@ -1,6 +1,30 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.52 - 2026-08-31
+    - 3.51 fixed the MTU and the log proved it: the exchange was requested,
+      the peer answered 247, and the format came out "ADPCM 16kHz, 160 byte
+      frames every 20ms = 50 notif/s" - 16kHz negotiated for the first time.
+      Every notification still failed with status=4 code=6, BLE_HS_ENOMEM, at
+      only 50 a second.
+    - The remaining piece is Data Length Extension, which was never requested.
+      MTU and DLE are different things and both matter: MTU 247 lets a 160 byte
+      notification exist, DLE decides how many link-layer packets it becomes.
+      At the 27 byte LL default that frame fragments into about seven packets,
+      which takes longer to put on air than the 20ms in which the next frame is
+      produced. Transmission falls behind production, the mbuf pool drains
+      (CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT is 12 on this build) and every
+      notify is refused for want of a buffer.
+    - ble_gap_set_data_len(conn, 251, 2120) is now requested on connect and
+      again once the MTU is negotiated, since a large MTU without DLE is
+      precisely the combination that starves the pool. The result is logged.
+    - 16kHz now requires DLE as well as a large enough MTU. Without it the
+      format falls back to 8kHz, which at 4000 bytes a second fits either way,
+      and the format line says which condition declined it.
+    - Frames the controller refuses are counted and reported separately from
+      frames sent. Counting a rejected frame as "sent" is how a stream that
+      delivered nothing at all still printed a healthy-looking summary.
+
   3.51 - 2026-08-31
     - Found it. Voice after a reconnect was never a subscription problem, an
       interaction-model problem or a bond-store problem: the connection was
@@ -3637,7 +3661,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.51"
+#define OPENREMOTE_VERSION_STRING "3.52"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -5069,6 +5093,18 @@ volatile bool atvvCapsRequestPending = false;
 // NimBLE connection handle, needed to drive an MTU exchange ourselves.
 volatile uint16_t bleConnHandle = 0;
 volatile bool bleConnHandleValid = false;
+// Whether Data Length Extension was accepted on this connection.
+//
+// MTU and DLE are different things and both matter. MTU 247 lets a 160 byte
+// ATT notification exist; DLE decides how many link-layer packets it becomes.
+// At the 27 byte LL default a 160 byte frame fragments into about seven
+// packets, which takes longer to transmit than the 20ms in which the next
+// frame is produced - so the mbuf pool (12 blocks on this build) drains and
+// every notify returns BLE_HS_ENOMEM. With DLE the same frame fits in a single
+// LL packet and the pool keeps up.
+volatile bool bleDataLenExtended = false;
+volatile uint32_t atvvNotifyFailures = 0;
+uint32_t atvvFramesDroppedThisStream = 0;
 volatile bool atvvRxPeerSubscribed = false;
 volatile bool atvvCtlPeerSubscribed = false;
 // Whether the host asked for our capabilities on *this* connection. A warm
@@ -7622,8 +7658,14 @@ void atvvChooseStreamFormat() {
   if (bleServer) mtu = bleServer->getPeerMTU(bleServer->getConnId());
   bool hostWants16k = (atvvHostCodecs & ATVV_CODEC_ADPCM_16KHZ) != 0;
   bool mtuFits = mtu >= (ATVV_FRAME_BYTES_16K + 3);
+  // A 160 byte frame every 20ms is only deliverable if it also fits in one
+  // link-layer packet. Without DLE it becomes ~7 packets, transmission falls
+  // behind production, and the mbuf pool drains - which on hardware showed up
+  // as a correctly negotiated 16kHz format whose every notify still failed
+  // with BLE_HS_ENOMEM. 8kHz at 4000 bytes/second fits either way.
+  bool dleOk = bleDataLenExtended;
 
-  if (hostWants16k && mtuFits && atvvHostSpecVersion >= 0x0100) {
+  if (hostWants16k && mtuFits && dleOk && atvvHostSpecVersion >= 0x0100) {
     atvvActiveCodec = ATVV_CODEC_ADPCM_16KHZ;
     atvvFrameBytes = ATVV_FRAME_BYTES_16K;
     atvvFrameIntervalMs = ATVV_FRAME_INTERVAL_16K_MS;
@@ -7662,7 +7704,8 @@ void atvvChooseStreamFormat() {
                 (unsigned)atvvFrameBytes, (unsigned)atvvFrameIntervalMs,
                 (unsigned)(1000U / (atvvFrameIntervalMs ? atvvFrameIntervalMs : 1)),
                 atvvHostCodecs, (unsigned)mtu,
-                (hostWants16k && !mtuFits) ? " - 16kHz declined, MTU too small" : "",
+                (hostWants16k && !mtuFits) ? " - 16kHz declined, MTU too small"
+                  : ((hostWants16k && !dleOk) ? " - 16kHz declined, no data length extension" : ""),
                 atvvFormatUsable ? "" : " - UNUSABLE, MTU never negotiated");
 }
 
@@ -8069,9 +8112,16 @@ bool atvvStopAudio(uint8_t reason) {
   uint8_t packet[] = {ATVV_AUDIO_STOP, reason};
   bool sent = atvvNotifyControlPacket(packet, sizeof(packet));
   if (!atvvStreamUsesTestAudio) {
-    Serial.printf("ATVV microphone: %lu frame(s) sent, %lu capture underrun(s)\n",
+    // Frames the controller refused are reported separately. Counting them as
+    // "sent" is how a stream that delivered nothing at all still looked
+    // healthy in the log.
+    Serial.printf("ATVV microphone: %lu frame(s) sent, %lu capture underrun(s), "
+                  "%lu frame(s) DROPPED by the BLE stack%s\n",
                   (unsigned long)atvvAudioFrameNumber,
-                  (unsigned long)microphoneUnderrunCount);
+                  (unsigned long)microphoneUnderrunCount,
+                  (unsigned long)atvvFramesDroppedThisStream,
+                  atvvFramesDroppedThisStream ? " - the host heard less than this claims" : "");
+    atvvFramesDroppedThisStream = 0;
     stopRealMicrophoneCapture();
   }
   // Hand the radio back its normal cadence. The voice profile's 7.5-15ms
@@ -8121,6 +8171,14 @@ void atvvSendAudioFrame() {
   atvvRx->setValue(frame, frameLen);
   atvvRx->notify();
   if (atvvNotifyMutex) xSemaphoreGive(atvvNotifyMutex);
+  // A frame the controller could not take is gone; there is no retry that
+  // would help, because the next one is already due. Counting them keeps the
+  // "N frames sent" summary honest rather than reporting frames that only ever
+  // reached the mbuf allocator.
+  if (atvvNotifyFailures) {
+    atvvFramesDroppedThisStream += atvvNotifyFailures;
+    atvvNotifyFailures = 0;
+  }
   if (atvvStreamUsesTestAudio && !atvvTestAudioFinished) {
     atvvTestAudioOffset += frameLen;
   }
@@ -8271,6 +8329,7 @@ class OpenRemoteAtvvNotifyCallbacks : public BLECharacteristicCallbacks {
   void onStatus(BLECharacteristic *characteristic, Status status,
                 uint32_t code) override {
     if (status == SUCCESS_NOTIFY || status == SUCCESS_INDICATE) return;
+    if (characteristic == atvvRx) atvvNotifyFailures++;
     static unsigned long lastReportMs = 0;
     static uint32_t suppressed = 0;
     unsigned long now = millis();
@@ -8486,12 +8545,27 @@ class OpenRemoteBleServerCallbacks : public BLEServerCallbacks {
       Serial.printf("BLE HID: MTU still at the %u byte default - requested "
                     "exchange (rc=%d)\n", (unsigned)BLE_ATT_MTU_DFLT, rc);
     }
+    bleDataLenExtended = false;
+    requestDataLengthExtension(desc->conn_handle);
+  }
+
+  // 251 octets is the LL maximum; 2120us is its air time on the 1M PHY.
+  void requestDataLengthExtension(uint16_t connHandle) {
+    int rc = ble_gap_set_data_len(connHandle, 251, 2120);
+    bleDataLenExtended = (rc == 0);
+    Serial.printf("BLE HID: data length extension %s (rc=%d)%s\n",
+                  rc == 0 ? "enabled, 251 byte LL packets" : "REFUSED",
+                  rc,
+                  rc == 0 ? "" : " - 16kHz will be declined, 8kHz fits anyway");
   }
 
   void onMtuChanged(BLEServer *server, ble_gap_conn_desc *desc,
                     uint16_t mtu) override {
     (void)desc;
     Serial.printf("BLE HID: MTU negotiated to %u\n", (unsigned)mtu);
+    // Ask for DLE now rather than at connect: a big MTU without it is exactly
+    // the combination that starves the mbuf pool.
+    if (bleConnHandleValid) requestDataLengthExtension(bleConnHandle);
     // Re-pick the framing now the real MTU is known. Skipped mid-stream: the
     // host is decoding against the frame size we advertised in CAPS_RESP, so
     // changing it under an active stream would corrupt it.
