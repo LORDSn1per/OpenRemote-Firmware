@@ -1,6 +1,85 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.40 - 2026-08-31
+    - Matched Google's ATVV 1.0 audio format properly, from the spec rather
+      than from what happened to work.
+    - THE ADPCM NIBBLE ORDER WAS WRONG, and had been for the life of this
+      feature. The encoder packed "low | (high << 4)", putting the FIRST sample
+      of each pair in the low nibble; ATVV specifies HIGH nibble first. Every
+      sample pair therefore arrived transposed. That is not a subtle loss: IMA
+      ADPCM is differential, so each sample decodes against the predictor state
+      the previous one left, and swapping them makes the decoder track a signal
+      that was never sent. This corrupts the stream at 8kHz as much as at
+      16kHz, and is the most likely reason recognition stayed poor after the
+      capture path had been measured clean (495 frames, 0 underruns).
+    - Added ADPCM 16kHz (codec 0x02), with 160-byte frames every 20ms - the
+      spec's preferred framing, and exactly 320 samples of 16kHz audio at
+      64 kbit/s. The microphone has always sampled at 16kHz and was being
+      decimated to 8kHz, so this stops discarding half the captured bandwidth,
+      including the top octave where fricatives live.
+    - Fewer, larger notifications is also better for the radio: 50 per second
+      instead of 200. The occasional BLE_HS_ENOMEM at the old rate was mbuf
+      pressure, and this reduces the packet count fourfold at double the data.
+    - Requests an ATT MTU of 247 at BLE init. Nothing ever asked for more than
+      the default 23 (20 bytes of payload), so a 160-byte notification could
+      never have fitted and 16kHz would have silently fallen back forever.
+    - Falls back to 8kHz cleanly and deliberately: 16kHz requires the host to
+      advertise codec 0x02/0x03, spec version 1.0, AND a negotiated MTU of at
+      least 163. Any of those missing keeps the old format, which is the spec's
+      own documented bandwidth fallback. Guessing wrong here costs silence, not
+      just quality, so all three are checked and the decision is logged.
+    - The bundled test phrase is 8kHz data in flash, so a test stream forces
+      8kHz framing regardless of negotiation - otherwise it would be announced
+      as 16kHz and decoded at twice its real rate.
+    - Verified the packing and geometry against the spec before shipping:
+      first sample lands in the high nibble, and 160 bytes / 20ms works out to
+      320 samples and 64 kbit/s exactly.
+
+  3.39 - 2026-08-31
+    - Made the ATVV opcode names direction-aware. 0x0A is AUDIO_SYNC when the
+      remote sends it and GET_CAPS when the host does, and the name lookup did
+      not know which way a packet was going - so every outgoing AUDIO_SYNC
+      printed as "GET_CAPS". Reading a log, that looks exactly like the host
+      asking for capabilities, and it sent this investigation the wrong way
+      more than once: the host's real GET_CAPS arrives at connection time, not
+      during a voice press, so a capture taken around the button press contains
+      no host traffic at all and the only "GET_CAPS" in it is the remote's own
+      notify.
+    - Outgoing CTL notifies now log as AUDIO_SYNC; only genuine TX writes from
+      the host log as GET_CAPS.
+
+  3.38 - 2026-08-31
+    - Fixed Settings > About disappearing from the menu, a regression from
+      3.28. renderSettingsHomeOmote() sizes its card from a hardcoded
+      "const int rowCount = 9", and adding the Dock row made ten. The card was
+      left exactly one row short, so About was drawn outside its bounds and was
+      simply not there. The classic menu style was unaffected - it positions
+      rows absolutely inside a scrolling container, which grows on its own.
+    - Only the OMOTE style carries this hazard, because the card height is
+      fixed at construction and cannot notice a row being added. Noted in a
+      comment beside the constant, with the ten rows listed, so the next person
+      to add one sees what has to change with it.
+
+  3.37 - 2026-08-31
+    - Log the host's GET_CAPS decoded and verbatim. Recognition is still poor
+      with a healthy stream (a live capture reported 495 frames sent and 0
+      underruns, with a single notify failure), so what is left is the audio
+      content rather than the transport - and the largest remaining lever is
+      that the microphone samples at 16kHz while ATVV is told the codec is
+      ADPCM 8kHz, so half the captured bandwidth is discarded before it is
+      ever encoded.
+    - Whether 16kHz can be used depends on what the host advertises, and this
+      firmware has never looked. GET_CAPS bytes 3-4 sit between the version and
+      the interaction-model byte already read at [5], and in the ATVV messages
+      seen so far they carry the supported-codec field. That reading is an
+      inference, so the raw bytes are printed alongside the decode - the log is
+      correct even if the interpretation is not.
+    - Nothing about the audio path changes here. Moving to 16kHz would double
+      the frame rate at the negotiated 20-byte frame size, and rc=6
+      (BLE_HS_ENOMEM) still appears occasionally at the current rate, so it is
+      not a change worth making on a guess about which codecs are on offer.
+
   3.36 - 2026-08-31
     - Validate a staged firmware image BEFORE erasing the OTA partition.
       "Could Not Activate The Firmware" is what Update reports when every byte
@@ -3246,7 +3325,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.36"
+#define OPENREMOTE_VERSION_STRING "3.40"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -3538,6 +3617,18 @@ static const uint16_t ATVV_RELEASE_SETTLE_MS = 40;
 static const uint32_t ATVV_AUDIO_TIMEOUT_MS = 15000UL;
 static const uint32_t ATVV_HELD_AUDIO_TIMEOUT_MS = 120000UL;
 static const uint8_t ATVV_CODEC_ADPCM_8KHZ = 0x01;
+// Google ATVV 1.0: 0x02 is ADPCM 16kHz/16-bit, 0x03 advertises both. The
+// microphone already samples at 16kHz, so 8kHz was discarding half the
+// captured bandwidth - and the half containing the fricatives a recogniser
+// needs most.
+static const uint8_t ATVV_CODEC_ADPCM_16KHZ = 0x02;
+static const uint8_t ATVV_CODEC_BOTH = 0x03;
+// 160-byte frames at 20ms, per the spec's preferred framing: 320 nibbles =
+// 320 samples = 20ms at 16kHz, i.e. 64 kbit/s. That is also FEWER, larger
+// notifications than the old 20-byte/5ms framing (50/s against 200/s), which
+// should ease the mbuf pressure behind the occasional BLE_HS_ENOMEM.
+static const size_t ATVV_FRAME_BYTES_16K = 160;
+static const uint16_t ATVV_FRAME_INTERVAL_16K_MS = 20;
 static const uint8_t ATVV_INTERACTION_ON_REQUEST = 0x00;
 static const uint8_t ATVV_INTERACTION_HOLD_TO_TALK = 0x03;
 static const uint8_t ATVV_AUDIO_START_MIC_OPEN = 0x00;
@@ -3547,8 +3638,14 @@ static const uint8_t ATVV_AUDIO_STOP_BUTTON_RELEASE = 0x02;
 static const uint8_t ATVV_AUDIO_STOP_NEW_STREAM = 0x04;
 static const uint8_t ATVV_AUDIO_STOP_TIMEOUT = 0x08;
 static const uint8_t ATVV_AUDIO_STOP_OTHER = 0x80;
+// The 8kHz fallback framing. Kept as the maximum for buffer sizing.
 static const size_t ATVV_AUDIO_FRAME_BYTES = 20;
 static const uint16_t ATVV_AUDIO_FRAME_INTERVAL_MS = 5;
+static const size_t ATVV_MAX_FRAME_BYTES = ATVV_FRAME_BYTES_16K;
+// Chosen per stream from what the host advertises and the negotiated MTU.
+uint8_t atvvActiveCodec = ATVV_CODEC_ADPCM_8KHZ;
+size_t atvvFrameBytes = ATVV_AUDIO_FRAME_BYTES;
+uint16_t atvvFrameIntervalMs = ATVV_AUDIO_FRAME_INTERVAL_MS;
 static const uint32_t BLE_PAIRING_WINDOW_MS = 3UL * 60UL * 1000UL;
 static const uint32_t BLE_POST_CONNECT_GRACE_MS = 60UL * 1000UL;
 
@@ -4638,6 +4735,7 @@ volatile uint8_t atvvMicCloseStreamId = 0xFF;
 volatile bool atvvCapsRequestPending = false;
 volatile uint16_t atvvHostSpecVersion = 0x0004;
 volatile uint8_t atvvHostInteractionModels = ATVV_INTERACTION_ON_REQUEST;
+volatile uint16_t atvvHostCodecs = 0;   // GET_CAPS bytes 3-4, logged verbatim
 volatile bool atvvAudioStarted = false;
 bool atvvVoiceReleasePending = false;
 uint8_t atvvInteractionModel = ATVV_INTERACTION_ON_REQUEST;
@@ -7038,12 +7136,17 @@ void serviceBluetoothConnectionProfile(unsigned long now) {
   requestBluetoothConnectionProfile(bleConnProfileTargetIdle);
 }
 
-const char *atvvOpcodeName(uint8_t opcode) {
+// 0x0A means two different things depending on which way the packet is going:
+// AUDIO_SYNC when the remote sends it, GET_CAPS when the host does. Naming it
+// without knowing the direction made every outgoing AUDIO_SYNC print as
+// "GET_CAPS", which repeatedly read as though the host were talking to us when
+// it was not - and sent this investigation the wrong way more than once.
+const char *atvvOpcodeName(uint8_t opcode, bool fromHost) {
   switch (opcode) {
     case ATVV_AUDIO_STOP: return "AUDIO_STOP";
     case ATVV_AUDIO_START: return "AUDIO_START";
     case ATVV_START_SEARCH: return "START_SEARCH";
-    case ATVV_GET_CAPS: return "GET_CAPS";
+    case ATVV_GET_CAPS: return fromHost ? "GET_CAPS" : "AUDIO_SYNC";
     case ATVV_CAPS_RESP: return "CAPS_RESP";
     case ATVV_MIC_OPEN: return "MIC_OPEN";
     case ATVV_MIC_CLOSE: return "MIC_CLOSE";
@@ -7058,7 +7161,7 @@ bool atvvNotifyControlPacket(const uint8_t *packet, size_t length) {
   if (!atvvCtlSubscribed) {
 #if OPENREMOTE_ATVV_DEBUG
     Serial.printf("ATVV CTL %s not sent: Chromecast has not subscribed\n",
-                  atvvOpcodeName(packet[0]));
+                  atvvOpcodeName(packet[0], false));
 #endif
     return false;
   }
@@ -7073,7 +7176,7 @@ bool atvvNotifyControlPacket(const uint8_t *packet, size_t length) {
 #if OPENREMOTE_ATVV_DEBUG
   Serial.print("ATVV CTL notify:");
   for (size_t i = 0; i < length; i++) Serial.printf(" %02X", packet[i]);
-  Serial.printf("  %s\n", atvvOpcodeName(packet[0]));
+  Serial.printf("  %s\n", atvvOpcodeName(packet[0], false));
 #endif
   return true;
 }
@@ -7087,7 +7190,7 @@ bool atvvSendAudioSync(uint16_t frameNumber, int16_t predictor,
   uint16_t predictorBits = static_cast<uint16_t>(predictor);
   uint8_t packet[] = {
     ATVV_AUDIO_SYNC,
-    ATVV_CODEC_ADPCM_8KHZ,
+    atvvActiveCodec,
     static_cast<uint8_t>(frameNumber >> 8),
     static_cast<uint8_t>(frameNumber & 0xFF),
     static_cast<uint8_t>(predictorBits >> 8),
@@ -7097,26 +7200,60 @@ bool atvvSendAudioSync(uint16_t frameNumber, int16_t predictor,
   return atvvNotifyControlPacket(packet, sizeof(packet));
 }
 
+// Decides the stream format for the next session and reports our capabilities.
+//
+// 16kHz needs three things to line up: the host must advertise codec 0x02 (or
+// 0x03 for both), the spec version must be 1.0, and the negotiated ATT MTU
+// must be able to carry a 160-byte notification (160 + 3 bytes of ATT header).
+// If any of those fails this stays on 8kHz, which is the spec's own documented
+// bandwidth fallback - a wrong guess here costs silence, not just quality.
+void atvvChooseStreamFormat() {
+  uint16_t mtu = 0;
+  if (bleServer) mtu = bleServer->getPeerMTU(bleServer->getConnId());
+  bool hostWants16k = (atvvHostCodecs & ATVV_CODEC_ADPCM_16KHZ) != 0;
+  bool mtuFits = mtu >= (ATVV_FRAME_BYTES_16K + 3);
+
+  if (hostWants16k && mtuFits && atvvHostSpecVersion >= 0x0100) {
+    atvvActiveCodec = ATVV_CODEC_ADPCM_16KHZ;
+    atvvFrameBytes = ATVV_FRAME_BYTES_16K;
+    atvvFrameIntervalMs = ATVV_FRAME_INTERVAL_16K_MS;
+  } else {
+    atvvActiveCodec = ATVV_CODEC_ADPCM_8KHZ;
+    atvvFrameBytes = ATVV_AUDIO_FRAME_BYTES;
+    atvvFrameIntervalMs = ATVV_AUDIO_FRAME_INTERVAL_MS;
+  }
+  Serial.printf("ATVV format: %s, %u byte frames every %ums (host codecs=0x%04X, MTU=%u%s)\n",
+                atvvActiveCodec == ATVV_CODEC_ADPCM_16KHZ ? "ADPCM 16kHz" : "ADPCM 8kHz",
+                (unsigned)atvvFrameBytes, (unsigned)atvvFrameIntervalMs,
+                atvvHostCodecs, (unsigned)mtu,
+                (hostWants16k && !mtuFits) ? " - 16kHz declined, MTU too small" : "");
+}
+
 bool atvvSendCapabilities() {
   uint16_t version = atvvHostSpecVersion >= 0x0100 ? 0x0100 : 0x0004;
   uint8_t model = atvvHostInteractionModels == ATVV_INTERACTION_HOLD_TO_TALK
     ? ATVV_INTERACTION_HOLD_TO_TALK
     : ATVV_INTERACTION_ON_REQUEST;
+  atvvChooseStreamFormat();
+  // Advertise both rates when the host offered both, so it knows 8kHz remains
+  // available as a fallback rather than believing 16kHz is all we can do.
+  uint8_t advertisedCodec = atvvActiveCodec == ATVV_CODEC_ADPCM_16KHZ
+    ? ATVV_CODEC_BOTH : ATVV_CODEC_ADPCM_8KHZ;
   uint8_t packet[] = {
     ATVV_CAPS_RESP,
     (uint8_t)(version >> 8), (uint8_t)(version & 0xFF),
-    ATVV_CODEC_ADPCM_8KHZ,
+    advertisedCodec,
     model,
-    0x00, (uint8_t)ATVV_AUDIO_FRAME_BYTES,
+    (uint8_t)(atvvFrameBytes >> 8), (uint8_t)(atvvFrameBytes & 0xFF),
     0x00,
     0x00
   };
   if (!atvvNotifyControlPacket(packet, sizeof(packet))) return false;
   atvvInteractionModel = model;
-  Serial.printf("ATVV capabilities: version=%u.%u model=%s frame=%u\n",
+  Serial.printf("ATVV capabilities: version=%u.%u model=%s codec=0x%02X frame=%u\n",
                 version >> 8, version & 0xFF,
                 model == ATVV_INTERACTION_HOLD_TO_TALK ? "hold-to-talk" : "on-request",
-                (unsigned)ATVV_AUDIO_FRAME_BYTES);
+                advertisedCodec, (unsigned)atvvFrameBytes);
   return true;
 }
 
@@ -7345,31 +7482,55 @@ static inline int16_t micFilterSample(int16_t sample) {
 
 bool readRealMicrophoneAdpcmFrame(uint8_t *frame) {
   if (!frame || !realMicrophoneActive || !microphoneRxChannel || !microphoneMutex) return false;
-  int32_t samples[80] = {};
+
+  const size_t wanted = atvvFrameBytes;              // bytes of ADPCM to produce
+  const size_t outSamples = wanted * 2;              // two 4-bit samples per byte
+  // 8kHz output is decimated 2:1, so it needs twice as many captured samples
+  // as it emits. 16kHz is the capture rate itself, so it needs exactly as many.
+  const size_t needSamples = (atvvActiveCodec == ATVV_CODEC_ADPCM_16KHZ)
+                             ? outSamples : outSamples * 2;
+
+  static int32_t samples[ATVV_MAX_FRAME_BYTES * 2];  // 320 at the 160-byte frame
+  if (needSamples > sizeof(samples) / sizeof(samples[0])) return false;
+
   size_t bytesRead = 0;
   if (xSemaphoreTake(microphoneMutex, pdMS_TO_TICKS(20)) != pdTRUE) return false;
-  esp_err_t error = i2s_channel_read(microphoneRxChannel, samples, sizeof(samples),
-                                     &bytesRead, pdMS_TO_TICKS(20));
-  if (error == ESP_OK && bytesRead >= sizeof(samples)) {
-    // Every one of the 80 captured samples goes through the filter - that is
-    // what makes it an anti-alias filter rather than decoration. Only every
-    // second FILTERED sample is kept, giving 40 samples at 8kHz.
-    int16_t decimated[ATVV_AUDIO_FRAME_BYTES * 2];
-    uint8_t taken = 0;
-    for (uint8_t i = 0; i < 80; i++) {
-      int16_t filtered = micFilterSample(micConditionSample(samples[i]));
-      if ((i & 1) == 1 && taken < sizeof(decimated) / sizeof(decimated[0])) {
-        decimated[taken++] = filtered;
+  esp_err_t error = i2s_channel_read(microphoneRxChannel, samples,
+                                     needSamples * sizeof(int32_t),
+                                     &bytesRead, pdMS_TO_TICKS(30));
+  bool complete = (error == ESP_OK && bytesRead >= needSamples * sizeof(int32_t));
+  if (complete) {
+    // Nibble order is HIGH first, then low, per Google's ATVV spec. This code
+    // previously packed "low | (high << 4)", putting the FIRST sample of each
+    // pair in the low nibble - so every pair arrived transposed. That corrupts
+    // an IMA ADPCM stream at any rate, because each sample's decode depends on
+    // the predictor state the previous one left behind; swapping them makes
+    // the decoder track a signal that was never sent.
+    if (atvvActiveCodec == ATVV_CODEC_ADPCM_16KHZ) {
+      // No filter and no decimation: 16kHz is the capture rate. The anti-alias
+      // filter exists only to make the 2:1 drop to 8kHz safe, and running it
+      // here would just remove the top octave this mode exists to keep.
+      for (size_t i = 0; i < wanted; i++) {
+        uint8_t hi = encodeMicrophoneAdpcmSample(micConditionSample(samples[i * 2]));
+        uint8_t lo = encodeMicrophoneAdpcmSample(micConditionSample(samples[i * 2 + 1]));
+        frame[i] = (uint8_t)((hi << 4) | lo);
       }
-    }
-    for (uint8_t i = 0; i < ATVV_AUDIO_FRAME_BYTES; i++) {
-      uint8_t low = encodeMicrophoneAdpcmSample(decimated[i * 2]);
-      uint8_t high = encodeMicrophoneAdpcmSample(decimated[i * 2 + 1]);
-      frame[i] = low | (high << 4);
+    } else {
+      for (size_t i = 0; i < wanted; i++) {
+        // Filter every captured sample, keep every second one. Filtering only
+        // the kept samples would not be an anti-alias filter at all.
+        int16_t a = micFilterSample(micConditionSample(samples[i * 4]));
+        (void)micFilterSample(micConditionSample(samples[i * 4 + 1]));
+        int16_t b = micFilterSample(micConditionSample(samples[i * 4 + 2]));
+        (void)micFilterSample(micConditionSample(samples[i * 4 + 3]));
+        uint8_t hi = encodeMicrophoneAdpcmSample(a);
+        uint8_t lo = encodeMicrophoneAdpcmSample(b);
+        frame[i] = (uint8_t)((hi << 4) | lo);
+      }
     }
   }
   xSemaphoreGive(microphoneMutex);
-  return error == ESP_OK && bytesRead >= sizeof(samples);
+  return complete;
 }
 
 bool atvvStartAudio(uint8_t reason, uint8_t streamId) {
@@ -7382,8 +7543,16 @@ bool atvvStartAudio(uint8_t reason, uint8_t streamId) {
     Serial.println("ATVV AUDIO_START not sent: real I2S microphone unavailable");
     return false;
   }
+  // The test phrase is 8kHz ADPCM baked into flash, so a test stream forces
+  // 8kHz framing regardless of what was negotiated - otherwise it would be
+  // announced as 16kHz and decoded at twice its real rate.
+  if (atvvStreamUsesTestAudio) {
+    atvvActiveCodec = ATVV_CODEC_ADPCM_8KHZ;
+    atvvFrameBytes = ATVV_AUDIO_FRAME_BYTES;
+    atvvFrameIntervalMs = ATVV_AUDIO_FRAME_INTERVAL_MS;
+  }
   uint8_t packet[] = {
-    ATVV_AUDIO_START, reason, ATVV_CODEC_ADPCM_8KHZ, streamId
+    ATVV_AUDIO_START, reason, atvvActiveCodec, streamId
   };
   if (!atvvNotifyControlPacket(packet, sizeof(packet))) {
     if (!atvvStreamUsesTestAudio) stopRealMicrophoneCapture();
@@ -7417,7 +7586,8 @@ bool atvvStartAudio(uint8_t reason, uint8_t streamId) {
                              ATVV_AUDIO_FRAME_BYTES),
                   OPENREMOTE_ATVV_TEST_PCM_SAMPLES / 8000.0f);
   } else {
-    Serial.println("ATVV microphone: streaming live 8 kHz IMA ADPCM");
+    Serial.printf("ATVV microphone: streaming live %s IMA ADPCM\n",
+                  atvvActiveCodec == ATVV_CODEC_ADPCM_16KHZ ? "16 kHz" : "8 kHz");
   }
   ensureAtvvAudioTask();
   if (atvvAudioTaskHandle) xTaskNotifyGive(atvvAudioTaskHandle);
@@ -7445,13 +7615,14 @@ bool atvvStopAudio(uint8_t reason) {
 void atvvSendAudioFrame() {
   if (!atvvAudioStarted || !atvvRx || !atvvRxCccd ||
       !atvvRxCccd->getNotifications()) return;
-  uint8_t frame[ATVV_AUDIO_FRAME_BYTES] = {0};
+  uint8_t frame[ATVV_MAX_FRAME_BYTES] = {0};
+  const size_t frameLen = atvvFrameBytes;
   bool switchToSilence = false;
   if (atvvStreamUsesTestAudio) {
     if (!atvvTestAudioFinished &&
         atvvTestAudioOffset < OPENREMOTE_ATVV_TEST_AUDIO_BYTES) {
       memcpy_P(frame, OPENREMOTE_ATVV_TEST_AUDIO + atvvTestAudioOffset,
-               sizeof(frame));
+               frameLen);
     } else if (!atvvTestAudioFinished) {
       switchToSilence = true;
     }
@@ -7478,11 +7649,11 @@ void atvvSendAudioFrame() {
     if (atvvNotifyMutex) xSemaphoreGive(atvvNotifyMutex);
     return;
   }
-  atvvRx->setValue(frame, sizeof(frame));
+  atvvRx->setValue(frame, frameLen);
   atvvRx->notify();
   if (atvvNotifyMutex) xSemaphoreGive(atvvNotifyMutex);
   if (atvvStreamUsesTestAudio && !atvvTestAudioFinished) {
-    atvvTestAudioOffset += sizeof(frame);
+    atvvTestAudioOffset += frameLen;
   }
   atvvAudioFrameNumber++;
 }
@@ -7504,12 +7675,12 @@ void atvvAudioTask(void *parameter) {
       // slower than real time while the microphone kept filling at a fixed
       // rate - the capture buffer overran and speech arrived with chunks
       // missing. Deadline-based scheduling keeps the average exact.
-      atvvNextAudioFrameMs += ATVV_AUDIO_FRAME_INTERVAL_MS;
+      atvvNextAudioFrameMs += atvvFrameIntervalMs;
       // If something stalled long enough that several frames are already due,
       // do not try to burst-send them: that is what floods the BLE buffers.
       // Give up the lost time instead and resynchronise on the current frame.
-      if ((int32_t)(millis() - atvvNextAudioFrameMs) > (int32_t)(ATVV_AUDIO_FRAME_INTERVAL_MS * 4)) {
-        atvvNextAudioFrameMs = millis() + ATVV_AUDIO_FRAME_INTERVAL_MS;
+      if ((int32_t)(millis() - atvvNextAudioFrameMs) > (int32_t)(atvvFrameIntervalMs * 4)) {
+        atvvNextAudioFrameMs = millis() + atvvFrameIntervalMs;
       }
     }
     vTaskDelay(pdMS_TO_TICKS(1));
@@ -7558,17 +7729,33 @@ class OpenRemoteAtvvTxCallbacks : public BLECharacteristicCallbacks {
         atvvHostSpecVersion = ((uint16_t)(uint8_t)value[1] << 8) |
                               (uint8_t)value[2];
       }
+      // Bytes 3-4 sit between the version and the interaction-model byte this
+      // code already reads at [5], and have never been looked at. In every
+      // ATVV GET_CAPS seen so far they are the host's supported-codec field.
+      // Decoding is a guess; PRINTING is not, so the raw bytes go to the log
+      // either way. 8kHz ADPCM is all this firmware sends today, and the
+      // microphone samples at 16kHz and is downsampled to reach it - so if a
+      // host advertises a 16kHz codec there is real quality being thrown away,
+      // and this is the line that will prove it one way or the other.
+      atvvHostCodecs = value.length() >= 5
+        ? (uint16_t)(((uint16_t)(uint8_t)value[3] << 8) | (uint8_t)value[4])
+        : 0;
       atvvHostInteractionModels = value.length() >= 6
         ? (uint8_t)value[5]
         : ATVV_INTERACTION_ON_REQUEST;
       atvvCapsRequestPending = true;
+      Serial.printf("ATVV HOST CAPS: version=%u.%u codecField=0x%04X models=0x%02X raw=",
+                    atvvHostSpecVersion >> 8, atvvHostSpecVersion & 0xFF,
+                    atvvHostCodecs, atvvHostInteractionModels);
+      for (size_t i = 0; i < value.length(); i++) Serial.printf(" %02X", (uint8_t)value[i]);
+      Serial.printf("  (we advertise codec 0x%02X = ADPCM 8kHz)\n", ATVV_CODEC_ADPCM_8KHZ);
     }
 #if OPENREMOTE_ATVV_DEBUG
     Serial.printf("ATVV TX write (%u):", (unsigned)value.length());
     for (size_t i = 0; i < value.length(); i++) {
       Serial.printf(" %02X", (uint8_t)value[i]);
     }
-    Serial.printf("  %s\n", atvvOpcodeName(opcode));
+    Serial.printf("  %s\n", atvvOpcodeName(opcode, true));
     if (opcode == ATVV_GET_CAPS) {
       Serial.println("ATVV discovery confirmed: Chromecast requested capabilities; response queued");
     } else if (opcode == ATVV_MIC_OPEN) {
@@ -7844,6 +8031,13 @@ void applyBluetoothState() {
       Serial.println("BLE HID: init failed");
       return;
     }
+    // ATVV's preferred framing is a 160-byte audio notification, which needs
+    // an ATT MTU of at least 163. The default is 23 (20 bytes of payload), and
+    // nothing here ever asked for more - so a 160-byte frame could never have
+    // fitted and 16kHz would always have fallen back to 8kHz. 247 is the
+    // common negotiated ceiling; the peer settles on whatever it can support,
+    // and atvvChooseStreamFormat() reads the result rather than assuming it.
+    BLEDevice::setMTU(247);
 
     bleSecurity = new BLESecurity();
     bleSecurity->setCapability(ESP_IO_CAP_NONE);
@@ -16550,7 +16744,12 @@ lv_obj_t *makeOmoteDropdownRow(lv_obj_t *card, const char *name, int y, int heig
 
 void renderSettingsHomeOmote() {
   const int rowH = 48;
-  const int rowCount = 9;
+  // 10 rows, not 9: Wi-Fi, Bluetooth, Clock, Wi-Fi Config, Display, Buttons,
+  // Dock, Debug, Backup / Restore, About. Adding Dock in 3.28 without raising
+  // this left the card exactly one row short, so About rendered outside it and
+  // vanished from the menu. Keep this in step with the makeOmoteRow() calls
+  // below - the card is a fixed height, so it cannot notice on its own.
+  const int rowCount = 10;
   lv_obj_t *card = makeOmoteCard(content, 8, rowCount * rowH + (rowCount - 1));
   int y = 0;
   String wifiState = !wifiOn ? "Off" : (WiFi.status() == WL_CONNECTED ? WiFi.SSID() : "Tap to scan networks");
