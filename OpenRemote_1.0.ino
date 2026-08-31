@@ -1,6 +1,35 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.55 - 2026-09-01
+    - 3.54 fixed the ordering and the log proves it: MTU reaches 247 before
+      GET_CAPS, and capabilities now commit to codec=0x03 frame=160 - the
+      format actually sent. Every notification still failed with
+      BLE_HS_ENOMEM, so the mismatch was real but was not the only fault.
+    - onConnParamsUpdate turns out to be the THIRD NimBLE callback that was
+      never implemented, after onConnect and onMtuChanged. It existed only in
+      its Bluedroid form, so the actual connection interval has never once been
+      visible on this build. The interval decides how much can be put on air
+      per event and therefore whether a 50 frame/second stream can drain at
+      all; requesting a fast one and never reading the answer is how a stream
+      gets refused for want of buffers while everything else in the log looks
+      correctly negotiated. It is now implemented and logged, and flags an
+      interval too slow to carry the stream.
+    - The voice connection interval is now requested during link setup, before
+      capabilities are answered, rather than when the button is pressed. By
+      capabilities time the peer has usually replied, so the format can be
+      chosen against the interval actually granted.
+    - 16kHz now additionally requires an interval of 30ms or better, and the
+      format line prints the interval and names whichever condition declined
+      16kHz - MTU, data length, interval, or past failure.
+    - Self-correcting fallback: if a 16kHz stream has more than a quarter of
+      its frames refused, the remote records that this link cannot carry 16kHz
+      and uses 8kHz from the next session (preferences key atvvNo16k, cleared
+      by Forget pairing). 8kHz is 4000 bytes a second, half the load, and is
+      the rate that gave good recognition before 16kHz was attempted at all.
+      The point is that voice ends up working by itself rather than needing
+      another firmware revision to find out which limit was binding.
+
   3.54 - 2026-09-01
     - Fixes voice on a reconnect for real. The capture showed the remote
       telling the host one thing and then doing another:
@@ -3715,7 +3744,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.54"
+#define OPENREMOTE_VERSION_STRING "3.55"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -5167,6 +5196,16 @@ unsigned long bleLinkSetupAtMs = 0;
 // answered anyway. Better a stale format than no reply at all.
 static const uint32_t ATVV_CAPS_HOLD_MAX_MS = 1500;
 unsigned long atvvCapsHoldUntilMs = 0;
+// Actual negotiated connection parameters, in 1.25ms units. 0 = not yet
+// reported by the peer.
+volatile uint16_t bleConnIntervalUnits = 0;
+volatile uint16_t bleConnLatency = 0;
+// Set when a 16kHz stream was refused by the controller often enough to be
+// certain the link cannot carry it, and remembered so the next session starts
+// at 8kHz instead of repeating a stream the host will never hear. 8kHz is
+// 4000 bytes a second - half the load - and is the rate that produced the
+// good recognition before 16kHz was attempted at all.
+bool atvvAvoid16kForPeer = false;
 volatile uint32_t atvvNotifyFailures = 0;
 uint32_t atvvFramesDroppedThisStream = 0;
 volatile bool atvvRxPeerSubscribed = false;
@@ -7207,6 +7246,7 @@ void loadSettings() {
   bleBonded = preferences.getBool("bleBonded", false);
   atvvRememberedInteractionModel =
     preferences.getUChar("atvvModel", ATVV_INTERACTION_ON_REQUEST);
+  atvvAvoid16kForPeer = preferences.getBool("atvvNo16k", false);
   clockEnabled = preferences.getBool("clock", true);
   clockUseInternetTime = preferences.getBool("ntp", true);
   wakeMode = constrain((int)preferences.getUChar("wakeMode", WAKE_MODE_MOTION),
@@ -7342,6 +7382,7 @@ void saveSettings() {
   preferences.putBool("ble", bluetoothOn);
   preferences.putBool("bleBonded", (bool)bleBonded);
   preferences.putUChar("atvvModel", atvvRememberedInteractionModel);
+  preferences.putBool("atvvNo16k", atvvAvoid16kForPeer);
   preferences.putBool("clock", clockEnabled);
   preferences.putBool("ntp", clockUseInternetTime);
   preferences.putUChar("wakeMode", wakeMode);
@@ -7728,8 +7769,18 @@ void atvvChooseStreamFormat() {
   // as a correctly negotiated 16kHz format whose every notify still failed
   // with BLE_HS_ENOMEM. 8kHz at 4000 bytes/second fits either way.
   bool dleOk = bleDataLenExtended;
+  // 16kHz is 8000 bytes a second. A slow connection interval cannot drain that
+  // whatever the MTU says, and the symptom is not a clean failure - it is
+  // every notification refused with BLE_HS_ENOMEM while the negotiated format
+  // looks perfect in the log. 0 means the peer has not reported an interval;
+  // that is treated as acceptable rather than blocking 16kHz on silence.
+  float intervalMs = bleConnIntervalUnits * 1.25f;
+  bool intervalOk = bleConnIntervalUnits == 0 || intervalMs <= 30.0f;
+  // A peer that has already failed to carry 16kHz is not asked to try again.
+  bool peerCarries16k = !atvvAvoid16kForPeer;
 
-  if (hostWants16k && mtuFits && dleOk && atvvHostSpecVersion >= 0x0100) {
+  if (hostWants16k && mtuFits && dleOk && intervalOk && peerCarries16k &&
+      atvvHostSpecVersion >= 0x0100) {
     atvvActiveCodec = ATVV_CODEC_ADPCM_16KHZ;
     atvvFrameBytes = ATVV_FRAME_BYTES_16K;
     atvvFrameIntervalMs = ATVV_FRAME_INTERVAL_16K_MS;
@@ -7763,13 +7814,15 @@ void atvvChooseStreamFormat() {
   atvvFormatUsable = atvvFrameIntervalMs >= 10;
 
   Serial.printf("ATVV format: %s, %u byte frames every %ums = %u notif/s "
-                "(host codecs=0x%04X, MTU=%u%s%s)\n",
+                "(host codecs=0x%04X, MTU=%u, interval=%.2fms%s%s)\n",
                 atvvActiveCodec == ATVV_CODEC_ADPCM_16KHZ ? "ADPCM 16kHz" : "ADPCM 8kHz",
                 (unsigned)atvvFrameBytes, (unsigned)atvvFrameIntervalMs,
                 (unsigned)(1000U / (atvvFrameIntervalMs ? atvvFrameIntervalMs : 1)),
-                atvvHostCodecs, (unsigned)mtu,
+                atvvHostCodecs, (unsigned)mtu, intervalMs,
                 (hostWants16k && !mtuFits) ? " - 16kHz declined, MTU too small"
-                  : ((hostWants16k && !dleOk) ? " - 16kHz declined, no data length extension" : ""),
+                  : ((hostWants16k && !dleOk) ? " - 16kHz declined, no data length extension"
+                  : ((hostWants16k && !intervalOk) ? " - 16kHz declined, connection interval too slow"
+                  : ((hostWants16k && !peerCarries16k) ? " - 16kHz declined, this peer could not carry it before" : ""))),
                 atvvFormatUsable ? "" : " - UNUSABLE, MTU never negotiated");
 }
 
@@ -8185,6 +8238,21 @@ bool atvvStopAudio(uint8_t reason) {
                   (unsigned long)microphoneUnderrunCount,
                   (unsigned long)atvvFramesDroppedThisStream,
                   atvvFramesDroppedThisStream ? " - the host heard less than this claims" : "");
+    // A 16kHz stream that lost most of its frames is proof this link cannot
+    // carry 16kHz, whatever the MTU and data length negotiation claimed.
+    // Recording it means the next session starts at 8kHz and works, instead of
+    // repeating an unusable stream every time.
+    if (atvvActiveCodec == ATVV_CODEC_ADPCM_16KHZ && !atvvAvoid16kForPeer &&
+        atvvFramesDroppedThisStream > 20 &&
+        atvvFramesDroppedThisStream > (atvvAudioFrameNumber / 4)) {
+      atvvAvoid16kForPeer = true;
+      bleBondStateSavePending = true;
+      Serial.printf("ATVV: %lu of %lu frames were refused at 16kHz - this link "
+                    "cannot carry it. Falling back to 8kHz from the next "
+                    "session.\n",
+                    (unsigned long)atvvFramesDroppedThisStream,
+                    (unsigned long)atvvAudioFrameNumber);
+    }
     atvvFramesDroppedThisStream = 0;
     stopRealMicrophoneCapture();
   }
@@ -8633,6 +8701,26 @@ class OpenRemoteBleServerCallbacks : public BLEServerCallbacks {
     bleDataLenExtended = false;
     bleLinkSetupPending = true;
     bleLinkSetupAtMs = millis() + BLE_LINK_SETUP_DELAY_MS;
+  }
+
+  // The third NimBLE callback that was never implemented - onConnParamsUpdate
+  // existed only in its Bluedroid form, so the actual connection interval has
+  // never once been visible on this build. It decides how much can be put on
+  // air per event, and therefore whether a 50 frame/second stream can drain at
+  // all. Requesting a fast interval and never checking the answer is how a
+  // stream can be refused for want of buffers while everything else looks
+  // correctly negotiated.
+  void onConnParamsUpdate(uint16_t connHandle, uint16_t interval,
+                          uint16_t latency, uint16_t timeout,
+                          uint8_t status) override {
+    (void)connHandle;
+    bleConnIntervalUnits = interval;
+    bleConnLatency = latency;
+    Serial.printf("BLE HID: connection params now interval=%.2f ms latency=%u "
+                  "timeout=%u ms status=%u%s\n",
+                  interval * 1.25f, latency, timeout * 10U, status,
+                  (interval * 1.25f) > 30.0f
+                    ? "  <- too slow to drain a 50 frame/s audio stream" : "");
   }
 
   void onMtuChanged(BLEServer *server, ble_gap_conn_desc *desc,
@@ -9239,6 +9327,7 @@ void serviceForgetBluetoothPairing(unsigned long now) {
   if (bleReady) BLEDevice::stopAdvertising();
   pendingUiRefresh = settingsView == SETTINGS_BLUETOOTH;
   atvvRememberedInteractionModel = ATVV_INTERACTION_ON_REQUEST;
+  atvvAvoid16kForPeer = false;
   bleBondStateSavePending = true;
   Serial.println("BLE HID: pairing forgotten");
 }
@@ -9266,6 +9355,11 @@ void serviceBluetoothLinkSetup(unsigned long now) {
   }
   if (bleDataLenRequestPending) {
     bleDataLenRequestPending = false;
+    // Ask for the voice interval now rather than when the button is pressed.
+    // By capabilities time the peer has usually answered, so the format can be
+    // chosen against the interval we actually got instead of the one we hoped
+    // for.
+    requestBluetoothConnectionProfileMode(BLE_PROFILE_VOICE);
     // 251 octets is the LL maximum; 2120us is its air time on the 1M PHY.
     int rc = ble_gap_set_data_len(bleConnHandle, 251, 2120);
     bleDataLenExtended = (rc == 0);
