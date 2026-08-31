@@ -1,6 +1,51 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.48 - 2026-08-31
+    - Found why pairing still failed once 3.47 kept the remote awake for it.
+      With the radio finally staying up, the TV got all the way through and the
+      real error surfaced:
+        E NimBLE: ble_store_config_write_rpa_rec rc=27
+        BLE HID: pairing complete
+        BLE HID/ATVV: host disconnected
+      rc=27 is BLE_HS_ESTORE_CAP - the bond could not be persisted, so the TV
+      dropped the link immediately after pairing appeared to succeed.
+    - The contradiction in that log is the clue: the same run reported "0
+      bond(s) stored before pairing". ble_store_clear() only iterates OUR_SEC,
+      PEER_SEC and CCCD. It never touches BLE_STORE_OBJ_TYPE_PEER_ADDR, the RPA
+      records - and those still occupy bond capacity. So every Forget pairing
+      left its RPA record behind, the array filled after enough cycles, and the
+      bond count kept reading zero because it only ever counted PEER_SEC.
+      Forget pairing was quietly making the problem worse, since the function it
+      called is precisely the one that skips these records.
+    - clearBluetoothStoreRecords() now empties all four types through
+      ble_store_util_delete_all() and logs before/after counts per type, so the
+      store's real state is visible instead of inferred. Both Forget pairing and
+      the pre-pairing capacity check use it.
+    - The pre-pairing check is no longer "bonds >= 3". bluetoothStoreAtCapacity()
+      tests PEER_SEC and the RPA records, because it was the RPA array
+      overflowing that actually blocked new bonds.
+    - Pairing progress overlay, in the style of the voice overlay. Full-screen
+      overlay on lv_layer_top() with a breathing ring and a Bluetooth glyph that
+      carries the state in its colour: blue advertising, amber connecting (and
+      breathing faster), green tick on success, red cross on failure with the
+      reason spelled out - no device responded, keys rejected, TV disconnected
+      early, or the radio would not start. Success holds the green tick for
+      1.6s then returns to the menu; a failure clears after 6s or on a tap, and
+      tapping while it is advertising cancels pairing rather than leaving a
+      three minute overlay with no way past it.
+    - The BLE callbacks that drive it run on the NimBLE host task, so they only
+      publish a requested state and a reason enum through two volatile bytes.
+      serviceBlePairingOverlay(), on the LVGL task, owns every widget. No
+      lv_obj_t is touched from the host task - that cross-task shortcut is what
+      corrupted the heap in 3.44.
+    - Sleep is now held off entirely while the Bluetooth settings page is open,
+      as requested: the display keeps the QR page's long timeout instead of the
+      user's normal short one, and light and deep sleep both defer.
+    - lv_conf.h enables LV_FONT_MONTSERRAT_48 for the overlay's glyph and tick.
+      The built-in Montserrat faces carry the FontAwesome symbol range, so
+      LV_SYMBOL_BLUETOOTH, LV_SYMBOL_OK and LV_SYMBOL_CLOSE come with it.
+
   3.47 - 2026-08-31
     - Fixes pairing never completing on either the oval Chromecast or the
       Google TV box. Nothing to do with the bond store, the WebConfig teardown
@@ -3501,7 +3546,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.47"
+#define OPENREMOTE_VERSION_STRING "3.48"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -4999,6 +5044,44 @@ int16_t splitDiagnosticLastY = INT16_MIN;
 lv_obj_t *deviceModal = nullptr;
 lv_obj_t *espNowDevicesModal = nullptr;
 lv_obj_t *brightnessOverlay = nullptr;
+// Pairing progress overlay.
+//
+// Split deliberately across two owners. The BLE callbacks below run on the
+// NimBLE host task, not the LVGL task, so they must never touch an lv_obj_t -
+// that is the same cross-task mistake that corrupted the heap in 3.44. They
+// only ever publish a requested state here; serviceBlePairingOverlay(), which
+// runs from loop() on the LVGL task, is the sole owner of every widget.
+//
+// The reason is an enum rather than a string so there is nothing to tear
+// between the two tasks; the UI side maps it to text.
+enum BlePairUiState : uint8_t {
+  BLE_PAIR_UI_OFF = 0,
+  BLE_PAIR_UI_ADVERTISING,
+  BLE_PAIR_UI_CONNECTING,
+  BLE_PAIR_UI_SUCCESS,
+  BLE_PAIR_UI_FAILED,
+};
+
+enum BlePairFailReason : uint8_t {
+  BLE_PAIR_FAIL_NONE = 0,
+  BLE_PAIR_FAIL_TIMEOUT,
+  BLE_PAIR_FAIL_AUTH,
+  BLE_PAIR_FAIL_LINK_LOST,
+  BLE_PAIR_FAIL_STACK,
+  BLE_PAIR_FAIL_CANCELLED,
+};
+
+volatile uint8_t blePairUiRequest = BLE_PAIR_UI_OFF;
+volatile uint8_t blePairUiFailReason = BLE_PAIR_FAIL_NONE;
+
+lv_obj_t *blePairOverlay = nullptr;
+lv_obj_t *blePairPulse = nullptr;
+lv_obj_t *blePairGlyph = nullptr;
+lv_obj_t *blePairTitle = nullptr;
+lv_obj_t *blePairHint = nullptr;
+uint8_t blePairUiState = BLE_PAIR_UI_OFF;
+unsigned long blePairUiStateSinceMs = 0;
+
 lv_obj_t *physicalVoiceOverlay = nullptr;
 lv_obj_t *physicalVoicePulse = nullptr;
 bool physicalVoiceOverlayVisible = false;
@@ -5178,6 +5261,8 @@ void bindPageUi(uint8_t index);
 void requestPageStripRebuild();
 void createPhysicalVoiceOverlay();
 void servicePhysicalVoiceOverlay();
+void serviceBlePairingOverlay(unsigned long now);
+void requestBlePairingOverlay(BlePairUiState state, BlePairFailReason reason);
 void showPhysicalVoiceOverlay();
 void hidePhysicalVoiceOverlay();
 void activateActivity(uint8_t index);
@@ -8093,6 +8178,11 @@ class OpenRemoteBleServerCallbacks : public BLEServerCallbacks {
     atvvInteractionModel = ATVV_INTERACTION_ON_REQUEST;
     atvvCapsRequestPending = false;
     nextAtvvDebugMs = millis();
+    // Only advance the overlay if the user actually started a pairing; this
+    // callback also fires for every ordinary reconnect.
+    if (blePairUiRequest == BLE_PAIR_UI_ADVERTISING) {
+      requestBlePairingOverlay(BLE_PAIR_UI_CONNECTING, BLE_PAIR_FAIL_NONE);
+    }
     Serial.println("BLE HID/ATVV: host connected; Chromecast controls queued");
   }
 
@@ -8128,6 +8218,11 @@ class OpenRemoteBleServerCallbacks : public BLEServerCallbacks {
     bleConnProfilePending = false;
     atvvRxSubscribed = false;
     atvvCtlSubscribed = false;
+    // Losing the link while the overlay still says CONNECTING means bonding
+    // never completed - report it rather than silently returning to the menu.
+    if (blePairUiRequest == BLE_PAIR_UI_CONNECTING) {
+      requestBlePairingOverlay(BLE_PAIR_UI_FAILED, BLE_PAIR_FAIL_LINK_LOST);
+    }
     pendingUiRefresh = settingsView == SETTINGS_BLUETOOTH;
     if (!bleShutdownInProgress && !bleSuspended &&
         (blePairingMode || bluetoothRuntimeRequired())) advertiseBluetoothHid();
@@ -8150,6 +8245,11 @@ class OpenRemoteBleSecurityCallbacks : public BLESecurityCallbacks {
       bleDeviceProvisionPending = true;
     }
     bleBondStateSavePending = true;
+    if (blePairUiRequest == BLE_PAIR_UI_ADVERTISING ||
+        blePairUiRequest == BLE_PAIR_UI_CONNECTING) {
+      requestBlePairingOverlay(result.success ? BLE_PAIR_UI_SUCCESS : BLE_PAIR_UI_FAILED,
+                               result.success ? BLE_PAIR_FAIL_NONE : BLE_PAIR_FAIL_AUTH);
+    }
     pendingUiRefresh = settingsView == SETTINGS_BLUETOOTH;
     Serial.printf("BLE HID: pairing %s\n", result.success ? "complete" : "failed");
   }
@@ -8162,6 +8262,11 @@ class OpenRemoteBleSecurityCallbacks : public BLESecurityCallbacks {
       bleDeviceProvisionPending = true;
     }
     bleBondStateSavePending = true;
+    if (blePairUiRequest == BLE_PAIR_UI_ADVERTISING ||
+        blePairUiRequest == BLE_PAIR_UI_CONNECTING) {
+      requestBlePairingOverlay(bleBonded ? BLE_PAIR_UI_SUCCESS : BLE_PAIR_UI_FAILED,
+                               bleBonded ? BLE_PAIR_FAIL_NONE : BLE_PAIR_FAIL_AUTH);
+    }
     pendingUiRefresh = settingsView == SETTINGS_BLUETOOTH;
     Serial.printf("BLE HID: pairing %s\n", bleBonded ? "complete" : "failed");
   }
@@ -8319,6 +8424,12 @@ bool bluetoothActivitySessionRequired() {
 // sleep) / movement wake / advertising for pairing" over and over. Bounded by
 // blePairingUntilMs (3 minutes), so this can only hold sleep off briefly, and
 // bleConnected ends it as soon as the link is up.
+// The Bluetooth settings page holds off sleep entirely, at the user's request.
+bool bluetoothSettingsPageActive() {
+  return pages[currentPage].kind == PAGE_REMOTE_SETTINGS &&
+         settingsView == SETTINGS_BLUETOOTH;
+}
+
 bool bluetoothPairingWindowOpen() {
   return blePairingMode && !bleConnected &&
          (int32_t)(millis() - blePairingUntilMs) < 0;
@@ -8436,6 +8547,59 @@ int bluetoothStoredBondCount() {
 #endif
 }
 
+#if defined(CONFIG_NIMBLE_ENABLED)
+// Empties every bond-related record type, not just the three ble_store_clear()
+// walks.
+//
+// ble_store_clear() iterates OUR_SEC, PEER_SEC and CCCD only. It leaves the RPA
+// records (BLE_STORE_OBJ_TYPE_PEER_ADDR) in place, and those still occupy bond
+// capacity. After enough pair/forget cycles the array fills, and the next
+// pairing fails inside the host with
+//   ble_store_config_write_rpa_rec rc=27   (BLE_HS_ESTORE_CAP)
+// The bond is never persisted, the TV drops the link straight after "pairing
+// complete", and pairing is stuck for good - while the remote cheerfully
+// reports "0 bond(s) stored before pairing", because that count only ever
+// looked at PEER_SEC. Forget pairing could not help either: it called
+// ble_store_clear(), which is exactly the function that skips these.
+//
+// Counts are logged per type so the state is visible rather than assumed.
+int clearBluetoothStoreRecords(const char *reason) {
+  static const int kTypes[] = {
+    BLE_STORE_OBJ_TYPE_OUR_SEC,
+    BLE_STORE_OBJ_TYPE_PEER_SEC,
+    BLE_STORE_OBJ_TYPE_CCCD,
+    BLE_STORE_OBJ_TYPE_PEER_ADDR,
+  };
+  static const char *kNames[] = { "our_sec", "peer_sec", "cccd", "peer_addr/rpa" };
+  union ble_store_key key;
+  memset(&key, 0, sizeof key);
+  int worstRc = 0;
+  for (unsigned i = 0; i < sizeof(kTypes) / sizeof(kTypes[0]); i++) {
+    int before = 0;
+    int after = 0;
+    ble_store_util_count(kTypes[i], &before);
+    int rc = ble_store_util_delete_all(kTypes[i], &key);
+    ble_store_util_count(kTypes[i], &after);
+    if (before || after || rc) {
+      Serial.printf("BLE HID: %s store %s: %d -> %d (rc=%d)\n",
+                    reason, kNames[i], before, after, rc);
+    }
+    if (rc != 0) worstRc = rc;
+  }
+  return worstRc;
+}
+
+// True when any record type is at the bond ceiling, so a new pairing could not
+// be persisted even though PEER_SEC alone may look empty.
+bool bluetoothStoreAtCapacity() {
+  int peerSec = 0;
+  int rpa = 0;
+  ble_store_util_count(BLE_STORE_OBJ_TYPE_PEER_SEC, &peerSec);
+  ble_store_util_count(BLE_STORE_OBJ_TYPE_PEER_ADDR, &rpa);
+  return peerSec >= 3 || rpa >= 3;
+}
+#endif
+
 void startBluetoothPairing() {
   /*
     Make room before advertising, rather than discovering there is none
@@ -8457,9 +8621,12 @@ void startBluetoothPairing() {
     Serial.printf("BLE HID: %d bond(s) stored before pairing (max %d)\n",
                   bonds, 3);
 #if defined(CONFIG_NIMBLE_ENABLED)
-    if (bonds >= 3) {
-      int rc = ble_store_clear();
-      Serial.printf("BLE HID: bond store was full - cleared to make room (rc=%d)\n", rc);
+    // Deliberately not "bonds >= 3" alone. The RPA records fill independently
+    // of PEER_SEC, and it is the RPA array overflowing that actually blocks a
+    // new bond - the failure looked like "0 bond(s) stored" followed by
+    // ble_store_config_write_rpa_rec rc=27.
+    if (bluetoothStoreAtCapacity()) {
+      clearBluetoothStoreRecords("full -");
       bleBonded = false;
       bleBondStateSavePending = true;
     }
@@ -8470,7 +8637,16 @@ void startBluetoothPairing() {
   bleKeepAliveUntilMs = millis() + BLE_PAIRING_WINDOW_MS;
   blePairingUntilMs = millis() + BLE_PAIRING_WINDOW_MS;
   saveSettings();
+  requestBlePairingOverlay(BLE_PAIR_UI_ADVERTISING, BLE_PAIR_FAIL_NONE);
   applyBluetoothState();
+  // applyBluetoothState() reports an init failure to serial and returns, which
+  // used to leave the user watching a pairing screen that was never going to
+  // do anything.
+  if (!bleReady) {
+    requestBlePairingOverlay(BLE_PAIR_UI_FAILED, BLE_PAIR_FAIL_STACK);
+    pendingUiRefresh = settingsView == SETTINGS_BLUETOOTH;
+    return;
+  }
   advertiseBluetoothHid();
   pendingUiRefresh = settingsView == SETTINGS_BLUETOOTH;
 }
@@ -8528,7 +8704,9 @@ void serviceForgetBluetoothPairing(unsigned long now) {
   bool cleared = false;
   if (bleReady) {
 #if defined(CONFIG_NIMBLE_ENABLED)
-    int rc = ble_store_clear();
+    // Not ble_store_clear(): it skips the RPA records, so repeatedly using
+    // Forget was itself filling the store that pairing later needed.
+    int rc = clearBluetoothStoreRecords("forget -");
     cleared = (rc == 0);
     Serial.printf("BLE HID: bond store cleared through NimBLE (rc=%d)\n", rc);
 #elif defined(CONFIG_BLUEDROID_ENABLED)
@@ -8612,6 +8790,9 @@ void serviceBluetooth(unsigned long now) {
   if (!blePairingMode || bleConnected || (int32_t)(now - blePairingUntilMs) < 0) return;
   blePairingMode = false;
   if (!bleBonded && bleReady) BLEDevice::stopAdvertising();
+  if (blePairUiRequest == BLE_PAIR_UI_ADVERTISING) {
+    requestBlePairingOverlay(BLE_PAIR_UI_FAILED, BLE_PAIR_FAIL_TIMEOUT);
+  }
   pendingUiRefresh = settingsView == SETTINGS_BLUETOOTH;
   Serial.println("BLE HID: pairing window expired");
 }
@@ -16548,6 +16729,192 @@ void servicePhysicalVoiceOverlay() {
   physicalVoicePulseAnimation(physicalVoicePulse, pulseSize);
 }
 
+// Publishes a requested overlay state. Safe from either task: it writes two
+// volatile bytes and nothing else. Callers on the BLE host task rely on that.
+void requestBlePairingOverlay(BlePairUiState state, BlePairFailReason reason) {
+  if (state == BLE_PAIR_UI_FAILED) blePairUiFailReason = (uint8_t)reason;
+  blePairUiRequest = (uint8_t)state;
+}
+
+const char *blePairFailText(uint8_t reason) {
+  switch (reason) {
+    case BLE_PAIR_FAIL_TIMEOUT:   return "No device responded in 3 minutes";
+    case BLE_PAIR_FAIL_AUTH:      return "The TV rejected the pairing keys";
+    case BLE_PAIR_FAIL_LINK_LOST: return "The TV disconnected before pairing finished";
+    case BLE_PAIR_FAIL_STACK:     return "The Bluetooth radio could not start";
+    case BLE_PAIR_FAIL_CANCELLED: return "Cancelled";
+    default:                      return "Unknown error";
+  }
+}
+
+lv_color_t blePairStateColour(uint8_t state) {
+  switch (state) {
+    case BLE_PAIR_UI_ADVERTISING: return lvRgb(45, 143, 255);   // blue: waiting
+    case BLE_PAIR_UI_CONNECTING:  return lvRgb(255, 176, 32);   // amber: working
+    case BLE_PAIR_UI_SUCCESS:     return lvRgb(48, 209, 88);    // green: bonded
+    case BLE_PAIR_UI_FAILED:      return lvRgb(255, 69, 58);    // red: failed
+    default:                      return lvRgb(45, 143, 255);
+  }
+}
+
+// Tapping the overlay cancels a pairing attempt, or dismisses a finished one.
+// Without this a three minute advertising window would sit over the menu with
+// no way past it.
+void blePairOverlayClicked(lv_event_t *e) {
+  (void)e;
+  if (blePairUiState == BLE_PAIR_UI_ADVERTISING ||
+      blePairUiState == BLE_PAIR_UI_CONNECTING) {
+    blePairingMode = false;
+    if (bleReady && !bleConnected) BLEDevice::stopAdvertising();
+    Serial.println("BLE HID: pairing cancelled from the overlay");
+    pendingUiRefresh = settingsView == SETTINGS_BLUETOOTH;
+  }
+  requestBlePairingOverlay(BLE_PAIR_UI_OFF, BLE_PAIR_FAIL_NONE);
+}
+
+void createBlePairingOverlay() {
+  if (blePairOverlay) return;
+
+  blePairOverlay = lv_obj_create(lv_layer_top());
+  lv_obj_set_pos(blePairOverlay, 0, 0);
+  lv_obj_set_size(blePairOverlay, LCD_W, LCD_H);
+  lv_obj_clear_flag(blePairOverlay, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(blePairOverlay, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_style_bg_color(blePairOverlay, lv_color_black(), 0);
+  lv_obj_set_style_bg_opa(blePairOverlay, LV_OPA_80, 0);
+  lv_obj_set_style_border_width(blePairOverlay, 0, 0);
+  lv_obj_set_style_radius(blePairOverlay, 0, 0);
+  lv_obj_set_style_pad_all(blePairOverlay, 0, 0);
+  lv_obj_add_event_cb(blePairOverlay, blePairOverlayClicked, LV_EVENT_CLICKED, nullptr);
+
+  blePairPulse = lv_obj_create(blePairOverlay);
+  lv_obj_set_size(blePairPulse, 88, 88);
+  lv_obj_align(blePairPulse, LV_ALIGN_CENTER, 0, -16);
+  lv_obj_clear_flag(blePairPulse, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(blePairPulse, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_style_bg_opa(blePairPulse, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_color(blePairPulse, lvRgb(45, 143, 255), 0);
+  lv_obj_set_style_border_width(blePairPulse, 4, 0);
+  lv_obj_set_style_border_opa(blePairPulse, LV_OPA_80, 0);
+  lv_obj_set_style_radius(blePairPulse, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_pad_all(blePairPulse, 0, 0);
+
+  blePairGlyph = makeLabel(blePairOverlay, LV_SYMBOL_BLUETOOTH, 0, 0,
+                           &lv_font_montserrat_48, lvRgb(45, 143, 255));
+  lv_obj_align(blePairGlyph, LV_ALIGN_CENTER, 0, -16);
+
+  blePairTitle = makeLabel(blePairOverlay, "PAIRING", 0, 0,
+                           &lv_font_montserrat_20, textPrimary());
+  lv_obj_align(blePairTitle, LV_ALIGN_CENTER, 0, 78);
+
+  blePairHint = makeLabel(blePairOverlay, "Select OpenRemote on your TV", 0, 0,
+                          &lv_font_montserrat_10, lvRgb(135, 195, 255));
+  lv_obj_align(blePairHint, LV_ALIGN_CENTER, 0, 105);
+  lv_label_set_long_mode(blePairHint, LV_LABEL_LONG_WRAP);
+  lv_obj_set_width(blePairHint, LCD_W - 40);
+  lv_obj_set_style_text_align(blePairHint, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_align(blePairHint, LV_ALIGN_CENTER, 0, 105);
+
+  lv_obj_add_flag(blePairOverlay, LV_OBJ_FLAG_HIDDEN);
+}
+
+// Applies a state change once, rather than restyling on every frame.
+void applyBlePairingOverlayState(uint8_t state) {
+  createBlePairingOverlay();
+  if (!blePairOverlay) return;
+
+  lv_color_t colour = blePairStateColour(state);
+  lv_obj_set_style_border_color(blePairPulse, colour, 0);
+  lv_obj_set_style_text_color(blePairGlyph, colour, 0);
+
+  switch (state) {
+    case BLE_PAIR_UI_ADVERTISING:
+      lv_label_set_text(blePairGlyph, LV_SYMBOL_BLUETOOTH);
+      lv_label_set_text(blePairTitle, "PAIRING");
+      lv_label_set_text(blePairHint, "Select OpenRemote on your TV\nTap to cancel");
+      break;
+    case BLE_PAIR_UI_CONNECTING:
+      lv_label_set_text(blePairGlyph, LV_SYMBOL_BLUETOOTH);
+      lv_label_set_text(blePairTitle, "CONNECTING");
+      lv_label_set_text(blePairHint, "Exchanging keys with the TV");
+      break;
+    case BLE_PAIR_UI_SUCCESS:
+      lv_label_set_text(blePairGlyph, LV_SYMBOL_OK);
+      lv_label_set_text(blePairTitle, "PAIRED");
+      lv_label_set_text(blePairHint, "Ready to use");
+      break;
+    case BLE_PAIR_UI_FAILED:
+      lv_label_set_text(blePairGlyph, LV_SYMBOL_CLOSE);
+      lv_label_set_text(blePairTitle, "PAIRING FAILED");
+      lv_label_set_text(blePairHint, blePairFailText(blePairUiFailReason));
+      break;
+    default: break;
+  }
+  lv_obj_align(blePairHint, LV_ALIGN_CENTER, 0, 105);
+
+  if (state == BLE_PAIR_UI_OFF) {
+    lv_obj_add_flag(blePairOverlay, LV_OBJ_FLAG_HIDDEN);
+  } else {
+    lv_obj_clear_flag(blePairOverlay, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(blePairOverlay);
+  }
+}
+
+void serviceBlePairingOverlay(unsigned long now) {
+  uint8_t requested = blePairUiRequest;
+
+  if (requested != blePairUiState) {
+    blePairUiState = requested;
+    blePairUiStateSinceMs = now;
+    applyBlePairingOverlayState(requested);
+  }
+  if (blePairUiState == BLE_PAIR_UI_OFF || !blePairOverlay) return;
+
+  unsigned long held = now - blePairUiStateSinceMs;
+
+  switch (blePairUiState) {
+    case BLE_PAIR_UI_ADVERTISING:
+    case BLE_PAIR_UI_CONNECTING: {
+      // Same breathing ring as the voice overlay, so the two read as one
+      // family. Connecting breathes faster to show it has moved on.
+      uint16_t divisor = blePairUiState == BLE_PAIR_UI_CONNECTING ? 4U : 6U;
+      uint16_t phase = (now / divisor) % 140U;
+      int32_t size = phase <= 70U ? 88 + phase : 158 - (phase - 70U);
+      lv_obj_set_size(blePairPulse, size, size);
+      lv_obj_align(blePairPulse, LV_ALIGN_CENTER, 0, -16);
+      lv_obj_set_style_border_opa(
+        blePairPulse, static_cast<lv_opa_t>(LV_OPA_80 - ((size - 88) * 56 / 70)), 0);
+      break;
+    }
+    case BLE_PAIR_UI_SUCCESS: {
+      // The tick rings outward once and settles, then hands the screen back.
+      int32_t size = held < 360UL ? 88 + (int32_t)(held * 70UL / 360UL) : 158;
+      lv_obj_set_size(blePairPulse, size, size);
+      lv_obj_align(blePairPulse, LV_ALIGN_CENTER, 0, -16);
+      lv_obj_set_style_border_opa(
+        blePairPulse,
+        static_cast<lv_opa_t>(held < 360UL ? LV_OPA_COVER : LV_OPA_60), 0);
+      if (held > 1600UL) {
+        requestBlePairingOverlay(BLE_PAIR_UI_OFF, BLE_PAIR_FAIL_NONE);
+        pendingUiRefresh = settingsView == SETTINGS_BLUETOOTH;
+      }
+      break;
+    }
+    case BLE_PAIR_UI_FAILED: {
+      lv_obj_set_size(blePairPulse, 128, 128);
+      lv_obj_align(blePairPulse, LV_ALIGN_CENTER, 0, -16);
+      lv_obj_set_style_border_opa(blePairPulse, LV_OPA_60, 0);
+      // Long enough to read the reason, and tappable to dismiss sooner.
+      if (held > 6000UL) {
+        requestBlePairingOverlay(BLE_PAIR_UI_OFF, BLE_PAIR_FAIL_NONE);
+        pendingUiRefresh = settingsView == SETTINGS_BLUETOOTH;
+      }
+      break;
+    }
+    default: break;
+  }
+}
+
 void clearModalObjects() {
   if (deviceModal) {
     lv_obj_del(deviceModal);
@@ -21448,7 +21815,8 @@ bool enterDeepPowerSleep(bool allowQrPage) {
   if (!lis3dhReady || !raiseToWake ||
       (webConfigQrPageActive() && !allowQrPage) ||
       webConfigTransferActive || usbSdTransferActive() || usbStudioLinkActive() || ntpSyncPending ||
-      bluetoothActivitySessionRequired() || bluetoothPairingWindowOpen()) {
+      bluetoothActivitySessionRequired() || bluetoothPairingWindowOpen() ||
+      bluetoothSettingsPageActive()) {
     Serial.printf(
       "Deep sleep deferred: accelerometer=%s raise=%s qr=%s transfer=%s usb=%s ntp=%s ble=%s pairing=%s\n",
       lis3dhReady ? "ready" : "missing", raiseToWake ? "on" : "off",
@@ -21660,10 +22028,13 @@ void enterLowPowerWait() {
       bluetoothActivitySessionRequired()) return;
   // The display may sleep during pairing - that costs nothing - but the radio
   // may not, and this path suspends it below.
-  if (bluetoothPairingWindowOpen()) {
+  if (bluetoothPairingWindowOpen() || bluetoothSettingsPageActive()) {
     if (!blePairingSleepHeld) {
       blePairingSleepHeld = true;
-      Serial.println("Light sleep held off: pairing window open, staying advertised");
+      Serial.printf("Light sleep held off: %s\n",
+                    bluetoothPairingWindowOpen()
+                      ? "pairing window open, staying advertised"
+                      : "Bluetooth menu open");
     }
     return;
   }
@@ -22349,6 +22720,7 @@ void loop() {
     now = millis();
   }
   servicePhysicalVoiceOverlay();
+  serviceBlePairingOverlay(millis());
   serviceAtvvDebug(now);
   if (!displaySleeping) {
     serviceDebugOverlay(now);
@@ -22604,12 +22976,16 @@ void loop() {
 
   bool qrPageActive = pages[currentPage].kind == PAGE_REMOTE_SETTINGS &&
                       settingsView == SETTINGS_WIFI_QR;
+  // Same treatment for the Bluetooth page. Pairing is a two-handed job - the
+  // user is looking at the TV, not the remote - and the screen going dark
+  // there previously took the radio down with it.
   // The QR page ignores the user's normal (usually short) screen timeout -
   // it should stay lit for as long as the user is looking at it, only
   // sleeping after a flat 30 minutes of inactivity, not whatever brief
   // timeout is configured for everyday remote use.
-  uint32_t activeSleepMs = qrPageActive ? QR_PAGE_AWAKE_TIMEOUT_MS
-                                        : (uint32_t)timeoutSeconds * 1000UL;
+  uint32_t activeSleepMs = (qrPageActive || bluetoothSettingsPageActive())
+                             ? QR_PAGE_AWAKE_TIMEOUT_MS
+                             : (uint32_t)timeoutSeconds * 1000UL;
   if (!activitySequenceActive && !usbSdTransferActive() && !usbStudioLinkActive() &&
       (uint32_t)(now - lastWakeMs) > activeSleepMs) {
     enterDisplaySleep();

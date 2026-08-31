@@ -43,6 +43,10 @@
 #define LV_FONT_MONTSERRAT_20 1
 #define LV_FONT_MONTSERRAT_22 1
 #define LV_FONT_MONTSERRAT_24 1
+// 48 is the hero glyph size for the pairing overlay's Bluetooth rune and
+// its success tick. The built-in Montserrat faces carry the FontAwesome
+// symbol range, so LV_SYMBOL_BLUETOOTH and LV_SYMBOL_OK come with it.
+#define LV_FONT_MONTSERRAT_48 1
 #define LV_FONT_DEFAULT &lv_font_montserrat_14
 
 #endif
