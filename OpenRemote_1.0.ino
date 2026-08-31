@@ -1,6 +1,32 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.49 - 2026-08-31
+    - Fixes voice being dead after a reconnect on the oval Chromecast while the
+      Google TV box was fine. Same firmware, same reconnect, different hosts -
+      and the difference is which of the two ATVV interaction models is in
+      force.
+    - The models are not interchangeable at the microphone. Under hold-to-talk
+      the remote starts the audio stream itself. Under on-request it sends
+      START_SEARCH and then waits for the host to send MIC_OPEN before any audio
+      moves at all.
+    - onConnect() reset atvvInteractionModel to on-request on *every*
+      connection, and only an incoming GET_CAPS could put it back. A host that
+      skips GET_CAPS on a warm reconnect - already bonded, already knows our
+      capabilities - therefore left the remote sitting in on-request waiting for
+      a MIC_OPEN that was never coming. Buttons carried on working because they
+      are plain HID, which is exactly how it presented: reconnects fine, no
+      audio. Note atvvHostCodecs was never reset this way; the model was the odd
+      one out.
+    - The negotiated model is now remembered across reconnects and reboots
+      (preferences key atvvModel) and restored on connect instead of being
+      downgraded. An incoming GET_CAPS still overwrites it, so the host always
+      wins when it does speak. Forgetting the pairing forgets the model too.
+    - The connect line now names the model in force, and the MIC_OPEN timeout
+      says both the model and whether the host sent GET_CAPS on this connection
+      - so "timed out waiting for MIC_OPEN (model=on-request, host has NOT sent
+      GET_CAPS this connection)" identifies this failure on sight.
+
   3.48 - 2026-08-31
     - Found why pairing still failed once 3.47 kept the remote awake for it.
       With the radio finally staying up, the TV got all the way through and the
@@ -3546,7 +3572,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.48"
+#define OPENREMOTE_VERSION_STRING "3.49"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -4955,12 +4981,31 @@ volatile bool atvvMicOpenPending = false;
 volatile bool atvvMicClosePending = false;
 volatile uint8_t atvvMicCloseStreamId = 0xFF;
 volatile bool atvvCapsRequestPending = false;
+// Whether the host asked for our capabilities on *this* connection. A warm
+// reconnect that skips GET_CAPS is the case that used to silently downgrade
+// the interaction model, so it is worth stating outright in the log.
+volatile bool atvvCapsSeenThisConnection = false;
 volatile uint16_t atvvHostSpecVersion = 0x0004;
 volatile uint8_t atvvHostInteractionModels = ATVV_INTERACTION_ON_REQUEST;
 volatile uint16_t atvvHostCodecs = 0;   // GET_CAPS bytes 3-4, logged verbatim
 volatile bool atvvAudioStarted = false;
 bool atvvVoiceReleasePending = false;
 uint8_t atvvInteractionModel = ATVV_INTERACTION_ON_REQUEST;
+// The last interaction model the host actually negotiated with us, kept across
+// reconnects and reboots.
+//
+// The two models behave completely differently at the microphone. Under
+// hold-to-talk the remote starts the stream itself; under on-request it sends
+// START_SEARCH and then waits for the host to send MIC_OPEN before any audio
+// moves. onConnect() used to reset this to on-request on *every* connection,
+// and only a GET_CAPS from the host could put it back. A host that skips
+// GET_CAPS on a warm reconnect - it is already bonded and knows our
+// capabilities - therefore left the remote waiting for a MIC_OPEN that was
+// never coming. Buttons kept working throughout, because they are plain HID,
+// which is exactly how it was reported: reconnects fine, no audio.
+// (Note that atvvHostCodecs was never reset this way; the model was the odd
+// one out.)
+uint8_t atvvRememberedInteractionModel = ATVV_INTERACTION_ON_REQUEST;
 uint8_t atvvStreamId = 0;
 uint8_t atvvNextStreamId = 1;
 volatile uint32_t atvvAudioFrameNumber = 0;
@@ -6970,6 +7015,8 @@ void loadSettings() {
   wifiOn = preferences.getBool("wifi", true);
   bluetoothOn = preferences.getBool("ble", true);
   bleBonded = preferences.getBool("bleBonded", false);
+  atvvRememberedInteractionModel =
+    preferences.getUChar("atvvModel", ATVV_INTERACTION_ON_REQUEST);
   clockEnabled = preferences.getBool("clock", true);
   clockUseInternetTime = preferences.getBool("ntp", true);
   wakeMode = constrain((int)preferences.getUChar("wakeMode", WAKE_MODE_MOTION),
@@ -7104,6 +7151,7 @@ void saveSettings() {
   preferences.putBool("wifi", wifiOn);
   preferences.putBool("ble", bluetoothOn);
   preferences.putBool("bleBonded", (bool)bleBonded);
+  preferences.putUChar("atvvModel", atvvRememberedInteractionModel);
   preferences.putBool("clock", clockEnabled);
   preferences.putBool("ntp", clockUseInternetTime);
   preferences.putUChar("wakeMode", wakeMode);
@@ -7522,6 +7570,10 @@ bool atvvSendCapabilities() {
   };
   if (!atvvNotifyControlPacket(packet, sizeof(packet))) return false;
   atvvInteractionModel = model;
+  if (atvvRememberedInteractionModel != model) {
+    atvvRememberedInteractionModel = model;
+    bleBondStateSavePending = true;
+  }
   Serial.printf("ATVV capabilities: version=%u.%u model=%s codec=0x%02X frame=%u\n",
                 version >> 8, version & 0xFF,
                 model == ATVV_INTERACTION_HOLD_TO_TALK ? "hold-to-talk" : "on-request",
@@ -8027,6 +8079,7 @@ class OpenRemoteAtvvTxCallbacks : public BLECharacteristicCallbacks {
         ? (uint8_t)value[5]
         : ATVV_INTERACTION_ON_REQUEST;
       atvvCapsRequestPending = true;
+      atvvCapsSeenThisConnection = true;
       Serial.printf("ATVV HOST CAPS: version=%u.%u codecField=0x%04X models=0x%02X raw=",
                     atvvHostSpecVersion >> 8, atvvHostSpecVersion & 0xFF,
                     atvvHostCodecs, atvvHostInteractionModels);
@@ -8115,7 +8168,13 @@ void serviceAtvvVoice(unsigned long now) {
 
   if (atvvVoiceState == ATVV_VOICE_SEARCH_REQUESTED &&
       (uint32_t)(now - atvvSearchRequestedMs) >= ATVV_SEARCH_TIMEOUT_MS) {
-    Serial.println("Voice Search: timed out waiting for MIC_OPEN");
+    // Naming the model matters: this timeout is what an on-request session
+    // looks like when the host never asks for the microphone.
+    Serial.printf("Voice Search: timed out waiting for MIC_OPEN "
+                  "(model=%s, host %s sent GET_CAPS this connection)\n",
+                  atvvInteractionModel == ATVV_INTERACTION_HOLD_TO_TALK
+                    ? "hold-to-talk" : "on-request",
+                  atvvCapsSeenThisConnection ? "has" : "has NOT");
     resetAtvvVoiceSession();
   }
 }
@@ -8175,15 +8234,21 @@ class OpenRemoteBleServerCallbacks : public BLEServerCallbacks {
     bleBondStateSavePending = true;
     bleDeviceProvisionPending = true;
     pendingUiRefresh = settingsView == SETTINGS_BLUETOOTH;
-    atvvInteractionModel = ATVV_INTERACTION_ON_REQUEST;
+    // Restore what this host negotiated last time rather than assuming
+    // on-request. A GET_CAPS still overwrites it, so the host always wins when
+    // it bothers to speak.
+    atvvInteractionModel = atvvRememberedInteractionModel;
     atvvCapsRequestPending = false;
+    atvvCapsSeenThisConnection = false;
     nextAtvvDebugMs = millis();
     // Only advance the overlay if the user actually started a pairing; this
     // callback also fires for every ordinary reconnect.
     if (blePairUiRequest == BLE_PAIR_UI_ADVERTISING) {
       requestBlePairingOverlay(BLE_PAIR_UI_CONNECTING, BLE_PAIR_FAIL_NONE);
     }
-    Serial.println("BLE HID/ATVV: host connected; Chromecast controls queued");
+    Serial.printf("BLE HID/ATVV: host connected; voice model=%s (remembered)\n",
+                  atvvInteractionModel == ATVV_INTERACTION_HOLD_TO_TALK
+                    ? "hold-to-talk" : "on-request");
   }
 
 #if defined(CONFIG_BLUEDROID_ENABLED)
@@ -8772,6 +8837,8 @@ void serviceForgetBluetoothPairing(unsigned long now) {
   bleBondStateSavePending = true;
   if (bleReady) BLEDevice::stopAdvertising();
   pendingUiRefresh = settingsView == SETTINGS_BLUETOOTH;
+  atvvRememberedInteractionModel = ATVV_INTERACTION_ON_REQUEST;
+  bleBondStateSavePending = true;
   Serial.println("BLE HID: pairing forgotten");
 }
 
