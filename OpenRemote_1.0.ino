@@ -1,6 +1,26 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.56 - 2026-09-01
+    - 16kHz works. Across seven voice presses on hardware, five streams sent
+      225/174/163/158/279 frames with zero drops, at MTU 247, DLE enabled and a
+      15ms interval. This release keeps it there.
+    - Fixes the drop counter, which could report more drops than frames sent -
+      "376 of 189 frames were refused". atvvFramesDroppedThisStream was cleared
+      only where the summary printed, so a stream ending by any other path
+      carried its drops into the next one. It is now cleared where the stream
+      starts, together with the pending notify-failure count, so each stream is
+      judged on its own evidence.
+    - Fixes 3.55's fallback, which condemned the link on a single bad stream -
+      and did it on those contaminated counts, dropping a working 16kHz link to
+      8kHz permanently. A transient bad stream on reconnect means nothing, so a
+      fallback now needs three mostly-refused streams in a row, and any clean
+      stream resets the count. 16kHz is the better rate and is kept unless the
+      link genuinely cannot hold it.
+    - The counter is stored under a new key (atvv16kBad), so the flag 3.55
+      wrote from bad data is no longer read and upgrading returns straight to
+      16kHz. No Forget pairing needed.
+
   3.55 - 2026-09-01
     - 3.54 fixed the ordering and the log proves it: MTU reaches 247 before
       GET_CAPS, and capabilities now commit to codec=0x03 frame=160 - the
@@ -3744,7 +3764,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.55"
+#define OPENREMOTE_VERSION_STRING "3.56"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -5200,12 +5220,19 @@ unsigned long atvvCapsHoldUntilMs = 0;
 // reported by the peer.
 volatile uint16_t bleConnIntervalUnits = 0;
 volatile uint16_t bleConnLatency = 0;
-// Set when a 16kHz stream was refused by the controller often enough to be
-// certain the link cannot carry it, and remembered so the next session starts
-// at 8kHz instead of repeating a stream the host will never hear. 8kHz is
-// 4000 bytes a second - half the load - and is the rate that produced the
-// good recognition before 16kHz was attempted at all.
-bool atvvAvoid16kForPeer = false;
+// How many 16kHz streams in a row were mostly refused by the controller.
+//
+// A single bad stream means nothing: a reconnect can transiently settle on a
+// fast interval and recover by itself, and on hardware six of seven streams
+// were clean while the odd one out tripped a one-shot verdict and dropped a
+// working link to 8kHz for good. Only a sustained run counts, and any clean
+// stream resets it - 16kHz is the better rate and is kept unless the link
+// really cannot hold it.
+//
+// Stored under a new key so the flag written by 3.55 on contaminated counts is
+// simply not read any more, and an upgrade starts back at 16kHz.
+static const uint8_t ATVV_16K_FAILURES_BEFORE_FALLBACK = 3;
+uint8_t atvv16kConsecutiveFailures = 0;
 volatile uint32_t atvvNotifyFailures = 0;
 uint32_t atvvFramesDroppedThisStream = 0;
 volatile bool atvvRxPeerSubscribed = false;
@@ -7246,7 +7273,7 @@ void loadSettings() {
   bleBonded = preferences.getBool("bleBonded", false);
   atvvRememberedInteractionModel =
     preferences.getUChar("atvvModel", ATVV_INTERACTION_ON_REQUEST);
-  atvvAvoid16kForPeer = preferences.getBool("atvvNo16k", false);
+  atvv16kConsecutiveFailures = preferences.getUChar("atvv16kBad", 0);
   clockEnabled = preferences.getBool("clock", true);
   clockUseInternetTime = preferences.getBool("ntp", true);
   wakeMode = constrain((int)preferences.getUChar("wakeMode", WAKE_MODE_MOTION),
@@ -7382,7 +7409,7 @@ void saveSettings() {
   preferences.putBool("ble", bluetoothOn);
   preferences.putBool("bleBonded", (bool)bleBonded);
   preferences.putUChar("atvvModel", atvvRememberedInteractionModel);
-  preferences.putBool("atvvNo16k", atvvAvoid16kForPeer);
+  preferences.putUChar("atvv16kBad", atvv16kConsecutiveFailures);
   preferences.putBool("clock", clockEnabled);
   preferences.putBool("ntp", clockUseInternetTime);
   preferences.putUChar("wakeMode", wakeMode);
@@ -7777,7 +7804,8 @@ void atvvChooseStreamFormat() {
   float intervalMs = bleConnIntervalUnits * 1.25f;
   bool intervalOk = bleConnIntervalUnits == 0 || intervalMs <= 30.0f;
   // A peer that has already failed to carry 16kHz is not asked to try again.
-  bool peerCarries16k = !atvvAvoid16kForPeer;
+  bool peerCarries16k =
+    atvv16kConsecutiveFailures < ATVV_16K_FAILURES_BEFORE_FALLBACK;
 
   if (hostWants16k && mtuFits && dleOk && intervalOk && peerCarries16k &&
       atvvHostSpecVersion >= 0x0100) {
@@ -8190,6 +8218,13 @@ bool atvvStartAudio(uint8_t reason, uint8_t streamId) {
   atvvStreamId = streamId;
   microphoneUnderrunCount = 0;
   atvvAudioFrameNumber = 0;
+  // Cleared here, at the start of the stream, rather than only where the
+  // summary is printed. A stream that ended by any other path used to carry
+  // its drops into the next one, which is how a log could report "376 of 189
+  // frames refused" - more drops than frames existed - and how one bad stream
+  // condemned the link on contaminated evidence.
+  atvvFramesDroppedThisStream = 0;
+  atvvNotifyFailures = 0;
   atvvTestAudioOffset = 0;
   atvvTestAudioFinished = false;
   atvvAudioStartedMs = millis();
@@ -8238,20 +8273,32 @@ bool atvvStopAudio(uint8_t reason) {
                   (unsigned long)microphoneUnderrunCount,
                   (unsigned long)atvvFramesDroppedThisStream,
                   atvvFramesDroppedThisStream ? " - the host heard less than this claims" : "");
-    // A 16kHz stream that lost most of its frames is proof this link cannot
-    // carry 16kHz, whatever the MTU and data length negotiation claimed.
-    // Recording it means the next session starts at 8kHz and works, instead of
-    // repeating an unusable stream every time.
-    if (atvvActiveCodec == ATVV_CODEC_ADPCM_16KHZ && !atvvAvoid16kForPeer &&
-        atvvFramesDroppedThisStream > 20 &&
-        atvvFramesDroppedThisStream > (atvvAudioFrameNumber / 4)) {
-      atvvAvoid16kForPeer = true;
-      bleBondStateSavePending = true;
-      Serial.printf("ATVV: %lu of %lu frames were refused at 16kHz - this link "
-                    "cannot carry it. Falling back to 8kHz from the next "
-                    "session.\n",
-                    (unsigned long)atvvFramesDroppedThisStream,
-                    (unsigned long)atvvAudioFrameNumber);
+    if (atvvActiveCodec == ATVV_CODEC_ADPCM_16KHZ) {
+      bool streamWasBad = atvvFramesDroppedThisStream > 20 &&
+                          atvvFramesDroppedThisStream > (atvvAudioFrameNumber / 4);
+      if (streamWasBad) {
+        if (atvv16kConsecutiveFailures < 255) atvv16kConsecutiveFailures++;
+        bleBondStateSavePending = true;
+        if (atvv16kConsecutiveFailures >= ATVV_16K_FAILURES_BEFORE_FALLBACK) {
+          Serial.printf("ATVV: %u 16kHz streams in a row were mostly refused - "
+                        "this link cannot hold 16kHz. Falling back to 8kHz from "
+                        "the next session.\n",
+                        (unsigned)atvv16kConsecutiveFailures);
+        } else {
+          Serial.printf("ATVV: %lu of %lu frames refused at 16kHz (%u of %u bad "
+                        "streams in a row). Staying on 16kHz - a clean stream "
+                        "clears this.\n",
+                        (unsigned long)atvvFramesDroppedThisStream,
+                        (unsigned long)atvvAudioFrameNumber,
+                        (unsigned)atvv16kConsecutiveFailures,
+                        (unsigned)ATVV_16K_FAILURES_BEFORE_FALLBACK);
+        }
+      } else if (atvv16kConsecutiveFailures) {
+        Serial.printf("ATVV: clean 16kHz stream - clearing %u earlier "
+                      "failure(s)\n", (unsigned)atvv16kConsecutiveFailures);
+        atvv16kConsecutiveFailures = 0;
+        bleBondStateSavePending = true;
+      }
     }
     atvvFramesDroppedThisStream = 0;
     stopRealMicrophoneCapture();
@@ -9327,7 +9374,7 @@ void serviceForgetBluetoothPairing(unsigned long now) {
   if (bleReady) BLEDevice::stopAdvertising();
   pendingUiRefresh = settingsView == SETTINGS_BLUETOOTH;
   atvvRememberedInteractionModel = ATVV_INTERACTION_ON_REQUEST;
-  atvvAvoid16kForPeer = false;
+  atvv16kConsecutiveFailures = 0;
   bleBondStateSavePending = true;
   Serial.println("BLE HID: pairing forgotten");
 }
