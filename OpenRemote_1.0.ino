@@ -1,6 +1,49 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.47 - 2026-08-31
+    - Fixes pairing never completing on either the oval Chromecast or the
+      Google TV box. Nothing to do with the bond store, the WebConfig teardown
+      or either TV: the remote was falling asleep in the middle of its own
+      pairing window. Serial showed the loop plainly - "advertising for
+      pairing", "suspended (light sleep)", "movement wake", "advertising for
+      pairing" - so the TV kept losing the advertiser it was trying to bond
+      with, and each nudge of the remote restarted the attempt from scratch.
+    - Both sleep paths guarded on bluetoothActivitySessionRequired(), which
+      only reports an established BLE activity. An open pairing window is not
+      one, so pairing sailed past the guard and enterLowPowerWait() called
+      stopBluetoothRadio(), stopping the advertising the TV needed. Note that
+      bluetoothRuntimeRequired() *does* return true for blePairingMode - the
+      stack was allowed to run, it was just being suspended out from under
+      itself by a different code path.
+    - Adds bluetoothPairingWindowOpen() and guards light sleep and deep sleep
+      with it. The display is still allowed to sleep during pairing, since that
+      costs nothing and the radio is what matters. The hold is bounded by the
+      existing 3 minute blePairingUntilMs window and ends the moment
+      bleConnected goes true, so it cannot keep the remote awake indefinitely.
+    - The light sleep hold logs once per window rather than every loop, and the
+      deep sleep deferral line gained a pairing= field.
+
+  3.46 - 2026-08-31
+    - Diagnostics for pairing getting stuck with no message on screen or on
+      serial. No behaviour change; this build only makes the two silent paths
+      speak up, because both of them currently fail by doing nothing.
+    - applyBluetoothState() now reports every input to its shouldRun decision
+      when it declines to start the stack. Previously, deciding not to run was
+      indistinguishable from running fine: startBluetoothPairing() sets
+      blePairingMode and calls this, and if shouldRun came out false the
+      function returned silently and the pairing spinner stayed up for ever.
+      webConfigPausedBle is in that set and is cleared in exactly one place -
+      openSettingsView() leaving the QR page - so it is the one most likely to
+      be stuck on.
+    - The stack init is now bracketed and timed. BLEDevice::init() ends with an
+      untimed `while (!m_synced)` spin waiting for the NimBLE host to sync, and
+      deinit() clears m_synced. Until 3.44 that ran once per boot; the WebConfig
+      teardown made it a repeating cycle, so a host that does not resync now
+      parks the calling task there for ever with the UI frozen. If that is what
+      is happening, "initialising stack..." will print with no completion line
+      after it.
+
   3.45 - 2026-08-31
     - Fixes the panic 3.44 introduced. Opening WebConfig during an active BLE
       activity died with "CORRUPT HEAP: Bad tail" and an assert in
@@ -3458,7 +3501,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.45"
+#define OPENREMOTE_VERSION_STRING "3.47"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -4783,6 +4826,7 @@ bool bleForgetPairingPending = false;
 bool bleForgetPairingStackRequested = false;
 unsigned long bleForgetPairingDeadlineMs = 0;
 unsigned long blePairingUntilMs = 0;
+bool blePairingSleepHeld = false;
 
 // ---------------------------------------------------------------------------
 // ESP-NOW paired devices (blaster docks) - see 3.07 changelog entry.
@@ -8265,6 +8309,21 @@ bool bluetoothActivitySessionRequired() {
   return false;
 }
 
+// True while the remote is actively advertising for a new pairing.
+//
+// bluetoothActivitySessionRequired() covers a *established* BLE activity and
+// nothing else, so both sleep paths used to treat an open pairing window as
+// idle time. Light sleep then called stopBluetoothRadio(), advertising stopped
+// mid-pairing, and the TV lost the advertiser it was trying to bond with -
+// which on serial looked like "advertising for pairing / suspended (light
+// sleep) / movement wake / advertising for pairing" over and over. Bounded by
+// blePairingUntilMs (3 minutes), so this can only hold sleep off briefly, and
+// bleConnected ends it as soon as the link is up.
+bool bluetoothPairingWindowOpen() {
+  return blePairingMode && !bleConnected &&
+         (int32_t)(millis() - blePairingUntilMs) < 0;
+}
+
 bool bluetoothRuntimeRequired() {
   if (blePairingMode) return true;
   if (bleConnected && (int32_t)(bleKeepAliveUntilMs - millis()) > 0) return true;
@@ -8276,11 +8335,29 @@ void applyBluetoothState() {
                    bluetoothRuntimeRequired() && !scheduledNtpWake &&
                    !setupApActive && !setupApPausedBle &&
                    !webConfigPausedBle;
+  // Pairing that "just gets stuck" has two silent failure modes, and neither
+  // used to print anything at all. One is this function deciding shouldRun is
+  // false and returning without doing a thing, leaving the pairing spinner up
+  // for ever. The other is BLEDevice::init() blocking: it ends with an
+  // untimed `while (!m_synced)` spin, and deinit() clears m_synced, so since
+  // 3.44 made init/deinit a repeating cycle rather than a once-per-boot event,
+  // a host that does not resync parks the UI task there permanently.
+  if (!shouldRun && !bleReady) {
+    Serial.printf("BLE HID: not started - on=%d pairing=%d bonded=%d required=%d "
+                  "webConfigPaused=%d setupAp=%d ntpWake=%d\n",
+                  (int)bluetoothOn, (int)blePairingMode, (int)bleBonded,
+                  (int)bluetoothRuntimeRequired(), (int)webConfigPausedBle,
+                  (int)setupApActive, (int)scheduledNtpWake);
+  }
   if (shouldRun && !bleReady && !setupApActive && !setupApPausedBle) {
+    unsigned long initStart = millis();
+    Serial.println("BLE HID: initialising stack...");
     if (!BLEDevice::init(BLE_HID_NAME)) {
       Serial.println("BLE HID: init failed");
       return;
     }
+    Serial.printf("BLE HID: stack init took %lu ms (heap=%u)\n",
+                  millis() - initStart, (unsigned)ESP.getFreeHeap());
     // ATVV's preferred framing is a 160-byte audio notification, which needs
     // an ATT MTU of at least 163. The default is 23 (20 bytes of payload), and
     // nothing here ever asked for more - so a 160-byte frame could never have
@@ -21371,15 +21448,16 @@ bool enterDeepPowerSleep(bool allowQrPage) {
   if (!lis3dhReady || !raiseToWake ||
       (webConfigQrPageActive() && !allowQrPage) ||
       webConfigTransferActive || usbSdTransferActive() || usbStudioLinkActive() || ntpSyncPending ||
-      bluetoothActivitySessionRequired()) {
+      bluetoothActivitySessionRequired() || bluetoothPairingWindowOpen()) {
     Serial.printf(
-      "Deep sleep deferred: accelerometer=%s raise=%s qr=%s transfer=%s usb=%s ntp=%s ble=%s\n",
+      "Deep sleep deferred: accelerometer=%s raise=%s qr=%s transfer=%s usb=%s ntp=%s ble=%s pairing=%s\n",
       lis3dhReady ? "ready" : "missing", raiseToWake ? "on" : "off",
       webConfigQrPageActive() ? "active" : "off",
       webConfigTransferActive ? "active" : "off",
       usbSdTransferActive() ? "active" : "off",
       ntpSyncPending ? "active" : "off",
-      bluetoothActivitySessionRequired() ? "required" : "off");
+      bluetoothActivitySessionRequired() ? "required" : "off",
+      bluetoothPairingWindowOpen() ? "open" : "off");
     return false;
   }
 
@@ -21580,6 +21658,16 @@ void enterLowPowerWait() {
   if (!displaySleeping || webConfigQrPageActive() || webConfigTransferActive ||
       usbSdTransferActive() || usbStudioLinkActive() || ntpSyncPending || wifiConnectPending ||
       bluetoothActivitySessionRequired()) return;
+  // The display may sleep during pairing - that costs nothing - but the radio
+  // may not, and this path suspends it below.
+  if (bluetoothPairingWindowOpen()) {
+    if (!blePairingSleepHeld) {
+      blePairingSleepHeld = true;
+      Serial.println("Light sleep held off: pairing window open, staying advertised");
+    }
+    return;
+  }
+  blePairingSleepHeld = false;
 
   serviceKeypad(millis());
   bool accelerometerWake = configureLis3dhMotionWake();
