@@ -1,6 +1,22 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.57 - 2026-09-01
+    - Tells a dock it has been paired, instead of leaving it to work that out
+      for itself. Pairing was silent from the dock's side: the remote stored
+      the new device and sent nothing back, so a dock could only infer that it
+      had been paired from the first command that happened to arrive - which
+      might be minutes later, or not until the next time anyone used the
+      remote. Its "paired" indicator was therefore always late and looked
+      broken.
+    - addEspNowDevice() now unicasts an EspNowPairAckPacket ("ORPA", magic plus
+      the remote's name) as soon as the dock is a registered peer and can
+      actually be addressed. Best effort by design: a dock that misses it still
+      confirms on the first command exactly as before, so a failed send costs
+      nothing but a late LED.
+    - Paired with OpenRemote Dock firmware 1.02, which already accepts this
+      packet - the dock side needed no change, it simply stops having to guess.
+
   3.56 - 2026-09-01
     - 16kHz works. Across seven voice presses on hardware, five streams sent
       225/174/163/158/279 frames with zero drops, at MTU 247, DLE enabled and a
@@ -3764,7 +3780,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.56"
+#define OPENREMOTE_VERSION_STRING "3.57"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -5105,6 +5121,7 @@ static const uint8_t MAX_ESPNOW_DEVICES = 8;
 static const uint32_t ESPNOW_ANNOUNCE_MAGIC = 0x4F52454EUL;  // "OREN"
 static const uint32_t ESPNOW_RF_LEARN_START_MAGIC = 0x4F524C53UL;  // "ORLS"
 static const uint32_t ESPNOW_RF_LEARN_RESULT_MAGIC = 0x4F524C52UL;  // "ORLR"
+static const uint32_t ESPNOW_PAIR_ACK_MAGIC = 0x4F525041UL;  // "ORPA"
 static const uint32_t ESPNOW_SCAN_TIMEOUT_MS = 20000UL;
 static const uint32_t ESPNOW_RF_LEARN_TIMEOUT_MS = 15000UL;
 static const size_t ESPNOW_MAX_PAYLOAD_BYTES = 250;
@@ -5124,6 +5141,20 @@ struct EspNowCandidate {
 struct __attribute__((packed)) EspNowAnnouncePacket {
   uint32_t magic;
   char name[24];
+};
+
+// Sent remote -> dock the moment a dock is paired, so the dock can say so on
+// its own LED.
+//
+// Pairing used to be silent from the dock's point of view: the remote stored
+// the new device and sent nothing, so a dock had no way to know it had been
+// paired and could only infer it from the first command that arrived - which
+// might be minutes later, or not until the next time someone used the remote.
+// The dock firmware already accepts this packet, so nothing there needs to
+// change; it just stops having to guess.
+struct __attribute__((packed)) EspNowPairAckPacket {
+  uint32_t magic;
+  char name[24];  // The remote's name, so a dock can show who paired with it.
 };
 
 // Sent remote -> dock to open an RF433 receive window - dock firmware
@@ -16336,6 +16367,20 @@ bool addEspNowDevice(const uint8_t mac[6], const char *name) {
     strlcpy(device.name, safeName, sizeof(device.name));
   }
   if (espNowRadioActive) espNowRegisterAllPeers();
+
+  // Tell the dock it is paired, now that it is a registered peer and can
+  // actually be unicast to. Best effort on purpose: a dock that misses this
+  // still confirms on the first command it receives, exactly as before, so a
+  // failed send costs nothing but the LED being late.
+  if (espNowRadioActive) {
+    EspNowPairAckPacket ack = {};
+    ack.magic = ESPNOW_PAIR_ACK_MAGIC;
+    strlcpy(ack.name, remoteName.c_str(), sizeof(ack.name));
+    esp_err_t sent = esp_now_send(mac, (const uint8_t *)&ack, sizeof(ack));
+    Serial.printf("ESP-NOW: pair ack -> %s (%s)\n", formatMacAddress(mac).c_str(),
+                  sent == ESP_OK ? "sent" : "not sent");
+  }
+
   espNowDevicesModalDirty = true;
   scheduleRuntimeSettingsSave();
   return true;
