@@ -1,6 +1,33 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.45 - 2026-08-31
+    - Fixes the panic 3.44 introduced. Opening WebConfig during an active BLE
+      activity died with "CORRUPT HEAP: Bad tail" and an assert in
+      multi_heap_free. The decoded backtrace put the fault in the NimBLE host
+      task, not in the teardown call itself:
+        ble_hs_hci_evt_disconn_complete -> ble_gap_rx_disconn_complete
+          -> ble_gap_conn_broken -> BLEServer::handleGATTServerEvent
+            -> BLEServer::removePeerDevice -> map::erase -> operator delete
+    - BLEServer::disconnect() only requests the link drop; the disconnect lands
+      later on the host task, which calls back into removePeerDevice(),
+      onDisconnect() and BLESecurity::resetSecurity(). 3.44 deleted the server
+      out from under that. The old code's delay(120) had been covering exactly
+      this, and 3.44 moved the teardown in front of it.
+    - BLEDevice::deinit() cannot fence this itself: it deletes m_pServer before
+      it calls nimble_port_stop(), so the host task is still live while the
+      server it is writing to is freed. The wait therefore has to happen before
+      deinit is called at all.
+    - shutdownBluetoothStack() now waits for bleConnected to clear (600ms cap,
+      and it logs how long it took or that it timed out) before touching
+      anything. removePeerDevice() runs before onDisconnect(), so that flag
+      dropping proves the map erase is already done; a 150ms settle covers the
+      rest of the event handler, and advertising is stopped again afterwards
+      because the disconnect handler can restart it.
+    - Teardown order swapped: deinit() first, then the two objects the library
+      does not own. nimble_port_stop() inside deinit() is what guarantees
+      nothing can call into any of it again.
+
   3.44 - 2026-08-31
     - WebConfig after a BLE activity: 3.43 was not enough. The heartbeat came
       back at heap=8,872 bytes, dipping to 5,140 while serving, so moving the
@@ -3431,7 +3458,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.44"
+#define OPENREMOTE_VERSION_STRING "3.45"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -8134,19 +8161,51 @@ void stopBluetoothRadio(const char *reason) {
 // device and the ATVV service from scratch.
 void shutdownBluetoothStack(const char *reason) {
   if (!bleReady) return;
+  bool wasConnected = bleConnected;
   stopBluetoothRadio(reason);
   unsigned heapBefore = ESP.getFreeHeap();
 
+  // BLEServer::disconnect() only *requests* the link drop. The disconnect
+  // completes later on the NimBLE host task, which calls straight back into
+  // BLEServer::removePeerDevice(), then onDisconnect(), then
+  // BLESecurity::resetSecurity() - and may restart advertising on the way out.
+  //
+  // 3.44 tore the stack down without waiting and panicked with a corrupted
+  // heap: the host task was erasing from the server's peer map while
+  // BLEDevice::deinit() was deleting that very server underneath it. deinit()
+  // cannot fence this itself - it deletes m_pServer *before* it calls
+  // nimble_port_stop() - so the wait has to happen here, before deinit is
+  // called at all.
+  //
+  // removePeerDevice() runs before onDisconnect(), so bleConnected going false
+  // proves the map erase has already finished. The settle delay then covers the
+  // rest of the event handler, which still touches the server after that.
+  if (wasConnected) {
+    unsigned long waitStart = millis();
+    while (bleConnected && (millis() - waitStart) < 600UL) delay(10);
+    if (bleConnected) {
+      Serial.println("BLE HID: disconnect did not complete in 600ms");
+    } else {
+      Serial.printf("BLE HID: disconnect completed in %lu ms\n",
+                    millis() - waitStart);
+    }
+  }
+  delay(150);
+  BLEDevice::stopAdvertising();  // the disconnect handler may have restarted it
+
+  // Host task first: nimble_port_stop() inside deinit() is what guarantees
+  // nothing can call into any of this again, so everything below it is then
+  // unambiguously safe to free.
+  BLEDevice::deinit(false);
+
   // Ours, not the library's: BLEDevice::deinit() never sees these. The HID
-  // destructor is empty and BLESecurity owns nothing, so both are safe to free
-  // once the stack below them is going away - and leaking one of each per
+  // destructor is empty and BLESecurity owns nothing, so neither dereferences
+  // the services deinit() just destroyed - and leaking one of each per
   // WebConfig session would defeat the point of the exercise.
   delete bleHid;
   bleHid = nullptr;
   delete bleSecurity;
   bleSecurity = nullptr;
-
-  BLEDevice::deinit(false);
 
   // Deleted by deinit() (bleServer) or owned by the server it just destroyed
   // (everything else). Null them together so nothing can dereference freed
