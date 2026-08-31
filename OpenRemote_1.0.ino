@@ -1,6 +1,29 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.53 - 2026-08-31
+    - Fixes the regression 3.52 introduced: after ending an activity the remote
+      would not reconnect at all, no buttons and no voice. Serial showed the
+      same four lines looping:
+        host connected
+        MTU still at the 23 byte default - requested exchange (rc=0)
+        data length extension enabled, 251 byte LL packets (rc=0)
+        BLE HID: pairing failed
+      then a disconnect, then the same again.
+    - Cause: 3.52 called ble_gattc_exchange_mtu() and ble_gap_set_data_len()
+      from inside onConnect. Both re-enter the host stack from within its own
+      GAP event callback, while the peer is still encrypting the link, and the
+      security procedure failed every time. 3.51 got away with the MTU exchange
+      alone; adding the data length request on top of it did not.
+    - Neither call is urgent, so both are now deferred to loop() and held off
+      for 900ms after connect, letting pairing and encryption finish first.
+      onConnect only records that the link needs tuning; onMtuChanged only
+      flags that DLE should be re-requested. serviceBluetoothLinkSetup() does
+      the work on the main task, and clears its own pending flags on
+      disconnect.
+    - Same lesson as the 3.44 heap corruption: BLE callbacks run on the NimBLE
+      host task and are not a safe place to drive the stack from.
+
   3.52 - 2026-08-31
     - 3.51 fixed the MTU and the log proved it: the exchange was requested,
       the peer answered 247, and the format came out "ADPCM 16kHz, 160 byte
@@ -3661,7 +3684,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.52"
+#define OPENREMOTE_VERSION_STRING "3.53"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -5103,6 +5126,12 @@ volatile bool bleConnHandleValid = false;
 // every notify returns BLE_HS_ENOMEM. With DLE the same frame fits in a single
 // LL packet and the pool keeps up.
 volatile bool bleDataLenExtended = false;
+// Link tuning is deferred out of the GAP callbacks and held off until the
+// peer has finished encrypting. See OpenRemoteBleServerCallbacks::onConnect.
+static const uint32_t BLE_LINK_SETUP_DELAY_MS = 900;
+volatile bool bleLinkSetupPending = false;
+volatile bool bleDataLenRequestPending = false;
+unsigned long bleLinkSetupAtMs = 0;
 volatile uint32_t atvvNotifyFailures = 0;
 uint32_t atvvFramesDroppedThisStream = 0;
 volatile bool atvvRxPeerSubscribed = false;
@@ -8538,34 +8567,26 @@ class OpenRemoteBleServerCallbacks : public BLEServerCallbacks {
     bleConnHandleValid = true;
     uint16_t mtu = ble_att_mtu(desc->conn_handle);
     Serial.printf("BLE HID: connected, MTU=%u\n", (unsigned)mtu);
-    // Start the exchange ourselves when the peer has not. Harmless if it has:
-    // NimBLE answers BLE_HS_EALREADY and the MTU stands.
-    if (mtu <= BLE_ATT_MTU_DFLT) {
-      int rc = ble_gattc_exchange_mtu(desc->conn_handle, nullptr, nullptr);
-      Serial.printf("BLE HID: MTU still at the %u byte default - requested "
-                    "exchange (rc=%d)\n", (unsigned)BLE_ATT_MTU_DFLT, rc);
-    }
+    // Record only. 3.52 called ble_gattc_exchange_mtu() and
+    // ble_gap_set_data_len() from right here and pairing began failing
+    // immediately every time:
+    //   connected -> MTU exchange -> data length extension -> pairing failed
+    // Both re-enter the host stack from inside its own GAP event callback,
+    // while the peer is still encrypting the link. Neither is urgent, so both
+    // are now deferred to loop() and held off until encryption has settled.
     bleDataLenExtended = false;
-    requestDataLengthExtension(desc->conn_handle);
-  }
-
-  // 251 octets is the LL maximum; 2120us is its air time on the 1M PHY.
-  void requestDataLengthExtension(uint16_t connHandle) {
-    int rc = ble_gap_set_data_len(connHandle, 251, 2120);
-    bleDataLenExtended = (rc == 0);
-    Serial.printf("BLE HID: data length extension %s (rc=%d)%s\n",
-                  rc == 0 ? "enabled, 251 byte LL packets" : "REFUSED",
-                  rc,
-                  rc == 0 ? "" : " - 16kHz will be declined, 8kHz fits anyway");
+    bleLinkSetupPending = true;
+    bleLinkSetupAtMs = millis() + BLE_LINK_SETUP_DELAY_MS;
   }
 
   void onMtuChanged(BLEServer *server, ble_gap_conn_desc *desc,
                     uint16_t mtu) override {
     (void)desc;
     Serial.printf("BLE HID: MTU negotiated to %u\n", (unsigned)mtu);
-    // Ask for DLE now rather than at connect: a big MTU without it is exactly
-    // the combination that starves the mbuf pool.
-    if (bleConnHandleValid) requestDataLengthExtension(bleConnHandle);
+    // Re-request DLE once the real MTU is known - a big MTU without it is
+    // exactly the combination that starves the mbuf pool - but again from
+    // loop(), not from inside this callback.
+    bleDataLenRequestPending = true;
     // Re-pick the framing now the real MTU is known. Skipped mid-stream: the
     // host is decoding against the frame size we advertised in CAPS_RESP, so
     // changing it under an active stream would corrupt it.
@@ -8588,6 +8609,8 @@ class OpenRemoteBleServerCallbacks : public BLEServerCallbacks {
     // may well be the user picking the remote back up.
     bleConnProfilePending = false;
     bleConnHandleValid = false;
+    bleLinkSetupPending = false;
+    bleDataLenRequestPending = false;
     atvvRxSubscribed = false;
     atvvCtlSubscribed = false;
     // Per-connection, so they must not survive the link that created them.
@@ -9152,7 +9175,43 @@ void serviceForgetBluetoothPairing(unsigned long now) {
   Serial.println("BLE HID: pairing forgotten");
 }
 
+// Raises the MTU and the link-layer packet size once the connection has
+// settled. Runs on the main task, never from a GAP callback.
+void serviceBluetoothLinkSetup(unsigned long now) {
+#if defined(CONFIG_NIMBLE_ENABLED)
+  if (!bleConnected || !bleConnHandleValid) {
+    bleLinkSetupPending = false;
+    bleDataLenRequestPending = false;
+    return;
+  }
+  if (bleLinkSetupPending && (int32_t)(now - bleLinkSetupAtMs) >= 0) {
+    bleLinkSetupPending = false;
+    uint16_t mtu = ble_att_mtu(bleConnHandle);
+    if (mtu <= BLE_ATT_MTU_DFLT) {
+      int rc = ble_gattc_exchange_mtu(bleConnHandle, nullptr, nullptr);
+      Serial.printf("BLE HID: MTU still at the %u byte default - requested "
+                    "exchange (rc=%d)\n", (unsigned)BLE_ATT_MTU_DFLT, rc);
+    } else {
+      Serial.printf("BLE HID: peer already raised the MTU to %u\n", (unsigned)mtu);
+    }
+    bleDataLenRequestPending = true;
+  }
+  if (bleDataLenRequestPending) {
+    bleDataLenRequestPending = false;
+    // 251 octets is the LL maximum; 2120us is its air time on the 1M PHY.
+    int rc = ble_gap_set_data_len(bleConnHandle, 251, 2120);
+    bleDataLenExtended = (rc == 0);
+    Serial.printf("BLE HID: data length extension %s (rc=%d)%s\n",
+                  rc == 0 ? "enabled, 251 byte LL packets" : "REFUSED", rc,
+                  rc == 0 ? "" : " - 16kHz will be declined, 8kHz fits anyway");
+  }
+#else
+  (void)now;
+#endif
+}
+
 void serviceBluetooth(unsigned long now) {
+  serviceBluetoothLinkSetup(now);
   serviceForgetBluetoothPairing(now);
   if (bleBondStateSavePending) {
     bleBondStateSavePending = false;
