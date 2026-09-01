@@ -1,6 +1,28 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.86 - 2026-09-02
+    - The dock's LED and the remote's ring now go out together. The link-down
+      packet that tells the dock the radio is going away was sent once and not
+      checked, so losing it left the dock to time out on its own nine second
+      idle instead - the ring went white while the dock stayed lit, the two
+      indicators disagreeing about the same link, which is the one thing they
+      exist not to do. It is now retried like any other send.
+    - The on-demand hold drops from 7 seconds to 2. The dock wakes fast enough
+      that the longer hold was buying nothing but idle radio time.
+    - The ESP-NOW status ring is blue rather than green - link state, not a
+      success indication, and no longer competing with the green used for
+      things that went well. The transmit pulse and its fill follow.
+    - "Wake with the screen" is replaced on the Dock page, in both menu styles,
+      by "Tx Power": Low, Medium or High, mapping to 8.5, 15 and 19.5 dBm.
+      Applied the moment it changes and on every bring-up after that, and the
+      value the radio actually accepted is logged, since the driver clamps to
+      whatever the part's calibration data allows. With the hold down to two
+      seconds, warming the link early was worth very little; choosing how hard
+      the radio shouts is worth a good deal more.
+    - The setting itself still exists in WebConfig and in the runtime config, so
+      nothing that reads it breaks; only the two on-device rows are gone.
+
   3.85 - 2026-09-02
     - Fixes the dock update failing while both ends blamed the other. Dock 1.18
       let the begin frame through and its log finally showed what happens next:
@@ -4369,7 +4391,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.85"
+#define OPENREMOTE_VERSION_STRING "3.86"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -5296,6 +5318,12 @@ bool dockLedOnTransmit = true;
 // would rather trade that for the first press feeling identical to the rest of
 // a burst, which is exactly the trade it is.
 bool dockWarmOnWake = false;
+// ESP-NOW transmit power, 0 = Low, 1 = Medium, 2 = High. Held as an index
+// rather than a raw value because the driver's unit is quarter-dBm and the
+// legal range is 8..84 - numbers that mean nothing on a settings row.
+uint8_t espNowTxPower = 2;
+static const int8_t ESPNOW_TX_POWER_LEVELS[3] = {34, 60, 78};  // 8.5 / 15 / 19.5 dBm
+static const char *ESPNOW_TX_POWER_OPTIONS = "Low\nMedium\nHigh";
 // "Online" means the dock acknowledged our last unicast at the MAC layer. That
 // is a real link check and costs no dock firmware: ESP-NOW acks every unicast,
 // so a powered dock in range answers whether or not it understands the payload.
@@ -5334,7 +5362,9 @@ char dockReportedVersion[9] = {0};
 // the last command. In a Bluetooth activity where only volume goes through the
 // dock, most presses touch ESP-NOW not at all, so a long hold left the pill
 // green almost permanently and it stopped meaning anything.
-static const uint32_t ESPNOW_ONDEMAND_HOLD_MS = 7000;
+// Two seconds, down from seven. The dock proved fast enough to wake that the
+// long hold was buying nothing but idle radio time.
+static const uint32_t ESPNOW_ONDEMAND_HOLD_MS = 2000;
 bool espNowStandalone = false;      // We brought the radio up ourselves.
 uint8_t espNowChannel = 0;          // 0 = not yet known.
 unsigned long espNowHoldUntilMs = 0;
@@ -6483,6 +6513,8 @@ void renderDisplayPage();
 void renderButtonsPage();
 void renderDebugPage();
 void renderDockPage();
+void espNowTxPowerDropdownEvent(lv_event_t *e);
+void applyEspNowTxPower();
 void renderDockRenamePage();
 void renderDockRenamePageOmote(const char *current);
 void espNowRenameClicked(lv_event_t *e);
@@ -8143,6 +8175,8 @@ void loadSettings() {
   dockRfEnabled = preferences.getBool("dockRf", true);
   dockLedOnTransmit = preferences.getBool("dockLed", true);
   dockWarmOnWake = preferences.getBool("dockWarm", false);
+  espNowTxPower = preferences.getUChar("enTxPwr", 2);
+  if (espNowTxPower > 2) espNowTxPower = 2;
   clockEnabled = preferences.getBool("clock", true);
   clockUseInternetTime = preferences.getBool("ntp", true);
   wakeMode = constrain((int)preferences.getUChar("wakeMode", WAKE_MODE_MOTION),
@@ -8283,6 +8317,7 @@ void saveSettings() {
   preferences.putBool("dockRf", dockRfEnabled);
   preferences.putBool("dockLed", dockLedOnTransmit);
   preferences.putBool("dockWarm", dockWarmOnWake);
+  preferences.putUChar("enTxPwr", espNowTxPower);
   preferences.putBool("clock", clockEnabled);
   preferences.putBool("ntp", clockUseInternetTime);
   preferences.putUChar("wakeMode", wakeMode);
@@ -11521,7 +11556,7 @@ bool remoteHasActiveTarget() {
 }
 
 lv_color_t pillIdleColour() {
-  return dockConnected() ? lv_color_hex(0x30D158) : lv_color_white();
+  return dockConnected() ? lv_color_hex(0x0A84FF) : lv_color_white();
 }
 
 // Repaints the pill when the dock link changes, without rebuilding the page.
@@ -11616,7 +11651,7 @@ void applyEspNowPulse(bool bright) {
   // Brightness only. The border width never changes - a thickening outline
   // made the pill jump about, and the geometry shifting is more distracting
   // than the colour change it was meant to support.
-  lv_color_t hot = lv_color_hex(0xC8FFDA);   // Near-white green, unmistakable.
+  lv_color_t hot = lv_color_hex(0xC8E4FF);   // Near-white blue, unmistakable.
   lv_color_t idle = pillIdleColour();
   for (uint8_t slot = 0; slot < PAGE_SLOT_COUNT; slot++) {
     PageUi &ui = pageUi[slot];
@@ -11662,10 +11697,10 @@ void serviceEspNowCommandFeedback(unsigned long now) {
 // or send). This paints the status pill green instead of applyCommandFeedbackStyle's
 // red, so a test-mode press is visually unmistakable from a genuine transmit.
 void applyButtonTestFeedbackStyle(bool active) {
-  lv_color_t green = lv_color_hex(0x30D158);
+  lv_color_t green = lv_color_hex(0x0A84FF);
   lv_color_t idle = pillIdleColour();
   if (statusPill && lv_obj_is_valid(statusPill)) {
-    lv_obj_set_style_bg_color(statusPill, active ? lv_color_hex(0x0B3A1E) : lv_color_black(), 0);
+    lv_obj_set_style_bg_color(statusPill, active ? lv_color_hex(0x0A2540) : lv_color_black(), 0);
     lv_obj_set_style_bg_opa(statusPill, active ? LV_OPA_COVER : (lv_opa_t)115, 0);
     lv_obj_set_style_border_color(statusPill, active ? green : idle, 0);
     lv_obj_set_style_border_opa(statusPill, (active || dockConnected()) ? LV_OPA_COVER : (lv_opa_t)64, 0);
@@ -17796,6 +17831,19 @@ bool ensureEspNowLink() {
   return espNowRadioActive;
 }
 
+// Reported back rather than assumed: the driver clamps to whatever the part's
+// calibration data allows, so the value that matters is the one it took.
+void applyEspNowTxPower() {
+  uint8_t level = espNowTxPower > 2 ? 2 : espNowTxPower;
+  esp_wifi_set_max_tx_power(ESPNOW_TX_POWER_LEVELS[level]);
+  int8_t actual = 0;
+  if (esp_wifi_get_max_tx_power(&actual) == ESP_OK) {
+    Serial.printf("ESP-NOW: TX power %s (asked %d, radio %d = %.2f dBm)\n",
+                  level == 0 ? "Low" : level == 1 ? "Medium" : "High",
+                  (int)ESPNOW_TX_POWER_LEVELS[level], (int)actual, actual / 4.0);
+  }
+}
+
 void startEspNow() {
   if (espNowRadioActive) return;
   if (esp_now_init() != ESP_OK) {
@@ -17814,6 +17862,7 @@ void startEspNow() {
   // negligible amount of awake time against a real gain in how reliably
   // pairing announcements and dock replies are heard.
   esp_wifi_set_ps(WIFI_PS_NONE);
+  applyEspNowTxPower();
   espNowRadioActive = true;
   uint8_t primary = 0;
   wifi_second_chan_t second;
@@ -18016,9 +18065,13 @@ void releaseEspNowLink(const char *reason, bool forceEvenOnQrPage) {
   // dark, or a large upload that needs the memory now - can force through this.
   if (webConfigQrPageActive() && !forceEvenOnQrPage) return;
   if (espNowDeviceCount > 0) {
+    // Retried, not fired blindly. This one packet is what puts the dock's LED
+    // out at the same instant the pill goes white; if it is lost the dock
+    // instead waits out its own nine second idle timeout, so the ring went
+    // dark while the dock stayed lit - the two indicators disagreeing about
+    // the same link, which is the one thing they exist not to do.
     uint32_t bye = ESPNOW_DOCK_LINK_DOWN_MAGIC;
-    esp_now_send(espNowDevices[0].mac, (const uint8_t *)&bye, sizeof(bye));
-    delay(5);   // Let it reach the air before the radio stops.
+    sendEspNowWithRetry(espNowDevices[0].mac, (const uint8_t *)&bye, sizeof(bye));
   }
   stopEspNow();
   espNowStandalone = false;
@@ -22991,9 +23044,11 @@ void renderDockPageOmote() {
     makeOmoteRow(dockCard, "Dock LED", "Blink the dock's LED as it transmits",
                  2 * rowH + 2, rowH, &dockLedOnTransmit);
     makeOmoteDivider(dockCard, 3 * rowH + 2);
-    makeOmoteRow(dockCard, "Wake with the screen",
-                 "Ready the dock link on wake - faster first press, more battery",
-                 3 * rowH + 3, rowH, &dockWarmOnWake);
+    lv_obj_t *txDropdown = makeOmoteDropdownRow(dockCard, "Tx Power",
+                                               3 * rowH + 3, rowH, 132);
+    lv_dropdown_set_options(txDropdown, ESPNOW_TX_POWER_OPTIONS);
+    lv_dropdown_set_selected(txDropdown, espNowTxPower);
+    lv_obj_add_event_cb(txDropdown, espNowTxPowerDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
     y += 4 * rowH + 3 + 14;
   }
 
@@ -23044,6 +23099,20 @@ void renderDockRenamePage() {
   renderCompactWifiKeyboard();
 }
 
+void espNowTxPowerDropdownEvent(lv_event_t *e) {
+  uint16_t choice = lv_dropdown_get_selected(lv_event_get_target(e));
+  if (choice > 2) choice = 2;
+  if (choice == espNowTxPower) return;
+  espNowTxPower = (uint8_t)choice;
+  preferences.begin(PREFERENCES_NAMESPACE, false);
+  preferences.putUChar("enTxPwr", espNowTxPower);
+  preferences.end();
+  // Takes effect at once when the radio is up, and is applied by startEspNow()
+  // for every bring-up after that.
+  if (espNowRadioActive) applyEspNowTxPower();
+  scheduleRuntimeSettingsSave();
+}
+
 void renderDockPage() {
   lv_obj_set_scrollbar_mode(content, LV_SCROLLBAR_MODE_AUTO);
   renderTopBar("Dock", false);
@@ -23072,14 +23141,22 @@ void renderDockPage() {
     addPhysicalNavFocusable(routeDropdown);
     makeSettingRow("Dock RF433", "Let the dock send RF433", 252, &dockRfEnabled);
     makeSettingRow("Dock LED", "Blink as the dock transmits", 302, &dockLedOnTransmit);
-    makeSettingRow("Wake with the screen", "Faster first press, more battery",
-                   352, &dockWarmOnWake);
+    lv_obj_t *txRow = makeSettingRow("Tx Power", "", 352, nullptr, nullptr);
+    lv_obj_t *txDropdown = lv_dropdown_create(txRow);
+    lv_obj_set_pos(txDropdown, 112, 8);
+    lv_obj_set_size(txDropdown, 100, 32);
+    styleDebugDropdown(txDropdown);
+    lv_dropdown_set_options(txDropdown, ESPNOW_TX_POWER_OPTIONS);
+    lv_dropdown_set_selected(txDropdown, espNowTxPower);
+    lv_obj_add_event_cb(txDropdown, espNowTxPowerDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
+    addPhysicalNavFocusable(txDropdown);
     hintY = 404;
   }
   lv_obj_t *hint = makeLabel(content,
     espNowDeviceCount > 0
       ? "Transmit IR from decides which emitter actually fires - this remote, the "
-        "dock, or both at once."
+        "dock, or both at once. Tx Power trades range against battery: use Low "
+        "if the dock sits close by, High if it is across the room."
       : "A dock relays IR and RF433 commands for devices the remote cannot reach "
         "directly. Turn ESP-NOW on, then use Paired devices to search for a dock "
         "in pairing mode.",
