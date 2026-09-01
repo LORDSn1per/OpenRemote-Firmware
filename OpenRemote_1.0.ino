@@ -1,6 +1,33 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.81 - 2026-09-01
+    - Fixes the green pill staying on forever after the dock's LED had gone
+      out. dockLinkOnline is a latch, and stopEspNow() never cleared it. The
+      only other place that clears it is serviceDockLink()'s 20 second
+      timeout, which cannot run while the radio is down because that function
+      returns early in exactly that case - so once the 7 second hold expired
+      and the radio went away, nothing could ever clear the flag again.
+      dockConnected() stayed true, and the pill stayed green indefinitely
+      while the dock sat dark. Stopping the radio now clears it, so the pill
+      goes white at the same moment the dock's LED does: the ORLD sent on the
+      way down puts the LED out immediately, and both ends now agree.
+    - Fixes a thrash 3.80 would have caused as soon as Wi-Fi was connected.
+      3.80 correctly stopped gating hold-expiry on espNowStandalone, but
+      serviceEspNow() also auto-starts the radio whenever the station is up,
+      and that condition is true purely because Wi-Fi is connected. Every
+      release was therefore undone by a startEspNow() on the very next loop
+      tick - an esp_now_init/deinit cycle per tick, indefinitely. The
+      auto-start now also requires the on-demand hold, so the radio comes up
+      when something actually asked for it (ensureEspNowLink() sets the hold
+      before starting) and stays down otherwise. That is the on-demand rule
+      the design already rested on; the auto-start was a leftover from when
+      ESP-NOW was always-on with the station.
+    - The WebConfig QR page's link hold moved from serviceDockLink() to
+      serviceEspNow(). It was unreachable where it was - serviceDockLink()
+      returns early while the radio is down, so the one case that needed it
+      most, bringing the link back up for the QR page, could never fire.
+
   3.80 - 2026-09-01
     - Fixes the 7 second hold never actually firing, sometimes. The caller
       that checks the hold gated on espNowStandalone, not espNowRadioActive -
@@ -4262,7 +4289,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.80"
+#define OPENREMOTE_VERSION_STRING "3.81"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -17721,13 +17748,11 @@ void serviceDockLink(unsigned long now) {
     }
     return;
   }
-  // A sleeping radio is not a disconnected dock. Under on-demand ESP-NOW the
-  // radio is off most of the time, and clearing the flag here would blink the
-  // pill white every time the link was released - saying "disconnected" when
-  // nothing of the sort had happened. Only a failed send clears it.
+  // Nothing to check while the radio is down; stopEspNow() has already cleared
+  // dockLinkOnline by then, because a dock that can no longer hear us has put
+  // its LED out and the pill has to say the same thing.
   if (!espNowRadioActive) return;
   if (dockOtaState != DOCK_OTA_IDLE) return;  // The transfer is its own proof.
-  if (webConfigQrPageActive()) espNowHoldUntilMs = now + ESPNOW_ONDEMAND_HOLD_MS;
   if ((int32_t)(now - dockNextPingMs) < 0) return;
   dockNextPingMs = now + 5000UL;
   uint32_t ping = ESPNOW_DOCK_PING_MAGIC;
@@ -17749,6 +17774,16 @@ void stopEspNow() {
   esp_now_unregister_recv_cb();
   esp_now_deinit();
   espNowRadioActive = false;
+  // The radio is down, so the dock is no longer hearing our pings and its LED
+  // goes out - immediately, on the ORLD sent just before this, or on its own
+  // 9s idle timeout. dockLinkOnline is a latch, and nothing was clearing it
+  // here: serviceDockLink's 20s timeout is the only other place that clears
+  // it, and that function returns early while the radio is down, so it could
+  // never run. Left set, dockConnected() stayed true forever and the pill
+  // stayed green long after the dock LED had gone dark - the exact mismatch
+  // the pill exists to mirror. A link that can no longer be proved is a link
+  // that is no longer claimed.
+  dockLinkOnline = false;
   dockLinkIndicatorDirty = true;
   Serial.println("ESP-NOW: stopped");
 }
@@ -17794,10 +17829,24 @@ void releaseEspNowLink(const char *reason, bool forceEvenOnQrPage) {
 }
 
 void serviceEspNow(unsigned long now) {
+  // WebConfig's dock controls need the link, and this is the one place that
+  // runs whether or not the radio is currently up - serviceDockLink(), where
+  // this refresh used to live, returns early while the radio is down and so
+  // could never bring it back for the QR page.
+  if (webConfigQrPageActive()) espNowHoldUntilMs = now + ESPNOW_ONDEMAND_HOLD_MS;
   bool holding = (int32_t)(now - espNowHoldUntilMs) < 0;
   bool shouldBeActive = espNowEnabled && networkStackActive && !setupApActive &&
                         WiFi.getMode() != WIFI_OFF;
-  if (shouldBeActive && !espNowRadioActive) {
+  // "holding" is what makes this on-demand rather than always-on. Without it,
+  // 3.80's release-on-hold-expiry fought this auto-start: with the Wi-Fi
+  // station up, shouldBeActive is true purely because Wi-Fi is connected, so
+  // every release below was undone by a startEspNow() on the very next loop
+  // tick - an esp_now_init/deinit cycle every few microseconds for as long as
+  // Wi-Fi stayed connected. Requiring the hold means the radio comes up when
+  // something actually asked for it (ensureEspNowLink sets the hold before
+  // starting) and stays down otherwise, which is the on-demand rule the
+  // whole design rests on.
+  if (shouldBeActive && !espNowRadioActive && holding) {
     startEspNow();
   } else if (!shouldBeActive && espNowRadioActive && !espNowStandalone) {
     stopEspNow();
