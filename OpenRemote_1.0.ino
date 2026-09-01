@@ -1,6 +1,17 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.82 - 2026-09-01
+    - Turns WiFi power save off while the ESP-NOW radio is up, the remote's
+      half of the dock 1.16 fix. A station defaults to WIFI_PS_MIN_MODEM and
+      duty-cycles its radio; ESP-NOW has no AP buffering what arrives during a
+      nap, so those frames are lost outright. Unlike the dock, this remote runs
+      on a battery, so power save is not disabled permanently - only while the
+      ESP-NOW radio is actually up, which under the on-demand hold is about
+      seven seconds at a time, and restored to the default in stopEspNow().
+      The cost is a few seconds of full-power radio per burst of presses; the
+      gain is that pairing announcements and dock replies are actually heard.
+
   3.81 - 2026-09-01
     - Fixes the green pill staying on forever after the dock's LED had gone
       out. dockLinkOnline is a latch, and stopEspNow() never cleared it. The
@@ -4289,7 +4300,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.81"
+#define OPENREMOTE_VERSION_STRING "3.82"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -17623,6 +17634,15 @@ void startEspNow() {
   esp_now_register_recv_cb(onEspNowDataRecv);
   esp_now_register_send_cb(onEspNowDataSent);
   espNowRegisterAllPeers();
+  // Same reasoning as the dock's, but deliberately scoped rather than
+  // permanent: a station defaults to WIFI_PS_MIN_MODEM and duty-cycles its
+  // radio, and ESP-NOW has no AP buffering anything that arrives during a nap.
+  // The remote IS battery powered, so this is not left on - it is turned off
+  // only while the ESP-NOW radio is up, which under the on-demand hold is
+  // about seven seconds at a time, and restored in stopEspNow(). That is a
+  // negligible amount of awake time against a real gain in how reliably
+  // pairing announcements and dock replies are heard.
+  esp_wifi_set_ps(WIFI_PS_NONE);
   espNowRadioActive = true;
   uint8_t primary = 0;
   wifi_second_chan_t second;
@@ -17773,6 +17793,8 @@ void stopEspNow() {
   rfLearnActive = false;
   esp_now_unregister_recv_cb();
   esp_now_deinit();
+  // Back to the battery-friendly default the rest of the firmware expects.
+  esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
   espNowRadioActive = false;
   // The radio is down, so the dock is no longer hearing our pings and its LED
   // goes out - immediately, on the ORLD sent just before this, or on its own
