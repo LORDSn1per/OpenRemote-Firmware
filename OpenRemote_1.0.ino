@@ -1,6 +1,28 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.83 - 2026-09-01
+    - A chunked upload can now start from its first chunk. The session lives
+      only in RAM, so anything that restarted the remote between /begin and the
+      first chunk, or any request that closed the session, stranded the browser
+      in a loop it could never escape: every retry re-sent a chunk against a
+      session that no longer existed, and each one came back "No upload session
+      for this target" until the retries ran out. A chunk at offset 0 carries
+      everything needed to open a session, so it now does exactly that. Only
+      offset 0 is adopted - a mid-transfer chunk with no session still fails,
+      because there is no way to know what came before it.
+    - That refusal now says which condition actually failed - not authorized,
+      no SD card, no target, or genuinely no session - and logs the target
+      asked for against the one being held, the offsets, and free heap. The
+      single "No upload session" message covered four different causes and
+      named none of them, which is why it took several rounds to get near.
+    - The three dock update endpoints answered 403 with a bare {"ok":false} and
+      no error text, so WebConfig could only report "Could not start: unknown
+      error". They now explain themselves. WebConfig 2.54 is the other half of
+      this: its two dock calls were the only ones in that file using a bare
+      fetch() rather than remoteFetch(), so they were the only ones arriving
+      without the auth token - which is what produced the 403.
+
   3.82 - 2026-09-01
     - Turns WiFi power save off while the ESP-NOW radio is up, the remote's
       half of the dock 1.16 fix. A station defaults to WIFI_PS_MIN_MODEM and
@@ -4300,7 +4322,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.82"
+#define OPENREMOTE_VERSION_STRING "3.83"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -15550,10 +15572,48 @@ void handleChunkUploadData() {
   if (upload.status == UPLOAD_FILE_START) {
     String target = webServer.arg("target");
     size_t offset = (size_t)strtoul(webServer.arg("offset").c_str(), nullptr, 10);
-    chunkUploadChunkOk = requestAuthorized() && sdReady &&
+    bool authorized = requestAuthorized();
+    // A chunk at offset 0 carries everything needed to start a transfer, so a
+    // missing session is recoverable rather than fatal: open one and take the
+    // chunk. The session lives only in RAM, so anything that restarts the
+    // remote between /begin and the first chunk - or any request that closed
+    // it - used to strand the browser in a loop of "No upload session for this
+    // target" that it could never get out of, because every retry re-sent a
+    // chunk against a session that no longer existed. Only offset 0 is
+    // adopted; a mid-transfer chunk with no session still fails, since there
+    // is no way to know what came before it.
+    if (authorized && sdReady && target.length() && target != chunkUploadTarget &&
+        offset == 0) {
+      String path = chunkUploadTempPathFor(target);
+      if (path.length()) {
+        closeChunkUploadSession();
+        SD.remove(path);
+        chunkUploadTarget = target;
+        chunkUploadTempPath = path;
+        chunkUploadBytes = 0;
+        chunkUploadCrc = 0;
+        chunkUploadError = "";
+        Serial.printf("Chunked upload: opened session for %s from a first chunk "
+                      "(no /begin held), heapFree=%u\n",
+                      target.c_str(), (unsigned)ESP.getFreeHeap());
+      }
+    }
+    chunkUploadChunkOk = authorized && sdReady &&
                          target.length() && target == chunkUploadTarget;
     if (!chunkUploadChunkOk) {
-      chunkUploadError = "No upload session for this target";
+      // Say which of the four conditions actually failed. "No upload session"
+      // covered all of them and named none, which is why this cost several
+      // rounds of guessing.
+      chunkUploadError = !authorized ? "Not authorized for this upload"
+                       : !sdReady    ? "SD card unavailable"
+                       : !target.length() ? "Upload chunk carried no target"
+                       : "No upload session for this target";
+      Serial.printf("Chunked upload: chunk REFUSED - %s (asked for '%s', holding "
+                    "'%s', offset %u, held %u, auth=%d sd=%d heapFree=%u)\n",
+                    chunkUploadError.c_str(), target.c_str(),
+                    chunkUploadTarget.c_str(), (unsigned)offset,
+                    (unsigned)chunkUploadBytes, (int)authorized, (int)sdReady,
+                    (unsigned)ESP.getFreeHeap());
     } else if (offset != chunkUploadBytes) {
       // The client and remote disagree about progress (a chunk that landed
       // but whose response was lost, or a stale retry). Refuse rather than
@@ -16231,7 +16291,11 @@ void handleDockFirmwareUploadData() {
 }
 
 void handleDockUpdateStart() {
-  if (!requestAuthorized()) { sendJson(403, "{\"ok\":false}"); return; }
+  if (!requestAuthorized()) {
+    sendJson(403, "{\"ok\":false,\"error\":\"Not authorized - reload WebConfig so it "
+                  "picks up a fresh token.\"}");
+    return;
+  }
   if (dockOtaState == DOCK_OTA_BEGIN || dockOtaState == DOCK_OTA_DATA ||
       dockOtaState == DOCK_OTA_END) {
     sendJson(409, "{\"ok\":false,\"error\":\"An update is already running.\"}");
@@ -16252,7 +16316,11 @@ void handleDockUpdateStart() {
 }
 
 void handleDockUpdateStatus() {
-  if (!requestAuthorized()) { sendJson(403, "{\"ok\":false}"); return; }
+  if (!requestAuthorized()) {
+    sendJson(403, "{\"ok\":false,\"error\":\"Not authorized - reload WebConfig so it "
+                  "picks up a fresh token.\"}");
+    return;
+  }
   JsonDocument doc;
   doc["ok"] = true;
   const char *state = "idle";
@@ -16277,7 +16345,11 @@ void handleDockUpdateStatus() {
 }
 
 void handleDockUpdateCancel() {
-  if (!requestAuthorized()) { sendJson(403, "{\"ok\":false}"); return; }
+  if (!requestAuthorized()) {
+    sendJson(403, "{\"ok\":false,\"error\":\"Not authorized - reload WebConfig so it "
+                  "picks up a fresh token.\"}");
+    return;
+  }
   if (dockOtaFile) dockOtaFile.close();
   dockOtaState = DOCK_OTA_IDLE;
   dockOtaError = "";
