@@ -1,6 +1,27 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.63 - 2026-09-01
+    - Fixes pairing that reported success on the remote while the dock carried
+      on blinking and then finished with its "failed" burst. The remote sent
+      its pair ack exactly once, but a dock in pairing mode walks channels 1-13
+      dwelling 450ms on each - a 5.85 second sweep, during which it is on the
+      remote's channel about 8% of the time. One ack therefore landed roughly
+      one attempt in twelve. The dock had in fact been paired the whole time as
+      far as the remote was concerned, which is why it went on to work from
+      WebConfig while the dock still looked like it had failed.
+    - The ack is now retried every 250ms for up to 30 attempts - 7.5 seconds,
+      comfortably past a full sweep, so the dock is guaranteed to be on the
+      remote's channel for at least one of them. It stops the moment a send is
+      acknowledged at the MAC layer, which is proof the dock heard it, and says
+      how many attempts it took.
+    - Fixes the pill going green in Settings and white again on the remote
+      page. Every page slot builds its own status pill and bindPageUi() swaps
+      the globals to whichever page is showing, so painting only the bound one
+      left every other page's pill white. All slots are painted now.
+    - Pairs with dock firmware 1.07, whose LED rests lit while a remote is
+      paired and dips while transmitting.
+
   3.62 - 2026-09-01
     - ESP-NOW is brought up on demand instead of the radio being held up all
       day. 3.61 kept the whole Wi-Fi station alive whenever a dock was paired,
@@ -3922,7 +3943,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.62"
+#define OPENREMOTE_VERSION_STRING "3.63"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -4828,6 +4849,9 @@ bool dockLedOnTransmit = true;
 volatile bool dockLinkOnline = false;
 unsigned long dockLastAckMs = 0;
 unsigned long dockNextPingMs = 0;
+uint8_t dockPairAckMac[6] = {0};
+uint8_t dockPairAckRetriesLeft = 0;
+unsigned long dockPairAckNextMs = 0;
 // Set from the ESP-NOW send callback (Wi-Fi task); acted on in loop(), because
 // LVGL objects must only be touched from the UI task.
 volatile bool dockLinkIndicatorDirty = false;
@@ -5925,9 +5949,11 @@ bool relayIrToDock(const DeviceCommand &command);
 bool dockConnected();
 void sendDockSettings();
 void serviceDockLink(unsigned long now);
+void serviceDockPairAck(unsigned long now);
 bool ensureEspNowLink();
 void refreshDockLinkIndicator();
 void applyDockLinkPillColour();
+lv_color_t pillIdleColour();
 bool espNowDockRadioRequired();
 void applyCommandFeedbackStyle(bool active);
 void serviceDockOta(unsigned long now);
@@ -10968,16 +10994,28 @@ lv_color_t pillIdleColour() {
 
 // Repaints the pill when the dock link changes, without rebuilding the page.
 void refreshDockLinkIndicator() {
-  applyCommandFeedbackStyle(false);
+  applyDockLinkPillColour();
 }
 
 // Every page render builds a new status pill with the default white outline.
 // Repainting only on a link *change* therefore lost the indication the moment
 // the user navigated anywhere, since the change had happened long before. This
 // is called after the pill is created so a green link survives navigation.
+// Every page slot builds its own status pill, and bindPageUi() swaps the
+// globals to whichever page is showing. Painting only the bound one therefore
+// left every other page's pill white - green in Settings, white the moment you
+// went back to the remote. All slots are painted here instead.
 void applyDockLinkPillColour() {
-  if (!dockConnected()) return;
-  applyCommandFeedbackStyle(false);
+  lv_color_t idle = pillIdleColour();
+  for (uint8_t slot = 0; slot < PAGE_SLOT_COUNT; slot++) {
+    PageUi &ui = pageUi[slot];
+    if (ui.statusPill && lv_obj_is_valid(ui.statusPill)) {
+      lv_obj_set_style_border_color(ui.statusPill, idle, 0);
+    }
+    if (ui.statusBattery && lv_obj_is_valid(ui.statusBattery)) {
+      lv_obj_set_style_border_color(ui.statusBattery, idle, 0);
+    }
+  }
 }
 
 void applyCommandFeedbackStyle(bool active) {
@@ -16989,6 +17027,32 @@ void sendDockSettings() {
 
 // A four byte nudge whose only job is to draw a MAC-layer ack, so the link
 // state stays current without the dock having to implement anything.
+void serviceDockPairAck(unsigned long now) {
+  if (!dockPairAckRetriesLeft) return;
+  if ((int32_t)(now - dockPairAckNextMs) < 0) return;
+  if (!ensureEspNowLink()) { dockPairAckRetriesLeft = 0; return; }
+
+  // A MAC-layer ack means the dock was on our channel and received it, so
+  // there is nothing left to retry.
+  if (dockLinkOnline) {
+    Serial.printf("ESP-NOW: pair ack acknowledged after %u attempt(s)\n",
+                  (unsigned)(31 - dockPairAckRetriesLeft));
+    dockPairAckRetriesLeft = 0;
+    return;
+  }
+
+  EspNowPairAckPacket ack = {};
+  ack.magic = ESPNOW_PAIR_ACK_MAGIC;
+  strlcpy(ack.name, remoteName.c_str(), sizeof(ack.name));
+  esp_now_send(dockPairAckMac, (const uint8_t *)&ack, sizeof(ack));
+  dockPairAckRetriesLeft--;
+  dockPairAckNextMs = now + 250UL;
+  if (!dockPairAckRetriesLeft) {
+    Serial.println("ESP-NOW: pair ack went unanswered - the dock will confirm on "
+                   "the first command instead");
+  }
+}
+
 void serviceDockLink(unsigned long now) {
   if (espNowDeviceCount == 0) {
     if (dockLinkOnline) {
@@ -17132,17 +17196,23 @@ bool addEspNowDevice(const uint8_t mac[6], const char *name) {
   }
   if (espNowRadioActive) espNowRegisterAllPeers();
 
-  // Tell the dock it is paired, now that it is a registered peer and can
-  // actually be unicast to. Best effort on purpose: a dock that misses this
-  // still confirms on the first command it receives, exactly as before, so a
-  // failed send costs nothing but the LED being late.
-  if (espNowRadioActive) {
-    EspNowPairAckPacket ack = {};
-    ack.magic = ESPNOW_PAIR_ACK_MAGIC;
-    strlcpy(ack.name, remoteName.c_str(), sizeof(ack.name));
-    esp_err_t sent = esp_now_send(mac, (const uint8_t *)&ack, sizeof(ack));
-    Serial.printf("ESP-NOW: pair ack -> %s (%s)\n", formatMacAddress(mac).c_str(),
-                  sent == ESP_OK ? "sent" : "not sent");
+  // Tell the dock it is paired - repeatedly, because a single attempt almost
+  // always missed.
+  //
+  // A dock in pairing mode walks channels 1-13 dwelling 450ms on each, so a
+  // full sweep is 5.85 seconds and it is listening on the remote's channel
+  // only about 8% of the time. One ack therefore landed roughly one try in
+  // twelve; the rest of the time the dock kept blinking until its window
+  // expired and finished with the fast "failed" burst, having been paired the
+  // whole time as far as the remote was concerned.
+  //
+  // Retrying past a full sweep guarantees the dock is on our channel for at
+  // least one attempt. It stops early the moment a send is acknowledged at the
+  // MAC layer, which is proof the dock heard it.
+  if (espNowDeviceCount > 0) {
+    memcpy(dockPairAckMac, mac, 6);
+    dockPairAckRetriesLeft = 30;   // 30 x 250ms = 7.5s, against a 5.85s sweep.
+    dockPairAckNextMs = millis();
   }
 
   espNowDevicesModalDirty = true;
@@ -24817,6 +24887,7 @@ void loop() {
   serviceBluetoothConnectionProfile(now);
   serviceEspNow(now);
   serviceDockOta(now);
+  serviceDockPairAck(now);
   serviceDockLink(now);
   serviceDockSettingsSync();
   if (dockLinkIndicatorDirty) { dockLinkIndicatorDirty = false; refreshDockLinkIndicator(); }
