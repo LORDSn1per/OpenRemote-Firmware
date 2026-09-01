@@ -1,6 +1,20 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.79 - 2026-09-01
+    - Fixes the resting pill looking like a thick white line instead of the
+      thin dim outline it should be, and matches the activity screen has:
+      colour and opacity had drifted onto two different signals. 3.77 moved
+      the colour (pillIdleColour()) to dockConnected() - a confirmed link -
+      but the two feedback styles' own opacity line was left checking the
+      older dockRadioLit() - merely "the radio is powered", true well before
+      anything is confirmed. Whenever the radio was active but not yet acked,
+      the border stayed white (correctly, from the colour signal) but jumped
+      to full opacity (from the stale one) - a bright, bold white line where a
+      dim default was expected, with the border width never having changed at
+      all. Both now read dockConnected(), so they cannot disagree again.
+    - Removes dockRadioLit(), left with no callers once both sites were fixed.
+
   3.78 - 2026-09-01
     - Retries a dropped IR command instead of losing it. True synchronised
       frequency hopping - as Bluetooth does - was asked for but is not what
@@ -4230,7 +4244,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.78"
+#define OPENREMOTE_VERSION_STRING "3.79"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -6286,7 +6300,6 @@ void releaseEspNowLink(const char *reason, bool forceEvenOnQrPage = false);
 void refreshDockLinkIndicator();
 void applyDockLinkPillColour();
 bool remoteHasActiveTarget();
-bool dockRadioLit();
 lv_color_t pillIdleColour();
 void clearEspNowCommandFeedback();
 void flashEspNowCommandFeedback();
@@ -11368,10 +11381,6 @@ bool remoteHasActiveTarget() {
   return activeDevice >= 0 || activeActivity >= 0;
 }
 
-bool dockRadioLit() {
-  return espNowEnabled && espNowDeviceCount > 0 && espNowRadioActive;
-}
-
 lv_color_t pillIdleColour() {
   return dockConnected() ? lv_color_hex(0x30D158) : lv_color_white();
 }
@@ -11418,7 +11427,14 @@ void applyCommandFeedbackStyle(bool active) {
     lv_obj_set_style_bg_color(statusPill, active ? lv_color_hex(0x5A0000) : lv_color_black(), 0);
     lv_obj_set_style_bg_opa(statusPill, active ? LV_OPA_COVER : (lv_opa_t)115, 0);
     lv_obj_set_style_border_color(statusPill, active ? red : idle, 0);
-    lv_obj_set_style_border_opa(statusPill, (active || dockRadioLit()) ? LV_OPA_COVER : (lv_opa_t)64, 0);
+    // Left over from before pillIdleColour() moved to dockConnected() in 3.77 -
+    // this still checked dockRadioLit() (radio merely powered, not confirmed),
+    // so a green-eligible-but-not-yet-acked window painted a WHITE colour at
+    // FULL opacity: bold and bright rather than the dim default, which is what
+    // read as "a thick white line" even though the border width never changed.
+    // Colour and opacity now come from the same signal, so they can never
+    // disagree again.
+    lv_obj_set_style_border_opa(statusPill, (active || dockConnected()) ? LV_OPA_COVER : (lv_opa_t)64, 0);
   }
   if (clockLabel && lv_obj_is_valid(clockLabel)) {
     lv_obj_set_style_text_color(clockLabel, active ? red : lv_color_white(), 0);
@@ -11513,7 +11529,7 @@ void applyButtonTestFeedbackStyle(bool active) {
     lv_obj_set_style_bg_color(statusPill, active ? lv_color_hex(0x0B3A1E) : lv_color_black(), 0);
     lv_obj_set_style_bg_opa(statusPill, active ? LV_OPA_COVER : (lv_opa_t)115, 0);
     lv_obj_set_style_border_color(statusPill, active ? green : idle, 0);
-    lv_obj_set_style_border_opa(statusPill, (active || dockRadioLit()) ? LV_OPA_COVER : (lv_opa_t)64, 0);
+    lv_obj_set_style_border_opa(statusPill, (active || dockConnected()) ? LV_OPA_COVER : (lv_opa_t)64, 0);
   }
   if (clockLabel && lv_obj_is_valid(clockLabel)) {
     lv_obj_set_style_text_color(clockLabel, active ? green : lv_color_white(), 0);
