@@ -1,6 +1,22 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.71 - 2026-09-01
+    - A paired dock can be renamed from the LCD. Paired docks now offers Rename
+      beside Forget, and it opens the same on-screen keyboard the Wi-Fi password
+      page uses, prefilled with the current name.
+    - The keyboard is reused rather than duplicated. Only two things differ when
+      renaming - what the typed text goes into, and what the OK key does - and
+      both follow settingsView, so the keys, the caps and symbol layers and
+      their layout stay in exactly one place. The OK key reads "Save" instead
+      of "Connect"/"Join" when renaming.
+    - Both menu styles. The Omote variant drops the password masking and the eye
+      toggle, which a name has no use for, and gives the text box the width they
+      freed.
+    - The field is capped at 23 characters, matching EspNowPairedDevice::name,
+      so a name cannot be silently truncated after being accepted. An empty or
+      whitespace-only name is ignored rather than stored.
+
   3.70 - 2026-09-01
     - Wake-warm returns as a switch rather than a decision made for you:
       "Wake with the screen", on the Dock page in both menu styles and in
@@ -4054,7 +4070,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.70"
+#define OPENREMOTE_VERSION_STRING "3.71"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -5018,6 +5034,7 @@ enum SettingsView {
   SETTINGS_BUTTONS,
   SETTINGS_DEBUG,
   SETTINGS_DOCK,
+  SETTINGS_DOCK_RENAME,
   SETTINGS_BATTERY,
   SETTINGS_BACKUP,
   SETTINGS_ABOUT,
@@ -6134,6 +6151,10 @@ void renderDisplayPage();
 void renderButtonsPage();
 void renderDebugPage();
 void renderDockPage();
+void renderDockRenamePage();
+void renderDockRenamePageOmote(const char *current);
+void espNowRenameClicked(lv_event_t *e);
+extern uint8_t dockRenameIndex;
 void renderBatteryPage();
 void renderBackupRestorePage();
 void stepLcdBackupAnim();
@@ -18952,6 +18973,14 @@ void hideEspNowPairedOverlay() {
 
 void rebuildEspNowPairedList();
 
+void espNowRenameClicked(lv_event_t *e) {
+  int index = (int)(intptr_t)lv_event_get_user_data(e);
+  if (index < 0 || index >= espNowDeviceCount) return;
+  dockRenameIndex = (uint8_t)index;
+  hideEspNowPairedOverlay();
+  openSettingsView(SETTINGS_DOCK_RENAME);
+}
+
 void espNowForgetClicked(lv_event_t *e) {
   int index = (int)(intptr_t)lv_event_get_user_data(e);
   if (index < 0 || index >= espNowDeviceCount) return;
@@ -18993,6 +19022,19 @@ void rebuildEspNowPairedList() {
     makeLabel(row, espNowDevices[i].name, 10, 5, &lv_font_montserrat_12, textPrimary());
     makeLabel(row, formatMacAddress(espNowDevices[i].mac).c_str(), 10, 23,
               &lv_font_montserrat_10, lvRgb(140, 155, 175));
+
+    lv_obj_t *rename = lv_btn_create(row);
+    lv_obj_set_size(rename, 62, 30);
+    lv_obj_align(rename, LV_ALIGN_RIGHT_MID, -72, 0);
+    lv_obj_set_style_bg_color(rename, lvRgb(34, 70, 116), 0);
+    lv_obj_set_style_radius(rename, 7, 0);
+    lv_obj_add_event_cb(rename, espNowRenameClicked, LV_EVENT_CLICKED,
+                        (void *)(intptr_t)i);
+    lv_obj_t *renameLabel = lv_label_create(rename);
+    lv_label_set_text(renameLabel, "Rename");
+    lv_obj_set_style_text_font(renameLabel, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(renameLabel, textPrimary(), 0);
+    lv_obj_center(renameLabel);
 
     lv_obj_t *forget = lv_btn_create(row);
     lv_obj_set_size(forget, 62, 30);
@@ -20515,9 +20557,28 @@ void wifiKeyboardEvent(lv_event_t *e) {
   if (!key) return;
 
   if (strcmp(key, "<OK>") == 0) {
+    if (settingsView == SETTINGS_DOCK_RENAME) {
+      String name = lv_textarea_get_text(wifiPasswordArea);
+      name.trim();
+      if (name.length() && dockRenameIndex < espNowDeviceCount) {
+        strlcpy(espNowDevices[dockRenameIndex].name, name.c_str(),
+                sizeof(espNowDevices[dockRenameIndex].name));
+        scheduleRuntimeSettingsSave();
+        Serial.printf("ESP-NOW: dock renamed to %s\n",
+                      espNowDevices[dockRenameIndex].name);
+      }
+      wifiPasswordArea = nullptr;
+      openSettingsView(SETTINGS_DOCK);
+      return;
+    }
     String password = lv_textarea_get_text(wifiPasswordArea);
     connectSelectedWifi(password, true);
   } else if (strcmp(key, "<CANCEL>") == 0) {
+    if (settingsView == SETTINGS_DOCK_RENAME) {
+      wifiPasswordArea = nullptr;
+      openSettingsView(SETTINGS_DOCK);
+      return;
+    }
     openSettingsView(SETTINGS_WIFI);
   } else if (strcmp(key, "<DEL>") == 0) {
     lv_textarea_del_char(wifiPasswordArea);
@@ -20597,7 +20658,8 @@ void renderCompactWifiKeyboard() {
   makeKeyboardKey("@#", "<SYM>", 4, 128, 36, 27, lvRgb(182, 215, 238));
   makeKeyboardKey("Cancel", "<CANCEL>", 43, 128, 54, 27, lvRgb(80, 96, 118));
   makeKeyboardKey("space", "<SPACE>", 100, 128, 58, 27, lvRgb(182, 215, 238));
-  makeKeyboardKey("Connect", "<OK>", 161, 128, 73, 27, lvRgb(42, 155, 230));
+  makeKeyboardKey(settingsView == SETTINGS_DOCK_RENAME ? "Save" : "Connect",
+                  "<OK>", 161, 128, 73, 27, lvRgb(42, 155, 230));
 }
 
 void addOmoteKeyboardTextRow(const char *keys, int count, int x, int y, int keyW, bool letters) {
@@ -20660,6 +20722,37 @@ void wifiPasswordVisibilityEvent(lv_event_t *e) {
   lv_textarea_set_password_mode(wifiPasswordArea, !wasHidden);
   lv_obj_t *icon = (lv_obj_t *)lv_event_get_user_data(e);
   if (icon) lv_label_set_text(icon, wasHidden ? LV_SYMBOL_EYE_CLOSE : LV_SYMBOL_EYE_OPEN);
+}
+
+// Same layout as the Wi-Fi password page, minus the things a name does not
+// need: no password masking and no eye toggle, and the text box takes the full
+// width they freed up.
+void renderDockRenamePageOmote(const char *current) {
+  lv_obj_t *macLabel = makeLabel(content,
+    dockRenameIndex < espNowDeviceCount
+      ? formatMacAddress(espNowDevices[dockRenameIndex].mac).c_str() : "",
+    58, 13, &lv_font_montserrat_12, textPrimary());
+  lv_obj_set_width(macLabel, 174);
+  lv_label_set_long_mode(macLabel, LV_LABEL_LONG_DOT);
+
+  wifiPasswordArea = lv_textarea_create(content);
+  lv_obj_set_pos(wifiPasswordArea, 8, 44);
+  lv_obj_set_size(wifiPasswordArea, 224, 30);
+  lv_textarea_set_one_line(wifiPasswordArea, true);
+  lv_textarea_set_max_length(wifiPasswordArea, 23);
+  lv_textarea_set_placeholder_text(wifiPasswordArea, "Dock name");
+  lv_textarea_set_text(wifiPasswordArea, current ? current : "");
+  lv_obj_set_style_bg_color(wifiPasswordArea, lvRgb(0x30, 0x30, 0x30), 0);
+  lv_obj_set_style_bg_opa(wifiPasswordArea, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(wifiPasswordArea, 1, 0);
+  lv_obj_set_style_border_color(wifiPasswordArea, lvRgb(0x50, 0x50, 0x50), 0);
+  lv_obj_set_style_radius(wifiPasswordArea, 8, 0);
+  lv_obj_set_style_text_color(wifiPasswordArea, textPrimary(), 0);
+
+  makeOmoteKeyboardKey(content, wifiKeyboardEvent, "Cancel", "<CANCEL>", 8, 80, 108, 30);
+  makeOmoteKeyboardKey(content, wifiKeyboardEvent, "Save", "<OK>", 124, 80, 108, 30, lvRgb(0x21, 0x96, 0xF3));
+
+  renderCompactWifiKeyboardOmote();
 }
 
 void renderWifiPasswordPageOmote() {
@@ -22168,6 +22261,41 @@ void renderDockPageOmote() {
   lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
 }
 
+// Renaming a dock reuses the Wi-Fi keyboard rather than growing a second one.
+// The only differences are what the text goes into and what the OK key does,
+// both of which follow settingsView - so the keys, the caps and symbol layers
+// and their layout stay in exactly one place.
+uint8_t dockRenameIndex = 0;
+
+void renderDockRenamePage() {
+  setCinematicBackground(false);
+  configureContent(42, 278, false);
+  renderTopBar("Rename dock", false);
+  renderSettingsBackButton();
+
+  const char *current = dockRenameIndex < espNowDeviceCount
+    ? espNowDevices[dockRenameIndex].name : "";
+
+  if (menuStyle == 1) {
+    renderDockRenamePageOmote(current);
+    return;
+  }
+
+  makeLabel(content, dockRenameIndex < espNowDeviceCount
+              ? formatMacAddress(espNowDevices[dockRenameIndex].mac).c_str() : "",
+            8, 13, &lv_font_montserrat_10, lvRgb(165, 180, 200));
+
+  wifiPasswordArea = lv_textarea_create(content);
+  lv_obj_set_pos(wifiPasswordArea, 8, 41);
+  lv_obj_set_size(wifiPasswordArea, 224, 36);
+  lv_textarea_set_one_line(wifiPasswordArea, true);
+  lv_textarea_set_max_length(wifiPasswordArea, 23);  // Matches EspNowPairedDevice::name.
+  lv_textarea_set_placeholder_text(wifiPasswordArea, "Dock name");
+  lv_textarea_set_text(wifiPasswordArea, current);
+
+  renderCompactWifiKeyboard();
+}
+
 void renderDockPage() {
   lv_obj_set_scrollbar_mode(content, LV_SCROLLBAR_MODE_AUTO);
   renderTopBar("Dock", false);
@@ -22681,6 +22809,7 @@ void renderSettingsPage() {
   switch (settingsView) {
     case SETTINGS_WIFI: renderWifiPage(); break;
     case SETTINGS_WIFI_PASSWORD: renderWifiPasswordPage(); break;
+    case SETTINGS_DOCK_RENAME: renderDockRenamePage(); break;
     case SETTINGS_WIFI_QR: renderWifiQrPage(); break;
     case SETTINGS_BLUETOOTH: renderBluetoothPage(); break;
     case SETTINGS_CLOCK: renderClockPage(); break;
