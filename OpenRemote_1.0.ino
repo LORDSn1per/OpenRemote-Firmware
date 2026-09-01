@@ -1,6 +1,36 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.62 - 2026-09-01
+    - ESP-NOW is brought up on demand instead of the radio being held up all
+      day. 3.61 kept the whole Wi-Fi station alive whenever a dock was paired,
+      which cost standby current continuously for a radio used seconds at a
+      time.
+    - It was doing that because ESP-NOW was tied to networkStackActive - a full
+      association: connect, authenticate, DHCP, seconds of work. ESP-NOW needs
+      none of it. It needs the radio powered and parked on the right channel,
+      which is a mode change and a channel set, with no AP and no router
+      involved. ensureEspNowLink() does exactly that and nothing else.
+    - The link is held for 15 seconds after each use, so a burst of presses -
+      volume, volume, volume - pays any bring-up cost once rather than per
+      press, then the radio is released again.
+    - It is also warmed on display wake, alongside the LCD and touch controller
+      coming up, so the cost overlaps work that has to happen anyway. Picking
+      the remote up is a reliable sign a button is about to be pressed, which
+      makes the first press feel like the rest of the burst.
+    - The channel is remembered (NVS key enChan). A dock locks onto whichever
+      channel it first heard the remote on, so standalone mode has to use that
+      same channel rather than whatever the radio would default to - otherwise
+      the two would be on different channels and never hear each other again.
+    - Bring-up is timed and logged - "ESP-NOW: link up in N ms" - so the real
+      cost is measured on hardware rather than estimated. Adjust the hold from
+      there if 15 seconds proves wrong.
+    - dockConnected() no longer means "the radio is up right now". Under
+      on-demand that would blink the pill green and white every fifteen seconds
+      and mean nothing. It now means a dock is paired and the last thing sent
+      to it was acknowledged, which is what a person means by connected, and it
+      goes white only when the dock actually stops answering.
+
   3.61 - 2026-09-01
     - Fixes the pill never turning green and the dock never flashing on a
       relayed command. One cause behind both: the idle shutdown took the Wi-Fi
@@ -3892,7 +3922,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.61"
+#define OPENREMOTE_VERSION_STRING "3.62"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -3925,6 +3955,7 @@ static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
 #include <SD.h>
 #include <WiFi.h>
 #include <esp_now.h>
+#include <esp_wifi.h>
 #include <esp_rom_crc.h>
 #include <HTTPClient.h>
 #include <WebServer.h>
@@ -4800,6 +4831,27 @@ unsigned long dockNextPingMs = 0;
 // Set from the ESP-NOW send callback (Wi-Fi task); acted on in loop(), because
 // LVGL objects must only be touched from the UI task.
 volatile bool dockLinkIndicatorDirty = false;
+
+// On-demand ESP-NOW.
+//
+// 3.61 held the whole Wi-Fi station up whenever a dock was paired, which cost
+// standby current all day for a radio used a few seconds at a time. It did that
+// because ESP-NOW was tied to networkStackActive - a full association: connect,
+// authenticate, DHCP, seconds of work.
+//
+// ESP-NOW needs none of that. It needs the radio powered and parked on the
+// right channel, which is a mode change and a channel set - no AP, no DHCP, no
+// router involved at all. So the radio is brought up on demand, held briefly in
+// case more commands follow, and dropped again.
+//
+// The channel is the catch: a dock locks onto whichever channel it first heard
+// the remote on, so standalone mode has to use that same channel rather than
+// whatever the radio defaults to. It is remembered here and in NVS.
+static const uint32_t ESPNOW_ONDEMAND_HOLD_MS = 15000;
+bool espNowStandalone = false;      // We brought the radio up ourselves.
+uint8_t espNowChannel = 0;          // 0 = not yet known.
+unsigned long espNowHoldUntilMs = 0;
+uint32_t espNowLastBringUpMs = 0;   // Measured, so the cost is known not guessed.
 char sdStatusText[64] = "Not checked";
 
 enum SettingsView {
@@ -5873,6 +5925,7 @@ bool relayIrToDock(const DeviceCommand &command);
 bool dockConnected();
 void sendDockSettings();
 void serviceDockLink(unsigned long now);
+bool ensureEspNowLink();
 void refreshDockLinkIndicator();
 void applyDockLinkPillColour();
 bool espNowDockRadioRequired();
@@ -7550,6 +7603,7 @@ void loadSettings() {
     preferences.getUChar("atvvModel", ATVV_INTERACTION_ON_REQUEST);
   atvv16kConsecutiveFailures = preferences.getUChar("atvv16kBad", 0);
   irRoute = preferences.getUChar("irRoute", IR_ROUTE_REMOTE);
+  espNowChannel = preferences.getUChar("enChan", 0);
   dockRfEnabled = preferences.getBool("dockRf", true);
   dockLedOnTransmit = preferences.getBool("dockLed", true);
   clockEnabled = preferences.getBool("clock", true);
@@ -7738,8 +7792,12 @@ bool webConfigQrPageActive() {
 // It costs standby current, which is why it is conditional rather than
 // permanent: switch ESP-NOW off, or forget the dock, and the idle shutdown
 // behaves exactly as it did before.
+// Nothing needs the *station* held up for ESP-NOW any more - 3.62 brings the
+// radio up on demand instead, which is what this was standing in for. Kept
+// only for an in-flight firmware transfer, which genuinely cannot survive the
+// radio going away underneath it.
 bool espNowDockRadioRequired() {
-  return espNowEnabled && espNowDeviceCount > 0;
+  return dockOtaState != DOCK_OTA_IDLE;
 }
 
 void scheduleNetworkShutdown(uint32_t delayMs = NETWORK_IDLE_SHUTDOWN_MS) {
@@ -16847,6 +16905,39 @@ void onEspNowDataSent(const wifi_tx_info_t *info, esp_now_send_status_t status) 
   }
 }
 
+// Brings ESP-NOW up without associating to anything, and reports how long it
+// took. Returns false only if the radio itself refuses.
+bool ensureEspNowLink() {
+  espNowHoldUntilMs = millis() + ESPNOW_ONDEMAND_HOLD_MS;
+  if (espNowRadioActive) return true;
+  if (!espNowEnabled || espNowDeviceCount == 0) return false;
+
+  unsigned long began = millis();
+  if (networkStackActive) {
+    startEspNow();                       // Ride the station that is already up.
+  } else {
+    if (!espNowChannel) {
+      Serial.println("ESP-NOW: no channel remembered yet - pair from the Dock menu once");
+      return false;
+    }
+    // Radio only: no WiFi.begin(), so none of the association cost.
+    WiFi.persistent(false);
+    if (WiFi.getMode() != WIFI_STA) WiFi.mode(WIFI_STA);
+    WiFi.disconnect(false, false);
+    esp_wifi_set_channel(espNowChannel, WIFI_SECOND_CHAN_NONE);
+    espNowStandalone = true;
+    startEspNow();
+  }
+  espNowLastBringUpMs = (uint32_t)(millis() - began);
+  if (espNowRadioActive) {
+    Serial.printf("ESP-NOW: link up in %u ms (%s, channel %u)\n",
+                  (unsigned)espNowLastBringUpMs,
+                  espNowStandalone ? "radio only" : "on the station",
+                  (unsigned)espNowChannel);
+  }
+  return espNowRadioActive;
+}
+
 void startEspNow() {
   if (espNowRadioActive) return;
   if (esp_now_init() != ESP_OK) {
@@ -16857,18 +16948,36 @@ void startEspNow() {
   esp_now_register_send_cb(onEspNowDataSent);
   espNowRegisterAllPeers();
   espNowRadioActive = true;
-  Serial.println("ESP-NOW: ready");
+  // Whatever channel we end up on is the one a dock will lock to, so record it
+  // for the standalone path to reuse.
+  uint8_t primary = 0;
+  wifi_second_chan_t second;
+  if (esp_wifi_get_channel(&primary, &second) == ESP_OK && primary) {
+    if (primary != espNowChannel) {
+      espNowChannel = primary;
+      preferences.begin(PREFERENCES_NAMESPACE, false);
+      preferences.putUChar("enChan", espNowChannel);
+      preferences.end();
+    }
+  }
+  Serial.printf("ESP-NOW: ready on channel %u\n", (unsigned)espNowChannel);
 }
 
 // True only while a dock is paired, the radio is up and it answered recently.
 // The pill outline and the Dock menu both read this, so they cannot disagree.
+// Deliberately not "the radio is up right now". With on-demand ESP-NOW the
+// radio is off most of the time, so that reading would blink the pill green
+// and white every fifteen seconds and mean nothing. This is "a dock is paired
+// and the last thing we sent it was acknowledged" - which is what a person
+// means by connected, and only goes white when the dock actually stops
+// answering.
 bool dockConnected() {
-  return espNowRadioActive && espNowDeviceCount > 0 && dockLinkOnline &&
-         (millis() - dockLastAckMs) < 20000UL;
+  return espNowEnabled && espNowDeviceCount > 0 && dockLinkOnline;
 }
 
 void sendDockSettings() {
-  if (!espNowRadioActive || espNowDeviceCount == 0) return;
+  if (espNowDeviceCount == 0) return;
+  if (!ensureEspNowLink()) return;
   EspNowDockSettingsPacket packet = {};
   packet.magic = ESPNOW_DOCK_SETTINGS_MAGIC;
   packet.rfEnabled = dockRfEnabled ? 1 : 0;
@@ -16881,18 +16990,24 @@ void sendDockSettings() {
 // A four byte nudge whose only job is to draw a MAC-layer ack, so the link
 // state stays current without the dock having to implement anything.
 void serviceDockLink(unsigned long now) {
-  if (!espNowRadioActive || espNowDeviceCount == 0) {
+  if (espNowDeviceCount == 0) {
     if (dockLinkOnline) {
       dockLinkOnline = false;
       dockLinkIndicatorDirty = true;
     }
     return;
   }
+  // A sleeping radio is not a disconnected dock. Under on-demand ESP-NOW the
+  // radio is off most of the time, and clearing the flag here would blink the
+  // pill white every time the link was released - saying "disconnected" when
+  // nothing of the sort had happened. Only a failed send clears it.
+  if (!espNowRadioActive) return;
   if (dockOtaState != DOCK_OTA_IDLE) return;  // The transfer is its own proof.
   if ((int32_t)(now - dockNextPingMs) < 0) return;
   dockNextPingMs = now + 5000UL;
   uint32_t ping = ESPNOW_DOCK_PING_MAGIC;
   esp_now_send(espNowDevices[0].mac, (const uint8_t *)&ping, sizeof(ping));
+  // Only meaningful while the radio is actually up and pinging.
   if (dockLinkOnline && (now - dockLastAckMs) > 20000UL) {
     dockLinkOnline = false;
     dockLinkIndicatorDirty = true;
@@ -16914,12 +17029,24 @@ void stopEspNow() {
 // and the same networkStackActive/setupApActive gate Wi-Fi itself already
 // uses, and times out an open pairing window.
 void serviceEspNow(unsigned long now) {
+  bool holding = (int32_t)(now - espNowHoldUntilMs) < 0;
   bool shouldBeActive = espNowEnabled && networkStackActive && !setupApActive &&
                         WiFi.getMode() != WIFI_OFF;
   if (shouldBeActive && !espNowRadioActive) {
     startEspNow();
-  } else if (!shouldBeActive && espNowRadioActive) {
+  } else if (!shouldBeActive && espNowRadioActive && !espNowStandalone) {
     stopEspNow();
+  }
+
+  // A radio we brought up ourselves is ours to put away again. Held briefly
+  // after the last use so a burst of presses - volume, volume, volume - pays
+  // the bring-up cost once rather than each time.
+  if (espNowStandalone && !holding && !espNowScanActive && !rfLearnActive &&
+      dockOtaState == DOCK_OTA_IDLE) {
+    stopEspNow();
+    espNowStandalone = false;
+    if (!networkStackActive && WiFi.getMode() != WIFI_OFF) WiFi.mode(WIFI_OFF);
+    Serial.println("ESP-NOW: link released");
   }
   if (espNowScanActive && now - espNowScanStartedMs >= ESPNOW_SCAN_TIMEOUT_MS) {
     espNowScanActive = false;
@@ -17246,7 +17373,10 @@ void serviceDockOta(unsigned long now) {
 // setting is for. Distinct from sendEspNowCommand(), which serves commands the
 // user deliberately configured as ESPNOW and which carry their own target.
 bool relayIrToDock(const DeviceCommand &command) {
-  if (!espNowRadioActive || espNowDeviceCount == 0) return false;
+  if (espNowDeviceCount == 0) return false;
+  // Brings the radio up if it is asleep. The first command after an idle spell
+  // pays for that; the rest of a burst does not, because the link is held.
+  if (!ensureEspNowLink()) return false;
   uint8_t payload[ESPNOW_MAX_PAYLOAD_BYTES];
   size_t payloadLen = 0;
   DeviceCommand routed = command;
@@ -24173,6 +24303,14 @@ void wakeDisplay() {
   restoreBacklightPwmAfterSleep();
   setLcdControllerSleeping(false);
   digitalWrite(PIN_IR_VCC, HIGH);
+  // Warm the dock link while the screen and touch controller are coming up, so
+  // the bring-up overlaps work that has to happen anyway. Picking the remote up
+  // is a reliable sign a button is about to be pressed, and this is what makes
+  // the first press feel the same as the rest of a burst instead of paying the
+  // radio's start-up cost in front of the user.
+  if (irRoute != IR_ROUTE_REMOTE && espNowEnabled && espNowDeviceCount > 0) {
+    ensureEspNowLink();
+  }
   wakeTouchController(100);
   lv_obj_clear_flag(uiRoot, LV_OBJ_FLAG_HIDDEN);
   displaySleeping = false;
