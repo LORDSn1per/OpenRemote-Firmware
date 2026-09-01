@@ -1,6 +1,28 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.60 - 2026-09-01
+    - Fixes the ESP-NOW search, which could not find a dock from the LCD at
+      all. It refused whenever the Wi-Fi station was down, and the remote shuts
+      the network stack down when idle - so the search was almost always
+      refused, which is why pairing had only ever worked from WebConfig, where
+      Wi-Fi is by definition already running. Pressing Search now starts the
+      station and begins scanning the moment it is up, showing "STARTING WI-FI"
+      meanwhile, instead of declining and blaming the user.
+    - Fixes the yellow warning that appeared for about 20 milliseconds and was
+      then replaced by "NO DOCKS FOUND". serviceEspNowSearchOverlay(), seeing
+      no scan running, overwrote the explanation on the very next tick - so the
+      real reason was visible for a single frame and a misleading one took its
+      place. A blocked overlay is now a finished statement and is left alone.
+    - Fixes the overlay layout. The ring grew downward from a fixed top edge,
+      so at full size it ran into the title and the text sat over the icon; it
+      now breathes around a fixed centre and the title sits clear of its
+      largest extent. Checked against the real 240x320 panel: ring 5-163, title
+      172-194, hint from 198, list 240-308, with no overlap in any state.
+    - The backdrop is nearly opaque rather than 80%. The settings rows
+      underneath were showing through and the white text landed on top of them,
+      which was unreadable in a dark room - as photographed.
+
   3.59 - 2026-09-01
     - The dock's LED never blinked on an IR command because nothing was ever
       sent to it. ESPNOW is a separate DeviceCommand kind, so an ordinary IR
@@ -3851,7 +3873,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.59"
+#define OPENREMOTE_VERSION_STRING "3.60"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -5842,6 +5864,7 @@ void serviceEspNowSearchOverlay(unsigned long now);
 void hideEspNowSearchOverlay();
 void showEspNowSearchBlocked(const char *why);
 void showEspNowSearchOverlay();
+void showEspNowSearchScanning();
 void toggleEspNowDevicesModal(lv_event_t *e);
 void serviceEspNowDevicesModal(unsigned long now);
 void startSetupAccessPoint();
@@ -18360,8 +18383,23 @@ lv_obj_t *espNowSearchHint = nullptr;
 lv_obj_t *espNowSearchList = nullptr;
 bool espNowSearchOverlayVisible = false;
 uint8_t espNowSearchShownCount = 0xFF;
+// Without this the service tick below, seeing no scan running, immediately
+// replaced a "cannot search" explanation with "no docks found" - so the real
+// reason appeared for a single frame and was then overwritten by a misleading
+// one. Reported from hardware as a yellow warning that flashed for about 20ms.
+bool espNowSearchBlocked = false;
+// Set while waiting for the Wi-Fi station to come up before scanning.
+bool espNowSearchAwaitingWifi = false;
+unsigned long espNowSearchWifiDeadlineMs = 0;
+
+// The ring breathes around a fixed centre rather than a fixed top edge. Growing
+// it from the top pushed it down into the title, which is what made the text
+// sit over the icon.
+static const int ESPNOW_RING_CENTRE_Y = 84;
 
 void hideEspNowSearchOverlay() {
+  espNowSearchBlocked = false;
+  espNowSearchAwaitingWifi = false;
   if (!espNowSearchOverlay) return;
   lv_obj_add_flag(espNowSearchOverlay, LV_OBJ_FLAG_HIDDEN);
   espNowSearchOverlayVisible = false;
@@ -18395,7 +18433,9 @@ void createEspNowSearchOverlay() {
   lv_obj_clear_flag(espNowSearchOverlay, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_flag(espNowSearchOverlay, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_set_style_bg_color(espNowSearchOverlay, lv_color_black(), 0);
-  lv_obj_set_style_bg_opa(espNowSearchOverlay, LV_OPA_80, 0);
+  // Nearly opaque. At 80% the settings rows underneath showed through and the
+  // white text landed on top of them, which was unreadable in a dark room.
+  lv_obj_set_style_bg_opa(espNowSearchOverlay, (lv_opa_t)242, 0);
   lv_obj_set_style_border_width(espNowSearchOverlay, 0, 0);
   lv_obj_set_style_radius(espNowSearchOverlay, 0, 0);
   lv_obj_set_style_pad_all(espNowSearchOverlay, 0, 0);
@@ -18403,7 +18443,7 @@ void createEspNowSearchOverlay() {
 
   espNowSearchPulse = lv_obj_create(espNowSearchOverlay);
   lv_obj_set_size(espNowSearchPulse, 88, 88);
-  lv_obj_align(espNowSearchPulse, LV_ALIGN_TOP_MID, 0, 26);
+  lv_obj_align(espNowSearchPulse, LV_ALIGN_TOP_MID, 0, ESPNOW_RING_CENTRE_Y - 44);
   lv_obj_clear_flag(espNowSearchPulse, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_clear_flag(espNowSearchPulse, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_set_style_bg_opa(espNowSearchPulse, LV_OPA_TRANSP, 0);
@@ -18414,22 +18454,24 @@ void createEspNowSearchOverlay() {
 
   espNowSearchGlyph = makeLabel(espNowSearchOverlay, LV_SYMBOL_WIFI, 0, 0,
                                 &lv_font_montserrat_48, lvRgb(45, 143, 255));
-  lv_obj_align(espNowSearchGlyph, LV_ALIGN_TOP_MID, 0, 44);
+  lv_obj_align(espNowSearchGlyph, LV_ALIGN_TOP_MID, 0, ESPNOW_RING_CENTRE_Y - 30);
 
   espNowSearchTitle = makeLabel(espNowSearchOverlay, "SEARCHING", 0, 0,
                                 &lv_font_montserrat_20, textPrimary());
-  lv_obj_align(espNowSearchTitle, LV_ALIGN_TOP_MID, 0, 124);
+  // Below the ring at its largest (centre 84 + half of 158 = 163), so a
+  // breathing ring can never reach the title.
+  lv_obj_align(espNowSearchTitle, LV_ALIGN_TOP_MID, 0, 172);
 
   espNowSearchHint = makeLabel(espNowSearchOverlay, "", 0, 0,
                                &lv_font_montserrat_10, lvRgb(135, 195, 255));
   lv_label_set_long_mode(espNowSearchHint, LV_LABEL_LONG_WRAP);
   lv_obj_set_width(espNowSearchHint, LCD_W - 36);
   lv_obj_set_style_text_align(espNowSearchHint, LV_TEXT_ALIGN_CENTER, 0);
-  lv_obj_align(espNowSearchHint, LV_ALIGN_TOP_MID, 0, 150);
+  lv_obj_align(espNowSearchHint, LV_ALIGN_TOP_MID, 0, 198);
 
   espNowSearchList = lv_obj_create(espNowSearchOverlay);
-  lv_obj_set_size(espNowSearchList, LCD_W - 28, 108);
-  lv_obj_align(espNowSearchList, LV_ALIGN_BOTTOM_MID, 0, -14);
+  lv_obj_set_size(espNowSearchList, LCD_W - 28, 68);
+  lv_obj_align(espNowSearchList, LV_ALIGN_BOTTOM_MID, 0, -12);
   lv_obj_set_style_bg_opa(espNowSearchList, LV_OPA_TRANSP, 0);
   lv_obj_set_style_border_width(espNowSearchList, 0, 0);
   lv_obj_set_style_pad_all(espNowSearchList, 0, 0);
@@ -18473,6 +18515,8 @@ void showEspNowSearchOverlay() {
 void showEspNowSearchBlocked(const char *why) {
   showEspNowSearchOverlay();
   if (!espNowSearchOverlay) return;
+  espNowSearchBlocked = true;
+  espNowSearchAwaitingWifi = false;
   lv_label_set_text(espNowSearchGlyph, LV_SYMBOL_WARNING);
   lv_obj_set_style_text_color(espNowSearchGlyph, lvRgb(255, 176, 32), 0);
   lv_obj_set_style_border_color(espNowSearchPulse, lvRgb(255, 176, 32), 0);
@@ -18481,14 +18525,57 @@ void showEspNowSearchBlocked(const char *why) {
   if (espNowSearchList) lv_obj_clean(espNowSearchList);
 }
 
+// Sets the overlay to its searching appearance. Used both when a scan starts
+// immediately and when one starts after Wi-Fi has come up.
+void showEspNowSearchScanning() {
+  espNowSearchBlocked = false;
+  espNowSearchAwaitingWifi = false;
+  espNowSearchShownCount = 0xFF;
+  lv_label_set_text(espNowSearchGlyph, LV_SYMBOL_WIFI);
+  lv_obj_set_style_text_color(espNowSearchGlyph, lvRgb(45, 143, 255), 0);
+  lv_obj_set_style_border_color(espNowSearchPulse, lvRgb(45, 143, 255), 0);
+  lv_label_set_text(espNowSearchTitle, "SEARCHING");
+  lv_label_set_text(espNowSearchHint,
+                    "Hold the dock's button for 5 seconds until its LED blinks.\nTap to cancel");
+}
+
 void serviceEspNowSearchOverlay(unsigned long now) {
   if (!espNowSearchOverlayVisible || !espNowSearchOverlay) return;
+
+  // A blocked overlay is a finished statement, not a stage of a search. Without
+  // this the branch below would overwrite it with "no docks found" on the very
+  // next tick, hiding the actual reason behind a wrong one.
+  if (espNowSearchBlocked) return;
+
+  // ESP-NOW shares the Wi-Fi radio, so the station has to be up before a scan
+  // can run. Rather than refusing - which is what happened, and looked like a
+  // failure the user had caused - the station is started and the scan follows
+  // once it is ready.
+  if (espNowSearchAwaitingWifi) {
+    uint16_t phase = (now / 6U) % 140U;
+    int32_t size = phase <= 70U ? 88 + phase : 158 - (phase - 70U);
+    lv_obj_set_size(espNowSearchPulse, size, size);
+    lv_obj_align(espNowSearchPulse, LV_ALIGN_TOP_MID, 0, ESPNOW_RING_CENTRE_Y - size / 2);
+    if (networkStackActive && !setupApActive) {
+      if (!espNowRadioActive) startEspNow();
+      if (startEspNowScan()) {
+        showEspNowSearchScanning();
+      } else {
+        showEspNowSearchBlocked("The Wi-Fi radio came up but the search still could not start. Check ESP-NOW is on.");
+      }
+      return;
+    }
+    if ((int32_t)(now - espNowSearchWifiDeadlineMs) >= 0) {
+      showEspNowSearchBlocked("Wi-Fi did not start in time. ESP-NOW shares the Wi-Fi radio, so it needs Wi-Fi switched on and a network selected.");
+    }
+    return;
+  }
 
   if (espNowScanActive) {
     uint16_t phase = (now / 6U) % 140U;
     int32_t size = phase <= 70U ? 88 + phase : 158 - (phase - 70U);
     lv_obj_set_size(espNowSearchPulse, size, size);
-    lv_obj_align(espNowSearchPulse, LV_ALIGN_TOP_MID, 0, 26 + (88 - size) / 2);
+    lv_obj_align(espNowSearchPulse, LV_ALIGN_TOP_MID, 0, ESPNOW_RING_CENTRE_Y - size / 2);
     lv_obj_set_style_border_opa(
       espNowSearchPulse, static_cast<lv_opa_t>(LV_OPA_80 - ((size - 88) * 56 / 70)), 0);
   }
@@ -18512,7 +18599,7 @@ void serviceEspNowSearchOverlay(unsigned long now) {
                         "Hold the dock's button for 5 seconds until its LED blinks, then search again.\nTap to close");
     }
     lv_obj_set_size(espNowSearchPulse, 128, 128);
-    lv_obj_align(espNowSearchPulse, LV_ALIGN_TOP_MID, 0, 6);
+    lv_obj_align(espNowSearchPulse, LV_ALIGN_TOP_MID, 0, ESPNOW_RING_CENTRE_Y - 64);
     lv_obj_set_style_border_opa(espNowSearchPulse, LV_OPA_60, 0);
   }
 }
@@ -23228,21 +23315,38 @@ void toggleEspNowDevicesModal(lv_event_t *e) {
     showEspNowSearchBlocked("ESP-NOW is switched off. Turn it on above, then search again.");
     return;
   }
+  showEspNowSearchOverlay();
+
+  // Wi-Fi down: bring it up and search when it is ready, rather than refusing.
+  // The remote shuts the network stack down when idle, so refusing here meant
+  // the LCD could almost never pair a dock - which is exactly what happened,
+  // and why pairing only ever worked from WebConfig, where Wi-Fi is by
+  // definition already running.
   if (!networkStackActive || setupApActive) {
-    showEspNowSearchBlocked("Wi-Fi is not running yet. ESP-NOW shares the Wi-Fi radio, so it needs a moment - or a connected network - before it can search.");
+    if (!wifiOn || !hasSelectedWifiProfile()) {
+      showEspNowSearchBlocked("ESP-NOW shares the Wi-Fi radio, so Wi-Fi must be on with a network selected before a dock can be found.");
+      return;
+    }
+    espNowSearchBlocked = false;
+    espNowSearchAwaitingWifi = true;
+    espNowSearchWifiDeadlineMs = millis() + 15000UL;
+    networkShutdownAtMs = 0;
+    startNetworkStack();
+    lv_label_set_text(espNowSearchGlyph, LV_SYMBOL_WIFI);
+    lv_obj_set_style_text_color(espNowSearchGlyph, lvRgb(45, 143, 255), 0);
+    lv_obj_set_style_border_color(espNowSearchPulse, lvRgb(45, 143, 255), 0);
+    lv_label_set_text(espNowSearchTitle, "STARTING WI-FI");
+    lv_label_set_text(espNowSearchHint,
+                      "ESP-NOW shares the Wi-Fi radio. The search starts as soon as it is up.\nTap to cancel");
     return;
   }
+
+  if (!espNowRadioActive) startEspNow();
   if (!startEspNowScan()) {
     showEspNowSearchBlocked("The search could not be started. Check Wi-Fi and ESP-NOW are on.");
     return;
   }
-  showEspNowSearchOverlay();
-  lv_label_set_text(espNowSearchGlyph, LV_SYMBOL_WIFI);
-  lv_obj_set_style_text_color(espNowSearchGlyph, lvRgb(45, 143, 255), 0);
-  lv_obj_set_style_border_color(espNowSearchPulse, lvRgb(45, 143, 255), 0);
-  lv_label_set_text(espNowSearchTitle, "SEARCHING");
-  lv_label_set_text(espNowSearchHint,
-                    "Hold the dock's button for 5 seconds until its LED blinks.\nTap to cancel");
+  showEspNowSearchScanning();
 }
 
 // Called from loop(): rebuilds the modal only when it's open and something
