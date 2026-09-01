@@ -1,6 +1,52 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.76 - 2026-09-01
+    - Fixes firmware and WebConfig uploads being rejected with "No upload
+      session for this target". releaseEspNowLink() gated its whole body on
+      espNowStandalone, which is false whenever ESP-NOW rode a Wi-Fi station
+      that was already up - which is every WebConfig session, since the
+      browser needs that station regardless. The function was therefore a
+      complete no-op for the entire duration of any WebConfig visit with a
+      dock paired, so 3.73's "keep the link up while the QR page is shown"
+      never actually gave that memory back for anything - including a
+      chunked upload that needed it. Under low heap a String assignment can
+      fail silently, and chunkUploadTarget = target is exactly that
+      assignment; a failed one left the session variable not matching what
+      the browser was sending, surfacing many requests later as a session
+      error that said nothing about memory. Fixed at the root: the gate is
+      now espNowRadioActive, which is true whenever ESP-NOW's own protocol
+      stack costs memory, standalone or not - and a chunked upload now
+      explicitly frees that memory before it starts, forcing through even
+      the QR-page hold.
+    - The same no-op silently broke "the dock LED never turns off": display
+      sleep's release call hit the identical gate and did nothing for as
+      long as the remote had ever brought ESP-NOW up while the WiFi QR page
+      was showing, which is how a remote gets to WebConfig in the first
+      place. Display going dark now always wins over holding the link for
+      the QR page - nobody is looking at anything once the screen is off.
+    - Fixes the link not coming back at all afterward, some of the time.
+      startEspNow() read back whatever channel the radio actually landed on
+      and persisted it to NVS unconditionally. In the standalone path that
+      is backwards: espNowChannel was just set explicitly moments before, so
+      if esp_wifi_set_channel() silently failed to take - most plausibly a
+      mode transition from OFF that had not settled - the radio defaulted to
+      its own channel, that wrong value got read back, and the ONE good
+      stored channel was overwritten with a wrong one and written straight
+      to NVS. Every later standalone attempt then explicitly requested the
+      now-corrupted channel - a permanent, self-inflicted break that looked
+      exactly like "the dock never comes back", because after that point it
+      genuinely could not. The channel is now only learned from a real
+      station association; a standalone bring-up instead verifies the
+      channel actually took (checking esp_wifi_set_channel()'s own result,
+      with a short settle after a mode change) and refuses to proceed on the
+      wrong one rather than silently adopting and saving it. Recovers on its
+      own the next time the remote genuinely associates to Wi-Fi - opening
+      WebConfig once is enough - or immediately on a fresh pairing.
+    - The remote now logs its own ESP-NOW link state every 10 seconds and on
+      change, mirroring the dock's own state line, so the next report carries
+      both sides of the link instead of just the dock's half.
+
   3.75 - 2026-09-01
     - Paces a held repeat to what the dock can actually transmit. An IR burst
       occupies the emitter for as long as the code lasts - the dock measures
@@ -4134,7 +4180,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.75"
+#define OPENREMOTE_VERSION_STRING "3.76"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -6184,7 +6230,7 @@ void sendDockSettings();
 void serviceDockLink(unsigned long now);
 void serviceDockPairAck(unsigned long now);
 bool ensureEspNowLink();
-void releaseEspNowLink(const char *reason);
+void releaseEspNowLink(const char *reason, bool forceEvenOnQrPage = false);
 void refreshDockLinkIndicator();
 void applyDockLinkPillColour();
 bool remoteHasActiveTarget();
@@ -15332,12 +15378,35 @@ void handleChunkUploadBegin() {
     return;
   }
   closeChunkUploadSession();
+  // A large upload matters more than a dock link nobody is actively using
+  // during it. 3.73 started holding the ESP-NOW/Wi-Fi-station radio up for as
+  // long as the WebConfig QR page is open, which is exactly the page a
+  // firmware or WebConfig upload runs from - so a paired dock now added
+  // standing heap pressure to precisely the transfer that has the least room
+  // to spare. Releasing it here hands that memory back before the transfer
+  // starts; the dock reconnects on demand the next time it is actually needed,
+  // which is the whole point of on-demand ESP-NOW.
+  releaseEspNowLink("chunked upload starting", true);
   SD.remove(path);
   chunkUploadTarget = target;
   chunkUploadTempPath = path;
   chunkUploadBytes = 0;
   chunkUploadCrc = 0;
   chunkUploadError = "";
+  // A String assignment is a heap allocation. Under real memory pressure it
+  // can fail and leave chunkUploadTarget empty rather than throw - which used
+  // to surface many chunks later as "No upload session for this target" on
+  // the very first chunk, with nothing to say why. Checked here so a genuine
+  // low-memory condition is reported as exactly that, at the moment it
+  // happens, instead of masquerading as a session bug several requests later.
+  if (chunkUploadTarget != target) {
+    closeChunkUploadSession();
+    Serial.printf("Chunked upload: begin target=%s REFUSED - could not allocate "
+                  "session state, heapFree=%u\n", target.c_str(), (unsigned)ESP.getFreeHeap());
+    sendJson(503, "{\"ok\":false,\"error\":\"Not enough free memory to start this upload right now. "
+                  "Wait a moment and try again.\"}");
+    return;
+  }
   Serial.printf("Chunked upload: begin target=%s heapFree=%u psramFree=%u\n",
                 target.c_str(), (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
   sendJson(200, "{\"ok\":true,\"bytes\":0}");
@@ -15504,9 +15573,9 @@ void handleChunkUploadFinish() {
   }
 
   if (!ok && target != "webconfig") SD.remove(path);
-  Serial.printf("Chunked upload: finish target=%s %s received=%u %s\n",
+  Serial.printf("Chunked upload: finish target=%s %s received=%u heapFree=%u %s\n",
                 target.c_str(), ok ? "committed" : "FAILED",
-                (unsigned)received, ok ? "" : error.c_str());
+                (unsigned)received, (unsigned)ESP.getFreeHeap(), ok ? "" : error.c_str());
   closeChunkUploadSession();
 
   if (!ok) {
@@ -17395,9 +17464,21 @@ bool ensureEspNowLink() {
     }
     // Radio only: no WiFi.begin(), so none of the association cost.
     WiFi.persistent(false);
-    if (WiFi.getMode() != WIFI_STA) WiFi.mode(WIFI_STA);
+    bool modeChanged = WiFi.getMode() != WIFI_STA;
+    if (modeChanged) WiFi.mode(WIFI_STA);
     WiFi.disconnect(false, false);
-    esp_wifi_set_channel(espNowChannel, WIFI_SECOND_CHAN_NONE);
+    // A mode transition from OFF is not always immediately ready to accept a
+    // channel set - delay(1) gives it one scheduler tick, cheap against the
+    // alternative of silently landing on the wrong channel. Only when the
+    // mode actually changed; already being in STA needs nothing extra.
+    if (modeChanged) delay(1);
+    esp_err_t channelResult = esp_wifi_set_channel(espNowChannel, WIFI_SECOND_CHAN_NONE);
+    if (channelResult != ESP_OK) {
+      Serial.printf("ESP-NOW: could not set channel %u (rc=%d) - not bringing "
+                    "the link up on the wrong one\n",
+                    (unsigned)espNowChannel, (int)channelResult);
+      return false;
+    }
     espNowStandalone = true;
     startEspNow();
   }
@@ -17421,20 +17502,36 @@ void startEspNow() {
   esp_now_register_send_cb(onEspNowDataSent);
   espNowRegisterAllPeers();
   espNowRadioActive = true;
-  // Whatever channel we end up on is the one a dock will lock to, so record it
-  // for the standalone path to reuse.
   uint8_t primary = 0;
   wifi_second_chan_t second;
-  if (esp_wifi_get_channel(&primary, &second) == ESP_OK && primary) {
+  bool readChannel = esp_wifi_get_channel(&primary, &second) == ESP_OK && primary;
+  if (readChannel && !espNowStandalone) {
+    // Riding an association: the router chose this channel, so it is
+    // authoritative and worth remembering for next time.
     if (primary != espNowChannel) {
       espNowChannel = primary;
       preferences.begin(PREFERENCES_NAMESPACE, false);
       preferences.putUChar("enChan", espNowChannel);
       preferences.end();
     }
+  } else if (readChannel && espNowStandalone && primary != espNowChannel) {
+    // Standalone: WE just asked for espNowChannel via esp_wifi_set_channel().
+    // Landing anywhere else means that call silently did not take - most
+    // likely a mode transition that had not settled - and this is the fault,
+    // not a new truth to adopt. The bug this guards against: the old code
+    // persisted whatever the radio actually read back here unconditionally,
+    // so a single failed channel set overwrote the one good value in NVS with
+    // a wrong one, and every later attempt then explicitly requested the now-
+    // corrupted channel - a permanent, self-inflicted break that looked
+    // exactly like "the dock never comes back", because after that point it
+    // never could.
+    Serial.printf("ESP-NOW: WARNING - asked for channel %u but the radio is on "
+                  "%u. Not saving this; the dock will not be heard until it is.\n",
+                  (unsigned)espNowChannel, (unsigned)primary);
   }
   dockLinkIndicatorDirty = true;
-  Serial.printf("ESP-NOW: ready on channel %u\n", (unsigned)espNowChannel);
+  Serial.printf("ESP-NOW: ready on channel %u (asked for %u, radio reports %u)\n",
+                (unsigned)espNowChannel, (unsigned)espNowChannel, (unsigned)primary);
 }
 
 // True only while a dock is paired, the radio is up and it answered recently.
@@ -17496,6 +17593,31 @@ void serviceDockPairAck(unsigned long now) {
   }
 }
 
+// Mirrors the dock's own serviceStateLog() - stated repeatedly rather than
+// once, and covering the specific fields that decide whether a standalone
+// bring-up can work at all, since guessing at this link from one side's log
+// has cost several rounds already.
+void serviceEspNowLinkLog(unsigned long now) {
+  static unsigned long nextMs = 0;
+  static bool lastActive = false;
+  static bool primed = false;
+  bool due = (int32_t)(now - nextMs) >= 0;
+  if (!primed || espNowRadioActive != lastActive || due) {
+    primed = true;
+    lastActive = espNowRadioActive;
+    nextMs = now + 10000UL;
+    Serial.printf("ESP-NOW link: active=%s standalone=%s channel=%u dockOnline=%s "
+                  "holdMsLeft=%ld enabled=%s paired=%u\n",
+                  espNowRadioActive ? "yes" : "no",
+                  espNowStandalone ? "yes" : "no",
+                  (unsigned)espNowChannel,
+                  dockLinkOnline ? "yes" : "no",
+                  (long)(espNowHoldUntilMs - now),
+                  espNowEnabled ? "yes" : "no",
+                  (unsigned)espNowDeviceCount);
+  }
+}
+
 void serviceDockLink(unsigned long now) {
   if (espNowDeviceCount == 0) {
     if (dockLinkOnline) {
@@ -17544,14 +17666,26 @@ void stopEspNow() {
 //
 // Refuses while a transfer, scan or learn is running - those own the radio and
 // losing it mid-way would abandon real work.
-void releaseEspNowLink(const char *reason) {
-  if (!espNowStandalone || !espNowRadioActive) return;
+void releaseEspNowLink(const char *reason, bool forceEvenOnQrPage) {
+  // espNowRadioActive is what actually costs memory and battery - the ESP-NOW
+  // protocol stack's own peer table and buffers - whether this session brought
+  // its own radio up (espNowStandalone) or rode a Wi-Fi station that was
+  // already required for something else. WebConfig always falls in the second
+  // case: the station has to be up for the browser to be talking to the remote
+  // at all, so ensureEspNowLink()'s "ride the station" branch is what runs and
+  // espNowStandalone is never set. Gating this function on espNowStandalone
+  // therefore made it a complete no-op for every WebConfig session - which is
+  // why the dock's LED and the remote's pill outline were staying on
+  // indefinitely once a WebConfig visit had brought ESP-NOW up, and why a
+  // firmware upload during that same visit never got the memory back either.
+  if (!espNowRadioActive) return;
   if (espNowScanActive || rfLearnActive || dockOtaState != DOCK_OTA_IDLE) return;
   // WebConfig is open and being looked at, and everything it offers for a dock
   // - the firmware push, the settings, the status row - needs the link. Letting
   // it lapse under the user's hands would make those fail for no reason they
-  // could see.
-  if (webConfigQrPageActive()) return;
+  // could see. Overridable: a caller with a stronger reason - the display going
+  // dark, or a large upload that needs the memory now - can force through this.
+  if (webConfigQrPageActive() && !forceEvenOnQrPage) return;
   if (espNowDeviceCount > 0) {
     uint32_t bye = ESPNOW_DOCK_LINK_DOWN_MAGIC;
     esp_now_send(espNowDevices[0].mac, (const uint8_t *)&bye, sizeof(bye));
@@ -24957,7 +25091,7 @@ void enterDisplaySleep() {
   // Released here rather than left to time out, so turning the remote face
   // down puts the dock's LED out at the same moment as the LCD instead of
   // seven seconds later.
-  releaseEspNowLink("display sleep");
+  releaseEspNowLink("display sleep", true);
   if (runtimeSettingsSavePending) {
     runtimeSettingsSavePending = !persistSettingsToRuntimeConfig();
     if (runtimeSettingsSavePending) runtimeSettingsSaveAtMs = millis() + 1000UL;
@@ -25518,6 +25652,7 @@ void loop() {
   serviceDockOta(now);
   serviceDockPairAck(now);
   serviceDockLink(now);
+  serviceEspNowLinkLog(now);
   serviceDockSettingsSync();
   if (dockLinkIndicatorDirty) { dockLinkIndicatorDirty = false; refreshDockLinkIndicator(); }
   serviceEspNowDevicesModal(now);
