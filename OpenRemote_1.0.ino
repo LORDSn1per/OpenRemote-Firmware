@@ -1,6 +1,41 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.58 - 2026-09-01
+    - Sends new dock firmware to a paired dock over ESP-NOW, so the dock can be
+      updated without unplugging it from the cabinet. WebConfig gains a Dock
+      pane: choose an ESP32-C3 .bin, it is stored on the SD card, then pushed to
+      the dock with live progress.
+    - Transfer is stop-and-wait in 240 byte chunks - 4 magic + 4 seq + 2 len +
+      240 is exactly the 250 byte ESP-NOW ceiling - with an ack on every chunk.
+      Slower than streaming, but it cannot outrun a dock busy writing flash, and
+      a lost frame costs one retry rather than the whole megabyte. The dock's
+      ack carries the sequence it actually wants next, so a retry resumes
+      exactly where the dock is rather than where the remote guessed.
+    - The image is checksummed on the SD card before a byte goes on air, and the
+      same CRC32 is sent up front and again at the end. The dock only makes the
+      new image bootable if its own running total matches, so a transfer that
+      fails leaves the dock on the firmware it already had.
+    - Wrong-firmware protection, in the two places it can be caught. The chunked
+      upload validates a dock image the moment it lands: the ESP32 header must
+      say ESP32-C3 (chip id 5) and the image must carry an
+      OPENREMOTE_DOCK_VERSION= marker. Remote firmware is an ESP32-S3 image with
+      a different marker, so it fails both and is refused with a message saying
+      so. A dock that accepted remote firmware would write it and then be dead
+      until someone re-flashed it over USB.
+    - "dock" joins config/webconfig/firmware as a chunked upload target. A dock
+      image is about a megabyte, which is exactly what that path exists for; the
+      legacy multipart route holds far too much in RAM.
+    - New endpoints: POST /api/dock/firmware (legacy upload), POST
+      /api/dock/update, GET /api/dock/update/status, POST
+      /api/dock/update/cancel. Progress is reported by the remote rather than
+      the browser, because the remote is what is actually pushing the chunks -
+      the upload only gets the image as far as the SD card.
+    - Requires OpenRemote Dock firmware 1.05 or later, which accepts firmware
+      only from the remote it is paired with. Pairing is therefore a
+      precondition of updating over the air; an unpaired dock can only be
+      updated over USB.
+
   3.57 - 2026-09-01
     - Tells a dock it has been paired, instead of leaving it to work that out
       for itself. Pairing was silent from the dock's side: the remote stored
@@ -3780,7 +3815,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.57"
+#define OPENREMOTE_VERSION_STRING "3.58"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -3813,6 +3848,7 @@ static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
 #include <SD.h>
 #include <WiFi.h>
 #include <esp_now.h>
+#include <esp_rom_crc.h>
 #include <HTTPClient.h>
 #include <WebServer.h>
 #include <DNSServer.h>
@@ -5122,6 +5158,85 @@ static const uint32_t ESPNOW_ANNOUNCE_MAGIC = 0x4F52454EUL;  // "OREN"
 static const uint32_t ESPNOW_RF_LEARN_START_MAGIC = 0x4F524C53UL;  // "ORLS"
 static const uint32_t ESPNOW_RF_LEARN_RESULT_MAGIC = 0x4F524C52UL;  // "ORLR"
 static const uint32_t ESPNOW_PAIR_ACK_MAGIC = 0x4F525041UL;  // "ORPA"
+
+// Firmware transfer, remote -> dock. The dock acks every chunk, so this is
+// stop-and-wait: the remote never runs ahead of a dock busy writing flash, and
+// a lost frame costs one retry rather than the whole image.
+//
+// These four must stay byte-identical with OpenRemote_Dock.ino, where the same
+// static_asserts guard them from the other side.
+static const uint32_t ESPNOW_OTA_BEGIN_MAGIC = 0x4F524F42UL;  // "OROB"
+static const uint32_t ESPNOW_OTA_DATA_MAGIC  = 0x4F524F44UL;  // "OROD"
+static const uint32_t ESPNOW_OTA_END_MAGIC   = 0x4F524F45UL;  // "OROE"
+static const uint32_t ESPNOW_OTA_ACK_MAGIC   = 0x4F524F41UL;  // "OROA"
+
+// 4 magic + 4 seq + 2 len + 240 payload is exactly ESP-NOW's 250 byte ceiling.
+static const uint16_t ESPNOW_OTA_CHUNK_BYTES = 240;
+
+struct __attribute__((packed)) EspNowOtaBeginPacket {
+  uint32_t magic;
+  uint32_t totalBytes;
+  uint32_t crc32;
+  char version[8];
+};
+
+struct __attribute__((packed)) EspNowOtaDataHeader {
+  uint32_t magic;
+  uint32_t seq;
+  uint16_t len;
+};
+
+struct __attribute__((packed)) EspNowOtaEndPacket {
+  uint32_t magic;
+  uint32_t crc32;
+};
+
+struct __attribute__((packed)) EspNowOtaAckPacket {
+  uint32_t magic;
+  uint32_t seq;
+  uint8_t status;
+};
+
+static const uint8_t OTA_ACK_OK = 0;
+static const uint8_t OTA_ACK_BEGIN_REFUSED = 1;
+static const uint8_t OTA_ACK_WRITE_FAILED = 2;
+static const uint8_t OTA_ACK_VERIFY_FAILED = 3;
+static const uint8_t OTA_ACK_COMPLETE = 4;
+
+static_assert(sizeof(EspNowOtaBeginPacket) == 20, "OTA begin layout drifted from the dock");
+static_assert(sizeof(EspNowOtaDataHeader) == 10, "OTA data header layout drifted from the dock");
+static_assert(sizeof(EspNowOtaEndPacket) == 8, "OTA end layout drifted from the dock");
+static_assert(sizeof(EspNowOtaAckPacket) == 9, "OTA ack layout drifted from the dock");
+static_assert(sizeof(EspNowOtaDataHeader) + ESPNOW_OTA_CHUNK_BYTES == 250,
+              "OTA data frame must exactly fill the ESP-NOW payload");
+
+static const char DOCK_FIRMWARE_PATH[] = "/dock/firmware.bin";
+static const uint32_t DOCK_OTA_ACK_TIMEOUT_MS = 400;
+static const uint8_t DOCK_OTA_MAX_RETRIES = 8;
+
+enum DockOtaState : uint8_t {
+  DOCK_OTA_IDLE = 0,
+  DOCK_OTA_BEGIN,
+  DOCK_OTA_DATA,
+  DOCK_OTA_END,
+  DOCK_OTA_DONE,
+  DOCK_OTA_FAILED,
+};
+
+DockOtaState dockOtaState = DOCK_OTA_IDLE;
+uint8_t dockOtaDeviceIndex = 0;
+File dockOtaFile;
+uint32_t dockOtaTotalBytes = 0;
+uint32_t dockOtaSentBytes = 0;
+uint32_t dockOtaSeq = 0;
+uint32_t dockOtaCrc = 0;
+char dockOtaVersion[9] = {0};
+unsigned long dockOtaLastSendMs = 0;
+uint8_t dockOtaRetries = 0;
+String dockOtaError;
+volatile uint32_t dockOtaAckedSeq = 0;
+volatile uint8_t dockOtaAckStatus = 0;
+volatile bool dockOtaAckPending = false;
 static const uint32_t ESPNOW_SCAN_TIMEOUT_MS = 20000UL;
 static const uint32_t ESPNOW_RF_LEARN_TIMEOUT_MS = 15000UL;
 static const size_t ESPNOW_MAX_PAYLOAD_BYTES = 250;
@@ -5640,6 +5755,8 @@ void cancelEspNowScan();
 bool addEspNowDevice(const uint8_t mac[6], const char *name);
 bool removeEspNowDevice(const uint8_t mac[6]);
 bool sendEspNowCommand(const DeviceCommand &command);
+bool dockOtaPrepare(uint8_t deviceIndex, String &error);
+void serviceDockOta(unsigned long now);
 bool startRfLearn(uint8_t deviceIndex);
 void cancelRfLearn();
 void showEspNowDevicesModal();
@@ -14439,10 +14556,76 @@ void handleBackupRestoreApi() {
 // single-shot endpoints used, so both paths behave identically once the bytes
 // have landed.
 // ---------------------------------------------------------------------------
+// Two independent tests, the same pair OpenRemote Studio applies to a file on
+// disk: the chip the image was built for, from the ESP32 header, and the
+// version marker the firmware embeds. Either alone could be coincidence; both
+// together cannot be remote firmware.
+bool uploadedDockFirmwareLooksValid(const String &path, String &version, String &error) {
+  File file = SD.open(path, FILE_READ);
+  if (!file) { error = "Could not read the uploaded dock firmware"; return false; }
+  uint8_t header[16] = {0};
+  if (file.read(header, sizeof(header)) < (int)sizeof(header)) {
+    file.close(); error = "The uploaded dock firmware is too short"; return false;
+  }
+  if (header[0] != 0xE9) {
+    file.close(); error = "That file is not an ESP32 firmware image"; return false;
+  }
+  uint16_t chipId = (uint16_t)(header[12] | (header[13] << 8));
+  if (chipId != 5) {
+    file.close();
+    error = (chipId == 9)
+      ? "That is remote firmware (ESP32-S3). The dock needs its own ESP32-C3 firmware."
+      : "That firmware is not built for the dock's ESP32-C3";
+    return false;
+  }
+
+  // Scan for the marker with an overlap, so it is still found when it straddles
+  // two reads.
+  static const char needle[] = "OPENREMOTE_DOCK_VERSION=";
+  const size_t needleLen = sizeof(needle) - 1;
+  uint8_t buffer[512 + 32];
+  size_t carry = 0;
+  bool found = false;
+  version = "";
+  file.seek(0);
+  while (!found) {
+    int got = file.read(buffer + carry, 512);
+    if (got <= 0) break;
+    size_t have = carry + (size_t)got;
+    for (size_t i = 0; i + needleLen < have; i++) {
+      if (memcmp(buffer + i, needle, needleLen) == 0) {
+        found = true;
+        size_t at = i + needleLen;
+        char text[12] = {0};
+        size_t v = 0;
+        while (at < have && v < sizeof(text) - 1 &&
+               (isdigit(buffer[at]) || buffer[at] == '.')) text[v++] = (char)buffer[at++];
+        version = text;
+        break;
+      }
+    }
+    if (found) break;
+    carry = have > needleLen ? needleLen : have;
+    memmove(buffer, buffer + have - carry, carry);
+  }
+  file.close();
+  if (!found) {
+    error = "That image carries no OpenRemote dock version marker";
+    return false;
+  }
+  return true;
+}
+
 String chunkUploadTempPathFor(const String &target) {
   if (target == "config") return String(RUNTIME_CONFIG_UPLOAD_PATH);
   if (target == "webconfig") return String("/tmp/index.upload.html");
   if (target == "firmware") return String(FIRMWARE_STAGE_PATH);
+  // Dock images are about a megabyte, which is exactly what the chunked path
+  // exists for - the legacy multipart route holds far too much in RAM.
+  if (target == "dock") {
+    if (sdReady && !SD.exists("/dock")) SD.mkdir("/dock");
+    return String(DOCK_FIRMWARE_PATH);
+  }
   return String();
 }
 
@@ -14585,6 +14768,18 @@ void handleChunkUploadFinish() {
   } else if (ok && target == "firmware") {
     ok = received >= 65536UL && uploadedFirmwareLooksValid(path);
     if (!ok) error = "Not a valid ESP32 firmware binary";
+  } else if (ok && target == "dock") {
+    // Checked here, before it can ever be transmitted. Remote firmware is an
+    // ESP32-S3 image with a different marker, so it fails both tests and cannot
+    // reach a dock by mistake - which matters, because the dock would write it
+    // and then be dead until someone re-flashed it over USB.
+    String version;
+    ok = received >= 1024UL && uploadedDockFirmwareLooksValid(path, version, error);
+    if (ok) {
+      strlcpy(dockOtaVersion, version.c_str(), sizeof(dockOtaVersion));
+      Serial.printf("Dock firmware stored: %u bytes, version %s\n",
+                    (unsigned)received, dockOtaVersion);
+    }
   }
 
   if (!ok && target != "webconfig") SD.remove(path);
@@ -15028,6 +15223,152 @@ void appendEspNowDeviceListJson(JsonArray target) {
     entry["mac"] = formatMacAddress(espNowDevices[i].mac);
     entry["name"] = espNowDevices[i].name;
   }
+}
+
+// Accepts a dock .bin upload and stores it on the SD card. Validated on the way
+// in rather than on the way out: this is the point where remote firmware could
+// be mistaken for dock firmware, and the dock has no way to tell once it is
+// mid-transfer.
+bool dockFirmwareUploadOk = false;
+String dockFirmwareUploadError;
+File dockFirmwareUploadFile;
+uint32_t dockFirmwareUploadBytes = 0;
+uint8_t dockFirmwareHeader[64];
+uint16_t dockFirmwareHeaderLen = 0;
+bool dockFirmwareSawMarker = false;
+String dockFirmwareUploadVersion;
+
+void handleDockFirmwareUploadData() {
+  HTTPUpload &upload = webServer.upload();
+  if (upload.status == UPLOAD_FILE_START) {
+    dockFirmwareUploadOk = false;
+    dockFirmwareUploadError = "";
+    dockFirmwareUploadBytes = 0;
+    dockFirmwareHeaderLen = 0;
+    dockFirmwareSawMarker = false;
+    dockFirmwareUploadVersion = "";
+    if (!sdReady) { dockFirmwareUploadError = "The SD card is not available."; return; }
+    if (!SD.exists("/dock")) SD.mkdir("/dock");
+    SD.remove(DOCK_FIRMWARE_PATH);
+    dockFirmwareUploadFile = SD.open(DOCK_FIRMWARE_PATH, FILE_WRITE);
+    if (!dockFirmwareUploadFile) dockFirmwareUploadError = "Could not open the SD card for writing.";
+    return;
+  }
+  if (upload.status == UPLOAD_FILE_WRITE) {
+    if (!dockFirmwareUploadFile || dockFirmwareUploadError.length()) return;
+    if (dockFirmwareHeaderLen < sizeof(dockFirmwareHeader)) {
+      uint16_t want = sizeof(dockFirmwareHeader) - dockFirmwareHeaderLen;
+      if (want > upload.currentSize) want = upload.currentSize;
+      memcpy(dockFirmwareHeader + dockFirmwareHeaderLen, upload.buf, want);
+      dockFirmwareHeaderLen += want;
+    }
+    // The marker can straddle two chunks, so scan each chunk with a little
+    // overlap rather than assuming it lands whole.
+    if (!dockFirmwareSawMarker) {
+      static const char needle[] = "OPENREMOTE_DOCK_VERSION=";
+      const size_t needleLen = sizeof(needle) - 1;
+      for (size_t i = 0; i + needleLen < upload.currentSize; i++) {
+        if (memcmp(upload.buf + i, needle, needleLen) == 0) {
+          dockFirmwareSawMarker = true;
+          char version[12] = {0};
+          size_t v = 0;
+          size_t at = i + needleLen;
+          while (at < upload.currentSize && v < sizeof(version) - 1 &&
+                 (isdigit(upload.buf[at]) || upload.buf[at] == '.')) {
+            version[v++] = (char)upload.buf[at++];
+          }
+          dockFirmwareUploadVersion = version;
+          break;
+        }
+      }
+    }
+    dockFirmwareUploadFile.write(upload.buf, upload.currentSize);
+    dockFirmwareUploadBytes += upload.currentSize;
+    return;
+  }
+  if (upload.status == UPLOAD_FILE_END) {
+    if (dockFirmwareUploadFile) dockFirmwareUploadFile.close();
+    if (dockFirmwareUploadError.length()) { SD.remove(DOCK_FIRMWARE_PATH); return; }
+
+    // Two independent checks, the same pair OpenRemote Studio applies to a file
+    // on disk: the chip the image was built for, and the marker the firmware
+    // embeds. Remote firmware is an ESP32-S3 image carrying a different marker,
+    // so it fails both and cannot reach a dock by mistake.
+    uint16_t chipId = dockFirmwareHeaderLen >= 14
+      ? (uint16_t)(dockFirmwareHeader[12] | (dockFirmwareHeader[13] << 8)) : 0xFFFF;
+    bool magicOk = dockFirmwareHeaderLen > 0 && dockFirmwareHeader[0] == 0xE9;
+    if (!magicOk) {
+      dockFirmwareUploadError = "That file is not an ESP32 firmware image.";
+    } else if (chipId != 5) {
+      dockFirmwareUploadError = chipId == 9
+        ? "That is remote firmware (ESP32-S3). The dock needs its own ESP32-C3 firmware."
+        : "That firmware is not built for the dock's ESP32-C3.";
+    } else if (!dockFirmwareSawMarker) {
+      dockFirmwareUploadError = "That image carries no OpenRemote dock version marker.";
+    } else if (dockFirmwareUploadBytes < 1024) {
+      dockFirmwareUploadError = "That file is too small to be dock firmware.";
+    } else {
+      dockFirmwareUploadOk = true;
+      strlcpy(dockOtaVersion, dockFirmwareUploadVersion.c_str(), sizeof(dockOtaVersion));
+      Serial.printf("Dock firmware stored: %lu bytes, version %s\n",
+                    (unsigned long)dockFirmwareUploadBytes, dockOtaVersion);
+    }
+    if (!dockFirmwareUploadOk) SD.remove(DOCK_FIRMWARE_PATH);
+  }
+}
+
+void handleDockUpdateStart() {
+  if (!requestAuthorized()) { sendJson(403, "{\"ok\":false}"); return; }
+  if (dockOtaState == DOCK_OTA_BEGIN || dockOtaState == DOCK_OTA_DATA ||
+      dockOtaState == DOCK_OTA_END) {
+    sendJson(409, "{\"ok\":false,\"error\":\"An update is already running.\"}");
+    return;
+  }
+  int index = webServer.hasArg("device") ? webServer.arg("device").toInt() : 0;
+  if (index < 0) index = 0;
+  String error;
+  if (!dockOtaPrepare((uint8_t)index, error)) {
+    JsonDocument doc;
+    doc["ok"] = false;
+    doc["error"] = error;
+    String out; serializeJson(doc, out);
+    sendJson(400, out);
+    return;
+  }
+  sendJson(200, "{\"ok\":true}");
+}
+
+void handleDockUpdateStatus() {
+  if (!requestAuthorized()) { sendJson(403, "{\"ok\":false}"); return; }
+  JsonDocument doc;
+  doc["ok"] = true;
+  const char *state = "idle";
+  switch (dockOtaState) {
+    case DOCK_OTA_BEGIN: state = "starting"; break;
+    case DOCK_OTA_DATA:  state = "sending"; break;
+    case DOCK_OTA_END:   state = "verifying"; break;
+    case DOCK_OTA_DONE:  state = "done"; break;
+    case DOCK_OTA_FAILED:state = "failed"; break;
+    default: break;
+  }
+  doc["state"] = state;
+  doc["sent"] = dockOtaSentBytes;
+  doc["total"] = dockOtaTotalBytes;
+  doc["percent"] = dockOtaTotalBytes ? (int)((uint64_t)dockOtaSentBytes * 100ULL / dockOtaTotalBytes) : 0;
+  doc["version"] = dockOtaVersion;
+  if (dockOtaError.length()) doc["error"] = dockOtaError;
+  bool stored = sdReady && SD.exists(DOCK_FIRMWARE_PATH);
+  doc["stored"] = stored;
+  String out; serializeJson(doc, out);
+  sendJson(200, out);
+}
+
+void handleDockUpdateCancel() {
+  if (!requestAuthorized()) { sendJson(403, "{\"ok\":false}"); return; }
+  if (dockOtaFile) dockOtaFile.close();
+  dockOtaState = DOCK_OTA_IDLE;
+  dockOtaError = "";
+  sendJson(200, "{\"ok\":true}");
 }
 
 void handleEspNowDevicesList() {
@@ -15755,6 +16096,22 @@ void configureWebServer() {
   webServer.on("/api/ir/learn/start", HTTP_POST, handleIrLearnStart);
   webServer.on("/api/ir/learn/status", HTTP_GET, handleIrLearnStatus);
   webServer.on("/api/ir/learn/cancel", HTTP_POST, handleIrLearnCancel);
+  webServer.on("/api/dock/firmware", HTTP_POST, []() {
+    if (!requestAuthorized()) { sendJson(403, "{\"ok\":false}"); return; }
+    if (dockFirmwareUploadOk) {
+      sendJson(200, String("{\"ok\":true,\"version\":\"") + dockOtaVersion + "\"}");
+    } else {
+      JsonDocument doc;
+      doc["ok"] = false;
+      doc["error"] = dockFirmwareUploadError.length() ? dockFirmwareUploadError
+                                                      : String("Dock firmware upload failed.");
+      String out; serializeJson(doc, out);
+      sendJson(400, out);
+    }
+  }, handleDockFirmwareUploadData);
+  webServer.on("/api/dock/update", HTTP_POST, handleDockUpdateStart);
+  webServer.on("/api/dock/update/status", HTTP_GET, handleDockUpdateStatus);
+  webServer.on("/api/dock/update/cancel", HTTP_POST, handleDockUpdateCancel);
   webServer.on("/api/espnow/devices", HTTP_GET, handleEspNowDevicesList);
   webServer.on("/api/espnow/devices", HTTP_POST, handleEspNowDeviceAdd);
   webServer.on("/api/espnow/devices", HTTP_DELETE, handleEspNowDeviceDelete);
@@ -16196,6 +16553,22 @@ void espNowRegisterAllPeers() {
 void onEspNowDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
   if (!info || !info->src_addr || !data) return;
 
+  // A firmware ack from the dock we are currently updating. Checked before the
+  // scan and learn windows because a transfer can be running while neither is
+  // open, and only ever accepted from the dock this transfer is addressed to.
+  if (dockOtaState != DOCK_OTA_IDLE && (size_t)len >= sizeof(EspNowOtaAckPacket) &&
+      dockOtaDeviceIndex < espNowDeviceCount &&
+      memcmp(espNowDevices[dockOtaDeviceIndex].mac, info->src_addr, 6) == 0) {
+    EspNowOtaAckPacket ack;
+    memcpy(&ack, data, sizeof(ack));
+    if (ack.magic == ESPNOW_OTA_ACK_MAGIC) {
+      dockOtaAckedSeq = ack.seq;
+      dockOtaAckStatus = ack.status;
+      dockOtaAckPending = true;
+      return;
+    }
+  }
+
   if (espNowScanActive && (size_t)len >= sizeof(EspNowAnnouncePacket)) {
     EspNowAnnouncePacket packet;
     memcpy(&packet, data, sizeof(packet));
@@ -16451,6 +16824,158 @@ bool buildEspNowPayload(const DeviceCommand &command, uint8_t *buf, size_t bufCa
   }
   outLen = payloadLen;
   return true;
+}
+
+// ---------------------------------------------------------------------------
+// Dock firmware transfer
+// ---------------------------------------------------------------------------
+//
+// Pushes the dock image stored on the SD card to a paired dock over ESP-NOW.
+// Stop-and-wait: one chunk in flight, an ack before the next. That is slower
+// than streaming but it cannot outrun a dock writing flash, and a dropped
+// frame costs a single retry instead of the whole megabyte.
+//
+// The dock only accepts firmware from the remote it is paired with, so this
+// path exists solely for docks already on the list - which is also why there
+// is no "broadcast an update" option here.
+
+void dockOtaFail(const String &why) {
+  dockOtaError = why;
+  if (dockOtaFile) dockOtaFile.close();
+  dockOtaState = DOCK_OTA_FAILED;
+  Serial.printf("Dock update: failed - %s\n", why.c_str());
+}
+
+// Reads the whole image once to checksum it before a byte goes on air, so a
+// truncated or corrupt file is caught here rather than by the dock a minute
+// later.
+bool dockOtaPrepare(uint8_t deviceIndex, String &error) {
+  if (!sdReady) { error = "The SD card is not available."; return false; }
+  if (!SD.exists(DOCK_FIRMWARE_PATH)) {
+    error = "No dock firmware has been uploaded yet.";
+    return false;
+  }
+  if (deviceIndex >= espNowDeviceCount) { error = "That dock is not paired."; return false; }
+  if (!espNowRadioActive) { error = "ESP-NOW is not running. Turn the Dock feature on."; return false; }
+
+  File file = SD.open(DOCK_FIRMWARE_PATH, FILE_READ);
+  if (!file) { error = "The stored dock firmware could not be opened."; return false; }
+  uint32_t total = file.size();
+  if (total < 1024) { file.close(); error = "The stored dock firmware is too small to be valid."; return false; }
+
+  uint32_t crc = 0;
+  uint8_t buffer[512];
+  while (true) {
+    int got = file.read(buffer, sizeof(buffer));
+    if (got <= 0) break;
+    crc = esp_rom_crc32_le(crc, buffer, (uint32_t)got);
+  }
+  file.close();
+
+  dockOtaFile = SD.open(DOCK_FIRMWARE_PATH, FILE_READ);
+  if (!dockOtaFile) { error = "The stored dock firmware could not be reopened."; return false; }
+  dockOtaDeviceIndex = deviceIndex;
+  dockOtaTotalBytes = total;
+  dockOtaSentBytes = 0;
+  dockOtaSeq = 0;
+  dockOtaCrc = crc;
+  dockOtaRetries = 0;
+  dockOtaAckPending = false;
+  dockOtaError = "";
+  dockOtaState = DOCK_OTA_BEGIN;
+  dockOtaLastSendMs = 0;
+  Serial.printf("Dock update: %lu bytes, CRC 0x%08lX -> %s\n",
+                (unsigned long)total, (unsigned long)crc,
+                espNowDevices[deviceIndex].name);
+  return true;
+}
+
+void dockOtaSendBegin() {
+  EspNowOtaBeginPacket begin = {};
+  begin.magic = ESPNOW_OTA_BEGIN_MAGIC;
+  begin.totalBytes = dockOtaTotalBytes;
+  begin.crc32 = dockOtaCrc;
+  strlcpy(begin.version, dockOtaVersion, sizeof(begin.version));
+  esp_now_send(espNowDevices[dockOtaDeviceIndex].mac, (const uint8_t *)&begin, sizeof(begin));
+  dockOtaLastSendMs = millis();
+}
+
+void dockOtaSendChunk() {
+  uint8_t frame[sizeof(EspNowOtaDataHeader) + ESPNOW_OTA_CHUNK_BYTES];
+  EspNowOtaDataHeader header = {};
+  header.magic = ESPNOW_OTA_DATA_MAGIC;
+  header.seq = dockOtaSeq;
+  // Seeking every time keeps a retry honest: the chunk resent is always the
+  // one the dock asked for, not wherever the file pointer happened to be.
+  if (!dockOtaFile.seek((uint32_t)dockOtaSeq * ESPNOW_OTA_CHUNK_BYTES)) {
+    dockOtaFail("Could not seek the dock firmware file.");
+    return;
+  }
+  int got = dockOtaFile.read(frame + sizeof(header), ESPNOW_OTA_CHUNK_BYTES);
+  if (got <= 0) { dockOtaFail("Ran out of dock firmware to send."); return; }
+  header.len = (uint16_t)got;
+  memcpy(frame, &header, sizeof(header));
+  esp_now_send(espNowDevices[dockOtaDeviceIndex].mac, frame, sizeof(header) + (size_t)got);
+  dockOtaLastSendMs = millis();
+}
+
+void dockOtaSendEnd() {
+  EspNowOtaEndPacket end = {};
+  end.magic = ESPNOW_OTA_END_MAGIC;
+  end.crc32 = dockOtaCrc;
+  esp_now_send(espNowDevices[dockOtaDeviceIndex].mac, (const uint8_t *)&end, sizeof(end));
+  dockOtaLastSendMs = millis();
+}
+
+void serviceDockOta(unsigned long now) {
+  if (dockOtaState == DOCK_OTA_IDLE || dockOtaState == DOCK_OTA_DONE ||
+      dockOtaState == DOCK_OTA_FAILED) return;
+
+  if (dockOtaAckPending) {
+    dockOtaAckPending = false;
+    uint8_t status = dockOtaAckStatus;
+    uint32_t acked = dockOtaAckedSeq;
+    dockOtaRetries = 0;
+
+    if (status == OTA_ACK_BEGIN_REFUSED) { dockOtaFail("The dock refused the image - it may be too large for its partition."); return; }
+    if (status == OTA_ACK_WRITE_FAILED)  { dockOtaFail("The dock could not write the image to flash."); return; }
+    if (status == OTA_ACK_VERIFY_FAILED) { dockOtaFail("The dock rejected the image as corrupt."); return; }
+    if (status == OTA_ACK_COMPLETE) {
+      if (dockOtaFile) dockOtaFile.close();
+      dockOtaState = DOCK_OTA_DONE;
+      Serial.println("Dock update: complete, the dock is restarting");
+      return;
+    }
+    // The ack carries the sequence the dock wants next, so a retry or a dock
+    // that fell behind resumes exactly where it actually is.
+    if (dockOtaState == DOCK_OTA_BEGIN) {
+      dockOtaState = DOCK_OTA_DATA;
+      dockOtaSeq = 0;
+    } else if (dockOtaState == DOCK_OTA_DATA) {
+      dockOtaSeq = acked;
+      dockOtaSentBytes = dockOtaSeq * ESPNOW_OTA_CHUNK_BYTES;
+      if (dockOtaSentBytes >= dockOtaTotalBytes) {
+        dockOtaSentBytes = dockOtaTotalBytes;
+        dockOtaState = DOCK_OTA_END;
+        dockOtaSendEnd();
+        return;
+      }
+    }
+    if (dockOtaState == DOCK_OTA_DATA) dockOtaSendChunk();
+    return;
+  }
+
+  if (dockOtaLastSendMs && (now - dockOtaLastSendMs) < DOCK_OTA_ACK_TIMEOUT_MS) return;
+
+  if (dockOtaLastSendMs) {
+    if (++dockOtaRetries > DOCK_OTA_MAX_RETRIES) {
+      dockOtaFail("The dock stopped responding. Check it is powered and in range.");
+      return;
+    }
+  }
+  if (dockOtaState == DOCK_OTA_BEGIN) dockOtaSendBegin();
+  else if (dockOtaState == DOCK_OTA_DATA) dockOtaSendChunk();
+  else if (dockOtaState == DOCK_OTA_END) dockOtaSendEnd();
 }
 
 bool sendEspNowCommand(const DeviceCommand &command) {
@@ -23399,6 +23924,7 @@ void loop() {
   serviceBluetooth(now);
   serviceBluetoothConnectionProfile(now);
   serviceEspNow(now);
+  serviceDockOta(now);
   serviceEspNowDevicesModal(now);
   servicePhysicalNavIdleHide(now);
   serviceFaceDownSleep(now);
