@@ -1,6 +1,18 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.65 - 2026-09-01
+    - The pill no longer fills green for a dock send. The fill announced a
+      special state and held for the life of the link, which drowned out the
+      resting green outline that means the radio is simply up - two different
+      things competing for the same pill.
+    - A dock send is now the outline alone: pulsed thicker and brighter
+      (3px, a lighter green) for 240ms in 40ms steps, then back to the resting
+      outline. That is the green counterpart of the red flash for the remote's
+      own emitter - same idea, same brevity, and the same timing the dock's own
+      LED now uses, so one command looks like one event at both ends.
+    - Paired with dock firmware 1.08.
+
   3.64 - 2026-09-01
     - The status pill now reports the ESP-NOW radio rather than the pairing:
         white outline   the radio is down - nothing in flight, nothing warm
@@ -3965,7 +3977,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.64"
+#define OPENREMOTE_VERSION_STRING "3.65"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -5795,6 +5807,7 @@ unsigned long commandFeedbackUntilMs = 0;
 // this holds for as long as the link does, so the pill answers "did that go via
 // the dock, and is the dock link still warm" at a glance rather than for 80ms.
 bool espNowCommandFeedbackActive = false;
+unsigned long espNowPulseUntilMs = 0;
 bool commandFeedbackActive = false;
 unsigned long buttonTestFeedbackUntilMs = 0;
 bool buttonTestFeedbackActive = false;
@@ -5983,7 +5996,8 @@ void applyDockLinkPillColour();
 lv_color_t pillIdleColour();
 void clearEspNowCommandFeedback();
 void flashEspNowCommandFeedback();
-void applyEspNowFeedbackStyle(bool active);
+void applyEspNowPulse(bool bright);
+void serviceEspNowCommandFeedback(unsigned long now);
 bool espNowDockRadioRequired();
 void applyCommandFeedbackStyle(bool active);
 void serviceDockOta(unsigned long now);
@@ -11098,42 +11112,55 @@ void serviceCommandFeedback(unsigned long now) {
   applyCommandFeedbackStyle(false);
 }
 
-// Green fill, held for the life of the ESP-NOW link rather than a fixed time.
-void applyEspNowFeedbackStyle(bool active) {
-  lv_color_t green = lv_color_hex(0x30D158);
+// A dock send is shown as the outline only, never a fill: the fill said "this
+// state is special" and stayed for the life of the link, which drowned out the
+// resting green that means the radio is simply up. This pulses the same outline
+// thicker and brighter for as long as the send takes - the green counterpart of
+// the red flash for the remote's own emitter.
+static const uint32_t ESPNOW_PULSE_MS = 240;      // Whole pulse train.
+static const uint32_t ESPNOW_PULSE_STEP_MS = 40;  // On/off period within it.
+
+void applyEspNowPulse(bool bright) {
+  lv_color_t hot = lv_color_hex(0x7CFFB0);   // Brighter than the resting green.
   lv_color_t idle = pillIdleColour();
   for (uint8_t slot = 0; slot < PAGE_SLOT_COUNT; slot++) {
     PageUi &ui = pageUi[slot];
     if (ui.statusPill && lv_obj_is_valid(ui.statusPill)) {
-      lv_obj_set_style_bg_color(ui.statusPill, active ? lv_color_hex(0x0B3A1E) : lv_color_black(), 0);
-      lv_obj_set_style_bg_opa(ui.statusPill, active ? LV_OPA_COVER : (lv_opa_t)115, 0);
-      lv_obj_set_style_border_color(ui.statusPill, active ? green : idle, 0);
-      lv_obj_set_style_border_opa(ui.statusPill, active ? LV_OPA_COVER : (lv_opa_t)64, 0);
-    }
-    if (ui.clockLabel && lv_obj_is_valid(ui.clockLabel)) {
-      lv_obj_set_style_text_color(ui.clockLabel, active ? green : lv_color_white(), 0);
+      lv_obj_set_style_border_color(ui.statusPill, bright ? hot : idle, 0);
+      lv_obj_set_style_border_opa(ui.statusPill, bright ? LV_OPA_COVER : (lv_opa_t)64, 0);
+      lv_obj_set_style_border_width(ui.statusPill, bright ? 3 : 1, 0);
     }
     if (ui.statusBattery && lv_obj_is_valid(ui.statusBattery)) {
-      lv_obj_set_style_border_color(ui.statusBattery, active ? green : idle, 0);
+      lv_obj_set_style_border_color(ui.statusBattery, bright ? hot : idle, 0);
     }
   }
 }
 
-// Called when a command actually went out over ESP-NOW. Takes the place of the
-// red flash for that command: red says "the remote transmitted", green says
-// "the dock did", and showing both would be a lie about one of them.
 void flashEspNowCommandFeedback() {
+  espNowPulseUntilMs = millis() + ESPNOW_PULSE_MS;
   if (!espNowCommandFeedbackActive) {
     espNowCommandFeedbackActive = true;
-    applyEspNowFeedbackStyle(true);
+    applyEspNowPulse(true);
+    lv_refr_now(nullptr);
   }
-  lv_refr_now(nullptr);
 }
 
 void clearEspNowCommandFeedback() {
   if (!espNowCommandFeedbackActive) return;
   espNowCommandFeedbackActive = false;
-  applyEspNowFeedbackStyle(false);
+  applyEspNowPulse(false);
+}
+
+// Runs from loop(): pulses while the send is in flight, then hands the pill
+// back to its resting outline.
+void serviceEspNowCommandFeedback(unsigned long now) {
+  if (!espNowCommandFeedbackActive) return;
+  if ((int32_t)(now - espNowPulseUntilMs) >= 0) {
+    clearEspNowCommandFeedback();
+    return;
+  }
+  bool bright = ((now / ESPNOW_PULSE_STEP_MS) % 2) == 0;
+  applyEspNowPulse(bright);
 }
 
 // Button Test mode never transmits a real IR/BLE command (see buttonTestModeActive()
@@ -17165,8 +17192,7 @@ void serviceDockLink(unsigned long now) {
 
 void stopEspNow() {
   if (!espNowRadioActive) return;
-  // The radio is going: drop the green fill and let the outline fall back to
-  // white on the next repaint below.
+  // Drop any pulse in flight so the outline falls back to white below.
   clearEspNowCommandFeedback();
   espNowScanActive = false;
   rfLearnActive = false;
@@ -24970,6 +24996,7 @@ void loop() {
   serviceButtonTest(now);
   serviceActivitySequence(now);
   serviceCommandFeedback(now);
+  serviceEspNowCommandFeedback(now);
   serviceButtonTestFeedback(now);
   serviceBluetooth(now);
   serviceBluetoothConnectionProfile(now);
