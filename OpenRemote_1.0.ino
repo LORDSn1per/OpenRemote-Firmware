@@ -1,6 +1,18 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.72 - 2026-09-01
+    - Rebuilds the Paired docks row, which did not fit. Name and MAC on the
+      left with both buttons to their right, in a 44px row, left the name
+      truncated to "OpenRemot", the MAC clipped mid-byte and the buttons drawn
+      over both. 240px of width was never going to hold a name, a MAC address
+      and two buttons side by side.
+    - Each dock is now a card: name, MAC beneath it, and the two actions on
+      their own row underneath. 12 + 90 + 12 + 90 + 12 comes to exactly the
+      216px list width, so the buttons are equal and neither is squeezed, and
+      the name gets the full width with a proper ellipsis rather than being cut
+      off mid-word.
+
   3.71 - 2026-09-01
     - A paired dock can be renamed from the LCD. Paired docks now offers Rename
       beside Forget, and it opens the same on-screen keyboard the Wi-Fi password
@@ -4070,7 +4082,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.71"
+#define OPENREMOTE_VERSION_STRING "3.72"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -19009,25 +19021,42 @@ void rebuildEspNowPairedList() {
     lv_obj_set_style_text_align(empty, LV_TEXT_ALIGN_CENTER, 0);
     return;
   }
+  // A card per dock: name, then MAC, then the two actions on their own row
+  // underneath. The previous 44px row put both buttons to the right of the
+  // text, which left the name truncated to "OpenRemot", the MAC clipped
+  // mid-byte and the buttons sitting over both. Nothing about 240px of width
+  // was ever going to fit a name, a MAC and two buttons side by side.
+  //
+  // 12 + 90 + 12 + 90 + 12 comes to exactly the 216px list width, so the two
+  // buttons are equal and neither is squeezed.
   for (uint8_t i = 0; i < espNowDeviceCount; i++) {
-    lv_obj_t *row = lv_obj_create(espNowPairedList);
-    lv_obj_remove_style_all(row);
-    lv_obj_set_width(row, LV_PCT(100));
-    lv_obj_set_height(row, 44);
-    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_bg_color(row, lvRgb(24, 42, 68), 0);
-    lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(row, 8, 0);
+    lv_obj_t *card = lv_obj_create(espNowPairedList);
+    lv_obj_remove_style_all(card);
+    lv_obj_set_width(card, LV_PCT(100));
+    lv_obj_set_height(card, 96);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_color(card, lvRgb(24, 42, 68), 0);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(card, 10, 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_border_color(card, lvRgb(46, 78, 120), 0);
 
-    makeLabel(row, espNowDevices[i].name, 10, 5, &lv_font_montserrat_12, textPrimary());
-    makeLabel(row, formatMacAddress(espNowDevices[i].mac).c_str(), 10, 23,
-              &lv_font_montserrat_10, lvRgb(140, 155, 175));
+    lv_obj_t *name = makeLabel(card, espNowDevices[i].name, 12, 9,
+                               &lv_font_montserrat_14, textPrimary());
+    lv_obj_set_width(name, 192);
+    lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
 
-    lv_obj_t *rename = lv_btn_create(row);
-    lv_obj_set_size(rename, 62, 30);
-    lv_obj_align(rename, LV_ALIGN_RIGHT_MID, -72, 0);
-    lv_obj_set_style_bg_color(rename, lvRgb(34, 70, 116), 0);
-    lv_obj_set_style_radius(rename, 7, 0);
+    lv_obj_t *mac = makeLabel(card, formatMacAddress(espNowDevices[i].mac).c_str(),
+                              12, 31, &lv_font_montserrat_10, lvRgb(140, 155, 175));
+    lv_obj_set_width(mac, 192);
+    lv_label_set_long_mode(mac, LV_LABEL_LONG_DOT);
+
+    lv_obj_t *rename = lv_btn_create(card);
+    lv_obj_set_pos(rename, 12, 54);
+    lv_obj_set_size(rename, 90, 32);
+    lv_obj_set_style_bg_color(rename, lvRgb(34, 84, 140), 0);
+    lv_obj_set_style_radius(rename, 8, 0);
+    lv_obj_set_style_shadow_width(rename, 0, 0);
     lv_obj_add_event_cb(rename, espNowRenameClicked, LV_EVENT_CLICKED,
                         (void *)(intptr_t)i);
     lv_obj_t *renameLabel = lv_label_create(rename);
@@ -19036,18 +19065,19 @@ void rebuildEspNowPairedList() {
     lv_obj_set_style_text_color(renameLabel, textPrimary(), 0);
     lv_obj_center(renameLabel);
 
-    lv_obj_t *forget = lv_btn_create(row);
-    lv_obj_set_size(forget, 62, 30);
-    lv_obj_align(forget, LV_ALIGN_RIGHT_MID, -6, 0);
+    lv_obj_t *forget = lv_btn_create(card);
+    lv_obj_set_pos(forget, 114, 54);
+    lv_obj_set_size(forget, 90, 32);
     lv_obj_set_style_bg_color(forget, lvRgb(120, 32, 32), 0);
-    lv_obj_set_style_radius(forget, 7, 0);
+    lv_obj_set_style_radius(forget, 8, 0);
+    lv_obj_set_style_shadow_width(forget, 0, 0);
     lv_obj_add_event_cb(forget, espNowForgetClicked, LV_EVENT_CLICKED,
                         (void *)(intptr_t)i);
-    lv_obj_t *label = lv_label_create(forget);
-    lv_label_set_text(label, "Forget");
-    lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(label, textPrimary(), 0);
-    lv_obj_center(label);
+    lv_obj_t *forgetLabel = lv_label_create(forget);
+    lv_label_set_text(forgetLabel, "Forget");
+    lv_obj_set_style_text_font(forgetLabel, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(forgetLabel, textPrimary(), 0);
+    lv_obj_center(forgetLabel);
   }
 }
 
