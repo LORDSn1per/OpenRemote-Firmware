@@ -1,6 +1,18 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.68 - 2026-09-01
+    - The ESP-NOW hold drops from 15 seconds to 7. In an activity where most
+      presses go over Bluetooth and only volume goes through the dock, a long
+      hold left the pill green almost permanently, so the outline stopped
+      meaning "a link is up right now" and started meaning "a dock exists".
+      Seven seconds still lets a burst of volume presses pay the bring-up once.
+    - The remote now tells the dock when it is releasing the radio, with a link
+      down packet sent while the radio is still up - afterwards there is no way
+      to tell it anything. That lets the dock put its LED out at the same moment
+      the pill outline goes white, rather than inferring it from silence.
+    - Pairs with dock firmware 1.12, whose LED mirrors the radio state.
+
   3.67 - 2026-09-01
     - Fixes pairing that the remote reported as successful while the dock timed
       out having heard nothing. The retry loop tested dockLinkOnline before
@@ -4004,7 +4016,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.67"
+#define OPENREMOTE_VERSION_STRING "3.68"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -4612,6 +4624,10 @@ static const uint8_t IR_ROUTE_DOCK   = 2;  // The dock only.
 // same however it is woken.
 static const uint32_t ESPNOW_DOCK_SETTINGS_MAGIC = 0x4F524453UL;  // "ORDS"
 static const uint32_t ESPNOW_DOCK_PING_MAGIC     = 0x4F525047UL;  // "ORPG"
+// Sent as the radio is released, so the dock can put its LED out at the same
+// moment the remote's pill outline goes white instead of waiting to notice
+// the silence.
+static const uint32_t ESPNOW_DOCK_LINK_DOWN_MAGIC = 0x4F524C44UL;  // "ORLD"
 
 struct __attribute__((packed)) EspNowDockSettingsPacket {
   uint32_t magic;
@@ -4933,7 +4949,12 @@ volatile bool dockLinkIndicatorDirty = false;
 // The channel is the catch: a dock locks onto whichever channel it first heard
 // the remote on, so standalone mode has to use that same channel rather than
 // whatever the radio defaults to. It is remembered here and in NVS.
-static const uint32_t ESPNOW_ONDEMAND_HOLD_MS = 15000;
+// 7 seconds. Long enough that a burst of presses pays the bring-up once, short
+// enough that the green outline is not still claiming a live link long after
+// the last command. In a Bluetooth activity where only volume goes through the
+// dock, most presses touch ESP-NOW not at all, so a long hold left the pill
+// green almost permanently and it stopped meaning anything.
+static const uint32_t ESPNOW_ONDEMAND_HOLD_MS = 7000;
 bool espNowStandalone = false;      // We brought the radio up ourselves.
 uint8_t espNowChannel = 0;          // 0 = not yet known.
 unsigned long espNowHoldUntilMs = 0;
@@ -17270,6 +17291,13 @@ void serviceEspNow(unsigned long now) {
   // the bring-up cost once rather than each time.
   if (espNowStandalone && !holding && !espNowScanActive && !rfLearnActive &&
       dockOtaState == DOCK_OTA_IDLE) {
+    // Say goodbye while the radio is still up - afterwards there is no way to
+    // tell the dock anything, and it would be left guessing from silence.
+    if (espNowDeviceCount > 0) {
+      uint32_t bye = ESPNOW_DOCK_LINK_DOWN_MAGIC;
+      esp_now_send(espNowDevices[0].mac, (const uint8_t *)&bye, sizeof(bye));
+      delay(5);   // Let it reach the air before the radio stops.
+    }
     stopEspNow();
     espNowStandalone = false;
     if (!networkStackActive && WiFi.getMode() != WIFI_OFF) WiFi.mode(WIFI_OFF);
