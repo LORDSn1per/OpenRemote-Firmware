@@ -1,6 +1,24 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.70 - 2026-09-01
+    - Wake-warm returns as a switch rather than a decision made for you:
+      "Wake with the screen", on the Dock page in both menu styles and in
+      WebConfig. On, the dock link is readied as the remote wakes so the first
+      press feels like the rest of a burst; off, the radio waits until a command
+      or a pairing actually needs it.
+    - Off by default, because the accelerometer sees every nudge and picking the
+      remote up is not a commitment to send anything - the default should be the
+      one that does not spend battery on a link usually never used.
+    - Flipping it does not send anything to the dock. It is the remote's own
+      behaviour, and pushing it would bring the radio up purely to announce a
+      setting about when to bring the radio up.
+    - Either way the link is never warmed with no activity or device open. On
+      the activity list no button can produce an IR command at all, so warming
+      there powers a radio for something that cannot happen. That holds whatever
+      the switch says: it chooses between readying the link early and waiting
+      for the command, not between sometimes pointless and never.
+
   3.69 - 2026-09-01
     - The radio no longer comes up merely because the remote woke. 3.62 warmed
       the dock link on display wake to hide the bring-up cost behind the screen
@@ -4036,7 +4054,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.69"
+#define OPENREMOTE_VERSION_STRING "3.70"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -4940,6 +4958,13 @@ String remoteName = "OpenRemote";
 uint8_t irRoute = IR_ROUTE_REMOTE;
 bool dockRfEnabled = true;
 bool dockLedOnTransmit = true;
+// Bring the dock link up when the remote wakes, rather than waiting for the
+// first command. Off by default: picking the remote off a table is not a
+// commitment to send anything - the accelerometer sees every nudge - so this
+// spends battery on a link usually never used. Worth having for anyone who
+// would rather trade that for the first press feeling identical to the rest of
+// a burst, which is exactly the trade it is.
+bool dockWarmOnWake = false;
 // "Online" means the dock acknowledged our last unicast at the MAC layer. That
 // is a real link check and costs no dock firmware: ESP-NOW acks every unicast,
 // so a powered dock in range answers whether or not it understands the payload.
@@ -6063,6 +6088,7 @@ bool ensureEspNowLink();
 void releaseEspNowLink(const char *reason);
 void refreshDockLinkIndicator();
 void applyDockLinkPillColour();
+bool remoteHasActiveTarget();
 bool dockRadioLit();
 lv_color_t pillIdleColour();
 void clearEspNowCommandFeedback();
@@ -7747,6 +7773,7 @@ void loadSettings() {
   espNowChannel = preferences.getUChar("enChan", 0);
   dockRfEnabled = preferences.getBool("dockRf", true);
   dockLedOnTransmit = preferences.getBool("dockLed", true);
+  dockWarmOnWake = preferences.getBool("dockWarm", false);
   clockEnabled = preferences.getBool("clock", true);
   clockUseInternetTime = preferences.getBool("ntp", true);
   wakeMode = constrain((int)preferences.getUChar("wakeMode", WAKE_MODE_MOTION),
@@ -7886,6 +7913,7 @@ void saveSettings() {
   preferences.putUChar("irRoute", irRoute);
   preferences.putBool("dockRf", dockRfEnabled);
   preferences.putBool("dockLed", dockLedOnTransmit);
+  preferences.putBool("dockWarm", dockWarmOnWake);
   preferences.putBool("clock", clockEnabled);
   preferences.putBool("ntp", clockUseInternetTime);
   preferences.putUChar("wakeMode", wakeMode);
@@ -10196,6 +10224,7 @@ String buildStatusJson() {
   doc["irRoute"] = irRoute;
   doc["dockRfEnabled"] = dockRfEnabled;
   doc["dockLedOnTransmit"] = dockLedOnTransmit;
+  doc["dockWarmOnWake"] = dockWarmOnWake;
   doc["dockConnected"] = dockConnected();
   doc["espNowDeviceCount"] = espNowDeviceCount;
   doc["clockEnabled"] = clockEnabled;
@@ -10495,6 +10524,7 @@ void applySettingsJson(JsonVariantConst settings) {
   bool previousRf = dockRfEnabled, previousLed = dockLedOnTransmit;
   dockRfEnabled = settings["dockRfEnabled"] | dockRfEnabled;
   dockLedOnTransmit = settings["dockLedOnTransmit"] | dockLedOnTransmit;
+  dockWarmOnWake = settings["dockWarmOnWake"] | dockWarmOnWake;
   // Push straight to the dock when either changed, so WebConfig's switches
   // take effect immediately rather than at the next reboot.
   if (previousRf != dockRfEnabled || previousLed != dockLedOnTransmit) sendDockSettings();
@@ -11110,6 +11140,12 @@ void appendIrDeviceFileSummaries(JsonArray target) {
 // (the radio is up to do it), green through the hold after a command went via
 // the dock, and back to white when the radio is released. A pairing that is
 // merely remembered, with the radio asleep, is not something to signal.
+// True when an activity or a device page is open - that is, when a button press
+// could actually produce a command. On the activity list it is false.
+bool remoteHasActiveTarget() {
+  return activeDevice >= 0 || activeActivity >= 0;
+}
+
 bool dockRadioLit() {
   return espNowEnabled && espNowDeviceCount > 0 && espNowRadioActive;
 }
@@ -12394,6 +12430,7 @@ bool persistSettingsToRuntimeConfig() {
   settings["irRoute"] = irRoute;
   settings["dockRfEnabled"] = dockRfEnabled;
   settings["dockLedOnTransmit"] = dockLedOnTransmit;
+  settings["dockWarmOnWake"] = dockWarmOnWake;
   JsonArray espNowDevicesOut = settings["espNowDevices"].to<JsonArray>();
   for (uint8_t i = 0; i < espNowDeviceCount; i++) {
     JsonObject entry = espNowDevicesOut.add<JsonObject>();
@@ -22059,14 +22096,23 @@ void irRouteDropdownEvent(lv_event_t *e) {
 void serviceDockSettingsSync() {
   static bool lastRf = true;
   static bool lastLed = true;
+  static bool lastWarm = false;
   static bool primed = false;
-  if (!primed) { primed = true; lastRf = dockRfEnabled; lastLed = dockLedOnTransmit; return; }
-  if (dockRfEnabled == lastRf && dockLedOnTransmit == lastLed) return;
+  if (!primed) {
+    primed = true;
+    lastRf = dockRfEnabled; lastLed = dockLedOnTransmit; lastWarm = dockWarmOnWake;
+    return;
+  }
+  bool dockSideChanged = dockRfEnabled != lastRf || dockLedOnTransmit != lastLed;
+  if (!dockSideChanged && dockWarmOnWake == lastWarm) return;
   lastRf = dockRfEnabled;
   lastLed = dockLedOnTransmit;
+  lastWarm = dockWarmOnWake;
   saveSettings();
   scheduleRuntimeSettingsSave();
-  sendDockSettings();
+  // Only the dock's own settings need sending; wake-warm is the remote's
+  // business and would bring the radio up purely to announce itself.
+  if (dockSideChanged) sendDockSettings();
 }
 
 void renderDockPageOmote() {
@@ -22092,7 +22138,7 @@ void renderDockPageOmote() {
   // Only shown once a dock exists to apply them to - three dead controls on a
   // page with nothing paired explains nothing and invites fiddling.
   if (espNowDeviceCount > 0) {
-    lv_obj_t *dockCard = makeOmoteCard(content, y, 3 * rowH + 2);
+    lv_obj_t *dockCard = makeOmoteCard(content, y, 4 * rowH + 3);
     lv_obj_t *routeDropdown = makeOmoteDropdownRow(dockCard, "Transmit IR from", 0, rowH, 132);
     lv_dropdown_set_options(routeDropdown, IR_ROUTE_OPTIONS);
     lv_dropdown_set_selected(routeDropdown, irRoute);
@@ -22103,7 +22149,11 @@ void renderDockPageOmote() {
     makeOmoteDivider(dockCard, 2 * rowH + 1);
     makeOmoteRow(dockCard, "Dock LED", "Blink the dock's LED as it transmits",
                  2 * rowH + 2, rowH, &dockLedOnTransmit);
-    y += 3 * rowH + 2 + 14;
+    makeOmoteDivider(dockCard, 3 * rowH + 2);
+    makeOmoteRow(dockCard, "Wake with the screen",
+                 "Ready the dock link on wake - faster first press, more battery",
+                 3 * rowH + 3, rowH, &dockWarmOnWake);
+    y += 4 * rowH + 3 + 14;
   }
 
   lv_obj_t *hint = makeLabel(content,
@@ -22146,7 +22196,9 @@ void renderDockPage() {
     addPhysicalNavFocusable(routeDropdown);
     makeSettingRow("Dock RF433", "Let the dock send RF433", 252, &dockRfEnabled);
     makeSettingRow("Dock LED", "Blink as the dock transmits", 302, &dockLedOnTransmit);
-    hintY = 354;
+    makeSettingRow("Wake with the screen", "Faster first press, more battery",
+                   352, &dockWarmOnWake);
+    hintY = 404;
   }
   lv_obj_t *hint = makeLabel(content,
     espNowDeviceCount > 0
@@ -24605,13 +24657,18 @@ void wakeDisplay() {
   restoreBacklightPwmAfterSleep();
   setLcdControllerSleeping(false);
   digitalWrite(PIN_IR_VCC, HIGH);
-  // Deliberately does NOT warm the dock link. 3.62 did, to hide the bring-up
-  // cost behind the screen coming up, but picking the remote off a table is not
-  // a commitment to send anything - it happens whenever the accelerometer is
-  // nudged. Powering a radio on every wake spends battery on a link that is
-  // usually never used, and made the dock report itself connected while sitting
-  // on the activity list doing nothing. The radio now comes up only when
-  // something actually needs it: a command to relay, or pairing.
+  // Only if asked for, and only when there is something to send to.
+  //
+  // With no activity or device open the remote is sitting on the activity list,
+  // where no button can produce an IR command at all - so warming the link
+  // there powers a radio for something that cannot happen. That holds whatever
+  // the switch says, which is why the check is here and not folded into
+  // dockWarmOnWake: the setting chooses between "ready it early" and "wait for
+  // the command", not between "sometimes pointless" and "never".
+  if (dockWarmOnWake && remoteHasActiveTarget() && irRoute != IR_ROUTE_REMOTE &&
+      espNowEnabled && espNowDeviceCount > 0) {
+    ensureEspNowLink();
+  }
   wakeTouchController(100);
   lv_obj_clear_flag(uiRoot, LV_OBJ_FLAG_HIDDEN);
   displaySleeping = false;
