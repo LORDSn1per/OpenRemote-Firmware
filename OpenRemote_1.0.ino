@@ -1,6 +1,19 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.66 - 2026-09-01
+    - The green link outline was hard to see for one reason: it inherited the
+      pill's resting border opacity of 64, a quarter strength. The red flash is
+      conspicuous only because it uses LV_OPA_COVER, so the green now does too.
+      Same border width as it always had - opacity was the whole difference.
+    - The send pulse no longer thickens the border. A thickening outline made
+      the pill's geometry jump, which is more distracting than the colour change
+      it was meant to support. It now pulses to a near-white green at the same
+      width and full opacity, so it reads as the same outline getting brighter
+      rather than a different shape appearing.
+    - Both feedback styles now hold full opacity while a dock link is up, so a
+      command press cannot stamp the dim resting value back over a live green.
+
   3.65 - 2026-09-01
     - The pill no longer fills green for a dock send. The fill announced a
       special state and held for the life of the link, which drowned out the
@@ -3977,7 +3990,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.65"
+#define OPENREMOTE_VERSION_STRING "3.66"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -5993,6 +6006,7 @@ void serviceDockPairAck(unsigned long now);
 bool ensureEspNowLink();
 void refreshDockLinkIndicator();
 void applyDockLinkPillColour();
+bool dockRadioLit();
 lv_color_t pillIdleColour();
 void clearEspNowCommandFeedback();
 void flashEspNowCommandFeedback();
@@ -11039,9 +11053,12 @@ void appendIrDeviceFileSummaries(JsonArray target) {
 // (the radio is up to do it), green through the hold after a command went via
 // the dock, and back to white when the radio is released. A pairing that is
 // merely remembered, with the radio asleep, is not something to signal.
+bool dockRadioLit() {
+  return espNowEnabled && espNowDeviceCount > 0 && espNowRadioActive;
+}
+
 lv_color_t pillIdleColour() {
-  return (espNowEnabled && espNowDeviceCount > 0 && espNowRadioActive)
-    ? lv_color_hex(0x30D158) : lv_color_white();
+  return dockRadioLit() ? lv_color_hex(0x30D158) : lv_color_white();
 }
 
 // Repaints the pill when the dock link changes, without rebuilding the page.
@@ -11059,11 +11076,19 @@ void refreshDockLinkIndicator() {
 // left every other page's pill white - green in Settings, white the moment you
 // went back to the remote. All slots are painted here instead.
 void applyDockLinkPillColour() {
+  bool linked = dockRadioLit();
   lv_color_t idle = pillIdleColour();
+  // The resting outline was inheriting the pill's normal 64 opacity - a quarter
+  // strength - which is why a green that reads clearly in red at full strength
+  // looked washed out. The red flash is only conspicuous because it uses
+  // LV_OPA_COVER, so the green link outline uses it too. Same border width as
+  // ever; only the opacity was ever the difference.
+  lv_opa_t opa = linked ? LV_OPA_COVER : (lv_opa_t)64;
   for (uint8_t slot = 0; slot < PAGE_SLOT_COUNT; slot++) {
     PageUi &ui = pageUi[slot];
     if (ui.statusPill && lv_obj_is_valid(ui.statusPill)) {
       lv_obj_set_style_border_color(ui.statusPill, idle, 0);
+      lv_obj_set_style_border_opa(ui.statusPill, opa, 0);
     }
     if (ui.statusBattery && lv_obj_is_valid(ui.statusBattery)) {
       lv_obj_set_style_border_color(ui.statusBattery, idle, 0);
@@ -11078,7 +11103,7 @@ void applyCommandFeedbackStyle(bool active) {
     lv_obj_set_style_bg_color(statusPill, active ? lv_color_hex(0x5A0000) : lv_color_black(), 0);
     lv_obj_set_style_bg_opa(statusPill, active ? LV_OPA_COVER : (lv_opa_t)115, 0);
     lv_obj_set_style_border_color(statusPill, active ? red : idle, 0);
-    lv_obj_set_style_border_opa(statusPill, active ? LV_OPA_COVER : (lv_opa_t)64, 0);
+    lv_obj_set_style_border_opa(statusPill, (active || dockRadioLit()) ? LV_OPA_COVER : (lv_opa_t)64, 0);
   }
   if (clockLabel && lv_obj_is_valid(clockLabel)) {
     lv_obj_set_style_text_color(clockLabel, active ? red : lv_color_white(), 0);
@@ -11121,14 +11146,16 @@ static const uint32_t ESPNOW_PULSE_MS = 240;      // Whole pulse train.
 static const uint32_t ESPNOW_PULSE_STEP_MS = 40;  // On/off period within it.
 
 void applyEspNowPulse(bool bright) {
-  lv_color_t hot = lv_color_hex(0x7CFFB0);   // Brighter than the resting green.
+  // Brightness only. The border width never changes - a thickening outline
+  // made the pill jump about, and the geometry shifting is more distracting
+  // than the colour change it was meant to support.
+  lv_color_t hot = lv_color_hex(0xC8FFDA);   // Near-white green, unmistakable.
   lv_color_t idle = pillIdleColour();
   for (uint8_t slot = 0; slot < PAGE_SLOT_COUNT; slot++) {
     PageUi &ui = pageUi[slot];
     if (ui.statusPill && lv_obj_is_valid(ui.statusPill)) {
       lv_obj_set_style_border_color(ui.statusPill, bright ? hot : idle, 0);
-      lv_obj_set_style_border_opa(ui.statusPill, bright ? LV_OPA_COVER : (lv_opa_t)64, 0);
-      lv_obj_set_style_border_width(ui.statusPill, bright ? 3 : 1, 0);
+      lv_obj_set_style_border_opa(ui.statusPill, LV_OPA_COVER, 0);
     }
     if (ui.statusBattery && lv_obj_is_valid(ui.statusBattery)) {
       lv_obj_set_style_border_color(ui.statusBattery, bright ? hot : idle, 0);
@@ -11174,7 +11201,7 @@ void applyButtonTestFeedbackStyle(bool active) {
     lv_obj_set_style_bg_color(statusPill, active ? lv_color_hex(0x0B3A1E) : lv_color_black(), 0);
     lv_obj_set_style_bg_opa(statusPill, active ? LV_OPA_COVER : (lv_opa_t)115, 0);
     lv_obj_set_style_border_color(statusPill, active ? green : idle, 0);
-    lv_obj_set_style_border_opa(statusPill, active ? LV_OPA_COVER : (lv_opa_t)64, 0);
+    lv_obj_set_style_border_opa(statusPill, (active || dockRadioLit()) ? LV_OPA_COVER : (lv_opa_t)64, 0);
   }
   if (clockLabel && lv_obj_is_valid(clockLabel)) {
     lv_obj_set_style_text_color(clockLabel, active ? green : lv_color_white(), 0);
