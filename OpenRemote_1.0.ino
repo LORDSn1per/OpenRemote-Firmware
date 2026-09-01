@@ -1,6 +1,31 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.84 - 2026-09-02
+    - A chunk the SD card does not fully store is now caught and re-sent,
+      instead of failing the whole upload at the end. WebConfig 2.55 made the
+      real error visible for the first time: "the SD card did not store the
+      file correctly (2572832 of 2576176 bytes, checksum wrong)". The transfer
+      itself was clean - the byte count and the transfer CRC both matched - and
+      the card had quietly swallowed 3344 bytes.
+    - write() returning the full count only means the SD library took the bytes
+      into its own buffer; the commit happens later, and a card that falls
+      behind loses them with nothing reported. That loss only surfaced at the
+      very end, as a whole-file checksum failure after 2.5MB had been sent, all
+      of it then discarded with no way to know which part went missing. Each
+      chunk is now flushed and the file asked how big it really is, so
+      chunkUploadBytes is corrected to what the card genuinely holds, /status
+      tells the truth, and the client's existing resume logic re-sends exactly
+      the missing span. The running CRC is recomputed from the card at the same
+      time so it keeps describing the actual file.
+    - Worth recording for whoever reads this next: SD access has no lock. HTTP
+      runs on core 0 and LVGL on core 1, both call into SD, and there are 71
+      SD.open sites between them. That is the most likely reason the card
+      "falls behind" at all, and it would equally explain the WebConfig
+      corruption chased in 3.74. This release repairs the damage rather than
+      removing the cause; a proper SD mutex is the real fix and is a larger
+      change than belongs in a build meant to unblock firmware updates.
+
   3.83 - 2026-09-01
     - A chunked upload can now start from its first chunk. The session lives
       only in RAM, so anything that restarted the remote between /begin and the
@@ -4322,7 +4347,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.83"
+#define OPENREMOTE_VERSION_STRING "3.84"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -15635,7 +15660,45 @@ void handleChunkUploadData() {
     }
     serviceUiDuringLongHttpTransfer();
   } else if (upload.status == UPLOAD_FILE_END) {
-    if (chunkUploadFile) chunkUploadFile.close();
+    if (chunkUploadFile) {
+      // Confirm the card actually took this chunk, at the chunk that wrote it.
+      //
+      // write() returning the full count only means the SD library accepted
+      // the bytes into its own buffer; the commit happens later, and a card
+      // that falls behind loses them with nothing reported. That loss used to
+      // surface only at the very end, as a whole-file checksum failure after
+      // 2.5MB had been sent - all of it then discarded, with no way to tell
+      // which part went missing or to recover anything.
+      //
+      // Flushing and then asking the file how big it really is turns that into
+      // a per-chunk problem. chunkUploadBytes is corrected to what the card
+      // genuinely holds, so /status tells the truth and the client's existing
+      // resume logic re-sends exactly the missing span instead of the whole
+      // file. A slow card now costs a retried chunk rather than a failed
+      // update.
+      chunkUploadFile.flush();
+      size_t onCard = chunkUploadFile.size();
+      chunkUploadFile.close();
+      if (onCard != chunkUploadBytes) {
+        Serial.printf("Chunked upload: SD fell behind - %u bytes written but %u on "
+                      "card, rewinding %d\n",
+                      (unsigned)chunkUploadBytes, (unsigned)onCard,
+                      (int)((long)chunkUploadBytes - (long)onCard));
+        // The CRC was accumulated over bytes that did not all land, so it no
+        // longer describes the file. Recomputing it from the card keeps the
+        // running total honest for the resumed remainder.
+        uint32_t cardCrc = 0;
+        size_t cardBytes = 0;
+        if (fileCrc32(chunkUploadTempPath, cardCrc, cardBytes)) {
+          chunkUploadCrc = cardCrc;
+          chunkUploadBytes = cardBytes;
+        } else {
+          chunkUploadBytes = onCard;
+        }
+        chunkUploadChunkOk = false;
+        chunkUploadError = "SD card fell behind on that chunk";
+      }
+    }
   } else if (upload.status == UPLOAD_FILE_ABORTED) {
     if (chunkUploadFile) chunkUploadFile.close();
     chunkUploadChunkOk = false;
