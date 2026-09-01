@@ -1,6 +1,24 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.80 - 2026-09-01
+    - Fixes the 7 second hold never actually firing, sometimes. The caller
+      that checks the hold gated on espNowStandalone, not espNowRadioActive -
+      the same distinction fixed in releaseEspNowLink() itself back in 3.76,
+      but missed here at the one place that decides whether to call it at all.
+      Whenever ESP-NOW rode an already-up Wi-Fi station - the station being
+      connected for any other reason, which has nothing to do with the dock -
+      espNowStandalone was never set, so the hold-expiry check was permanently
+      false and never even attempted a release. The link then stayed up
+      indefinitely, with nothing left to tear it down except display sleep
+      forcing one through - exactly "only turns off when the screen does,"
+      and unrelated to the Wake with the screen switch, which only controls
+      proactive bring-up, not this.
+    - releaseEspNowLink() was already safe to call in this case - it only
+      touches Wi-Fi's own mode when NOT riding the station, so this cannot
+      disturb a station the remote needs for something else. The fix is the
+      caller's gate, not the function itself.
+
   3.79 - 2026-09-01
     - Fixes the resting pill looking like a thick white line instead of the
       thin dim outline it should be, and matches the activity screen has:
@@ -4244,7 +4262,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.79"
+#define OPENREMOTE_VERSION_STRING "3.80"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -17785,10 +17803,19 @@ void serviceEspNow(unsigned long now) {
     stopEspNow();
   }
 
-  // A radio we brought up ourselves is ours to put away again. Held briefly
-  // after the last use so a burst of presses - volume, volume, volume - pays
-  // the bring-up cost once rather than each time.
-  if (espNowStandalone && !holding && !espNowScanActive && !rfLearnActive &&
+  // Gated on espNowRadioActive, not espNowStandalone. Whenever ESP-NOW rides
+  // an already-up Wi-Fi station - any time the station happens to be
+  // connected for some other reason, which is common and has nothing to do
+  // with the dock - espNowStandalone is never set, so gating on it meant the
+  // 7 second hold could never fire at all in that case: the link stayed up
+  // indefinitely with no timeout, and the only thing that ever tore it down
+  // was display sleep forcing a release through. That is exactly "only turns
+  // off when the screen does" - the hold was never actually being tried.
+  // releaseEspNowLink() is itself already safe to call here regardless of
+  // how the link came up: it only touches Wi-Fi's own mode when NOT riding
+  // the station, so this cannot disturb a station the remote needs for
+  // something else.
+  if (espNowRadioActive && !holding && !espNowScanActive && !rfLearnActive &&
       dockOtaState == DOCK_OTA_IDLE) {
     releaseEspNowLink("hold expired");
   }
