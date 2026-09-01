@@ -1,6 +1,28 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.64 - 2026-09-01
+    - The status pill now reports the ESP-NOW radio rather than the pairing:
+        white outline   the radio is down - nothing in flight, nothing warm
+        green outline   the radio is up, from the moment pairing succeeds and
+                        through the hold after a command went via the dock
+        green fill      a command was just sent through the dock, held for as
+                        long as the link is
+      Tied to the radio, so the pill says something true at every moment. A
+      pairing that is merely remembered, with the radio asleep, is not
+      something to signal - and 3.63's version claimed otherwise.
+    - Green replaces the red flash for a dock-sent command rather than joining
+      it. Red claims this remote's own emitter transmitted; green claims the
+      dock did. Showing both would be a lie about one of them, so
+      flashCommandFeedback() now declines while the green is up - which covers
+      every parsed-protocol branch at once instead of each having to remember.
+    - Unlike the red flash, which is an 80ms acknowledgement of a keypress, the
+      green is held for the life of the link. So the pill answers "did that go
+      through the dock, and is the dock link still warm" at a glance rather
+      than for a twentieth of a second.
+    - The fill outranks the outline while it is up, so a link-state repaint
+      cannot wipe it mid-command.
+
   3.63 - 2026-09-01
     - Fixes pairing that reported success on the remote while the dock carried
       on blinking and then finished with its "failed" burst. The remote sent
@@ -3943,7 +3965,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.63"
+#define OPENREMOTE_VERSION_STRING "3.64"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -5768,6 +5790,11 @@ unsigned long nextBatteryPageRefreshMs = 0;
 unsigned long nextSetupApStatusRefreshMs = 0;
 unsigned long brightnessLastActivityMs = 0;
 unsigned long commandFeedbackUntilMs = 0;
+// Lit green while the ESP-NOW radio is up because a command went through the
+// dock. Unlike the red flash - which is a brief acknowledgement of a keypress -
+// this holds for as long as the link does, so the pill answers "did that go via
+// the dock, and is the dock link still warm" at a glance rather than for 80ms.
+bool espNowCommandFeedbackActive = false;
 bool commandFeedbackActive = false;
 unsigned long buttonTestFeedbackUntilMs = 0;
 bool buttonTestFeedbackActive = false;
@@ -5954,6 +5981,9 @@ bool ensureEspNowLink();
 void refreshDockLinkIndicator();
 void applyDockLinkPillColour();
 lv_color_t pillIdleColour();
+void clearEspNowCommandFeedback();
+void flashEspNowCommandFeedback();
+void applyEspNowFeedbackStyle(bool active);
 bool espNowDockRadioRequired();
 void applyCommandFeedbackStyle(bool active);
 void serviceDockOta(unsigned long now);
@@ -10988,12 +11018,21 @@ void appendIrDeviceFileSummaries(JsonArray target) {
 // screen space. Both feedback styles below fall back to this rather than to
 // white, or a command press would leave the pill white on a connected dock and
 // the indication would only survive until the next button.
+// Green while the ESP-NOW radio is actually powered, white once it is not.
+//
+// Tied to the radio rather than to "a dock is paired", so the pill says
+// something true at every moment: green from the instant pairing succeeds
+// (the radio is up to do it), green through the hold after a command went via
+// the dock, and back to white when the radio is released. A pairing that is
+// merely remembered, with the radio asleep, is not something to signal.
 lv_color_t pillIdleColour() {
-  return dockConnected() ? lv_color_hex(0x30D158) : lv_color_white();
+  return (espNowEnabled && espNowDeviceCount > 0 && espNowRadioActive)
+    ? lv_color_hex(0x30D158) : lv_color_white();
 }
 
 // Repaints the pill when the dock link changes, without rebuilding the page.
 void refreshDockLinkIndicator() {
+  if (espNowCommandFeedbackActive) return;  // The fill outranks the outline.
   applyDockLinkPillColour();
 }
 
@@ -11042,6 +11081,9 @@ void applyCommandFeedbackStyle(bool active) {
 }
 
 void flashCommandFeedback() {
+  // Green already says the dock sent it. Red would claim this remote's emitter
+  // did, and both at once is a lie about one of them.
+  if (espNowCommandFeedbackActive) return;
   commandFeedbackUntilMs = millis() + 80UL;
   if (!commandFeedbackActive) {
     commandFeedbackActive = true;
@@ -11054,6 +11096,44 @@ void serviceCommandFeedback(unsigned long now) {
   if (!commandFeedbackActive || (int32_t)(now - commandFeedbackUntilMs) < 0) return;
   commandFeedbackActive = false;
   applyCommandFeedbackStyle(false);
+}
+
+// Green fill, held for the life of the ESP-NOW link rather than a fixed time.
+void applyEspNowFeedbackStyle(bool active) {
+  lv_color_t green = lv_color_hex(0x30D158);
+  lv_color_t idle = pillIdleColour();
+  for (uint8_t slot = 0; slot < PAGE_SLOT_COUNT; slot++) {
+    PageUi &ui = pageUi[slot];
+    if (ui.statusPill && lv_obj_is_valid(ui.statusPill)) {
+      lv_obj_set_style_bg_color(ui.statusPill, active ? lv_color_hex(0x0B3A1E) : lv_color_black(), 0);
+      lv_obj_set_style_bg_opa(ui.statusPill, active ? LV_OPA_COVER : (lv_opa_t)115, 0);
+      lv_obj_set_style_border_color(ui.statusPill, active ? green : idle, 0);
+      lv_obj_set_style_border_opa(ui.statusPill, active ? LV_OPA_COVER : (lv_opa_t)64, 0);
+    }
+    if (ui.clockLabel && lv_obj_is_valid(ui.clockLabel)) {
+      lv_obj_set_style_text_color(ui.clockLabel, active ? green : lv_color_white(), 0);
+    }
+    if (ui.statusBattery && lv_obj_is_valid(ui.statusBattery)) {
+      lv_obj_set_style_border_color(ui.statusBattery, active ? green : idle, 0);
+    }
+  }
+}
+
+// Called when a command actually went out over ESP-NOW. Takes the place of the
+// red flash for that command: red says "the remote transmitted", green says
+// "the dock did", and showing both would be a lie about one of them.
+void flashEspNowCommandFeedback() {
+  if (!espNowCommandFeedbackActive) {
+    espNowCommandFeedbackActive = true;
+    applyEspNowFeedbackStyle(true);
+  }
+  lv_refr_now(nullptr);
+}
+
+void clearEspNowCommandFeedback() {
+  if (!espNowCommandFeedbackActive) return;
+  espNowCommandFeedbackActive = false;
+  applyEspNowFeedbackStyle(false);
 }
 
 // Button Test mode never transmits a real IR/BLE command (see buttonTestModeActive()
@@ -11505,12 +11585,16 @@ bool transmitIrCommand(const DeviceCommand &command) {
   }
   // Routing applies to real IR only - a Bluetooth or Homebridge command has
   // nothing a dock could transmit, and those returned above.
-  bool useDock = irRoute != IR_ROUTE_REMOTE && espNowDeviceCount > 0 && espNowRadioActive;
+  bool useDock = irRoute != IR_ROUTE_REMOTE && espNowDeviceCount > 0;
   bool useLocal = irRoute != IR_ROUTE_DOCK;
-  if (useDock) relayIrToDock(command);
+  bool wentViaDock = useDock && relayIrToDock(command);
+
+  // Green when the dock carried it, red when this remote's own emitter did.
+  // Never both: each colour is a claim about where the signal came from.
+  if (wentViaDock) flashEspNowCommandFeedback();
 
   if (command.kind == DeviceCommand::RAW && command.rawTimings && command.rawCount) {
-    flashCommandFeedback();
+    if (!wentViaDock) flashCommandFeedback();
     if (useLocal) {
       IrSender.sendRaw(command.rawTimings, command.rawCount,
                        command.frequencyKhz ? command.frequencyKhz : 38);
@@ -11521,10 +11605,9 @@ bool transmitIrCommand(const DeviceCommand &command) {
   if (!useLocal) {
     // Dock-only: the dock has been given the command and the remote's own
     // emitter stays dark. Reported as sent, because it was.
-    flashCommandFeedback();
+    if (!wentViaDock) flashCommandFeedback();
     return true;
   }
-
   if (strcmp(command.protocol, "NEC") == 0) {
     flashCommandFeedback();
     IrSender.sendNEC((uint16_t)command.address, (uint16_t)command.command, 0);
@@ -16998,6 +17081,7 @@ void startEspNow() {
       preferences.end();
     }
   }
+  dockLinkIndicatorDirty = true;
   Serial.printf("ESP-NOW: ready on channel %u\n", (unsigned)espNowChannel);
 }
 
@@ -17081,11 +17165,15 @@ void serviceDockLink(unsigned long now) {
 
 void stopEspNow() {
   if (!espNowRadioActive) return;
+  // The radio is going: drop the green fill and let the outline fall back to
+  // white on the next repaint below.
+  clearEspNowCommandFeedback();
   espNowScanActive = false;
   rfLearnActive = false;
   esp_now_unregister_recv_cb();
   esp_now_deinit();
   espNowRadioActive = false;
+  dockLinkIndicatorDirty = true;
   Serial.println("ESP-NOW: stopped");
 }
 
