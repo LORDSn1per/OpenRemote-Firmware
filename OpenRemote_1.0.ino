@@ -1,6 +1,42 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.59 - 2026-09-01
+    - The dock's LED never blinked on an IR command because nothing was ever
+      sent to it. ESPNOW is a separate DeviceCommand kind, so an ordinary IR
+      command always went out of the remote's own emitter and the dock saw
+      none of it. That was missing routing, not a fault in the dock.
+    - Adds "Transmit IR from": this remote, remote and dock, or dock only. On
+      the Dock page in both menu styles and in WebConfig, phrased around where
+      the signal comes out because that is the question a cabinet door actually
+      poses. Dock-only still reports the command as sent, because it was.
+    - Dock RF433 and Dock LED on transmit switches, in both places. They are
+      pushed to the dock over ESP-NOW and stored there, so the dock behaves the
+      same however it is woken. The LED switch silences the indicator only; the
+      dock still transmits.
+    - Changes are noticed centrally rather than from a switch callback - the
+      row helpers write their bool directly and offer none - which has the
+      side benefit of covering the LCD, WebConfig and a restored backup at
+      once instead of each having to remember to push.
+    - The status pill's outline turns green while a dock is connected and
+      reverts when it is not, so the pill doubles as the link indicator without
+      costing any screen space. "Connected" means the dock acknowledged our
+      last unicast: ESP-NOW acks every unicast at the MAC layer, so a five
+      second four-byte ping is a real link check that needs nothing from the
+      dock firmware. Both feedback styles now fall back to this colour rather
+      than to white, or the indication would vanish at the next button press.
+    - New ESP-NOW search overlay, in the style of the Bluetooth pairing one.
+      The old inline list gave no sign anything was happening during the 20
+      second window, and when a search could not start at all - ESP-NOW off, or
+      the Wi-Fi station down, both of which startEspNowScan() refuses on - it
+      said so only on serial. From the screen a refused search and one that
+      found nothing looked identical: an empty list. The overlay animates while
+      searching, lists what it finds for tapping, says plainly why it cannot
+      search, and offers real advice when nothing answers.
+    - WebConfig can rename a paired dock. It is the same call as pairing, since
+      the firmware updates the name when the MAC is already known - no second
+      endpoint to drift out of step.
+
   3.58 - 2026-09-01
     - Sends new dock firmware to a paired dock over ESP-NOW, so the dock can be
       updated without unplugging it from the cabinet. WebConfig gains a Dock
@@ -3815,7 +3851,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.58"
+#define OPENREMOTE_VERSION_STRING "3.59"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -4407,6 +4443,30 @@ struct DeviceCommand {
 static const uint8_t ESPNOW_TRANSPORT_IR = 0;
 static const uint8_t ESPNOW_TRANSPORT_RF433 = 1;
 
+// Where an ordinary IR command is actually emitted.
+//
+// Until now a command reached the dock only if it had been configured with the
+// ESPNOW kind, so every normal IR command went out of the remote's own emitter
+// and the dock never saw one - which is why a paired dock sat there with its
+// LED dark while commands were plainly working. This is the routing that was
+// missing, not a fault in the dock.
+static const uint8_t IR_ROUTE_REMOTE = 0;  // The remote's own emitter only.
+static const uint8_t IR_ROUTE_BOTH   = 1;  // Both, for cabinets with a blind spot.
+static const uint8_t IR_ROUTE_DOCK   = 2;  // The dock only.
+
+// Settings pushed to the dock rather than kept here, so the dock behaves the
+// same however it is woken.
+static const uint32_t ESPNOW_DOCK_SETTINGS_MAGIC = 0x4F524453UL;  // "ORDS"
+static const uint32_t ESPNOW_DOCK_PING_MAGIC     = 0x4F525047UL;  // "ORPG"
+
+struct __attribute__((packed)) EspNowDockSettingsPacket {
+  uint32_t magic;
+  uint8_t rfEnabled;       // RF433 receiver/transmitter on the dock.
+  uint8_t ledOnTransmit;   // Blink the dock's LED when it transmits.
+  uint8_t reserved[2];
+};
+static_assert(sizeof(EspNowDockSettingsPacket) == 8, "dock settings layout drifted from the dock");
+
 struct PhysicalBinding {
   uint8_t deviceIndex;
   uint8_t commandIndex;
@@ -4687,6 +4747,18 @@ String homebridgeUsername;
 String homebridgePassword;
 String homebridgeToken;
 String remoteName = "OpenRemote";
+uint8_t irRoute = IR_ROUTE_REMOTE;
+bool dockRfEnabled = true;
+bool dockLedOnTransmit = true;
+// "Online" means the dock acknowledged our last unicast at the MAC layer. That
+// is a real link check and costs no dock firmware: ESP-NOW acks every unicast,
+// so a powered dock in range answers whether or not it understands the payload.
+volatile bool dockLinkOnline = false;
+unsigned long dockLastAckMs = 0;
+unsigned long dockNextPingMs = 0;
+// Set from the ESP-NOW send callback (Wi-Fi task); acted on in loop(), because
+// LVGL objects must only be touched from the UI task.
+volatile bool dockLinkIndicatorDirty = false;
 char sdStatusText[64] = "Not checked";
 
 enum SettingsView {
@@ -5756,10 +5828,20 @@ bool addEspNowDevice(const uint8_t mac[6], const char *name);
 bool removeEspNowDevice(const uint8_t mac[6]);
 bool sendEspNowCommand(const DeviceCommand &command);
 bool dockOtaPrepare(uint8_t deviceIndex, String &error);
+bool relayIrToDock(const DeviceCommand &command);
+bool dockConnected();
+void sendDockSettings();
+void serviceDockLink(unsigned long now);
+void refreshDockLinkIndicator();
+void applyCommandFeedbackStyle(bool active);
 void serviceDockOta(unsigned long now);
 bool startRfLearn(uint8_t deviceIndex);
 void cancelRfLearn();
 void showEspNowDevicesModal();
+void serviceEspNowSearchOverlay(unsigned long now);
+void hideEspNowSearchOverlay();
+void showEspNowSearchBlocked(const char *why);
+void showEspNowSearchOverlay();
 void toggleEspNowDevicesModal(lv_event_t *e);
 void serviceEspNowDevicesModal(unsigned long now);
 void startSetupAccessPoint();
@@ -7422,6 +7504,9 @@ void loadSettings() {
   atvvRememberedInteractionModel =
     preferences.getUChar("atvvModel", ATVV_INTERACTION_ON_REQUEST);
   atvv16kConsecutiveFailures = preferences.getUChar("atvv16kBad", 0);
+  irRoute = preferences.getUChar("irRoute", IR_ROUTE_REMOTE);
+  dockRfEnabled = preferences.getBool("dockRf", true);
+  dockLedOnTransmit = preferences.getBool("dockLed", true);
   clockEnabled = preferences.getBool("clock", true);
   clockUseInternetTime = preferences.getBool("ntp", true);
   wakeMode = constrain((int)preferences.getUChar("wakeMode", WAKE_MODE_MOTION),
@@ -7558,6 +7643,9 @@ void saveSettings() {
   preferences.putBool("bleBonded", (bool)bleBonded);
   preferences.putUChar("atvvModel", atvvRememberedInteractionModel);
   preferences.putUChar("atvv16kBad", atvv16kConsecutiveFailures);
+  preferences.putUChar("irRoute", irRoute);
+  preferences.putBool("dockRf", dockRfEnabled);
+  preferences.putBool("dockLed", dockLedOnTransmit);
   preferences.putBool("clock", clockEnabled);
   preferences.putBool("ntp", clockUseInternetTime);
   preferences.putUChar("wakeMode", wakeMode);
@@ -9844,6 +9932,10 @@ String buildStatusJson() {
   doc["bluetoothPairing"] = blePairingMode;
   doc["bluetoothName"] = BLE_HID_NAME;
   doc["espNowEnabled"] = espNowEnabled;
+  doc["irRoute"] = irRoute;
+  doc["dockRfEnabled"] = dockRfEnabled;
+  doc["dockLedOnTransmit"] = dockLedOnTransmit;
+  doc["dockConnected"] = dockConnected();
   doc["espNowDeviceCount"] = espNowDeviceCount;
   doc["clockEnabled"] = clockEnabled;
   doc["clockUseInternetTime"] = clockUseInternetTime;
@@ -10137,6 +10229,14 @@ void applySettingsJson(JsonVariantConst settings) {
   debugSplitEnabled = settings["debugSplit"] | debugSplitEnabled;
   bluetoothSleepEnabled = settings["bluetoothSleepEnabled"] | bluetoothSleepEnabled;
   espNowEnabled = settings["espNowEnabled"] | espNowEnabled;
+  irRoute = settings["irRoute"] | irRoute;
+  if (irRoute > IR_ROUTE_DOCK) irRoute = IR_ROUTE_REMOTE;
+  bool previousRf = dockRfEnabled, previousLed = dockLedOnTransmit;
+  dockRfEnabled = settings["dockRfEnabled"] | dockRfEnabled;
+  dockLedOnTransmit = settings["dockLedOnTransmit"] | dockLedOnTransmit;
+  // Push straight to the dock when either changed, so WebConfig's switches
+  // take effect immediately rather than at the next reboot.
+  if (previousRf != dockRfEnabled || previousLed != dockLedOnTransmit) sendDockSettings();
   JsonArrayConst espNowDevicesIn = settings["espNowDevices"].as<JsonArrayConst>();
   if (!espNowDevicesIn.isNull()) {
     espNowDeviceCount = 0;
@@ -10737,19 +10837,34 @@ void appendIrDeviceFileSummaries(JsonArray target) {
   root.close();
 }
 
+// The pill's resting colour. Green while a dock is connected, white otherwise -
+// so the status pill doubles as the dock's link indicator without costing any
+// screen space. Both feedback styles below fall back to this rather than to
+// white, or a command press would leave the pill white on a connected dock and
+// the indication would only survive until the next button.
+lv_color_t pillIdleColour() {
+  return dockConnected() ? lv_color_hex(0x30D158) : lv_color_white();
+}
+
+// Repaints the pill when the dock link changes, without rebuilding the page.
+void refreshDockLinkIndicator() {
+  applyCommandFeedbackStyle(false);
+}
+
 void applyCommandFeedbackStyle(bool active) {
   lv_color_t red = lv_color_hex(0xFF453A);
+  lv_color_t idle = pillIdleColour();
   if (statusPill && lv_obj_is_valid(statusPill)) {
     lv_obj_set_style_bg_color(statusPill, active ? lv_color_hex(0x5A0000) : lv_color_black(), 0);
     lv_obj_set_style_bg_opa(statusPill, active ? LV_OPA_COVER : (lv_opa_t)115, 0);
-    lv_obj_set_style_border_color(statusPill, active ? red : lv_color_white(), 0);
+    lv_obj_set_style_border_color(statusPill, active ? red : idle, 0);
     lv_obj_set_style_border_opa(statusPill, active ? LV_OPA_COVER : (lv_opa_t)64, 0);
   }
   if (clockLabel && lv_obj_is_valid(clockLabel)) {
     lv_obj_set_style_text_color(clockLabel, active ? red : lv_color_white(), 0);
   }
   if (statusBattery && lv_obj_is_valid(statusBattery)) {
-    lv_obj_set_style_border_color(statusBattery, active ? red : lv_color_white(), 0);
+    lv_obj_set_style_border_color(statusBattery, active ? red : idle, 0);
   }
   if (batteryFill && lv_obj_is_valid(batteryFill)) {
     lv_obj_set_style_bg_color(batteryFill, active ? red : lv_color_make(166, 255, 184), 0);
@@ -10780,17 +10895,18 @@ void serviceCommandFeedback(unsigned long now) {
 // red, so a test-mode press is visually unmistakable from a genuine transmit.
 void applyButtonTestFeedbackStyle(bool active) {
   lv_color_t green = lv_color_hex(0x30D158);
+  lv_color_t idle = pillIdleColour();
   if (statusPill && lv_obj_is_valid(statusPill)) {
     lv_obj_set_style_bg_color(statusPill, active ? lv_color_hex(0x0B3A1E) : lv_color_black(), 0);
     lv_obj_set_style_bg_opa(statusPill, active ? LV_OPA_COVER : (lv_opa_t)115, 0);
-    lv_obj_set_style_border_color(statusPill, active ? green : lv_color_white(), 0);
+    lv_obj_set_style_border_color(statusPill, active ? green : idle, 0);
     lv_obj_set_style_border_opa(statusPill, active ? LV_OPA_COVER : (lv_opa_t)64, 0);
   }
   if (clockLabel && lv_obj_is_valid(clockLabel)) {
     lv_obj_set_style_text_color(clockLabel, active ? green : lv_color_white(), 0);
   }
   if (statusBattery && lv_obj_is_valid(statusBattery)) {
-    lv_obj_set_style_border_color(statusBattery, active ? green : lv_color_white(), 0);
+    lv_obj_set_style_border_color(statusBattery, active ? green : idle, 0);
   }
   if (batteryFill && lv_obj_is_valid(batteryFill)) {
     lv_obj_set_style_bg_color(batteryFill, active ? green : lv_color_make(166, 255, 184), 0);
@@ -11220,13 +11336,27 @@ bool transmitIrCommand(const DeviceCommand &command) {
     flashCommandFeedback();
     return sendEspNowCommand(command);
   }
+  // Routing applies to real IR only - a Bluetooth or Homebridge command has
+  // nothing a dock could transmit, and those returned above.
+  bool useDock = irRoute != IR_ROUTE_REMOTE && espNowDeviceCount > 0 && espNowRadioActive;
+  bool useLocal = irRoute != IR_ROUTE_DOCK;
+  if (useDock) relayIrToDock(command);
+
   if (command.kind == DeviceCommand::RAW && command.rawTimings && command.rawCount) {
     flashCommandFeedback();
-    IrSender.sendRaw(command.rawTimings, command.rawCount,
-                     command.frequencyKhz ? command.frequencyKhz : 38);
+    if (useLocal) {
+      IrSender.sendRaw(command.rawTimings, command.rawCount,
+                       command.frequencyKhz ? command.frequencyKhz : 38);
+    }
     return true;
   }
   if (command.kind != DeviceCommand::PARSED) return false;
+  if (!useLocal) {
+    // Dock-only: the dock has been given the command and the remote's own
+    // emitter stays dark. Reported as sent, because it was.
+    flashCommandFeedback();
+    return true;
+  }
 
   if (strcmp(command.protocol, "NEC") == 0) {
     flashCommandFeedback();
@@ -11900,6 +12030,9 @@ bool persistSettingsToRuntimeConfig() {
   settings["debugSplit"] = debugSplitEnabled;
   settings["bluetoothSleepEnabled"] = bluetoothSleepEnabled;
   settings["espNowEnabled"] = espNowEnabled;
+  settings["irRoute"] = irRoute;
+  settings["dockRfEnabled"] = dockRfEnabled;
+  settings["dockLedOnTransmit"] = dockLedOnTransmit;
   JsonArray espNowDevicesOut = settings["espNowDevices"].to<JsonArray>();
   for (uint8_t i = 0; i < espNowDeviceCount; i++) {
     JsonObject entry = espNowDevicesOut.add<JsonObject>();
@@ -16624,6 +16757,25 @@ void onEspNowDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int 
   }
 }
 
+// ESP-NOW acknowledges every unicast at the MAC layer, so the send status is a
+// genuine "is the dock there" signal that needs nothing from the dock firmware
+// at all. Broadcasts always report success and are ignored here.
+// The callback takes a wifi_tx_info_t on this IDF, not a bare MAC - the older
+// two-pointer signature compiles to a type error rather than a warning.
+void onEspNowDataSent(const wifi_tx_info_t *info, esp_now_send_status_t status) {
+  if (!info || !info->des_addr) return;
+  const uint8_t *mac = info->des_addr;
+  static const uint8_t broadcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+  if (memcmp(mac, broadcast, 6) == 0) return;
+  bool online = (status == ESP_NOW_SEND_SUCCESS);
+  if (online) dockLastAckMs = millis();
+  if (online != dockLinkOnline) {
+    dockLinkOnline = online;
+    dockLinkIndicatorDirty = true;
+    Serial.printf("Dock link: %s\n", online ? "online" : "not responding");
+  }
+}
+
 void startEspNow() {
   if (espNowRadioActive) return;
   if (esp_now_init() != ESP_OK) {
@@ -16631,9 +16783,50 @@ void startEspNow() {
     return;
   }
   esp_now_register_recv_cb(onEspNowDataRecv);
+  esp_now_register_send_cb(onEspNowDataSent);
   espNowRegisterAllPeers();
   espNowRadioActive = true;
   Serial.println("ESP-NOW: ready");
+}
+
+// True only while a dock is paired, the radio is up and it answered recently.
+// The pill outline and the Dock menu both read this, so they cannot disagree.
+bool dockConnected() {
+  return espNowRadioActive && espNowDeviceCount > 0 && dockLinkOnline &&
+         (millis() - dockLastAckMs) < 20000UL;
+}
+
+void sendDockSettings() {
+  if (!espNowRadioActive || espNowDeviceCount == 0) return;
+  EspNowDockSettingsPacket packet = {};
+  packet.magic = ESPNOW_DOCK_SETTINGS_MAGIC;
+  packet.rfEnabled = dockRfEnabled ? 1 : 0;
+  packet.ledOnTransmit = dockLedOnTransmit ? 1 : 0;
+  esp_now_send(espNowDevices[0].mac, (const uint8_t *)&packet, sizeof(packet));
+  Serial.printf("Dock settings sent: RF=%s LED=%s\n",
+                dockRfEnabled ? "on" : "off", dockLedOnTransmit ? "on" : "off");
+}
+
+// A four byte nudge whose only job is to draw a MAC-layer ack, so the link
+// state stays current without the dock having to implement anything.
+void serviceDockLink(unsigned long now) {
+  if (!espNowRadioActive || espNowDeviceCount == 0) {
+    if (dockLinkOnline) {
+      dockLinkOnline = false;
+      dockLinkIndicatorDirty = true;
+    }
+    return;
+  }
+  if (dockOtaState != DOCK_OTA_IDLE) return;  // The transfer is its own proof.
+  if ((int32_t)(now - dockNextPingMs) < 0) return;
+  dockNextPingMs = now + 5000UL;
+  uint32_t ping = ESPNOW_DOCK_PING_MAGIC;
+  esp_now_send(espNowDevices[0].mac, (const uint8_t *)&ping, sizeof(ping));
+  if (dockLinkOnline && (now - dockLastAckMs) > 20000UL) {
+    dockLinkOnline = false;
+    dockLinkIndicatorDirty = true;
+    Serial.println("Dock link: timed out");
+  }
 }
 
 void stopEspNow() {
@@ -16976,6 +17169,20 @@ void serviceDockOta(unsigned long now) {
   if (dockOtaState == DOCK_OTA_BEGIN) dockOtaSendBegin();
   else if (dockOtaState == DOCK_OTA_DATA) dockOtaSendChunk();
   else if (dockOtaState == DOCK_OTA_END) dockOtaSendEnd();
+}
+
+// Sends an ordinary IR command to the paired dock, which is what the routing
+// setting is for. Distinct from sendEspNowCommand(), which serves commands the
+// user deliberately configured as ESPNOW and which carry their own target.
+bool relayIrToDock(const DeviceCommand &command) {
+  if (!espNowRadioActive || espNowDeviceCount == 0) return false;
+  uint8_t payload[ESPNOW_MAX_PAYLOAD_BYTES];
+  size_t payloadLen = 0;
+  DeviceCommand routed = command;
+  routed.espNowTransport = ESPNOW_TRANSPORT_IR;
+  if (!buildEspNowPayload(routed, payload, sizeof(payload), payloadLen)) return false;
+  esp_err_t result = esp_now_send(espNowDevices[0].mac, payload, payloadLen);
+  return result == ESP_OK;
 }
 
 bool sendEspNowCommand(const DeviceCommand &command) {
@@ -18127,6 +18334,186 @@ void serviceBlePairingOverlay(unsigned long now) {
       break;
     }
     default: break;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ESP-NOW search overlay
+// ---------------------------------------------------------------------------
+//
+// Replaces the old inline device list, which had two problems. It gave no sign
+// that anything was happening while the 20 second window ran, and when the
+// search could not start at all - ESP-NOW switched off, or the Wi-Fi station
+// down, both of which startEspNowScan() refuses on - it said so only on serial.
+// From the screen a refused search and a search that found nothing looked
+// identical: a list that stayed empty.
+//
+// Built in the same style as the Bluetooth pairing overlay, and like it, every
+// widget is owned by the LVGL task. The scan itself fills espNowCandidates from
+// the Wi-Fi task; this only ever reads the count.
+
+lv_obj_t *espNowSearchOverlay = nullptr;
+lv_obj_t *espNowSearchPulse = nullptr;
+lv_obj_t *espNowSearchGlyph = nullptr;
+lv_obj_t *espNowSearchTitle = nullptr;
+lv_obj_t *espNowSearchHint = nullptr;
+lv_obj_t *espNowSearchList = nullptr;
+bool espNowSearchOverlayVisible = false;
+uint8_t espNowSearchShownCount = 0xFF;
+
+void hideEspNowSearchOverlay() {
+  if (!espNowSearchOverlay) return;
+  lv_obj_add_flag(espNowSearchOverlay, LV_OBJ_FLAG_HIDDEN);
+  espNowSearchOverlayVisible = false;
+}
+
+void espNowSearchPairClicked(lv_event_t *e) {
+  int index = (int)(intptr_t)lv_event_get_user_data(e);
+  if (index < 0 || index >= espNowCandidateCount) return;
+  EspNowCandidate candidate = espNowCandidates[index];
+  cancelEspNowScan();
+  if (addEspNowDevice(candidate.mac, candidate.name)) {
+    Serial.printf("ESP-NOW: paired with %s\n", candidate.name);
+    sendDockSettings();
+  }
+  hideEspNowSearchOverlay();
+  pendingUiRefresh = settingsView == SETTINGS_DOCK;
+}
+
+void espNowSearchOverlayClicked(lv_event_t *e) {
+  (void)e;
+  cancelEspNowScan();
+  hideEspNowSearchOverlay();
+  pendingUiRefresh = settingsView == SETTINGS_DOCK;
+}
+
+void createEspNowSearchOverlay() {
+  if (espNowSearchOverlay) return;
+  espNowSearchOverlay = lv_obj_create(lv_layer_top());
+  lv_obj_set_pos(espNowSearchOverlay, 0, 0);
+  lv_obj_set_size(espNowSearchOverlay, LCD_W, LCD_H);
+  lv_obj_clear_flag(espNowSearchOverlay, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(espNowSearchOverlay, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_style_bg_color(espNowSearchOverlay, lv_color_black(), 0);
+  lv_obj_set_style_bg_opa(espNowSearchOverlay, LV_OPA_80, 0);
+  lv_obj_set_style_border_width(espNowSearchOverlay, 0, 0);
+  lv_obj_set_style_radius(espNowSearchOverlay, 0, 0);
+  lv_obj_set_style_pad_all(espNowSearchOverlay, 0, 0);
+  lv_obj_add_event_cb(espNowSearchOverlay, espNowSearchOverlayClicked, LV_EVENT_CLICKED, nullptr);
+
+  espNowSearchPulse = lv_obj_create(espNowSearchOverlay);
+  lv_obj_set_size(espNowSearchPulse, 88, 88);
+  lv_obj_align(espNowSearchPulse, LV_ALIGN_TOP_MID, 0, 26);
+  lv_obj_clear_flag(espNowSearchPulse, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(espNowSearchPulse, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_style_bg_opa(espNowSearchPulse, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_color(espNowSearchPulse, lvRgb(45, 143, 255), 0);
+  lv_obj_set_style_border_width(espNowSearchPulse, 4, 0);
+  lv_obj_set_style_radius(espNowSearchPulse, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_pad_all(espNowSearchPulse, 0, 0);
+
+  espNowSearchGlyph = makeLabel(espNowSearchOverlay, LV_SYMBOL_WIFI, 0, 0,
+                                &lv_font_montserrat_48, lvRgb(45, 143, 255));
+  lv_obj_align(espNowSearchGlyph, LV_ALIGN_TOP_MID, 0, 44);
+
+  espNowSearchTitle = makeLabel(espNowSearchOverlay, "SEARCHING", 0, 0,
+                                &lv_font_montserrat_20, textPrimary());
+  lv_obj_align(espNowSearchTitle, LV_ALIGN_TOP_MID, 0, 124);
+
+  espNowSearchHint = makeLabel(espNowSearchOverlay, "", 0, 0,
+                               &lv_font_montserrat_10, lvRgb(135, 195, 255));
+  lv_label_set_long_mode(espNowSearchHint, LV_LABEL_LONG_WRAP);
+  lv_obj_set_width(espNowSearchHint, LCD_W - 36);
+  lv_obj_set_style_text_align(espNowSearchHint, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_align(espNowSearchHint, LV_ALIGN_TOP_MID, 0, 150);
+
+  espNowSearchList = lv_obj_create(espNowSearchOverlay);
+  lv_obj_set_size(espNowSearchList, LCD_W - 28, 108);
+  lv_obj_align(espNowSearchList, LV_ALIGN_BOTTOM_MID, 0, -14);
+  lv_obj_set_style_bg_opa(espNowSearchList, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(espNowSearchList, 0, 0);
+  lv_obj_set_style_pad_all(espNowSearchList, 0, 0);
+  lv_obj_set_flex_flow(espNowSearchList, LV_FLEX_FLOW_COLUMN);
+
+  lv_obj_add_flag(espNowSearchOverlay, LV_OBJ_FLAG_HIDDEN);
+}
+
+// Rebuilt only when the number of candidates changes, so the buttons do not
+// flicker out from under a finger every service tick.
+void rebuildEspNowSearchList() {
+  if (!espNowSearchList) return;
+  lv_obj_clean(espNowSearchList);
+  for (uint8_t i = 0; i < espNowCandidateCount; i++) {
+    lv_obj_t *row = lv_btn_create(espNowSearchList);
+    lv_obj_set_width(row, LV_PCT(100));
+    lv_obj_set_height(row, 34);
+    lv_obj_set_style_bg_color(row, lvRgb(28, 62, 110), 0);
+    lv_obj_set_style_radius(row, 8, 0);
+    lv_obj_add_event_cb(row, espNowSearchPairClicked, LV_EVENT_CLICKED,
+                        (void *)(intptr_t)i);
+    lv_obj_t *label = lv_label_create(row);
+    lv_label_set_text(label, espNowCandidates[i].name);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(label, textPrimary(), 0);
+    lv_obj_center(label);
+  }
+}
+
+void showEspNowSearchOverlay() {
+  createEspNowSearchOverlay();
+  if (!espNowSearchOverlay) return;
+  espNowSearchShownCount = 0xFF;
+  lv_obj_clear_flag(espNowSearchOverlay, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_move_foreground(espNowSearchOverlay);
+  espNowSearchOverlayVisible = true;
+}
+
+// Explains a refusal instead of leaving an empty list, which is the whole
+// reason this exists.
+void showEspNowSearchBlocked(const char *why) {
+  showEspNowSearchOverlay();
+  if (!espNowSearchOverlay) return;
+  lv_label_set_text(espNowSearchGlyph, LV_SYMBOL_WARNING);
+  lv_obj_set_style_text_color(espNowSearchGlyph, lvRgb(255, 176, 32), 0);
+  lv_obj_set_style_border_color(espNowSearchPulse, lvRgb(255, 176, 32), 0);
+  lv_label_set_text(espNowSearchTitle, "CANNOT SEARCH");
+  lv_label_set_text(espNowSearchHint, why);
+  if (espNowSearchList) lv_obj_clean(espNowSearchList);
+}
+
+void serviceEspNowSearchOverlay(unsigned long now) {
+  if (!espNowSearchOverlayVisible || !espNowSearchOverlay) return;
+
+  if (espNowScanActive) {
+    uint16_t phase = (now / 6U) % 140U;
+    int32_t size = phase <= 70U ? 88 + phase : 158 - (phase - 70U);
+    lv_obj_set_size(espNowSearchPulse, size, size);
+    lv_obj_align(espNowSearchPulse, LV_ALIGN_TOP_MID, 0, 26 + (88 - size) / 2);
+    lv_obj_set_style_border_opa(
+      espNowSearchPulse, static_cast<lv_opa_t>(LV_OPA_80 - ((size - 88) * 56 / 70)), 0);
+  }
+
+  if (espNowSearchShownCount != espNowCandidateCount) {
+    espNowSearchShownCount = espNowCandidateCount;
+    rebuildEspNowSearchList();
+    if (espNowCandidateCount) {
+      lv_label_set_text(espNowSearchTitle, espNowCandidateCount == 1 ? "1 DOCK FOUND" : "DOCKS FOUND");
+      lv_label_set_text(espNowSearchHint, "Tap a dock to pair with it");
+    }
+  }
+
+  if (!espNowScanActive) {
+    if (espNowCandidateCount == 0) {
+      lv_label_set_text(espNowSearchGlyph, LV_SYMBOL_CLOSE);
+      lv_obj_set_style_text_color(espNowSearchGlyph, lvRgb(255, 69, 58), 0);
+      lv_obj_set_style_border_color(espNowSearchPulse, lvRgb(255, 69, 58), 0);
+      lv_label_set_text(espNowSearchTitle, "NO DOCKS FOUND");
+      lv_label_set_text(espNowSearchHint,
+                        "Hold the dock's button for 5 seconds until its LED blinks, then search again.\nTap to close");
+    }
+    lv_obj_set_size(espNowSearchPulse, 128, 128);
+    lv_obj_align(espNowSearchPulse, LV_ALIGN_TOP_MID, 0, 6);
+    lv_obj_set_style_border_opa(espNowSearchPulse, LV_OPA_60, 0);
   }
 }
 
@@ -20975,6 +21362,38 @@ void renderDebugPageOmote() {
 // Settings > Dock. ESP-NOW lived under Debug while it was an experiment; it is
 // a real feature now, and burying dock pairing among touch/display diagnostics
 // made it hard to find and implied it was a developer toggle.
+// "Transmit IR from" - deliberately about where the signal comes out rather
+// than about ESP-NOW, because that is the question the user is actually
+// answering when a cabinet door blocks the remote's own emitter.
+static const char *IR_ROUTE_OPTIONS = "This remote\nRemote and dock\nDock only";
+
+void irRouteDropdownEvent(lv_event_t *e) {
+  uint16_t selected = lv_dropdown_get_selected(lv_event_get_target(e));
+  irRoute = (uint8_t)(selected > IR_ROUTE_DOCK ? IR_ROUTE_REMOTE : selected);
+  saveSettings();
+  scheduleRuntimeSettingsSave();
+  Serial.printf("IR route: %s\n",
+                irRoute == IR_ROUTE_REMOTE ? "remote" :
+                (irRoute == IR_ROUTE_BOTH ? "remote and dock" : "dock only"));
+}
+
+// The switch helpers write their bool directly and offer no change callback, so
+// the change is noticed centrally instead. That has the side benefit of
+// covering every source at once - the LCD switches, WebConfig and a restored
+// backup all end up here rather than each needing to remember to push.
+void serviceDockSettingsSync() {
+  static bool lastRf = true;
+  static bool lastLed = true;
+  static bool primed = false;
+  if (!primed) { primed = true; lastRf = dockRfEnabled; lastLed = dockLedOnTransmit; return; }
+  if (dockRfEnabled == lastRf && dockLedOnTransmit == lastLed) return;
+  lastRf = dockRfEnabled;
+  lastLed = dockLedOnTransmit;
+  saveSettings();
+  scheduleRuntimeSettingsSave();
+  sendDockSettings();
+}
+
 void renderDockPageOmote() {
   const int rowH = 48;
   int y = 44;
@@ -20989,10 +21408,31 @@ void renderDockPageOmote() {
               nullptr, toggleEspNowDevicesModal);
   y += 2 * rowH + 1 + 14;
 
+  // Only shown once a dock exists to apply them to - three dead controls on a
+  // page with nothing paired explains nothing and invites fiddling.
+  if (espNowDeviceCount > 0) {
+    lv_obj_t *dockCard = makeOmoteCard(content, y, 3 * rowH + 2);
+    lv_obj_t *routeDropdown = makeOmoteDropdownRow(dockCard, "Transmit IR from", 0, rowH, 132);
+    lv_dropdown_set_options(routeDropdown, IR_ROUTE_OPTIONS);
+    lv_dropdown_set_selected(routeDropdown, irRoute);
+    lv_obj_add_event_cb(routeDropdown, irRouteDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
+    makeOmoteDivider(dockCard, rowH);
+    makeOmoteRow(dockCard, "Dock RF433", "Let the dock send RF433 commands",
+                 rowH + 1, rowH, &dockRfEnabled);
+    makeOmoteDivider(dockCard, 2 * rowH + 1);
+    makeOmoteRow(dockCard, "Dock LED", "Blink the dock's LED as it transmits",
+                 2 * rowH + 2, rowH, &dockLedOnTransmit);
+    y += 3 * rowH + 2 + 14;
+  }
+
   lv_obj_t *hint = makeLabel(content,
-    "A dock relays IR and RF433 commands for devices the remote cannot reach "
-    "directly. Turn ESP-NOW on, then use Paired devices to search for a dock "
-    "in pairing mode.", 10, y, &lv_font_montserrat_12, lvRgb(150, 160, 175));
+    espNowDeviceCount > 0
+      ? "The dock relays IR and RF433 for devices the remote cannot reach directly. "
+        "Transmit IR from decides which emitter actually fires."
+      : "A dock relays IR and RF433 commands for devices the remote cannot reach "
+        "directly. Turn ESP-NOW on, then use Paired devices to search for a dock "
+        "in pairing mode.",
+    10, y, &lv_font_montserrat_12, lvRgb(150, 160, 175));
   lv_obj_set_width(hint, 216);
   lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
 }
@@ -21010,10 +21450,29 @@ void renderDockPage() {
   makeSettingRow("ESP-NOW", "Send commands to a paired blaster dock", 52, &espNowEnabled);
   makeSettingRow("Paired devices", espNowStatusText, 102, nullptr,
                  toggleEspNowDevicesModal);
+  int hintY = 164;
+  if (espNowDeviceCount > 0) {
+    lv_obj_t *routeRow = makeSettingRow("Transmit IR from", "", 152, nullptr, nullptr);
+    lv_obj_t *routeDropdown = lv_dropdown_create(routeRow);
+    lv_obj_set_pos(routeDropdown, 112, 8);
+    lv_obj_set_size(routeDropdown, 100, 32);
+    styleDebugDropdown(routeDropdown);
+    lv_dropdown_set_options(routeDropdown, IR_ROUTE_OPTIONS);
+    lv_dropdown_set_selected(routeDropdown, irRoute);
+    lv_obj_add_event_cb(routeDropdown, irRouteDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
+    addPhysicalNavFocusable(routeDropdown);
+    makeSettingRow("Dock RF433", "Let the dock send RF433", 202, &dockRfEnabled);
+    makeSettingRow("Dock LED", "Blink as the dock transmits", 252, &dockLedOnTransmit);
+    hintY = 304;
+  }
   lv_obj_t *hint = makeLabel(content,
-    "A dock relays IR and RF433 commands for devices the remote cannot reach "
-    "directly. Turn ESP-NOW on, then use Paired devices to search for a dock "
-    "in pairing mode.", 10, 164, &lv_font_montserrat_12, lvRgb(150, 160, 175));
+    espNowDeviceCount > 0
+      ? "Transmit IR from decides which emitter actually fires - this remote, the "
+        "dock, or both at once."
+      : "A dock relays IR and RF433 commands for devices the remote cannot reach "
+        "directly. Turn ESP-NOW on, then use Paired devices to search for a dock "
+        "in pairing mode.",
+    10, hintY, &lv_font_montserrat_12, lvRgb(150, 160, 175));
   lv_obj_set_width(hint, 216);
   lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
 }
@@ -22755,14 +23214,35 @@ void showEspNowDevicesModal() {
   lv_obj_move_foreground(espNowDevicesModal);
 }
 
+// Search now opens the overlay rather than the old inline list, and starts the
+// scan itself - so pressing it always produces something on screen, including
+// when the scan cannot start.
 void toggleEspNowDevicesModal(lv_event_t *e) {
-  if (espNowDevicesModal) {
+  (void)e;
+  if (espNowSearchOverlayVisible) {
     cancelEspNowScan();
-    lv_obj_del(espNowDevicesModal);
-    espNowDevicesModal = nullptr;
+    hideEspNowSearchOverlay();
     return;
   }
-  showEspNowDevicesModal();
+  if (!espNowEnabled) {
+    showEspNowSearchBlocked("ESP-NOW is switched off. Turn it on above, then search again.");
+    return;
+  }
+  if (!networkStackActive || setupApActive) {
+    showEspNowSearchBlocked("Wi-Fi is not running yet. ESP-NOW shares the Wi-Fi radio, so it needs a moment - or a connected network - before it can search.");
+    return;
+  }
+  if (!startEspNowScan()) {
+    showEspNowSearchBlocked("The search could not be started. Check Wi-Fi and ESP-NOW are on.");
+    return;
+  }
+  showEspNowSearchOverlay();
+  lv_label_set_text(espNowSearchGlyph, LV_SYMBOL_WIFI);
+  lv_obj_set_style_text_color(espNowSearchGlyph, lvRgb(45, 143, 255), 0);
+  lv_obj_set_style_border_color(espNowSearchPulse, lvRgb(45, 143, 255), 0);
+  lv_label_set_text(espNowSearchTitle, "SEARCHING");
+  lv_label_set_text(espNowSearchHint,
+                    "Hold the dock's button for 5 seconds until its LED blinks.\nTap to cancel");
 }
 
 // Called from loop(): rebuilds the modal only when it's open and something
@@ -23925,7 +24405,11 @@ void loop() {
   serviceBluetoothConnectionProfile(now);
   serviceEspNow(now);
   serviceDockOta(now);
+  serviceDockLink(now);
+  serviceDockSettingsSync();
+  if (dockLinkIndicatorDirty) { dockLinkIndicatorDirty = false; refreshDockLinkIndicator(); }
   serviceEspNowDevicesModal(now);
+  serviceEspNowSearchOverlay(now);
   servicePhysicalNavIdleHide(now);
   serviceFaceDownSleep(now);
   now = millis();
