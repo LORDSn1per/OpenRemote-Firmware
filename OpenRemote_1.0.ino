@@ -1,6 +1,26 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.87 - 2026-09-02
+    - Puts the Button Test pill back to green. 3.86 recoloured the ESP-NOW
+      status blue and took this with it, which was wrong: Button Test is the
+      one case that deliberately paints both the ring AND the fill green, to
+      make a test press unmistakable from a real transmit. It is unrelated to
+      the dock link and should not have followed it.
+    - The pill's fill now belongs solely to this remote's own IR: red while it
+      transmits, and nothing else touches it. Dock activity flickers the
+      outline alone - verified rather than assumed, applyEspNowPulse(),
+      applyDockLinkPillColour() and flashEspNowCommandFeedback() make no
+      background call at all between them. Fill means "this remote is
+      transmitting"; outline means "the dock link". One indicator, one meaning.
+    - dockWarmOnWake is removed outright - the setting, its NVS key, both
+      runtime config fields and the WebConfig switch (2.56). 3.86 had left the
+      plumbing in place after taking the on-device rows away, which left a
+      setting nothing could reach and nothing could change. With the on-demand
+      hold at two seconds the link comes up fast enough that warming it early
+      bought almost nothing, and it powered the radio on every wake for a
+      command that might never come.
+
   3.86 - 2026-09-02
     - The dock's LED and the remote's ring now go out together. The link-down
       packet that tells the dock the radio is going away was sent once and not
@@ -4391,7 +4411,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.86"
+#define OPENREMOTE_VERSION_STRING "3.87"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -5317,7 +5337,6 @@ bool dockLedOnTransmit = true;
 // spends battery on a link usually never used. Worth having for anyone who
 // would rather trade that for the first press feeling identical to the rest of
 // a burst, which is exactly the trade it is.
-bool dockWarmOnWake = false;
 // ESP-NOW transmit power, 0 = Low, 1 = Medium, 2 = High. Held as an index
 // rather than a raw value because the driver's unit is quarter-dBm and the
 // legal range is 8..84 - numbers that mean nothing on a settings row.
@@ -8174,7 +8193,6 @@ void loadSettings() {
   espNowChannel = preferences.getUChar("enChan", 0);
   dockRfEnabled = preferences.getBool("dockRf", true);
   dockLedOnTransmit = preferences.getBool("dockLed", true);
-  dockWarmOnWake = preferences.getBool("dockWarm", false);
   espNowTxPower = preferences.getUChar("enTxPwr", 2);
   if (espNowTxPower > 2) espNowTxPower = 2;
   clockEnabled = preferences.getBool("clock", true);
@@ -8316,7 +8334,6 @@ void saveSettings() {
   preferences.putUChar("irRoute", irRoute);
   preferences.putBool("dockRf", dockRfEnabled);
   preferences.putBool("dockLed", dockLedOnTransmit);
-  preferences.putBool("dockWarm", dockWarmOnWake);
   preferences.putUChar("enTxPwr", espNowTxPower);
   preferences.putBool("clock", clockEnabled);
   preferences.putBool("ntp", clockUseInternetTime);
@@ -10628,7 +10645,6 @@ String buildStatusJson() {
   doc["irRoute"] = irRoute;
   doc["dockRfEnabled"] = dockRfEnabled;
   doc["dockLedOnTransmit"] = dockLedOnTransmit;
-  doc["dockWarmOnWake"] = dockWarmOnWake;
   doc["dockConnected"] = dockConnected();
   if (espNowDeviceCount > 0) {
     doc["dockName"] = espNowDevices[0].name;
@@ -10933,7 +10949,6 @@ void applySettingsJson(JsonVariantConst settings) {
   bool previousRf = dockRfEnabled, previousLed = dockLedOnTransmit;
   dockRfEnabled = settings["dockRfEnabled"] | dockRfEnabled;
   dockLedOnTransmit = settings["dockLedOnTransmit"] | dockLedOnTransmit;
-  dockWarmOnWake = settings["dockWarmOnWake"] | dockWarmOnWake;
   // Push straight to the dock when either changed, so WebConfig's switches
   // take effect immediately rather than at the next reboot.
   if (previousRf != dockRfEnabled || previousLed != dockLedOnTransmit) sendDockSettings();
@@ -11697,10 +11712,10 @@ void serviceEspNowCommandFeedback(unsigned long now) {
 // or send). This paints the status pill green instead of applyCommandFeedbackStyle's
 // red, so a test-mode press is visually unmistakable from a genuine transmit.
 void applyButtonTestFeedbackStyle(bool active) {
-  lv_color_t green = lv_color_hex(0x0A84FF);
+  lv_color_t green = lv_color_hex(0x30D158);
   lv_color_t idle = pillIdleColour();
   if (statusPill && lv_obj_is_valid(statusPill)) {
-    lv_obj_set_style_bg_color(statusPill, active ? lv_color_hex(0x0A2540) : lv_color_black(), 0);
+    lv_obj_set_style_bg_color(statusPill, active ? lv_color_hex(0x0B3A1E) : lv_color_black(), 0);
     lv_obj_set_style_bg_opa(statusPill, active ? LV_OPA_COVER : (lv_opa_t)115, 0);
     lv_obj_set_style_border_color(statusPill, active ? green : idle, 0);
     lv_obj_set_style_border_opa(statusPill, (active || dockConnected()) ? LV_OPA_COVER : (lv_opa_t)64, 0);
@@ -12841,7 +12856,6 @@ bool persistSettingsToRuntimeConfig() {
   settings["irRoute"] = irRoute;
   settings["dockRfEnabled"] = dockRfEnabled;
   settings["dockLedOnTransmit"] = dockLedOnTransmit;
-  settings["dockWarmOnWake"] = dockWarmOnWake;
   JsonArray espNowDevicesOut = settings["espNowDevices"].to<JsonArray>();
   for (uint8_t i = 0; i < espNowDeviceCount; i++) {
     JsonObject entry = espNowDevicesOut.add<JsonObject>();
@@ -22990,18 +23004,16 @@ void irRouteDropdownEvent(lv_event_t *e) {
 void serviceDockSettingsSync() {
   static bool lastRf = true;
   static bool lastLed = true;
-  static bool lastWarm = false;
   static bool primed = false;
   if (!primed) {
     primed = true;
-    lastRf = dockRfEnabled; lastLed = dockLedOnTransmit; lastWarm = dockWarmOnWake;
+    lastRf = dockRfEnabled; lastLed = dockLedOnTransmit;
     return;
   }
   bool dockSideChanged = dockRfEnabled != lastRf || dockLedOnTransmit != lastLed;
-  if (!dockSideChanged && dockWarmOnWake == lastWarm) return;
+  if (!dockSideChanged) return;
   lastRf = dockRfEnabled;
   lastLed = dockLedOnTransmit;
-  lastWarm = dockWarmOnWake;
   saveSettings();
   scheduleRuntimeSettingsSave();
   // Only the dock's own settings need sending; wake-warm is the remote's
@@ -25613,16 +25625,10 @@ void wakeDisplay() {
   digitalWrite(PIN_IR_VCC, HIGH);
   // Only if asked for, and only when there is something to send to.
   //
-  // With no activity or device open the remote is sitting on the activity list,
-  // where no button can produce an IR command at all - so warming the link
-  // there powers a radio for something that cannot happen. That holds whatever
-  // the switch says, which is why the check is here and not folded into
-  // dockWarmOnWake: the setting chooses between "ready it early" and "wait for
-  // the command", not between "sometimes pointless" and "never".
-  if (dockWarmOnWake && remoteHasActiveTarget() && irRoute != IR_ROUTE_REMOTE &&
-      espNowEnabled && espNowDeviceCount > 0) {
-    ensureEspNowLink();
-  }
+  // Nothing is warmed on wake any more. With the on-demand hold down to two
+  // seconds the link comes up fast enough that readying it early bought almost
+  // nothing, and it powered the radio on every wake for a command that might
+  // never come.
   wakeTouchController(100);
   lv_obj_clear_flag(uiRoot, LV_OBJ_FLAG_HIDDEN);
   displaySleeping = false;
