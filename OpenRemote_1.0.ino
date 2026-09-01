@@ -1,6 +1,22 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.75 - 2026-09-01
+    - Paces a held repeat to what the dock can actually transmit. An IR burst
+      occupies the emitter for as long as the code lasts - the dock measures
+      about 190ms for the captured volume code, of which only 6ms is library
+      overhead, so the code itself simply is that long - while the held-button
+      rate asks for one every 111ms. Asking nearly twice as fast as the air
+      allows does not produce more presses; it produces the same number plus a
+      stream the dock must discard, which is what "only some of my commands go
+      through" was.
+    - Dock-routed repeats are therefore floored at 210ms, a small margin over
+      the burst, so every request lands instead of roughly four in ten being
+      thrown away. Nothing changes for commands the remote sends itself.
+    - The remote's own emitter has always had the same limit; it simply never
+      had to say no to itself, because it drops a repeat silently while a send
+      is still running.
+
   3.74 - 2026-09-01
     - Fixes WebConfig being able to install corrupted and report success. The
       transfer was already checked - the client sends a size and a CRC32 and
@@ -4118,7 +4134,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.74"
+#define OPENREMOTE_VERSION_STRING "3.75"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -4721,6 +4737,12 @@ static const uint8_t ESPNOW_TRANSPORT_RF433 = 1;
 static const uint8_t IR_ROUTE_REMOTE = 0;  // The remote's own emitter only.
 static const uint8_t IR_ROUTE_BOTH   = 1;  // Both, for cabinets with a blind spot.
 static const uint8_t IR_ROUTE_DOCK   = 2;  // The dock only.
+
+// The floor for a held repeat that goes through the dock. A typical captured
+// code runs ~190ms of air time and the dock reports the real figure per burst;
+// 210ms leaves a small margin over that without being noticeably slower to a
+// person holding a volume button.
+static const uint16_t DOCK_MIN_REPEAT_INTERVAL_MS = 210;
 
 // Settings pushed to the dock rather than kept here, so the dock behaves the
 // same however it is woken.
@@ -6600,6 +6622,22 @@ void beginHeldIrCommand(DeviceCommand *command, bool repeat, bool fromTouch = fa
     heldRepeatFromTouch = fromTouch;
     heldRepeatIntervalMs = fromTouch ? IR_REPEAT_INTERVAL_MS :
       (uint16_t)max(50, 1000 / (int)physicalRepeatRateHz);
+    // A dock-routed repeat is paced to what the dock can actually put on air.
+    //
+    // An IR burst occupies the emitter for as long as the code lasts - about
+    // 190ms for the captured volume code - while the held-button rate asks for
+    // one every 111ms. Asking nearly twice as fast as the air allows does not
+    // produce more presses; it produces the same number plus a stream the dock
+    // has to discard, which is what "only some of my commands go through" was.
+    // Pacing the request to the capability makes every one land.
+    //
+    // The remote's own emitter has exactly the same limit - it simply never
+    // had to say no to itself, because it drops the repeat silently when the
+    // send is still running.
+    if (irRoute != IR_ROUTE_REMOTE && espNowDeviceCount > 0 &&
+        heldRepeatIntervalMs < DOCK_MIN_REPEAT_INTERVAL_MS) {
+      heldRepeatIntervalMs = DOCK_MIN_REPEAT_INTERVAL_MS;
+    }
     nextIrRepeatMs = millis() +
       (fromTouch ? IR_REPEAT_DELAY_MS : physicalRepeatDelayMs);
   }
