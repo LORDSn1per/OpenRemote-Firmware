@@ -1,6 +1,34 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.78 - 2026-09-01
+    - Retries a dropped IR command instead of losing it. True synchronised
+      frequency hopping - as Bluetooth does - was asked for but is not what
+      ESP-NOW makes available: both devices would need a shared hop schedule
+      and the clock sync to keep it, which means the radio running
+      continuously on both ends, directly undoing the on-demand design this
+      whole thread has been building toward. What the reported symptom
+      actually needs is a fast retry on the same channel: 2.4GHz interference
+      on a busy desk is bursty - a beacon, a neighbouring AP's traffic - and
+      the window is typically gone within a few milliseconds.
+    - The real gap this closes: esp_now_send() returning ESP_OK only means the
+      driver accepted the frame, not that it arrived. The real answer comes
+      later, asynchronously, from the send callback - and relayIrToDock() was
+      not waiting for it at all, so a single dropped packet was already a
+      silently lost command with no retry of any kind.
+    - sendEspNowWithRetry() now waits briefly (15ms) for that answer and
+      retries up to 3 times on a timeout or an explicit failure. Checked
+      against the pacing this whole thread has been tuning: worst case (all 3
+      attempts needed, itself the rare case) adds 45ms to a dock-only send,
+      comfortably inside the 210ms repeat pace, and 45ms + the ~190ms local
+      burst = 235ms for "Remote and dock" mode in that same worst case, 25ms
+      over the 210ms pace only when genuinely unlucky. The common case - the
+      first attempt succeeding - adds whatever the real ack takes, typically a
+      few milliseconds, so ordinary operation is barely touched.
+    - The 7 second on-demand hold and the link-down notice sent to the dock
+      before the radio powers off are both already in place, from 3.68 and
+      3.69, and untouched by anything in this build.
+
   3.77 - 2026-09-01
     - The pill can no longer show green while the dock's LED is dark. It was
       driven by dockRadioLit() - "our own ESP-NOW radio is powered" - which is
@@ -4202,7 +4230,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.77"
+#define OPENREMOTE_VERSION_STRING "3.78"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -5133,6 +5161,8 @@ bool dockWarmOnWake = false;
 // is a real link check and costs no dock firmware: ESP-NOW acks every unicast,
 // so a powered dock in range answers whether or not it understands the payload.
 volatile bool dockLinkOnline = false;
+volatile bool espNowSendWaiting = false;
+volatile bool espNowSendSucceeded = false;
 unsigned long dockLastAckMs = 0;
 unsigned long dockNextPingMs = 0;
 uint8_t dockPairAckMac[6] = {0};
@@ -17460,6 +17490,16 @@ void onEspNowDataSent(const wifi_tx_info_t *info, esp_now_send_status_t status) 
   static const uint8_t broadcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
   if (memcmp(mac, broadcast, 6) == 0) return;
   bool online = (status == ESP_NOW_SEND_SUCCESS);
+  // Answers "did the one send I am currently waiting on land", independent of
+  // the broader dockLinkOnline tracking below. A held volume repeat sends
+  // every ~210ms, so more than one send can be in flight in quick succession;
+  // this flag is only meaningful while sendEspNowWithRetry() has explicitly
+  // armed it for a specific attempt, which is what keeps it from being
+  // confused by an unrelated ping or settings push completing in between.
+  if (espNowSendWaiting) {
+    espNowSendWaiting = false;
+    espNowSendSucceeded = online;
+  }
   if (online) dockLastAckMs = millis();
   if (online != dockLinkOnline) {
     dockLinkOnline = online;
@@ -18070,6 +18110,51 @@ void serviceDockOta(unsigned long now) {
 // Sends an ordinary IR command to the paired dock, which is what the routing
 // setting is for. Distinct from sendEspNowCommand(), which serves commands the
 // user deliberately configured as ESPNOW and which carry their own target.
+// Interference on a busy 2.4GHz desk is bursty - a WiFi network's beacon, a
+// microwave, a neighbouring AP's traffic - and the window is typically gone a
+// few milliseconds later. A retry on the SAME channel therefore recovers most
+// drops on its own; real synchronised frequency hopping (as Bluetooth does)
+// would need both devices maintaining a shared hop schedule with the clock
+// sync to match it, which is not something ESP-NOW provides and would mean
+// keeping the radio running continuously on both ends - exactly what the
+// on-demand design was built to avoid.
+//
+// esp_now_send() returning ESP_OK only means the driver accepted the frame for
+// transmission, not that it arrived; the real answer comes later, from
+// onEspNowDataSent(). This waits for that answer, briefly, and retries on a
+// timeout or an explicit failure - which is the gap that let a single dropped
+// packet silently become a lost command with no retry at all.
+static const uint8_t ESPNOW_SEND_MAX_ATTEMPTS = 3;
+static const uint32_t ESPNOW_SEND_ATTEMPT_TIMEOUT_MS = 15;
+
+bool sendEspNowWithRetry(const uint8_t mac[6], const uint8_t *payload, size_t len) {
+  for (uint8_t attempt = 0; attempt < ESPNOW_SEND_MAX_ATTEMPTS; attempt++) {
+    espNowSendWaiting = true;
+    espNowSendSucceeded = false;
+    esp_err_t queued = esp_now_send(mac, payload, len);
+    if (queued != ESP_OK) {
+      // The driver itself refused the frame - nothing to wait for, try again
+      // immediately rather than waiting out a timeout for an answer that
+      // was never going to come.
+      espNowSendWaiting = false;
+      continue;
+    }
+    unsigned long waitStart = millis();
+    while (espNowSendWaiting && (millis() - waitStart) < ESPNOW_SEND_ATTEMPT_TIMEOUT_MS) {
+      delay(1);
+    }
+    if (!espNowSendWaiting && espNowSendSucceeded) {
+      if (attempt) {
+        Serial.printf("ESP-NOW: send recovered on attempt %u\n", (unsigned)(attempt + 1));
+      }
+      return true;
+    }
+    espNowSendWaiting = false;  // Timed out - stop waiting, next attempt rearms it.
+  }
+  Serial.printf("ESP-NOW: send failed after %u attempts\n", (unsigned)ESPNOW_SEND_MAX_ATTEMPTS);
+  return false;
+}
+
 bool relayIrToDock(const DeviceCommand &command) {
   if (espNowDeviceCount == 0) return false;
   // Brings the radio up if it is asleep. The first command after an idle spell
@@ -18080,8 +18165,7 @@ bool relayIrToDock(const DeviceCommand &command) {
   DeviceCommand routed = command;
   routed.espNowTransport = ESPNOW_TRANSPORT_IR;
   if (!buildEspNowPayload(routed, payload, sizeof(payload), payloadLen)) return false;
-  esp_err_t result = esp_now_send(espNowDevices[0].mac, payload, payloadLen);
-  return result == ESP_OK;
+  return sendEspNowWithRetry(espNowDevices[0].mac, payload, payloadLen);
 }
 
 bool sendEspNowCommand(const DeviceCommand &command) {
