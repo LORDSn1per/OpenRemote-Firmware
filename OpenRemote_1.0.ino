@@ -1,6 +1,28 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.77 - 2026-09-01
+    - The pill can no longer show green while the dock's LED is dark. It was
+      driven by dockRadioLit() - "our own ESP-NOW radio is powered" - which is
+      true the instant the radio comes up, whether or not anything sent on it
+      is actually reaching the dock. A wrong channel, a corrupted saved
+      channel, or simple range would leave the radio "active" while every
+      packet went nowhere: the exact green-pill/dark-LED split that has been
+      reported. It now uses dockConnected(), which requires dockLinkOnline - a
+      real MAC-layer acknowledgement from the dock - the same kind of one-way
+      evidence the dock's own LED already runs on for remoteLinkUp(). The two
+      can now only agree or both be honestly uncertain; the pill can no longer
+      claim a link that was never actually confirmed. If a press still does not
+      reach the dock, the pill will now say so plainly by staying white, rather
+      than hiding it.
+    - Fixes red never flashing for "Remote and dock" mode. flashCommandFeedback
+      declined outright whenever the dock's green pulse was active, and the RAW
+      branch - which is what a held volume repeat actually is - additionally
+      skipped calling it at all whenever the dock relay succeeded. In BOTH mode
+      the remote's own emitter genuinely fires too, so suppressing red there
+      was hiding something true rather than avoiding a lie. Both flashes are
+      brief and independently timed; letting them coexist costs nothing.
+
   3.76 - 2026-09-01
     - Fixes firmware and WebConfig uploads being rejected with "No upload
       session for this target". releaseEspNowLink() gated its whole body on
@@ -4180,7 +4202,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.76"
+#define OPENREMOTE_VERSION_STRING "3.77"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -11321,7 +11343,7 @@ bool dockRadioLit() {
 }
 
 lv_color_t pillIdleColour() {
-  return dockRadioLit() ? lv_color_hex(0x30D158) : lv_color_white();
+  return dockConnected() ? lv_color_hex(0x30D158) : lv_color_white();
 }
 
 // Repaints the pill when the dock link changes, without rebuilding the page.
@@ -11339,7 +11361,7 @@ void refreshDockLinkIndicator() {
 // left every other page's pill white - green in Settings, white the moment you
 // went back to the remote. All slots are painted here instead.
 void applyDockLinkPillColour() {
-  bool linked = dockRadioLit();
+  bool linked = dockConnected();
   lv_color_t idle = pillIdleColour();
   // The resting outline was inheriting the pill's normal 64 opacity - a quarter
   // strength - which is why a green that reads clearly in red at full strength
@@ -11383,9 +11405,6 @@ void applyCommandFeedbackStyle(bool active) {
 }
 
 void flashCommandFeedback() {
-  // Green already says the dock sent it. Red would claim this remote's emitter
-  // did, and both at once is a lie about one of them.
-  if (espNowCommandFeedbackActive) return;
   commandFeedbackUntilMs = millis() + 80UL;
   if (!commandFeedbackActive) {
     commandFeedbackActive = true;
@@ -11911,7 +11930,10 @@ bool transmitIrCommand(const DeviceCommand &command) {
   if (wentViaDock) flashEspNowCommandFeedback();
 
   if (command.kind == DeviceCommand::RAW && command.rawTimings && command.rawCount) {
-    if (!wentViaDock) flashCommandFeedback();
+    // Red belongs whenever this remote's own emitter is genuinely about to
+    // fire - "Remote and dock" really does transmit locally too, and that
+    // deserves the same red flash a remote-only send gets.
+    if (useLocal) flashCommandFeedback();
     if (useLocal) {
       IrSender.sendRaw(command.rawTimings, command.rawCount,
                        command.frequencyKhz ? command.frequencyKhz : 38);
@@ -11921,8 +11943,7 @@ bool transmitIrCommand(const DeviceCommand &command) {
   if (command.kind != DeviceCommand::PARSED) return false;
   if (!useLocal) {
     // Dock-only: the dock has been given the command and the remote's own
-    // emitter stays dark. Reported as sent, because it was.
-    if (!wentViaDock) flashCommandFeedback();
+    // emitter stays dark, so there is genuinely nothing local to flash red for.
     return true;
   }
   if (strcmp(command.protocol, "NEC") == 0) {
