@@ -1,6 +1,26 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.69 - 2026-09-01
+    - The radio no longer comes up merely because the remote woke. 3.62 warmed
+      the dock link on display wake to hide the bring-up cost behind the screen
+      coming up, but picking the remote off a table is not a commitment to send
+      anything - it happens whenever the accelerometer is nudged. That spent
+      battery on a link usually never used, and showed the dock as connected
+      while the remote sat on the activity list doing nothing, which is how it
+      was noticed. The radio now comes up only when something actually needs
+      it: a command to relay, or pairing.
+    - The link is released when the display sleeps, rather than being left to
+      time out. A dark screen means nobody is pressing anything, so there is no
+      command that could arrive - and turning the remote face down now puts the
+      dock's LED out at the same moment as the LCD instead of seven seconds
+      later.
+    - Both go through one releaseEspNowLink(), which tells the dock before
+      dropping the radio so its LED goes out with the pill rather than on a
+      timeout, and which refuses while a firmware transfer, scan or RF learn is
+      running - those own the radio and losing it mid-way would abandon real
+      work.
+
   3.68 - 2026-09-01
     - The ESP-NOW hold drops from 15 seconds to 7. In an activity where most
       presses go over Bluetooth and only volume goes through the dock, a long
@@ -4016,7 +4036,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.68"
+#define OPENREMOTE_VERSION_STRING "3.69"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -6040,6 +6060,7 @@ void sendDockSettings();
 void serviceDockLink(unsigned long now);
 void serviceDockPairAck(unsigned long now);
 bool ensureEspNowLink();
+void releaseEspNowLink(const char *reason);
 void refreshDockLinkIndicator();
 void applyDockLinkPillColour();
 bool dockRadioLit();
@@ -17276,6 +17297,26 @@ void stopEspNow() {
 // Called every loop() tick: brings the radio up/down to track espNowEnabled
 // and the same networkStackActive/setupApActive gate Wi-Fi itself already
 // uses, and times out an open pairing window.
+// Puts the radio away, telling the dock first so its LED goes out at the same
+// moment rather than some seconds later on a timeout.
+//
+// Refuses while a transfer, scan or learn is running - those own the radio and
+// losing it mid-way would abandon real work.
+void releaseEspNowLink(const char *reason) {
+  if (!espNowStandalone || !espNowRadioActive) return;
+  if (espNowScanActive || rfLearnActive || dockOtaState != DOCK_OTA_IDLE) return;
+  if (espNowDeviceCount > 0) {
+    uint32_t bye = ESPNOW_DOCK_LINK_DOWN_MAGIC;
+    esp_now_send(espNowDevices[0].mac, (const uint8_t *)&bye, sizeof(bye));
+    delay(5);   // Let it reach the air before the radio stops.
+  }
+  stopEspNow();
+  espNowStandalone = false;
+  espNowHoldUntilMs = 0;
+  if (!networkStackActive && WiFi.getMode() != WIFI_OFF) WiFi.mode(WIFI_OFF);
+  Serial.printf("ESP-NOW: link released (%s)\n", reason);
+}
+
 void serviceEspNow(unsigned long now) {
   bool holding = (int32_t)(now - espNowHoldUntilMs) < 0;
   bool shouldBeActive = espNowEnabled && networkStackActive && !setupApActive &&
@@ -17291,17 +17332,7 @@ void serviceEspNow(unsigned long now) {
   // the bring-up cost once rather than each time.
   if (espNowStandalone && !holding && !espNowScanActive && !rfLearnActive &&
       dockOtaState == DOCK_OTA_IDLE) {
-    // Say goodbye while the radio is still up - afterwards there is no way to
-    // tell the dock anything, and it would be left guessing from silence.
-    if (espNowDeviceCount > 0) {
-      uint32_t bye = ESPNOW_DOCK_LINK_DOWN_MAGIC;
-      esp_now_send(espNowDevices[0].mac, (const uint8_t *)&bye, sizeof(bye));
-      delay(5);   // Let it reach the air before the radio stops.
-    }
-    stopEspNow();
-    espNowStandalone = false;
-    if (!networkStackActive && WiFi.getMode() != WIFI_OFF) WiFi.mode(WIFI_OFF);
-    Serial.println("ESP-NOW: link released");
+    releaseEspNowLink("hold expired");
   }
   if (espNowScanActive && now - espNowScanStartedMs >= ESPNOW_SCAN_TIMEOUT_MS) {
     espNowScanActive = false;
@@ -24529,6 +24560,12 @@ void enterLowPowerWait() {
 void enterDisplaySleep() {
   if (displaySleeping) return;
   Serial.println("Display sleep: controller and backlights off");
+  // The screen going dark means nobody is pressing anything, so there is no
+  // reason to keep a radio powered waiting for a command that cannot come.
+  // Released here rather than left to time out, so turning the remote face
+  // down puts the dock's LED out at the same moment as the LCD instead of
+  // seven seconds later.
+  releaseEspNowLink("display sleep");
   if (runtimeSettingsSavePending) {
     runtimeSettingsSavePending = !persistSettingsToRuntimeConfig();
     if (runtimeSettingsSavePending) runtimeSettingsSaveAtMs = millis() + 1000UL;
@@ -24568,14 +24605,13 @@ void wakeDisplay() {
   restoreBacklightPwmAfterSleep();
   setLcdControllerSleeping(false);
   digitalWrite(PIN_IR_VCC, HIGH);
-  // Warm the dock link while the screen and touch controller are coming up, so
-  // the bring-up overlaps work that has to happen anyway. Picking the remote up
-  // is a reliable sign a button is about to be pressed, and this is what makes
-  // the first press feel the same as the rest of a burst instead of paying the
-  // radio's start-up cost in front of the user.
-  if (irRoute != IR_ROUTE_REMOTE && espNowEnabled && espNowDeviceCount > 0) {
-    ensureEspNowLink();
-  }
+  // Deliberately does NOT warm the dock link. 3.62 did, to hide the bring-up
+  // cost behind the screen coming up, but picking the remote off a table is not
+  // a commitment to send anything - it happens whenever the accelerometer is
+  // nudged. Powering a radio on every wake spends battery on a link that is
+  // usually never used, and made the dock report itself connected while sitting
+  // on the activity list doing nothing. The radio now comes up only when
+  // something actually needs it: a command to relay, or pairing.
   wakeTouchController(100);
   lv_obj_clear_flag(uiRoot, LV_OBJ_FLAG_HIDDEN);
   displaySleeping = false;
