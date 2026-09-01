@@ -1,6 +1,27 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.74 - 2026-09-01
+    - Fixes WebConfig being able to install corrupted and report success. The
+      transfer was already checked - the client sends a size and a CRC32 and
+      the firmware compares both - but that CRC is accumulated over the bytes
+      as they arrive. It proves the transfer was clean and says nothing about
+      what actually landed on the SD card, so a card that writes badly or runs
+      out of room part way passed the check and stored a broken file. That is
+      the reported symptom exactly: WebConfig installs, says it worked, then
+      renders as garbage or not at all.
+    - The uploaded file is now read back off the card and its CRC and length
+      compared with what was received, before anything is committed. A few
+      hundred milliseconds against a 1.6MB file, in exchange for turning a
+      silent corruption into a refusal.
+    - The installed copy is verified again after the rename, and the previous
+      version is restored automatically if it does not match. Installing a
+      broken WebConfig is the one failure a user cannot recover from through
+      WebConfig, because the page they would need is the page that is broken -
+      so it must never be left in that state.
+    - Both outcomes are logged with byte counts and the checksum, so a failure
+      says which stage caught it rather than leaving it to be guessed.
+
   3.73 - 2026-09-01
     - The dock now reports its firmware version and name, in reply to the ping
       the remote already sends every 5 seconds while the link is up. Previously
@@ -4097,7 +4118,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.73"
+#define OPENREMOTE_VERSION_STRING "3.74"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -13039,6 +13060,30 @@ bool htmlFileLooksComplete(const String &path) {
   return tail.indexOf("</html>") >= 0;
 }
 
+// Defined further down with the upload machinery; declared here because the
+// read-back verification below is the first thing that needs it.
+uint32_t crc32Update(uint32_t crc, const uint8_t *data, size_t length);
+
+// CRC32 and length of a file as it exists on the card, so what was written can
+// be compared with what was meant to be written.
+bool fileCrc32(const String &path, uint32_t &crcOut, size_t &bytesOut) {
+  File file = SD.open(path, FILE_READ);
+  if (!file) return false;
+  uint32_t crc = 0;
+  size_t total = 0;
+  uint8_t buffer[512];
+  while (true) {
+    int got = file.read(buffer, sizeof(buffer));
+    if (got <= 0) break;
+    crc = crc32Update(crc, buffer, (size_t)got);
+    total += (size_t)got;
+  }
+  file.close();
+  crcOut = crc;
+  bytesOut = total;
+  return true;
+}
+
 bool uploadedWebConfigLooksValid(const String &path) {
   File file = SD.open(path, FILE_READ);
   if (!file) return false;
@@ -15347,6 +15392,28 @@ void handleChunkUploadFinish() {
       ok = false;
       error = "Upload corrupted in transfer (checksum mismatch)";
     }
+    // Read the file back off the card and check it again.
+    //
+    // The CRC above is accumulated over the bytes as they arrive, which proves
+    // the transfer was clean and nothing about what actually landed on the SD.
+    // A card that writes badly - or runs out of space part way - passes that
+    // check and stores a corrupt file, which is exactly the failure being seen:
+    // WebConfig installs, reports success, and then renders as garbage or not
+    // at all. Re-reading is a few hundred milliseconds against a 1.6MB file and
+    // turns a silent corruption into a refusal.
+    if (ok) {
+      uint32_t storedCrc = 0;
+      size_t storedBytes = 0;
+      if (!fileCrc32(path, storedCrc, storedBytes)) {
+        ok = false;
+        error = "Could not read the uploaded file back to verify it";
+      } else if (storedBytes != received || storedCrc != chunkUploadCrc) {
+        ok = false;
+        error = String("The SD card did not store the file correctly (") +
+                String((unsigned)storedBytes) + " of " + String((unsigned)received) +
+                " bytes, checksum " + (storedCrc == chunkUploadCrc ? "ok" : "wrong") + ")";
+      }
+    }
   }
 
   if (ok && target == "config") {
@@ -15360,6 +15427,26 @@ void handleChunkUploadFinish() {
       if (SD.exists(WEB_CONFIG_PATH)) SD.rename(WEB_CONFIG_PATH, "/backups/index.previous.html");
       ok = SD.rename(path, WEB_CONFIG_PATH);
       if (!ok) error = "Could not install the uploaded WebConfig";
+      // Check what is actually at the destination before declaring success, and
+      // put the previous version back if it is wrong. Installing a broken
+      // WebConfig is the one failure the user cannot recover from through
+      // WebConfig itself - the page they would need is the page that is broken.
+      if (ok) {
+        uint32_t liveCrc = 0;
+        size_t liveBytes = 0;
+        if (!fileCrc32(String(WEB_CONFIG_PATH), liveCrc, liveBytes) ||
+            liveBytes != received || liveCrc != chunkUploadCrc) {
+          ok = false;
+          error = "The installed WebConfig did not verify - the previous version has been restored";
+          SD.remove(WEB_CONFIG_PATH);
+          SD.rename("/backups/index.previous.html", WEB_CONFIG_PATH);
+          Serial.printf("WebConfig: install FAILED verification (%u of %u bytes) - rolled back\n",
+                        (unsigned)liveBytes, (unsigned)received);
+        } else {
+          Serial.printf("WebConfig: installed and verified, %u bytes, CRC 0x%08lX\n",
+                        (unsigned)liveBytes, (unsigned long)liveCrc);
+        }
+      }
     }
   } else if (ok && target == "firmware") {
     ok = received >= 65536UL && uploadedFirmwareLooksValid(path);
