@@ -1,6 +1,20 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.67 - 2026-09-01
+    - Fixes pairing that the remote reported as successful while the dock timed
+      out having heard nothing. The retry loop tested dockLinkOnline before
+      sending anything, and that flag is a latch left true by any earlier
+      successful send - so on an already-paired dock it was true before the
+      first attempt, the loop stopped immediately, and it logged "pair ack
+      acknowledged after 1 attempt" having sent exactly none. The remote
+      declared success on the strength of a send it never made.
+    - The check now requires that something was actually sent in this exchange,
+      and arming the retry clears the latch so it can only be set by an ack for
+      this pairing. The attempt count in the log was also off by one.
+    - Pairs with dock firmware 1.10, which settles on the agreed channel at
+      pairing and stops hopping.
+
   3.66 - 2026-09-01
     - The green link outline was hard to see for one reason: it inherited the
       pill's resting border opacity of 64, a quarter strength. The red flash is
@@ -3990,7 +4004,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.66"
+#define OPENREMOTE_VERSION_STRING "3.67"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -4899,6 +4913,7 @@ unsigned long dockNextPingMs = 0;
 uint8_t dockPairAckMac[6] = {0};
 uint8_t dockPairAckRetriesLeft = 0;
 unsigned long dockPairAckNextMs = 0;
+bool dockPairAckSent = false;
 // Set from the ESP-NOW send callback (Wi-Fi task); acted on in loop(), because
 // LVGL objects must only be touched from the UI task.
 volatile bool dockLinkIndicatorDirty = false;
@@ -17172,9 +17187,15 @@ void serviceDockPairAck(unsigned long now) {
 
   // A MAC-layer ack means the dock was on our channel and received it, so
   // there is nothing left to retry.
-  if (dockLinkOnline) {
-    Serial.printf("ESP-NOW: pair ack acknowledged after %u attempt(s)\n",
-                  (unsigned)(31 - dockPairAckRetriesLeft));
+  //
+  // Only meaningful once something has actually been sent in THIS exchange.
+  // dockLinkOnline is a latch left true by any earlier successful send, so
+  // testing it before the first attempt made this stop immediately, report
+  // "acknowledged after 1 attempt" and send nothing at all - the remote
+  // declaring success while the dock heard silence and timed out.
+  if (dockPairAckSent && dockLinkOnline) {
+    Serial.printf("ESP-NOW: pair ack acknowledged after %u attempt(s) on channel %u\n",
+                  (unsigned)(30 - dockPairAckRetriesLeft), (unsigned)espNowChannel);
     dockPairAckRetriesLeft = 0;
     return;
   }
@@ -17183,6 +17204,7 @@ void serviceDockPairAck(unsigned long now) {
   ack.magic = ESPNOW_PAIR_ACK_MAGIC;
   strlcpy(ack.name, remoteName.c_str(), sizeof(ack.name));
   esp_now_send(dockPairAckMac, (const uint8_t *)&ack, sizeof(ack));
+  dockPairAckSent = true;
   dockPairAckRetriesLeft--;
   dockPairAckNextMs = now + 250UL;
   if (!dockPairAckRetriesLeft) {
@@ -17354,6 +17376,10 @@ bool addEspNowDevice(const uint8_t mac[6], const char *name) {
     memcpy(dockPairAckMac, mac, 6);
     dockPairAckRetriesLeft = 30;   // 30 x 250ms = 7.5s, against a 5.85s sweep.
     dockPairAckNextMs = millis();
+    // Nothing has been sent for this pairing yet, so the stale latch must not
+    // be allowed to stand in for an acknowledgement of it.
+    dockPairAckSent = false;
+    dockLinkOnline = false;
   }
 
   espNowDevicesModalDirty = true;
