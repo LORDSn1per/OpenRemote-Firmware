@@ -1,6 +1,28 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.85 - 2026-09-02
+    - Fixes the dock update failing while both ends blamed the other. Dock 1.18
+      let the begin frame through and its log finally showed what happens next:
+      "OTA begin frame received", "firmware transfer starting - into app1",
+      then "firmware transfer aborted - sender stopped responding" - while the
+      remote was reporting the dock as unreachable. Neither was true. The dock
+      answers a begin only after esp_ota_begin(), which erases the whole target
+      partition: a megabyte of flash, several seconds, during which it cannot
+      answer anything at all. The remote allowed 400ms x 8 = 3.2 seconds, so it
+      always gave up first, and the dock finished erasing to find nobody there.
+    - Begin and end now get 6000ms x 5 instead, because neither is a data chunk:
+      the dock erases before it can accept, and verifies the whole image before
+      it can confirm. Data chunks keep the fast 400ms timing, which is right for
+      them. The begin failure also says what it means now, rather than blaming
+      power and range for a dock that was busy erasing.
+    - Fixes the dock's LED going dark while the WebConfig QR page was still on
+      screen. The keepalive ping was fire-and-forget every 5 seconds and the
+      dock drops its link after 9 seconds of silence, so two lost pings put the
+      LED out even though the radio was up and the page was still showing. The
+      ping now goes every 3 seconds and is retried like any other send, so the
+      LED follows the actual link rather than local interference.
+
   3.84 - 2026-09-02
     - A chunk the SD card does not fully store is now caught and re-sent,
       instead of failing the whole upload at the end. WebConfig 2.55 made the
@@ -4347,7 +4369,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.84"
+#define OPENREMOTE_VERSION_STRING "3.85"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -5844,6 +5866,19 @@ static_assert(sizeof(EspNowOtaDataHeader) + ESPNOW_OTA_CHUNK_BYTES == 250,
 static const char DOCK_FIRMWARE_PATH[] = "/dock/firmware.bin";
 static const uint32_t DOCK_OTA_ACK_TIMEOUT_MS = 400;
 static const uint8_t DOCK_OTA_MAX_RETRIES = 8;
+// Begin and end are not data chunks and must not be timed like them.
+//
+// The dock answers a begin only after esp_ota_begin(), which ERASES the whole
+// target partition - a megabyte of flash on the C3, and several seconds during
+// which the dock cannot answer anything. The old budget for that was
+// 400ms x 8 = 3.2 seconds, so the remote always gave up first, reported "the
+// dock stopped responding", and left the dock erasing for an update that had
+// already been abandoned. The dock then sat waiting for data that would never
+// come and timed out too - both ends blaming the other, which is exactly what
+// the two logs showed. The end frame is the same shape of problem: the dock
+// verifies the whole image before answering.
+static const uint32_t DOCK_OTA_SLOW_TIMEOUT_MS = 6000;
+static const uint8_t DOCK_OTA_SLOW_MAX_RETRIES = 5;
 
 enum DockOtaState : uint8_t {
   DOCK_OTA_IDLE = 0,
@@ -6399,6 +6434,7 @@ void sendDockSettings();
 void serviceDockLink(unsigned long now);
 void serviceDockPairAck(unsigned long now);
 bool ensureEspNowLink();
+bool sendEspNowWithRetry(const uint8_t mac[6], const uint8_t *payload, size_t len);
 void releaseEspNowLink(const char *reason, bool forceEvenOnQrPage = false);
 void refreshDockLinkIndicator();
 void applyDockLinkPillColour();
@@ -17909,9 +17945,15 @@ void serviceDockLink(unsigned long now) {
   if (!espNowRadioActive) return;
   if (dockOtaState != DOCK_OTA_IDLE) return;  // The transfer is its own proof.
   if ((int32_t)(now - dockNextPingMs) < 0) return;
-  dockNextPingMs = now + 5000UL;
+  // Every 3 seconds, and retried like any other send. The dock puts its LED
+  // out after 9 seconds of hearing nothing, so at the old fire-and-forget
+  // 5 second interval just two lost pings were enough to drop the link - which
+  // is why the dock's LED went dark while the QR page was still being shown
+  // and the radio was still perfectly alive. Three seconds with retries means
+  // the LED now follows the link rather than the local interference.
+  dockNextPingMs = now + 3000UL;
   uint32_t ping = ESPNOW_DOCK_PING_MAGIC;
-  esp_now_send(espNowDevices[0].mac, (const uint8_t *)&ping, sizeof(ping));
+  sendEspNowWithRetry(espNowDevices[0].mac, (const uint8_t *)&ping, sizeof(ping));
   // Only meaningful while the radio is actually up and pinging.
   if (dockLinkOnline && (now - dockLastAckMs) > 20000UL) {
     dockLinkOnline = false;
@@ -18343,11 +18385,18 @@ void serviceDockOta(unsigned long now) {
     return;
   }
 
-  if (dockOtaLastSendMs && (now - dockOtaLastSendMs) < DOCK_OTA_ACK_TIMEOUT_MS) return;
+  bool slowPhase = (dockOtaState == DOCK_OTA_BEGIN || dockOtaState == DOCK_OTA_END);
+  uint32_t ackTimeout = slowPhase ? DOCK_OTA_SLOW_TIMEOUT_MS : DOCK_OTA_ACK_TIMEOUT_MS;
+  uint8_t maxRetries = slowPhase ? DOCK_OTA_SLOW_MAX_RETRIES : DOCK_OTA_MAX_RETRIES;
+  if (dockOtaLastSendMs && (now - dockOtaLastSendMs) < ackTimeout) return;
 
   if (dockOtaLastSendMs) {
-    if (++dockOtaRetries > DOCK_OTA_MAX_RETRIES) {
-      dockOtaFail("The dock stopped responding. Check it is powered and in range.");
+    if (++dockOtaRetries > maxRetries) {
+      dockOtaFail(dockOtaState == DOCK_OTA_BEGIN
+                    ? "The dock never accepted the transfer. It erases its spare "
+                      "firmware slot first, which takes a few seconds - if this "
+                      "keeps happening it is out of range rather than busy."
+                    : "The dock stopped responding. Check it is powered and in range.");
       return;
     }
   }
