@@ -1,6 +1,21 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.73 - 2026-09-01
+    - The dock now reports its firmware version and name, in reply to the ping
+      the remote already sends every 5 seconds while the link is up. Previously
+      the remote knew a dock was there but nothing about what it was running -
+      which is exactly what you want to see before pushing new firmware at it.
+      Exposed as dockName, dockMac and dockFirmware in /api/status.
+    - The ESP-NOW link is held up while the WebConfig QR page is shown, and
+      brought up as the page opens. Everything WebConfig offers for a dock - the
+      firmware push, the settings, the new status row - needs the link, and
+      letting it lapse under the user's hands would make those fail for no
+      reason they could see.
+    - Requires dock firmware 1.14 for the version reporting; older docks simply
+      report nothing and the field stays empty rather than showing something
+      untrue.
+
   3.72 - 2026-09-01
     - Rebuilds the Paired docks row, which did not fit. Name and MAC on the
       left with both buttons to their right, in a 44px row, left the name
@@ -4082,7 +4097,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.72"
+#define OPENREMOTE_VERSION_STRING "3.73"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -4694,6 +4709,16 @@ static const uint32_t ESPNOW_DOCK_PING_MAGIC     = 0x4F525047UL;  // "ORPG"
 // moment the remote's pill outline goes white instead of waiting to notice
 // the silence.
 static const uint32_t ESPNOW_DOCK_LINK_DOWN_MAGIC = 0x4F524C44UL;  // "ORLD"
+// Dock -> remote, in reply to a ping. Without it the remote knows a dock is
+// there but nothing about what it is running.
+static const uint32_t ESPNOW_DOCK_INFO_MAGIC = 0x4F524449UL;  // "ORDI"
+
+struct __attribute__((packed)) EspNowDockInfoPacket {
+  uint32_t magic;
+  char version[8];
+  char name[24];
+};
+static_assert(sizeof(EspNowDockInfoPacket) == 36, "dock info layout drifted from the dock");
 
 struct __attribute__((packed)) EspNowDockSettingsPacket {
   uint32_t magic;
@@ -5006,6 +5031,8 @@ bool dockPairAckSent = false;
 // Set from the ESP-NOW send callback (Wi-Fi task); acted on in loop(), because
 // LVGL objects must only be touched from the UI task.
 volatile bool dockLinkIndicatorDirty = false;
+// What the dock last told us about itself. Empty until it answers a ping.
+char dockReportedVersion[9] = {0};
 
 // On-demand ESP-NOW.
 //
@@ -10259,6 +10286,11 @@ String buildStatusJson() {
   doc["dockLedOnTransmit"] = dockLedOnTransmit;
   doc["dockWarmOnWake"] = dockWarmOnWake;
   doc["dockConnected"] = dockConnected();
+  if (espNowDeviceCount > 0) {
+    doc["dockName"] = espNowDevices[0].name;
+    doc["dockMac"] = formatMacAddress(espNowDevices[0].mac);
+    doc["dockFirmware"] = dockReportedVersion;
+  }
   doc["espNowDeviceCount"] = espNowDeviceCount;
   doc["clockEnabled"] = clockEnabled;
   doc["clockUseInternetTime"] = clockUseInternetTime;
@@ -17120,6 +17152,20 @@ void onEspNowDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int 
   // A firmware ack from the dock we are currently updating. Checked before the
   // scan and learn windows because a transfer can be running while neither is
   // open, and only ever accepted from the dock this transfer is addressed to.
+  if ((size_t)len >= sizeof(EspNowDockInfoPacket) && espNowDeviceCount > 0 &&
+      memcmp(espNowDevices[0].mac, info->src_addr, 6) == 0) {
+    EspNowDockInfoPacket dockInfo;
+    memcpy(&dockInfo, data, sizeof(dockInfo));
+    if (dockInfo.magic == ESPNOW_DOCK_INFO_MAGIC) {
+      dockInfo.version[sizeof(dockInfo.version) - 1] = '\0';
+      if (strcmp(dockReportedVersion, dockInfo.version) != 0) {
+        strlcpy(dockReportedVersion, dockInfo.version, sizeof(dockReportedVersion));
+        Serial.printf("Dock: reports firmware %s\n", dockReportedVersion);
+      }
+      return;
+    }
+  }
+
   if (dockOtaState != DOCK_OTA_IDLE && (size_t)len >= sizeof(EspNowOtaAckPacket) &&
       dockOtaDeviceIndex < espNowDeviceCount &&
       memcmp(espNowDevices[dockOtaDeviceIndex].mac, info->src_addr, 6) == 0) {
@@ -17339,6 +17385,7 @@ void serviceDockLink(unsigned long now) {
   // nothing of the sort had happened. Only a failed send clears it.
   if (!espNowRadioActive) return;
   if (dockOtaState != DOCK_OTA_IDLE) return;  // The transfer is its own proof.
+  if (webConfigQrPageActive()) espNowHoldUntilMs = now + ESPNOW_ONDEMAND_HOLD_MS;
   if ((int32_t)(now - dockNextPingMs) < 0) return;
   dockNextPingMs = now + 5000UL;
   uint32_t ping = ESPNOW_DOCK_PING_MAGIC;
@@ -17375,6 +17422,11 @@ void stopEspNow() {
 void releaseEspNowLink(const char *reason) {
   if (!espNowStandalone || !espNowRadioActive) return;
   if (espNowScanActive || rfLearnActive || dockOtaState != DOCK_OTA_IDLE) return;
+  // WebConfig is open and being looked at, and everything it offers for a dock
+  // - the firmware push, the settings, the status row - needs the link. Letting
+  // it lapse under the user's hands would make those fail for no reason they
+  // could see.
+  if (webConfigQrPageActive()) return;
   if (espNowDeviceCount > 0) {
     uint32_t bye = ESPNOW_DOCK_LINK_DOWN_MAGIC;
     esp_now_send(espNowDevices[0].mac, (const uint8_t *)&bye, sizeof(bye));
@@ -20018,6 +20070,10 @@ void openSettingsView(SettingsView view) {
     wifiConnectPending = false;
     stationFallbackToSetupAp = false;
     webConfigPausedBle = true;
+    // Bring the dock link up for the session rather than waiting for the first
+    // thing that needs it, so WebConfig's dock controls work the moment the
+    // page is opened.
+    if (espNowEnabled && espNowDeviceCount > 0) ensureEspNowLink();
     if (bleReady) {
       shutdownBluetoothStack("WebConfig session");
       delay(120);
