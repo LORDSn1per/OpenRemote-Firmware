@@ -1,6 +1,25 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.61 - 2026-09-01
+    - Fixes the pill never turning green and the dock never flashing on a
+      relayed command. One cause behind both: the idle shutdown took the Wi-Fi
+      radio down without regard for ESP-NOW, and serviceEspNow() then stopped
+      ESP-NOW with it. By the time either the link indicator or a relayed
+      command was wanted, the radio had already gone. The network stack is now
+      held up while ESP-NOW is on and a dock is paired - conditional, not
+      permanent, so switching ESP-NOW off or forgetting the dock restores the
+      old idle behaviour and its standby current with it.
+    - The pill also lost its colour on navigation. Every page render builds a
+      new status pill with the default white outline, and the colour was only
+      applied when the link *changed* - which had happened long before. It is
+      now reapplied wherever the pill is built.
+    - Paired docks and Search are separate buttons. One control that both
+      listed what you had and went hunting for something new made neither job
+      clear, and there was no way to remove a dock from the remote at all -
+      only from WebConfig. Paired docks opens a list showing each dock's name
+      and MAC with a Forget button; Search does only that.
+
   3.60 - 2026-09-01
     - Fixes the ESP-NOW search, which could not find a dock from the LCD at
       all. It refused whenever the Wi-Fi station was down, and the remote shuts
@@ -3873,7 +3892,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.60"
+#define OPENREMOTE_VERSION_STRING "3.61"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -5855,6 +5874,8 @@ bool dockConnected();
 void sendDockSettings();
 void serviceDockLink(unsigned long now);
 void refreshDockLinkIndicator();
+void applyDockLinkPillColour();
+bool espNowDockRadioRequired();
 void applyCommandFeedbackStyle(bool active);
 void serviceDockOta(unsigned long now);
 bool startRfLearn(uint8_t deviceIndex);
@@ -5863,6 +5884,7 @@ void showEspNowDevicesModal();
 void serviceEspNowSearchOverlay(unsigned long now);
 void hideEspNowSearchOverlay();
 void showEspNowSearchBlocked(const char *why);
+void showEspNowPairedOverlay(lv_event_t *e);
 void showEspNowSearchOverlay();
 void showEspNowSearchScanning();
 void toggleEspNowDevicesModal(lv_event_t *e);
@@ -7707,7 +7729,21 @@ bool webConfigQrPageActive() {
          settingsView == SETTINGS_WIFI_QR;
 }
 
+// ESP-NOW runs on the Wi-Fi radio, so a paired dock needs that radio up. The
+// idle shutdown took it down without asking, and serviceEspNow() then stopped
+// ESP-NOW with it - which is why a paired dock never turned the pill green and
+// never flashed its LED on a relayed command. Both symptoms, one cause: by the
+// time either was wanted the radio had already gone.
+//
+// It costs standby current, which is why it is conditional rather than
+// permanent: switch ESP-NOW off, or forget the dock, and the idle shutdown
+// behaves exactly as it did before.
+bool espNowDockRadioRequired() {
+  return espNowEnabled && espNowDeviceCount > 0;
+}
+
 void scheduleNetworkShutdown(uint32_t delayMs = NETWORK_IDLE_SHUTDOWN_MS) {
+  if (espNowDockRadioRequired()) return;
   bool wifiUiActive = pages[currentPage].kind == PAGE_REMOTE_SETTINGS &&
     (settingsView == SETTINGS_WIFI || settingsView == SETTINGS_WIFI_PASSWORD ||
      settingsView == SETTINGS_WIFI_QR);
@@ -7841,6 +7877,9 @@ void serviceInternetTime(unsigned long now) {
 void serviceNetworkPower(unsigned long now) {
   if (!networkShutdownAtMs || (int32_t)(now - networkShutdownAtMs) < 0) return;
   networkShutdownAtMs = 0;
+  // Checked here as well as in scheduleNetworkShutdown(), because a shutdown
+  // may already have been queued before the dock was paired.
+  if (espNowDockRadioRequired()) return;
   bool wifiUiActive = pages[currentPage].kind == PAGE_REMOTE_SETTINGS &&
     (settingsView == SETTINGS_WIFI || settingsView == SETTINGS_WIFI_PASSWORD ||
      settingsView == SETTINGS_WIFI_QR);
@@ -10871,6 +10910,15 @@ lv_color_t pillIdleColour() {
 
 // Repaints the pill when the dock link changes, without rebuilding the page.
 void refreshDockLinkIndicator() {
+  applyCommandFeedbackStyle(false);
+}
+
+// Every page render builds a new status pill with the default white outline.
+// Repainting only on a link *change* therefore lost the indication the moment
+// the user navigated anywhere, since the change had happened long before. This
+// is called after the pill is created so a green link survives navigation.
+void applyDockLinkPillColour() {
+  if (!dockConnected()) return;
   applyCommandFeedbackStyle(false);
 }
 
@@ -18425,6 +18473,117 @@ void espNowSearchOverlayClicked(lv_event_t *e) {
   pendingUiRefresh = settingsView == SETTINGS_DOCK;
 }
 
+// Paired-dock list, with delete. Kept separate from Search on purpose: one
+// button that both listed what you had and went hunting for something new made
+// neither job clear, and there was no way to remove a dock from the remote at
+// all - only from WebConfig.
+lv_obj_t *espNowPairedOverlay = nullptr;
+lv_obj_t *espNowPairedList = nullptr;
+bool espNowPairedOverlayVisible = false;
+
+void hideEspNowPairedOverlay() {
+  if (!espNowPairedOverlay) return;
+  lv_obj_add_flag(espNowPairedOverlay, LV_OBJ_FLAG_HIDDEN);
+  espNowPairedOverlayVisible = false;
+}
+
+void rebuildEspNowPairedList();
+
+void espNowForgetClicked(lv_event_t *e) {
+  int index = (int)(intptr_t)lv_event_get_user_data(e);
+  if (index < 0 || index >= espNowDeviceCount) return;
+  uint8_t mac[6];
+  memcpy(mac, espNowDevices[index].mac, 6);
+  Serial.printf("ESP-NOW: forgetting %s\n", formatMacAddress(mac).c_str());
+  removeEspNowDevice(mac);
+  rebuildEspNowPairedList();
+  pendingUiRefresh = settingsView == SETTINGS_DOCK;
+}
+
+void espNowPairedOverlayClicked(lv_event_t *e) {
+  (void)e;
+  hideEspNowPairedOverlay();
+  pendingUiRefresh = settingsView == SETTINGS_DOCK;
+}
+
+void rebuildEspNowPairedList() {
+  if (!espNowPairedList) return;
+  lv_obj_clean(espNowPairedList);
+  if (espNowDeviceCount == 0) {
+    lv_obj_t *empty = makeLabel(espNowPairedList, "No docks paired yet.\nUse Search to find one.",
+                                0, 0, &lv_font_montserrat_12, lvRgb(150, 160, 175));
+    lv_label_set_long_mode(empty, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(empty, LCD_W - 40);
+    lv_obj_set_style_text_align(empty, LV_TEXT_ALIGN_CENTER, 0);
+    return;
+  }
+  for (uint8_t i = 0; i < espNowDeviceCount; i++) {
+    lv_obj_t *row = lv_obj_create(espNowPairedList);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_width(row, LV_PCT(100));
+    lv_obj_set_height(row, 44);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_color(row, lvRgb(24, 42, 68), 0);
+    lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(row, 8, 0);
+
+    makeLabel(row, espNowDevices[i].name, 10, 5, &lv_font_montserrat_12, textPrimary());
+    makeLabel(row, formatMacAddress(espNowDevices[i].mac).c_str(), 10, 23,
+              &lv_font_montserrat_10, lvRgb(140, 155, 175));
+
+    lv_obj_t *forget = lv_btn_create(row);
+    lv_obj_set_size(forget, 62, 30);
+    lv_obj_align(forget, LV_ALIGN_RIGHT_MID, -6, 0);
+    lv_obj_set_style_bg_color(forget, lvRgb(120, 32, 32), 0);
+    lv_obj_set_style_radius(forget, 7, 0);
+    lv_obj_add_event_cb(forget, espNowForgetClicked, LV_EVENT_CLICKED,
+                        (void *)(intptr_t)i);
+    lv_obj_t *label = lv_label_create(forget);
+    lv_label_set_text(label, "Forget");
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(label, textPrimary(), 0);
+    lv_obj_center(label);
+  }
+}
+
+void showEspNowPairedOverlay(lv_event_t *e) {
+  (void)e;
+  if (espNowPairedOverlayVisible) { hideEspNowPairedOverlay(); return; }
+  if (!espNowPairedOverlay) {
+    espNowPairedOverlay = lv_obj_create(lv_layer_top());
+    lv_obj_set_pos(espNowPairedOverlay, 0, 0);
+    lv_obj_set_size(espNowPairedOverlay, LCD_W, LCD_H);
+    lv_obj_clear_flag(espNowPairedOverlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(espNowPairedOverlay, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_bg_color(espNowPairedOverlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(espNowPairedOverlay, (lv_opa_t)242, 0);
+    lv_obj_set_style_border_width(espNowPairedOverlay, 0, 0);
+    lv_obj_set_style_radius(espNowPairedOverlay, 0, 0);
+    lv_obj_set_style_pad_all(espNowPairedOverlay, 0, 0);
+    lv_obj_add_event_cb(espNowPairedOverlay, espNowPairedOverlayClicked, LV_EVENT_CLICKED, nullptr);
+
+    lv_obj_t *title = makeLabel(espNowPairedOverlay, "PAIRED DOCKS", 0, 0,
+                                &lv_font_montserrat_20, textPrimary());
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 26);
+    lv_obj_t *hint = makeLabel(espNowPairedOverlay, "Tap anywhere else to close", 0, 0,
+                               &lv_font_montserrat_10, lvRgb(135, 195, 255));
+    lv_obj_align(hint, LV_ALIGN_TOP_MID, 0, 54);
+
+    espNowPairedList = lv_obj_create(espNowPairedOverlay);
+    lv_obj_set_size(espNowPairedList, LCD_W - 24, LCD_H - 96);
+    lv_obj_align(espNowPairedList, LV_ALIGN_TOP_MID, 0, 78);
+    lv_obj_set_style_bg_opa(espNowPairedList, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(espNowPairedList, 0, 0);
+    lv_obj_set_style_pad_all(espNowPairedList, 0, 0);
+    lv_obj_set_style_pad_row(espNowPairedList, 8, 0);
+    lv_obj_set_flex_flow(espNowPairedList, LV_FLEX_FLOW_COLUMN);
+  }
+  rebuildEspNowPairedList();
+  lv_obj_clear_flag(espNowPairedOverlay, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_move_foreground(espNowPairedOverlay);
+  espNowPairedOverlayVisible = true;
+}
+
 void createEspNowSearchOverlay() {
   if (espNowSearchOverlay) return;
   espNowSearchOverlay = lv_obj_create(lv_layer_top());
@@ -19014,6 +19173,9 @@ void renderTopBar(const char *title, bool allowDevices) {
     boundPageUi->statusBatteryTerminal = statusBatteryTerminal;
     boundPageUi->batteryFill = batteryFill;
   }
+  // The pill has just been rebuilt with the default outline, so restore the
+  // dock's green if a dock is connected.
+  applyDockLinkPillColour();
   lv_obj_move_foreground(topBar);
 }
 
@@ -21487,13 +21649,19 @@ void renderDockPageOmote() {
   char espNowStatusText[24];
   snprintf(espNowStatusText, sizeof(espNowStatusText), "%u paired", (unsigned)espNowDeviceCount);
 
-  lv_obj_t *card = makeOmoteCard(content, y, 2 * rowH + 1);
+  lv_obj_t *card = makeOmoteCard(content, y, 3 * rowH + 2);
   makeOmoteRow(card, "ESP-NOW", "Send commands to a paired blaster dock",
               0, rowH, &espNowEnabled);
   makeOmoteDivider(card, rowH);
-  makeOmoteRow(card, "Paired devices", espNowStatusText, rowH + 1, rowH,
-              nullptr, toggleEspNowDevicesModal);
-  y += 2 * rowH + 1 + 14;
+  // Two separate jobs, two separate rows. One button that both listed what you
+  // had and went hunting for something new made neither clear, and there was
+  // no way to remove a dock from the remote at all.
+  makeOmoteRow(card, "Paired docks", espNowStatusText, rowH + 1, rowH,
+              nullptr, showEspNowPairedOverlay);
+  makeOmoteDivider(card, 2 * rowH + 1);
+  makeOmoteRow(card, "Search for a dock", "Find a dock in pairing mode",
+              2 * rowH + 2, rowH, nullptr, toggleEspNowDevicesModal);
+  y += 3 * rowH + 2 + 14;
 
   // Only shown once a dock exists to apply them to - three dead controls on a
   // page with nothing paired explains nothing and invites fiddling.
@@ -21535,11 +21703,13 @@ void renderDockPage() {
   char espNowStatusText[24];
   snprintf(espNowStatusText, sizeof(espNowStatusText), "%u paired", (unsigned)espNowDeviceCount);
   makeSettingRow("ESP-NOW", "Send commands to a paired blaster dock", 52, &espNowEnabled);
-  makeSettingRow("Paired devices", espNowStatusText, 102, nullptr,
+  makeSettingRow("Paired docks", espNowStatusText, 102, nullptr,
+                 showEspNowPairedOverlay);
+  makeSettingRow("Search for a dock", "Find a dock in pairing mode", 152, nullptr,
                  toggleEspNowDevicesModal);
-  int hintY = 164;
+  int hintY = 214;
   if (espNowDeviceCount > 0) {
-    lv_obj_t *routeRow = makeSettingRow("Transmit IR from", "", 152, nullptr, nullptr);
+    lv_obj_t *routeRow = makeSettingRow("Transmit IR from", "", 202, nullptr, nullptr);
     lv_obj_t *routeDropdown = lv_dropdown_create(routeRow);
     lv_obj_set_pos(routeDropdown, 112, 8);
     lv_obj_set_size(routeDropdown, 100, 32);
@@ -21548,9 +21718,9 @@ void renderDockPage() {
     lv_dropdown_set_selected(routeDropdown, irRoute);
     lv_obj_add_event_cb(routeDropdown, irRouteDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
     addPhysicalNavFocusable(routeDropdown);
-    makeSettingRow("Dock RF433", "Let the dock send RF433", 202, &dockRfEnabled);
-    makeSettingRow("Dock LED", "Blink as the dock transmits", 252, &dockLedOnTransmit);
-    hintY = 304;
+    makeSettingRow("Dock RF433", "Let the dock send RF433", 252, &dockRfEnabled);
+    makeSettingRow("Dock LED", "Blink as the dock transmits", 302, &dockLedOnTransmit);
+    hintY = 354;
   }
   lv_obj_t *hint = makeLabel(content,
     espNowDeviceCount > 0
