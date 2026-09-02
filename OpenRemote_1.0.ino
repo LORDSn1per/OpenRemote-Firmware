@@ -1,6 +1,34 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.91 - 2026-09-02
+    - Fixes the ring dropping out of blue moments after a press that plainly
+      worked, properly this time. 3.90 changed what colour got painted; it did
+      not ask why the wrong colour was being chosen, which is the actual fault
+      and is a race.
+    - dockConnected() rested on dockLinkOnline, a single boolean flipped by
+      whichever send callback fired last. sendEspNowWithRetry() abandons an
+      attempt after 15ms and moves on, but the abandoned attempt's callback
+      still arrives - and it still flipped the flag. So a late FAILED callback
+      from an attempt already given up on cleared the link even though a LATER
+      attempt had succeeded. Same press, same outcome, different callback
+      order: sometimes blue held for the full two seconds, sometimes it fell
+      away immediately.
+    - It now rests on two pieces of evidence that one stray callback cannot
+      overturn: the radio is actually up, and a send has been acknowledged
+      within a five second grace. A failure no longer erases a success that
+      already happened. The grace sits comfortably above the two second hold,
+      so it can never be what ends the blue.
+    - What ends the blue is espNowRadioActive going false in stopEspNow() -
+      the same moment the link-down packet has gone to the dock. The ring and
+      the dock's LED therefore go out on the same event rather than each
+      guessing, which is the behaviour that was already right and is now the
+      only way it can happen.
+    - dockLastAckMs is cleared when the radio stops, so a new session earns its
+      blue with a fresh acknowledgement instead of inheriting the last one's,
+      and the indicator is marked dirty when the first ack lands so the ring
+      is repainted for it.
+
   3.90 - 2026-09-02
     - Fixes the ring sometimes ending up thick white instead of blue. The
       border width has never changed; a dim white painted at full opacity
@@ -4464,7 +4492,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.90"
+#define OPENREMOTE_VERSION_STRING "3.91"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -17880,7 +17908,13 @@ void onEspNowDataSent(const wifi_tx_info_t *info, esp_now_send_status_t status) 
     espNowSendWaiting = false;
     espNowSendSucceeded = online;
   }
-  if (online) dockLastAckMs = millis();
+  if (online) {
+    // The ack that makes dockConnected() true, so the ring has to be repainted
+    // for it - without this the blue only appeared when something else
+    // happened to mark the indicator dirty.
+    if (!dockLastAckMs) dockLinkIndicatorDirty = true;
+    dockLastAckMs = millis();
+  }
   if (online != dockLinkOnline) {
     dockLinkOnline = online;
     dockLinkIndicatorDirty = true;
@@ -18006,8 +18040,32 @@ void startEspNow() {
 // and the last thing we sent it was acknowledged" - which is what a person
 // means by connected, and only goes white when the dock actually stops
 // answering.
+// "The radio is up and the dock has answered it recently."
+//
+// It used to be espNowDeviceCount && dockLinkOnline, and dockLinkOnline is a
+// single boolean flipped by whichever send callback happened to fire last -
+// including a callback from an attempt sendEspNowWithRetry() had already given
+// up on at 15ms and moved past. A late FAILED callback from an abandoned
+// attempt therefore cleared the flag even though a LATER attempt had
+// succeeded, so the ring dropped out of blue moments after a press that had
+// plainly worked. That is the intermittent case: same press, same outcome, a
+// different callback order.
+//
+// Two pieces of evidence instead, neither of which one stray callback can
+// overturn: the radio is actually up, and a send has genuinely been
+// acknowledged inside the grace window. A failure does not erase a success
+// that already happened.
+//
+// espNowRadioActive is what makes the ring and the dock's LED go out together:
+// it becomes false in stopEspNow(), the same moment the link-down packet has
+// been sent, so both ends stop showing the link at the same instant rather
+// than one of them guessing.
+static const uint32_t DOCK_LINK_ACK_GRACE_MS = 5000;   // Comfortably over the 2s hold.
+
 bool dockConnected() {
-  return espNowEnabled && espNowDeviceCount > 0 && dockLinkOnline;
+  if (!espNowEnabled || espNowDeviceCount == 0 || !espNowRadioActive) return false;
+  if (!dockLastAckMs) return false;   // Nothing acknowledged yet this session.
+  return (millis() - dockLastAckMs) < DOCK_LINK_ACK_GRACE_MS;
 }
 
 void sendDockSettings() {
@@ -18134,6 +18192,7 @@ void stopEspNow() {
   // the pill exists to mirror. A link that can no longer be proved is a link
   // that is no longer claimed.
   dockLinkOnline = false;
+  dockLastAckMs = 0;
   dockLinkIndicatorDirty = true;
   Serial.println("ESP-NOW: stopped");
 }
