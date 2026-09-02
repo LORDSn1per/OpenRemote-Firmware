@@ -1,6 +1,27 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.92 - 2026-09-02
+    - The dock update's data chunks ignored esp_now_send()'s return value, so a
+      send that never left the remote looked exactly like one the dock had
+      failed to answer. The retry loop repeated it eight times, none of them
+      went out, and the dock was reported as "stopped responding" to something
+      it was never sent. The dock's own log showed this from the other side:
+      begin received, transfer opened into app1, acceptance ack repeated, and
+      then nothing arriving at all.
+    - Why data and not begin: a data frame is 250 bytes - the ESP-NOW maximum -
+      against the begin frame's 20. It is the one that fails first when the
+      send queue is full or heap is short, which during a WebConfig session it
+      may well be, and it was the only send in the whole path whose result
+      nobody looked at.
+    - All three OTA frames now go through sendEspNowWithRetry() like every other
+      send, and a failure is logged with the reason and the free heap rather
+      than being silently counted as sent.
+    - sendEspNowWithRetry() now waits 2ms before retrying a frame the driver
+      refused outright. The usual cause is ESP_ERR_ESPNOW_NO_MEM - the internal
+      send queue being full - which needs air time to drain, so retrying in the
+      same microsecond simply got refused three times in a row.
+
   3.91 - 2026-09-02
     - Fixes the ring dropping out of blue moments after a press that plainly
       worked, properly this time. 3.90 changed what colour got painted; it did
@@ -4492,7 +4513,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.91"
+#define OPENREMOTE_VERSION_STRING "3.92"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -5430,6 +5451,9 @@ static const char *ESPNOW_TX_POWER_OPTIONS = "Low\nMedium\nHigh";
 volatile bool dockLinkOnline = false;
 volatile bool espNowSendWaiting = false;
 volatile bool espNowSendSucceeded = false;
+// Kept so a failure can be reported by the caller that cares, rather than
+// vanishing inside the retry helper.
+esp_err_t espNowLastSendError = ESP_OK;
 unsigned long dockLastAckMs = 0;
 unsigned long dockNextPingMs = 0;
 uint8_t dockPairAckMac[6] = {0};
@@ -18530,7 +18554,9 @@ void dockOtaSendBegin() {
   begin.totalBytes = dockOtaTotalBytes;
   begin.crc32 = dockOtaCrc;
   strlcpy(begin.version, dockOtaVersion, sizeof(begin.version));
-  esp_now_send(espNowDevices[dockOtaDeviceIndex].mac, (const uint8_t *)&begin, sizeof(begin));
+  if (!sendEspNowWithRetry(espNowDevices[dockOtaDeviceIndex].mac, (const uint8_t *)&begin, sizeof(begin))) {
+    Serial.println("Dock update: the begin frame did not go out");
+  }
   dockOtaLastSendMs = millis();
 }
 
@@ -18549,7 +18575,26 @@ void dockOtaSendChunk() {
   if (got <= 0) { dockOtaFail("Ran out of dock firmware to send."); return; }
   header.len = (uint16_t)got;
   memcpy(frame, &header, sizeof(header));
-  esp_now_send(espNowDevices[dockOtaDeviceIndex].mac, frame, sizeof(header) + (size_t)got);
+  // The return was ignored here, which made a send that never left the remote
+  // look exactly like one the dock failed to answer: the retry loop repeated
+  // it eight times, none of them went out, and the dock was blamed for not
+  // responding to something it was never sent. A data frame is 250 bytes
+  // against the begin frame's 20, and 250 is the ESP-NOW maximum - so it is
+  // the one that fails first when the send queue is full or heap is short,
+  // which during a WebConfig session it may well be.
+  espNowLastSendError = ESP_OK;
+  bool sent = sendEspNowWithRetry(espNowDevices[dockOtaDeviceIndex].mac,
+                                  frame, sizeof(header) + (size_t)got);
+  if (!sent) {
+    Serial.printf("Dock update: chunk %lu (%u bytes) did not go out%s - "
+                  "heapFree=%u\n",
+                  (unsigned long)dockOtaSeq, (unsigned)(sizeof(header) + (size_t)got),
+                  espNowLastSendError != ESP_OK ? " (driver refused it)" : " (no acknowledgement)",
+                  (unsigned)ESP.getFreeHeap());
+  } else if (dockOtaSeq == 0) {
+    Serial.printf("Dock update: first chunk away, %u bytes, heapFree=%u\n",
+                  (unsigned)(sizeof(header) + (size_t)got), (unsigned)ESP.getFreeHeap());
+  }
   dockOtaLastSendMs = millis();
 }
 
@@ -18557,7 +18602,9 @@ void dockOtaSendEnd() {
   EspNowOtaEndPacket end = {};
   end.magic = ESPNOW_OTA_END_MAGIC;
   end.crc32 = dockOtaCrc;
-  esp_now_send(espNowDevices[dockOtaDeviceIndex].mac, (const uint8_t *)&end, sizeof(end));
+  if (!sendEspNowWithRetry(espNowDevices[dockOtaDeviceIndex].mac, (const uint8_t *)&end, sizeof(end))) {
+    Serial.println("Dock update: the end frame did not go out");
+  }
   dockOtaLastSendMs = millis();
 }
 
@@ -18645,10 +18692,15 @@ bool sendEspNowWithRetry(const uint8_t mac[6], const uint8_t *payload, size_t le
     espNowSendSucceeded = false;
     esp_err_t queued = esp_now_send(mac, payload, len);
     if (queued != ESP_OK) {
-      // The driver itself refused the frame - nothing to wait for, try again
-      // immediately rather than waiting out a timeout for an answer that
-      // was never going to come.
+      // The driver itself refused the frame, so there is no callback coming
+      // and nothing to wait for. Retrying in the same microsecond just gets
+      // refused again though: the usual reason is ESP_ERR_ESPNOW_NO_MEM, the
+      // internal send queue being full, which needs air time to drain. A
+      // couple of milliseconds is the difference between a retry that can
+      // work and three that cannot.
       espNowSendWaiting = false;
+      espNowLastSendError = queued;
+      delay(2);
       continue;
     }
     unsigned long waitStart = millis();
