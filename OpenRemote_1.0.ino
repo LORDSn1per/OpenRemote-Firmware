@@ -1,6 +1,20 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.02 - 2026-09-02
+    - Reports why the chunk retry is not firing. In the last capture exactly one
+      chunk went out and nothing was resent for fifteen seconds, when the data
+      phase should retry every 400ms and give up after eight. dockOtaLastSendMs
+      has only three writers and all of them log, so either the timer check is
+      not being reached or "now" is stale - and "now" is millis() taken once at
+      the top of loop(), so one long iteration would explain it exactly. This
+      logs the wait once a second with loop()'s own lag measured separately,
+      which tells the two apart instead of guessing again.
+    - Diagnostics only. The matching dock fix is in 1.28: the dock was refusing
+      any frame that arrived while a handler was still running, and its
+      acceptance ack is sent from inside that handler - so the remote's reply,
+      arriving a millisecond later, landed in exactly that gap.
+
   4.01 - 2026-09-02
     - Fixes the ring staying blue and the dock's LED staying lit indefinitely
       after WebConfig is closed. Removing the QR page hold in 3.98 was not
@@ -4679,7 +4693,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.01"
+#define OPENREMOTE_VERSION_STRING "4.02"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -18926,7 +18940,25 @@ void serviceDockOta(unsigned long now) {
   bool slowPhase = (dockOtaState == DOCK_OTA_BEGIN || dockOtaState == DOCK_OTA_END);
   uint32_t ackTimeout = slowPhase ? DOCK_OTA_SLOW_TIMEOUT_MS : DOCK_OTA_ACK_TIMEOUT_MS;
   uint8_t maxRetries = slowPhase ? DOCK_OTA_SLOW_MAX_RETRIES : DOCK_OTA_MAX_RETRIES;
-  if (dockOtaLastSendMs && (now - dockOtaLastSendMs) < ackTimeout) return;
+  // The retry timer visibly did not fire for fifteen seconds in a capture where
+  // exactly one chunk went out and nothing was resent. dockOtaLastSendMs has
+  // only three writers, all of which log, so either this comparison is not
+  // being reached or "now" is stale - and "now" is millis() taken once at the
+  // top of loop(), so a single long iteration would do it. Reported once a
+  // second while waiting, with loop() timed independently, which distinguishes
+  // the two without guessing.
+  if (dockOtaLastSendMs && (now - dockOtaLastSendMs) < ackTimeout) {
+    static unsigned long lastWaitLogMs = 0;
+    unsigned long real = millis();
+    if (real - lastWaitLogMs > 1000UL) {
+      lastWaitLogMs = real;
+      Serial.printf("Dock update: waiting in state %d - %lums since the last send "
+                    "(now is %lums behind millis), retries %u\n",
+                    (int)dockOtaState, (unsigned long)(real - dockOtaLastSendMs),
+                    (unsigned long)(real - now), (unsigned)dockOtaRetries);
+    }
+    return;
+  }
 
   if (dockOtaLastSendMs) {
     if (++dockOtaRetries > maxRetries) {
