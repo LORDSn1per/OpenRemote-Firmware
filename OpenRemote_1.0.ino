@@ -1,6 +1,26 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.90 - 2026-09-02
+    - Fixes the ring sometimes ending up thick white instead of blue. The
+      border width has never changed; a dim white painted at full opacity
+      simply reads as a bolder line, which is the same illusion chased in 3.79
+      and fixed there in two other functions while this third one kept doing
+      it.
+    - Two paths caused it, both in the transmit pulse. Its dim phase used
+      pillIdleColour(), which is white whenever the dock link is not currently
+      proved, so a transmit whose latch had lapsed flickered white mid-pulse.
+      And the pulse ended by calling applyEspNowPulse(false), which paints that
+      same idle colour at LV_OPA_COVER - the opacity a pulse forces - leaving
+      bold white behind after every send that finished with the link unproved,
+      where it stayed until something else repainted the pill.
+    - Both phases of a pulse now mean "the dock is transmitting" and use the
+      dock blue, never white. When the pulse ends the outline is handed back to
+      whoever should own it - red if this remote's own emitter is still firing,
+      otherwise the resting link state, which knows to be dim white with
+      nothing to report and blue with something. No path can now leave a
+      full-opacity white behind.
+
   3.89 - 2026-09-02
     - Fixes the blue ring never appearing. In "Remote and dock" both emitters
       genuinely fire, and both feedback styles were writing the same border
@@ -4444,7 +4464,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.89"
+#define OPENREMOTE_VERSION_STRING "3.90"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -11716,15 +11736,22 @@ void applyEspNowPulse(bool bright) {
   // made the pill jump about, and the geometry shifting is more distracting
   // than the colour change it was meant to support.
   lv_color_t hot = lv_color_hex(0xC8E4FF);   // Near-white blue, unmistakable.
-  lv_color_t idle = pillIdleColour();
+  // Both phases of the pulse mean "the dock is transmitting", so the dim phase
+  // is the dock blue rather than pillIdleColour(). It used to be the idle
+  // colour, which is WHITE whenever the link is not currently proved - so a
+  // transmit whose latch had lapsed flickered white mid-pulse and, worse, left
+  // white behind when the pulse ended, painted at the full opacity the pulse
+  // forces. That is the "thick white ring": the width never changed, only a
+  // dim white became a bold one.
+  lv_color_t base = lv_color_hex(0x0A84FF);
   for (uint8_t slot = 0; slot < PAGE_SLOT_COUNT; slot++) {
     PageUi &ui = pageUi[slot];
     if (ui.statusPill && lv_obj_is_valid(ui.statusPill)) {
-      lv_obj_set_style_border_color(ui.statusPill, bright ? hot : idle, 0);
+      lv_obj_set_style_border_color(ui.statusPill, bright ? hot : base, 0);
       lv_obj_set_style_border_opa(ui.statusPill, LV_OPA_COVER, 0);
     }
     if (ui.statusBattery && lv_obj_is_valid(ui.statusBattery)) {
-      lv_obj_set_style_border_color(ui.statusBattery, bright ? hot : idle, 0);
+      lv_obj_set_style_border_color(ui.statusBattery, bright ? hot : base, 0);
     }
   }
 }
@@ -11741,7 +11768,14 @@ void flashEspNowCommandFeedback() {
 void clearEspNowCommandFeedback() {
   if (!espNowCommandFeedbackActive) return;
   espNowCommandFeedbackActive = false;
-  applyEspNowPulse(false);
+  // Hand the outline back to whoever should own it now, rather than to
+  // applyEspNowPulse(false) - which paints a transmit colour at transmit
+  // opacity and has no idea the transmit is over. If this remote's own
+  // emitter is still firing the outline is red; otherwise it is the resting
+  // link state, which knows to be dim white when there is nothing to report
+  // and blue when there is.
+  if (commandFeedbackActive) applyCommandFeedbackStyle(true);
+  else applyDockLinkPillColour();
 }
 
 // Runs from loop(): pulses while the send is in flight, then hands the pill
