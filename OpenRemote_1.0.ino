@@ -1,6 +1,19 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.99 - 2026-09-02
+    - Logs what the remote does with the dock's acceptance ack, and any SD seek
+      or read failure in the chunk sender. Diagnostics only, no behaviour
+      change.
+    - Dock 1.26's counters ruled out everything on that side: "0 frame(s) heard
+      from the remote, 0 OTA frame(s) dropped as busy". Nothing at all arrives
+      after the begin, so the dock's busy gate is innocent and the dock is
+      behaving correctly throughout - it hears the begin, erases app1, sends
+      its acceptance and waits. It also hears no REPEATED begin frames, which
+      means the remote did receive that acceptance and stopped resending. What
+      the remote does next is now the only unobserved step in the exchange, and
+      guessing at it has already cost more rounds than it deserves.
+
   3.98 - 2026-09-02
     - The two second release now applies everywhere, including after WebConfig.
       Resetting the remote restored it, which was the clue: a reset leaves the
@@ -4629,7 +4642,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.98"
+#define OPENREMOTE_VERSION_STRING "3.99"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -18736,11 +18749,17 @@ void dockOtaSendChunk() {
   // Seeking every time keeps a retry honest: the chunk resent is always the
   // one the dock asked for, not wherever the file pointer happened to be.
   if (!dockOtaFile.seek((uint32_t)dockOtaSeq * ESPNOW_OTA_CHUNK_BYTES)) {
+    Serial.printf("Dock update: SEEK FAILED at chunk %lu\n", (unsigned long)dockOtaSeq);
     dockOtaFail("Could not seek the dock firmware file.");
     return;
   }
   int got = dockOtaFile.read(frame + sizeof(header), ESPNOW_OTA_CHUNK_BYTES);
-  if (got <= 0) { dockOtaFail("Ran out of dock firmware to send."); return; }
+  if (got <= 0) {
+    Serial.printf("Dock update: READ RETURNED %d at chunk %lu\n", got,
+                  (unsigned long)dockOtaSeq);
+    dockOtaFail("Ran out of dock firmware to send.");
+    return;
+  }
   header.len = (uint16_t)got;
   memcpy(frame, &header, sizeof(header));
   // The return was ignored here, which made a send that never left the remote
@@ -18785,6 +18804,14 @@ void serviceDockOta(unsigned long now) {
     uint8_t status = dockOtaAckStatus;
     uint32_t acked = dockOtaAckedSeq;
     dockOtaRetries = 0;
+    // Logged until the first byte is genuinely through. The dock has proved it
+    // hears the begin and sends its acceptance, and that nothing whatsoever
+    // reaches it afterwards - so what the remote does on receiving that ack is
+    // the last unobserved step in the whole exchange.
+    if (dockOtaSentBytes == 0) {
+      Serial.printf("Dock update: ack seq=%lu status=%u while in state %d\n",
+                    (unsigned long)acked, (unsigned)status, (int)dockOtaState);
+    }
 
     if (status == OTA_ACK_BEGIN_REFUSED) { dockOtaFail("The dock refused the image - it may be too large for its partition."); return; }
     if (status == OTA_ACK_WRITE_FAILED)  { dockOtaFail("The dock could not write the image to flash."); return; }
