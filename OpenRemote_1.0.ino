@@ -1,6 +1,27 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.00 - 2026-09-02
+    - Fixes the dock firmware update. The remote log finally named it: "Dock
+      update: ack seq=0 status=5 while in state 1".
+    - Status 5 is OTA_ACK_STALLED, which the dock has sent since 1.19 when it
+      gives up waiting - and which was never added to this side. The remote
+      therefore did not recognise it, fell past all four error codes it did
+      know, and treated an ABORT as an ACCEPTANCE. It then moved to sending
+      data at a dock that was still erasing its firmware slot, spent its whole
+      retry budget on chunks nobody was listening for, and reported the dock as
+      unresponsive.
+    - Which made it self-perpetuating, and explains why it survived so many
+      attempts: every failure ended with the dock sending status 5, and that
+      abort was still in flight when the next attempt began, so each run primed
+      the next to fail in exactly the same way. Both ends looked correct in
+      isolation the whole time.
+    - Three changes. The status is now defined and handled here. Any status this
+      firmware does not recognise is a failure rather than a silent success -
+      a protocol the two ends disagree about must stop, not guess. And a new
+      transfer discards any ack left over from the last one, since without a
+      transfer id a stale abort is indistinguishable from a fresh reply.
+
   3.99 - 2026-09-02
     - Logs what the remote does with the dock's acceptance ack, and any SD seek
       or read failure in the chunk sender. Diagnostics only, no behaviour
@@ -4642,7 +4663,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.99"
+#define OPENREMOTE_VERSION_STRING "4.00"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -6152,6 +6173,11 @@ static const uint8_t OTA_ACK_BEGIN_REFUSED = 1;
 static const uint8_t OTA_ACK_WRITE_FAILED = 2;
 static const uint8_t OTA_ACK_VERIFY_FAILED = 3;
 static const uint8_t OTA_ACK_COMPLETE = 4;
+// Added to the dock in 1.19 and never mirrored here, which is the bug that
+// broke every dock update since. The dock sends this when it gives up waiting;
+// the remote did not recognise it, fell past all four known error codes, and
+// took an ABORT for an ACCEPTANCE.
+static const uint8_t OTA_ACK_STALLED = 5;
 
 static_assert(sizeof(EspNowOtaBeginPacket) == 20, "OTA begin layout drifted from the dock");
 static_assert(sizeof(EspNowOtaDataHeader) == 10, "OTA data header layout drifted from the dock");
@@ -18694,6 +18720,14 @@ bool dockOtaPrepare(uint8_t deviceIndex, String &error) {
   // radio on for a whole WebConfig session to keep one button working was the
   // wrong way round - it left the ring blue and the dock's LED lit until the
   // remote was reset. Everything else that sends already calls this.
+  // A previous failed transfer ends with the dock sending an abort ack, and
+  // that ack can still be in flight - or already queued here - when the next
+  // attempt starts. Without a transfer id there is no way to tell it from a
+  // fresh reply, so it is discarded at the start of every attempt. This is what
+  // made the failure self-perpetuating: each run's abort corrupted the next.
+  dockOtaAckPending = false;
+  dockOtaAckStatus = OTA_ACK_OK;
+  dockOtaAckedSeq = 0;
   if (!espNowEnabled) { error = "ESP-NOW is switched off. Turn the Dock feature on."; return false; }
   if (!ensureEspNowLink()) { error = "The dock link could not be brought up."; return false; }
 
@@ -18813,6 +18847,22 @@ void serviceDockOta(unsigned long now) {
                     (unsigned long)acked, (unsigned)status, (int)dockOtaState);
     }
 
+    if (status == OTA_ACK_STALLED) {
+      dockOtaFail("The dock gave up waiting for the transfer and stopped. Try again.");
+      return;
+    }
+    // Anything not recognised is a failure, never a silent success. Treating an
+    // unknown code as "carry on" is exactly how a status 5 abort was mistaken
+    // for an acceptance: the remote moved to sending data at a dock that was
+    // still erasing, threw its whole retry budget at it, and reported the dock
+    // as unresponsive - which then made the dock emit another status 5, priming
+    // the next attempt to fail the same way. A protocol the two ends disagree
+    // about must stop, not guess.
+    if (status > OTA_ACK_STALLED) {
+      Serial.printf("Dock update: unknown ack status %u from the dock\n", (unsigned)status);
+      dockOtaFail("The dock replied with something this firmware does not understand.");
+      return;
+    }
     if (status == OTA_ACK_BEGIN_REFUSED) { dockOtaFail("The dock refused the image - it may be too large for its partition."); return; }
     if (status == OTA_ACK_WRITE_FAILED)  { dockOtaFail("The dock could not write the image to flash."); return; }
     if (status == OTA_ACK_VERIFY_FAILED) { dockOtaFail("The dock rejected the image as corrupt."); return; }
