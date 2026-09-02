@@ -1,6 +1,21 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.88 - 2026-09-02
+    - An RF433 command sent through the dock now flashes the pill outline blue,
+      like a dock IR command. It was flashing red, which under the colour rules
+      claims this remote's own emitter fired - the opposite of what happened.
+      Blue outline means the dock is transmitting, whatever it is transmitting.
+    - Fixes RF433 commands being skipped nearly every time they were pressed.
+      sendEspNowCommand() refused outright when the radio was down instead of
+      bringing it up, and under on-demand ESP-NOW the radio is down two seconds
+      after the last use - so the common case was a press that did nothing but
+      print "send skipped, radio not active" to a serial port nobody was
+      watching. The IR relay path has always called ensureEspNowLink(); this
+      one predates the radio being on demand and never caught up. It now brings
+      the link up like everything else, and retries the send, so interference
+      costs a repeat rather than the press.
+
   3.87 - 2026-09-02
     - Puts the Button Test pill back to green. 3.86 recoloured the ESP-NOW
       status blue and took this with it, which was wrong: Button Test is the
@@ -4411,7 +4426,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.87"
+#define OPENREMOTE_VERSION_STRING "3.88"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -12151,8 +12166,13 @@ bool transmitIrCommand(const DeviceCommand &command) {
     return false;
   }
   if (command.kind == DeviceCommand::ESPNOW) {
-    flashCommandFeedback();
-    return sendEspNowCommand(command);
+    // Blue, not red. This command leaves via the dock, and red is reserved for
+    // this remote's own emitter - the outline is what says "the dock is
+    // transmitting", whether that is IR or RF433. Flashed only on a send that
+    // actually went, so the indicator keeps meaning something.
+    bool sent = sendEspNowCommand(command);
+    if (sent) flashEspNowCommandFeedback();
+    return sent;
   }
   // Routing applies to real IR only - a Bluetooth or Homebridge command has
   // nothing a dock could transmit, and those returned above.
@@ -18538,18 +18558,23 @@ bool sendEspNowCommand(const DeviceCommand &command) {
     Serial.println("ESP-NOW: command has no valid paired device");
     return false;
   }
-  if (!espNowRadioActive) {
-    Serial.println("ESP-NOW: send skipped, radio not active");
+  // Brings the radio up rather than refusing when it is down. Under on-demand
+  // ESP-NOW the radio is off almost all of the time - two seconds after the
+  // last use - so a bare "radio not active" check meant an RF433 command was
+  // skipped nearly every time it was pressed, silently and with only a serial
+  // line to say so. The IR relay path has always called this; this one was
+  // written before the radio was on demand and never caught up.
+  if (!ensureEspNowLink()) {
+    Serial.println("ESP-NOW: command dropped, could not bring the link up");
     return false;
   }
   uint8_t payload[ESPNOW_MAX_PAYLOAD_BYTES];
   size_t payloadLen = 0;
   if (!buildEspNowPayload(command, payload, sizeof(payload), payloadLen)) return false;
   const uint8_t *mac = espNowDevices[command.espNowDeviceIndex].mac;
-  esp_err_t result = esp_now_send(mac, payload, payloadLen);
-  if (result != ESP_OK) {
-    Serial.printf("ESP-NOW: send failed (%d) to %s\n", (int)result,
-                  formatMacAddress(mac).c_str());
+  // Retried like every other send: interference costs a repeat, not the press.
+  if (!sendEspNowWithRetry(mac, payload, payloadLen)) {
+    Serial.printf("ESP-NOW: send failed to %s\n", formatMacAddress(mac).c_str());
     return false;
   }
   return true;
