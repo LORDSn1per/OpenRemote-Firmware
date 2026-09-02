@@ -1,6 +1,28 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.95 - 2026-09-02
+    - The keepalive ping now carries the channel the remote is actually on.
+      This is the fix for a dock that pairs, works, and then stops the moment
+      WebConfig is opened.
+    - The cause, finally visible in a dock log taken across a pairing: the
+      remote does not choose its channel. With Wi-Fi off it runs ESP-NOW
+      standalone on the stored channel, and the instant the station associates
+      it moves to whatever the router dictates. Opening WebConfig brings the
+      station up, the remote moves, and the dock - which has no way to see that
+      - stays where it was. Everything then behaves exactly as reported: paired
+      and working, then dead, with a re-pair as the only cure.
+    - It also explains the pairing being wrong to begin with. The dock locked to
+      "channel 7" while the remote was on 8, and earlier to 9, because it
+      records whichever channel it happened to be sweeping when it heard the
+      pair ack - and adjacent 2.4GHz channels overlap so heavily that it can
+      hear the remote from one or two channels away. It was never measuring the
+      remote's channel, only its own position when a frame leaked through.
+    - Stating the channel rather than inferring it fixes both, and needs no
+      sweeping: the same leakage that caused the confusion is enough to deliver
+      the correction. The ping is five bytes now instead of four, and an older
+      dock reads the magic and ignores the rest.
+
   3.94 - 2026-09-02
     - Pings every 500ms instead of every 3 seconds while the dock link is
       unproven, dropping back to 3 seconds the moment it is acknowledged. A
@@ -4550,7 +4572,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.94"
+#define OPENREMOTE_VERSION_STRING "3.95"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -18245,8 +18267,27 @@ void serviceDockLink(unsigned long now) {
   // at half a second it is near certain within one pass. Costs nothing extra:
   // the radio is already up, and this stops the moment the link is proved.
   dockNextPingMs = now + (dockLastAckMs ? 3000UL : 500UL);
-  uint32_t ping = ESPNOW_DOCK_PING_MAGIC;
-  sendEspNowWithRetry(espNowDevices[0].mac, (const uint8_t *)&ping, sizeof(ping));
+  // The ping now states which channel the remote is actually on.
+  //
+  // The remote does not choose its channel: with Wi-Fi off it uses the stored
+  // one, and the moment the station associates it moves to whatever the router
+  // dictates. The dock cannot see that happen, so it sat on the old channel and
+  // the link died - which is exactly why a freshly paired dock worked until
+  // WebConfig was opened and then stopped.
+  //
+  // Saying it in the ping fixes it without any sweeping. Adjacent 2.4GHz
+  // channels overlap heavily, which is what made this hard to see - the dock
+  // hears the odd frame from a channel or two away - but that same leakage is
+  // enough to deliver this correction, and the dock can then move to exactly
+  // the right channel instead of guessing from where it happened to hear us.
+  // Five bytes: an older dock reads the magic and ignores the rest.
+  uint8_t ping[5];
+  uint32_t pingMagic = ESPNOW_DOCK_PING_MAGIC;
+  memcpy(ping, &pingMagic, sizeof(pingMagic));
+  uint8_t primary = 0;
+  wifi_second_chan_t second;
+  ping[4] = (esp_wifi_get_channel(&primary, &second) == ESP_OK && primary) ? primary : 0;
+  sendEspNowWithRetry(espNowDevices[0].mac, ping, sizeof(ping));
   // Only meaningful while the radio is actually up and pinging.
   if (dockLinkOnline && (now - dockLastAckMs) > 20000UL) {
     dockLinkOnline = false;
