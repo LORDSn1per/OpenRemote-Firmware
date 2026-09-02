@@ -1,6 +1,22 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.01 - 2026-09-02
+    - Fixes the ring staying blue and the dock's LED staying lit indefinitely
+      after WebConfig is closed. Removing the QR page hold in 3.98 was not
+      enough because this is a different fault, and the link log said so
+      plainly: "active=yes ... holdMsLeft=-8002". The hold had expired eight
+      seconds earlier and nothing was allowed to act on it.
+    - Four sites tested dockOtaState != DOCK_OTA_IDLE to mean "a transfer is
+      running". DONE and FAILED are terminal states, not running ones, and
+      dockOtaFail() leaves DOCK_OTA_FAILED set until the next attempt - so after
+      any failed dock update the radio could never be released and the keepalive
+      pings never stopped. Every dock update failure left the link pinned on
+      permanently, which is why this appeared exactly when it did.
+    - They now use dockOtaBusy(), true only for BEGIN, DATA and END. A running
+      transfer still holds the radio for as long as it runs, which is the case
+      the guard was written for.
+
   4.00 - 2026-09-02
     - Fixes the dock firmware update. The remote log finally named it: "Dock
       update: ack seq=0 status=5 while in state 1".
@@ -4663,7 +4679,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.00"
+#define OPENREMOTE_VERSION_STRING "4.01"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -6767,6 +6783,7 @@ void clearEspNowCommandFeedback();
 void flashEspNowCommandFeedback();
 void applyEspNowPulse(bool bright);
 void serviceEspNowCommandFeedback(unsigned long now);
+bool dockOtaBusy();
 bool espNowDockRadioRequired();
 void applyCommandFeedbackStyle(bool active);
 void serviceDockOta(unsigned long now);
@@ -8660,8 +8677,23 @@ bool webConfigQrPageActive() {
 // radio up on demand instead, which is what this was standing in for. Kept
 // only for an in-flight firmware transfer, which genuinely cannot survive the
 // radio going away underneath it.
+// True only while a transfer is genuinely running.
+//
+// DONE and FAILED are terminal states, not running ones, and every site that
+// tested "!= DOCK_OTA_IDLE" was treating them as a transfer still in progress.
+// dockOtaFail() leaves DOCK_OTA_FAILED set until the next attempt, so after any
+// failed dock update the radio could never be released, the pings never
+// stopped, and the ring stayed blue and the dock's LED lit indefinitely - long
+// after WebConfig had been closed. The hold had expired; nothing was allowed to
+// act on it. holdMsLeft going steadily negative with active=yes in the link log
+// is exactly that.
+bool dockOtaBusy() {
+  return dockOtaState == DOCK_OTA_BEGIN || dockOtaState == DOCK_OTA_DATA ||
+         dockOtaState == DOCK_OTA_END;
+}
+
 bool espNowDockRadioRequired() {
-  return dockOtaState != DOCK_OTA_IDLE;
+  return dockOtaBusy();
 }
 
 void scheduleNetworkShutdown(uint32_t delayMs = NETWORK_IDLE_SHUTDOWN_MS) {
@@ -18012,7 +18044,7 @@ void onEspNowDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int 
     }
   }
 
-  if (dockOtaState != DOCK_OTA_IDLE && (size_t)len >= sizeof(EspNowOtaAckPacket) &&
+  if (dockOtaBusy() && (size_t)len >= sizeof(EspNowOtaAckPacket) &&
       dockOtaDeviceIndex < espNowDeviceCount &&
       memcmp(espNowDevices[dockOtaDeviceIndex].mac, info->src_addr, 6) == 0) {
     EspNowOtaAckPacket ack;
@@ -18345,7 +18377,7 @@ void serviceDockLink(unsigned long now) {
   // dockLinkOnline by then, because a dock that can no longer hear us has put
   // its LED out and the pill has to say the same thing.
   if (!espNowRadioActive) return;
-  if (dockOtaState != DOCK_OTA_IDLE) return;  // The transfer is its own proof.
+  if (dockOtaBusy()) return;  // A running transfer is its own proof.
   if ((int32_t)(now - dockNextPingMs) < 0) return;
   // Every 3 seconds, and retried like any other send. The dock puts its LED
   // out after 9 seconds of hearing nothing, so at the old fire-and-forget
@@ -18437,7 +18469,7 @@ void releaseEspNowLink(const char *reason) {
   // indefinitely once a WebConfig visit had brought ESP-NOW up, and why a
   // firmware upload during that same visit never got the memory back either.
   if (!espNowRadioActive) return;
-  if (espNowScanActive || rfLearnActive || dockOtaState != DOCK_OTA_IDLE) return;
+  if (espNowScanActive || rfLearnActive || dockOtaBusy()) return;
   if (espNowDeviceCount > 0) {
     // Retried, not fired blindly. This one packet is what puts the dock's LED
     // out at the same instant the pill goes white; if it is lost the dock
@@ -18503,7 +18535,7 @@ void serviceEspNow(unsigned long now) {
   // the station, so this cannot disturb a station the remote needs for
   // something else.
   if (espNowRadioActive && !holding && !espNowScanActive && !rfLearnActive &&
-      dockOtaState == DOCK_OTA_IDLE) {
+      !dockOtaBusy()) {
     releaseEspNowLink("hold expired");
   }
   if (espNowScanActive && now - espNowScanStartedMs >= ESPNOW_SCAN_TIMEOUT_MS) {
