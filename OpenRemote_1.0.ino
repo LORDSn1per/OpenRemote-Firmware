@@ -1,6 +1,23 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.97 - 2026-09-02
+    - Removes the WebConfig session hold added in 3.93. It kept the ring blue
+      and the dock's LED lit indefinitely after a command, which is not what
+      was wanted: a WebConfig page left open in a browser polls for status, so
+      every poll refreshed the session and the radio never dropped at all.
+      Asking for the link to stay up "while WebConfig is open" turned into
+      "for as long as a tab exists somewhere", which is a different thing.
+    - The two second on-demand hold is back in charge, so after a command the
+      ring stays blue for two seconds and then goes white as the radio is
+      released - which also sends the link-down packet, putting the dock's LED
+      out at the same moment. The roughly ten seconds the LED was staying lit
+      was the dock's own nine second idle timeout, reached because with the
+      radio never released no link-down packet was ever sent.
+    - The QR page hold is unchanged, and the power save fix from 3.93 stays:
+      re-asserting WIFI_PS_NONE while the radio is up was a genuine bug fix and
+      has nothing to do with how long the link is held.
+
   3.96 - 2026-09-02
     - The dock firmware chunk drops from 240 bytes to 160. This is the answer to
       the dock update failing, and 3.95's channel fix is what finally made it
@@ -4593,7 +4610,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.96"
+#define OPENREMOTE_VERSION_STRING "3.97"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -5846,18 +5863,7 @@ bool dnsServerStarted = false;
 bool networkStackActive = false;
 bool setupApActive = false;
 volatile bool webConfigTransferActive = false;
-// When WebConfig last asked the remote for anything. The QR page being on the
-// LCD is not the same thing as WebConfig being in use: the page is how you
-// reach it, but the browsing happens on a laptop and the remote's screen is
-// free to move on or go dark meanwhile. Holding the dock link on the LCD page
-// alone therefore dropped it exactly when WebConfig was busiest.
-unsigned long webConfigLastRequestMs = 0;
-static const uint32_t WEBCONFIG_SESSION_MS = 60000;
 
-bool webConfigSessionActive() {
-  return webConfigLastRequestMs &&
-         (millis() - webConfigLastRequestMs) < WEBCONFIG_SESSION_MS;
-}
 volatile bool webConfigTransferCancelRequested = false;
 bool bleReady = false;
 bool bleShutdownInProgress = false;
@@ -10612,9 +10618,6 @@ bool requestAuthorized() {
 }
 
 void sendJson(int status, const String &body) {
-  // Every API reply passes through here, so this is the one place that sees
-  // all WebConfig traffic regardless of which handler served it.
-  webConfigLastRequestMs = millis();
   webServer.sendHeader("Cache-Control", "no-store");
   webServer.send(status, "application/json", body);
 }
@@ -18376,14 +18379,7 @@ void releaseEspNowLink(const char *reason, bool forceEvenOnQrPage) {
   // indefinitely once a WebConfig visit had brought ESP-NOW up, and why a
   // firmware upload during that same visit never got the memory back either.
   if (!espNowRadioActive) return;
-  // WebConfig in use is as strong a claim on the link as a transfer is: every
-  // dock control it offers needs the link, and the user has asked for the ring
-  // and the dock's LED to stay lit for as long as WebConfig is open. Grouped
-  // with the transfers deliberately, so even display sleep cannot take it -
-  // the screen going dark says nothing about whether a browser elsewhere is
-  // still using the remote.
-  if (espNowScanActive || rfLearnActive || dockOtaState != DOCK_OTA_IDLE ||
-      webConfigSessionActive()) return;
+  if (espNowScanActive || rfLearnActive || dockOtaState != DOCK_OTA_IDLE) return;
   // WebConfig is open and being looked at, and everything it offers for a dock
   // - the firmware push, the settings, the status row - needs the link. Letting
   // it lapse under the user's hands would make those fail for no reason they
@@ -18411,9 +18407,7 @@ void serviceEspNow(unsigned long now) {
   // runs whether or not the radio is currently up - serviceDockLink(), where
   // this refresh used to live, returns early while the radio is down and so
   // could never bring it back for the QR page.
-  if (webConfigQrPageActive() || webConfigSessionActive()) {
-    espNowHoldUntilMs = now + ESPNOW_ONDEMAND_HOLD_MS;
-  }
+  if (webConfigQrPageActive()) espNowHoldUntilMs = now + ESPNOW_ONDEMAND_HOLD_MS;
 
   // Power save re-asserted while the radio is up, not just once at start-up.
   // esp_wifi_set_ps(WIFI_PS_NONE) is applied in startEspNow(), but the station
