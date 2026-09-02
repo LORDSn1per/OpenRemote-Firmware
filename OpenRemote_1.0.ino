@@ -1,6 +1,21 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.94 - 2026-09-02
+    - Pings every 500ms instead of every 3 seconds while the dock link is
+      unproven, dropping back to 3 seconds the moment it is acknowledged. A
+      dock that has lost the channel sweeps the band looking for the remote,
+      and it can only find one that transmits while it happens to be sitting on
+      the right channel. At a three second ping the two coincide roughly once
+      every two minutes; at half a second it is near certain within a single
+      sweep. It costs nothing extra - the radio is already up whenever this
+      runs - and it stops as soon as the link is proved.
+    - Worth recording plainly: a white ring is now a diagnosis, not a display
+      bug. Since 3.91 the ring only goes blue on a genuine acknowledgement, so
+      white with the QR page open means the remote truly cannot reach the dock.
+      The dock's LED being dark at the same time says the same thing from the
+      other end. Both were telling the truth.
+
   3.93 - 2026-09-02
     - Wi-Fi power save is re-asserted every second while the ESP-NOW radio is
       up, instead of once when it starts. This is very likely the dock update
@@ -4535,7 +4550,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.93"
+#define OPENREMOTE_VERSION_STRING "3.94"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -18222,7 +18237,14 @@ void serviceDockLink(unsigned long now) {
   // is why the dock's LED went dark while the QR page was still being shown
   // and the radio was still perfectly alive. Three seconds with retries means
   // the LED now follows the link rather than the local interference.
-  dockNextPingMs = now + 3000UL;
+  // Faster while the link is unproven. dockLastAckMs is zero until something
+  // has actually been acknowledged in this radio session, which is exactly the
+  // state where the dock may be sweeping the band looking for us - and it can
+  // only find us on a channel it happens to be sitting on when we transmit.
+  // At three seconds a sweeping dock can take minutes to coincide with a ping;
+  // at half a second it is near certain within one pass. Costs nothing extra:
+  // the radio is already up, and this stops the moment the link is proved.
+  dockNextPingMs = now + (dockLastAckMs ? 3000UL : 500UL);
   uint32_t ping = ESPNOW_DOCK_PING_MAGIC;
   sendEspNowWithRetry(espNowDevices[0].mac, (const uint8_t *)&ping, sizeof(ping));
   // Only meaningful while the radio is actually up and pinging.
