@@ -1,6 +1,25 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.98 - 2026-09-02
+    - The two second release now applies everywhere, including after WebConfig.
+      Resetting the remote restored it, which was the clue: a reset leaves the
+      Wi-Fi QR page, and it was that page - still on screen after a WebConfig
+      session - refreshing the hold on every pass and blocking the release
+      outright. The link stayed up, so the ring stayed blue and the dock's LED
+      stayed lit, until the remote was reset.
+    - The hold existed so that Send to Dock would find the radio already
+      running. Holding the radio on for an entire WebConfig session to keep one
+      button working was the wrong way round: dockOtaPrepare() now calls
+      ensureEspNowLink() and brings the link up itself, exactly as every other
+      sender in the firmware already does. The QR page hold and its release
+      guard are both gone, and releaseEspNowLink() no longer needs its
+      force-past-the-QR-page argument.
+    - Behaviour is now uniform: the radio comes up when something actually needs
+      it and goes two seconds after the last use, whatever page the remote
+      happens to be showing. A transfer, a pairing scan or an RF capture still
+      holds it for as long as it runs.
+
   3.97 - 2026-09-02
     - Removes the WebConfig session hold added in 3.93. It kept the ring blue
       and the dock's LED lit indefinitely after a command, which is not what
@@ -4610,7 +4629,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.97"
+#define OPENREMOTE_VERSION_STRING "3.98"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -6700,7 +6719,7 @@ void serviceDockLink(unsigned long now);
 void serviceDockPairAck(unsigned long now);
 bool ensureEspNowLink();
 bool sendEspNowWithRetry(const uint8_t mac[6], const uint8_t *payload, size_t len);
-void releaseEspNowLink(const char *reason, bool forceEvenOnQrPage = false);
+void releaseEspNowLink(const char *reason);
 void refreshDockLinkIndicator();
 void applyDockLinkPillColour();
 bool remoteHasActiveTarget();
@@ -15892,7 +15911,7 @@ void handleChunkUploadBegin() {
   // to spare. Releasing it here hands that memory back before the transfer
   // starts; the dock reconnects on demand the next time it is actually needed,
   // which is the whole point of on-demand ESP-NOW.
-  releaseEspNowLink("chunked upload starting", true);
+  releaseEspNowLink("chunked upload starting");
   SD.remove(path);
   chunkUploadTarget = target;
   chunkUploadTempPath = path;
@@ -18366,7 +18385,7 @@ void stopEspNow() {
 //
 // Refuses while a transfer, scan or learn is running - those own the radio and
 // losing it mid-way would abandon real work.
-void releaseEspNowLink(const char *reason, bool forceEvenOnQrPage) {
+void releaseEspNowLink(const char *reason) {
   // espNowRadioActive is what actually costs memory and battery - the ESP-NOW
   // protocol stack's own peer table and buffers - whether this session brought
   // its own radio up (espNowStandalone) or rode a Wi-Fi station that was
@@ -18380,12 +18399,6 @@ void releaseEspNowLink(const char *reason, bool forceEvenOnQrPage) {
   // firmware upload during that same visit never got the memory back either.
   if (!espNowRadioActive) return;
   if (espNowScanActive || rfLearnActive || dockOtaState != DOCK_OTA_IDLE) return;
-  // WebConfig is open and being looked at, and everything it offers for a dock
-  // - the firmware push, the settings, the status row - needs the link. Letting
-  // it lapse under the user's hands would make those fail for no reason they
-  // could see. Overridable: a caller with a stronger reason - the display going
-  // dark, or a large upload that needs the memory now - can force through this.
-  if (webConfigQrPageActive() && !forceEvenOnQrPage) return;
   if (espNowDeviceCount > 0) {
     // Retried, not fired blindly. This one packet is what puts the dock's LED
     // out at the same instant the pill goes white; if it is lost the dock
@@ -18407,7 +18420,6 @@ void serviceEspNow(unsigned long now) {
   // runs whether or not the radio is currently up - serviceDockLink(), where
   // this refresh used to live, returns early while the radio is down and so
   // could never bring it back for the QR page.
-  if (webConfigQrPageActive()) espNowHoldUntilMs = now + ESPNOW_ONDEMAND_HOLD_MS;
 
   // Power save re-asserted while the radio is up, not just once at start-up.
   // esp_wifi_set_ps(WIFI_PS_NONE) is applied in startEspNow(), but the station
@@ -18664,7 +18676,13 @@ bool dockOtaPrepare(uint8_t deviceIndex, String &error) {
     return false;
   }
   if (deviceIndex >= espNowDeviceCount) { error = "That dock is not paired."; return false; }
-  if (!espNowRadioActive) { error = "ESP-NOW is not running. Turn the Dock feature on."; return false; }
+  // Brings the link up rather than demanding it already be up. That
+  // requirement is what the QR page hold existed to satisfy, and holding the
+  // radio on for a whole WebConfig session to keep one button working was the
+  // wrong way round - it left the ring blue and the dock's LED lit until the
+  // remote was reset. Everything else that sends already calls this.
+  if (!espNowEnabled) { error = "ESP-NOW is switched off. Turn the Dock feature on."; return false; }
+  if (!ensureEspNowLink()) { error = "The dock link could not be brought up."; return false; }
 
   File file = SD.open(DOCK_FIRMWARE_PATH, FILE_READ);
   if (!file) { error = "The stored dock firmware could not be opened."; return false; }
@@ -25937,7 +25955,7 @@ void enterDisplaySleep() {
   // Released here rather than left to time out, so turning the remote face
   // down puts the dock's LED out at the same moment as the LCD instead of
   // seven seconds later.
-  releaseEspNowLink("display sleep", true);
+  releaseEspNowLink("display sleep");
   if (runtimeSettingsSavePending) {
     runtimeSettingsSavePending = !persistSettingsToRuntimeConfig();
     if (runtimeSettingsSavePending) runtimeSettingsSaveAtMs = millis() + 1000UL;
