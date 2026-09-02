@@ -1,6 +1,28 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.93 - 2026-09-02
+    - Wi-Fi power save is re-asserted every second while the ESP-NOW radio is
+      up, instead of once when it starts. This is very likely the dock update
+      failure. WIFI_PS_NONE is applied in startEspNow(), but the station
+      re-associating puts the Arduino default WIFI_PS_MIN_MODEM back, and a
+      station in modem sleep parks its radio between beacons. Transmitting is
+      unaffected - which is why commands went out and were MAC-acked normally -
+      but anything the dock sent BACK during a nap was simply gone: the OTA
+      acceptance ack, the data acks, an RF capture result. From the sending
+      side it looks exactly like a dock that has stopped answering, which is
+      what it was reported as.
+    - The dock link is now held for the whole WebConfig session rather than
+      only while the LCD happens to be showing the QR page. The page is how you
+      reach WebConfig; the browsing happens on a laptop, and the remote's screen
+      is free to move on or go dark meanwhile - so the link was being dropped
+      exactly when WebConfig was busiest. Any API reply refreshes the session,
+      and it lasts a minute past the last one.
+    - A live WebConfig session now also outranks display sleep, alongside the
+      transfers. The screen going dark says nothing about whether a browser
+      elsewhere is still using the remote, so the ring and the dock's LED stay
+      lit for as long as WebConfig is open, which is what was asked for.
+
   3.92 - 2026-09-02
     - The dock update's data chunks ignored esp_now_send()'s return value, so a
       send that never left the remote looked exactly like one the dock had
@@ -4513,7 +4535,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.92"
+#define OPENREMOTE_VERSION_STRING "3.93"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -5489,7 +5511,8 @@ char dockReportedVersion[9] = {0};
 // Two seconds, down from seven. The dock proved fast enough to wake that the
 // long hold was buying nothing but idle radio time.
 static const uint32_t ESPNOW_ONDEMAND_HOLD_MS = 2000;
-bool espNowStandalone = false;      // We brought the radio up ourselves.
+bool espNowStandalone = false;
+unsigned long lastEspNowPsAssertMs = 0;      // We brought the radio up ourselves.
 uint8_t espNowChannel = 0;          // 0 = not yet known.
 unsigned long espNowHoldUntilMs = 0;
 uint32_t espNowLastBringUpMs = 0;   // Measured, so the cost is known not guessed.
@@ -5765,6 +5788,18 @@ bool dnsServerStarted = false;
 bool networkStackActive = false;
 bool setupApActive = false;
 volatile bool webConfigTransferActive = false;
+// When WebConfig last asked the remote for anything. The QR page being on the
+// LCD is not the same thing as WebConfig being in use: the page is how you
+// reach it, but the browsing happens on a laptop and the remote's screen is
+// free to move on or go dark meanwhile. Holding the dock link on the LCD page
+// alone therefore dropped it exactly when WebConfig was busiest.
+unsigned long webConfigLastRequestMs = 0;
+static const uint32_t WEBCONFIG_SESSION_MS = 60000;
+
+bool webConfigSessionActive() {
+  return webConfigLastRequestMs &&
+         (millis() - webConfigLastRequestMs) < WEBCONFIG_SESSION_MS;
+}
 volatile bool webConfigTransferCancelRequested = false;
 bool bleReady = false;
 bool bleShutdownInProgress = false;
@@ -10507,6 +10542,9 @@ bool requestAuthorized() {
 }
 
 void sendJson(int status, const String &body) {
+  // Every API reply passes through here, so this is the one place that sees
+  // all WebConfig traffic regardless of which handler served it.
+  webConfigLastRequestMs = millis();
   webServer.sendHeader("Cache-Control", "no-store");
   webServer.send(status, "application/json", body);
 }
@@ -18242,7 +18280,14 @@ void releaseEspNowLink(const char *reason, bool forceEvenOnQrPage) {
   // indefinitely once a WebConfig visit had brought ESP-NOW up, and why a
   // firmware upload during that same visit never got the memory back either.
   if (!espNowRadioActive) return;
-  if (espNowScanActive || rfLearnActive || dockOtaState != DOCK_OTA_IDLE) return;
+  // WebConfig in use is as strong a claim on the link as a transfer is: every
+  // dock control it offers needs the link, and the user has asked for the ring
+  // and the dock's LED to stay lit for as long as WebConfig is open. Grouped
+  // with the transfers deliberately, so even display sleep cannot take it -
+  // the screen going dark says nothing about whether a browser elsewhere is
+  // still using the remote.
+  if (espNowScanActive || rfLearnActive || dockOtaState != DOCK_OTA_IDLE ||
+      webConfigSessionActive()) return;
   // WebConfig is open and being looked at, and everything it offers for a dock
   // - the firmware push, the settings, the status row - needs the link. Letting
   // it lapse under the user's hands would make those fail for no reason they
@@ -18270,7 +18315,22 @@ void serviceEspNow(unsigned long now) {
   // runs whether or not the radio is currently up - serviceDockLink(), where
   // this refresh used to live, returns early while the radio is down and so
   // could never bring it back for the QR page.
-  if (webConfigQrPageActive()) espNowHoldUntilMs = now + ESPNOW_ONDEMAND_HOLD_MS;
+  if (webConfigQrPageActive() || webConfigSessionActive()) {
+    espNowHoldUntilMs = now + ESPNOW_ONDEMAND_HOLD_MS;
+  }
+
+  // Power save re-asserted while the radio is up, not just once at start-up.
+  // esp_wifi_set_ps(WIFI_PS_NONE) is applied in startEspNow(), but the station
+  // re-associating puts the Arduino default WIFI_PS_MIN_MODEM back - and a
+  // station in modem sleep parks its radio between beacons. Transmitting still
+  // works, which is why commands go out and get MAC-acked, but anything the
+  // dock sends BACK during a nap is simply gone: the OTA acceptance ack, the
+  // data acks, the RF capture result. That is the "something is sleeping" and
+  // it is invisible from the sending side.
+  if (espNowRadioActive && (now - lastEspNowPsAssertMs) > 1000UL) {
+    lastEspNowPsAssertMs = now;
+    esp_wifi_set_ps(WIFI_PS_NONE);
+  }
   bool holding = (int32_t)(now - espNowHoldUntilMs) < 0;
   bool shouldBeActive = espNowEnabled && networkStackActive && !setupApActive &&
                         WiFi.getMode() != WIFI_OFF;
