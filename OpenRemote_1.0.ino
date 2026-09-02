@@ -1,6 +1,24 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.89 - 2026-09-02
+    - Fixes the blue ring never appearing. In "Remote and dock" both emitters
+      genuinely fire, and both feedback styles were writing the same border
+      microseconds apart: the dock's blue went on first and the remote's red
+      straight over the top of it, every press, so blue was never on screen
+      long enough to see. 3.77 removed the guard that used to prevent this, on
+      the grounds that suppressing red in BOTH mode hid something true - which
+      it did, but the fix was aimed at the wrong half. Red now takes the fill
+      and leaves the outline alone while a dock send is in flight, so BOTH
+      mode shows a red fill inside a blue ring: both true at once, which is
+      exactly what is happening.
+    - Fixes held repeats being dropped. flashCommandFeedback() called
+      lv_refr_now() on every call rather than only when the pill actually
+      changed - a synchronous full-screen redraw, tens of milliseconds, on
+      every repeat of a held button, repainting a pill that already looked the
+      way it was about to be painted. Against the 210ms dock pace that was a
+      large part of the budget spent on nothing.
+
   3.88 - 2026-09-02
     - An RF433 command sent through the dock now flashes the pill outline blue,
       like a dock IR command. It was flashing red, which under the colour rules
@@ -4426,7 +4444,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.88"
+#define OPENREMOTE_VERSION_STRING "3.89"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -11630,6 +11648,14 @@ void applyCommandFeedbackStyle(bool active) {
   if (statusPill && lv_obj_is_valid(statusPill)) {
     lv_obj_set_style_bg_color(statusPill, active ? lv_color_hex(0x5A0000) : lv_color_black(), 0);
     lv_obj_set_style_bg_opa(statusPill, active ? LV_OPA_COVER : (lv_opa_t)115, 0);
+    // The outline belongs to the dock whenever the dock is transmitting, so
+    // red takes the fill and leaves the border alone. In "Remote and dock"
+    // both emitters genuinely fire, and both were writing this same border
+    // microseconds apart - blue first, red immediately over the top - which is
+    // why the blue ring never appeared at all. Fill says "this remote is
+    // transmitting", outline says "the dock is transmitting", and BOTH mode
+    // now shows a red fill inside a blue ring: both true at once.
+    if (!espNowCommandFeedbackActive)
     lv_obj_set_style_border_color(statusPill, active ? red : idle, 0);
     // Left over from before pillIdleColour() moved to dockConnected() in 3.77 -
     // this still checked dockRadioLit() (radio merely powered, not confirmed),
@@ -11638,12 +11664,13 @@ void applyCommandFeedbackStyle(bool active) {
     // read as "a thick white line" even though the border width never changed.
     // Colour and opacity now come from the same signal, so they can never
     // disagree again.
+    if (!espNowCommandFeedbackActive)
     lv_obj_set_style_border_opa(statusPill, (active || dockConnected()) ? LV_OPA_COVER : (lv_opa_t)64, 0);
   }
   if (clockLabel && lv_obj_is_valid(clockLabel)) {
     lv_obj_set_style_text_color(clockLabel, active ? red : lv_color_white(), 0);
   }
-  if (statusBattery && lv_obj_is_valid(statusBattery)) {
+  if (statusBattery && lv_obj_is_valid(statusBattery) && !espNowCommandFeedbackActive) {
     lv_obj_set_style_border_color(statusBattery, active ? red : idle, 0);
   }
   if (batteryFill && lv_obj_is_valid(batteryFill)) {
@@ -11659,8 +11686,15 @@ void flashCommandFeedback() {
   if (!commandFeedbackActive) {
     commandFeedbackActive = true;
     applyCommandFeedbackStyle(true);
+    // Inside the state change, not outside it. lv_refr_now() is a synchronous
+    // full-screen redraw costing tens of milliseconds, and this ran on EVERY
+    // call - so a held volume repeat paid for a complete repaint on every
+    // press even though the pill already looked exactly as it was about to be
+    // painted. Against the 210ms dock pace that is a large slice of the budget
+    // spent redrawing nothing, and it is why held repeats were dropped. The
+    // redraw still happens the moment the pill actually changes.
+    lv_refr_now(nullptr);
   }
-  lv_refr_now(nullptr);
 }
 
 void serviceCommandFeedback(unsigned long now) {
