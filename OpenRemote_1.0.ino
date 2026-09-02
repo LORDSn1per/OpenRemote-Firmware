@@ -1,6 +1,27 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  3.96 - 2026-09-02
+    - The dock firmware chunk drops from 240 bytes to 160. This is the answer to
+      the dock update failing, and 3.95's channel fix is what finally made it
+      visible: with the dock provably on the same channel, linkUp yes and
+      commands working, the begin frame still arrived and not one data chunk
+      ever did.
+    - 240 plus the 10 byte header is exactly 250 - ESP_NOW_MAX_DATA_LEN, the
+      very top of what ESP-NOW carries. At that size the frame was acknowledged
+      by the receiving RADIO and then discarded by the receiving ESP-NOW STACK
+      before any callback ran. sendEspNowWithRetry() saw a successful MAC ack
+      and reported the chunk sent, so from this end it looked like a perfect
+      send into silence - which is exactly why it survived so many rounds of
+      looking somewhere else.
+    - The size was measured on this link, not guessed. A 5 byte ping, a 9 byte
+      ack, a 20 byte OTA begin and a 179 byte raw IR command all cross reliably;
+      only the 250 byte chunk never arrived. 160 + 10 = 170 sits inside
+      everything proven to work, with margin.
+    - It costs about 35% more chunks - 6491 instead of 4327 - on a transfer that
+      happens rarely. A slower update that finishes beats a faster one that
+      cannot start.
+
   3.95 - 2026-09-02
     - The keepalive ping now carries the channel the remote is actually on.
       This is the fix for a dock that pairs, works, and then stops the moment
@@ -4572,7 +4593,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "3.95"
+#define OPENREMOTE_VERSION_STRING "3.96"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -6050,7 +6071,19 @@ static const uint32_t ESPNOW_OTA_END_MAGIC   = 0x4F524F45UL;  // "OROE"
 static const uint32_t ESPNOW_OTA_ACK_MAGIC   = 0x4F524F41UL;  // "OROA"
 
 // 4 magic + 4 seq + 2 len + 240 payload is exactly ESP-NOW's 250 byte ceiling.
-static const uint16_t ESPNOW_OTA_CHUNK_BYTES = 240;
+// 160, not 240. A 240 byte chunk plus its 10 byte header is exactly 250, which
+// is ESP_NOW_MAX_DATA_LEN - the very top of what ESP-NOW will carry - and at
+// that size the frame was being acknowledged by the receiving radio and then
+// discarded by the receiving ESP-NOW stack before any callback ran. From the
+// sending side it looked like a perfect send into silence, which is why it
+// survived so many rounds of looking elsewhere.
+//
+// Measured on this link rather than guessed: a 5 byte ping, a 9 byte ack, a 20
+// byte OTA begin and a 179 byte raw IR command all cross reliably, and only the
+// 250 byte chunk never arrived. 160 + 10 = 170 sits inside everything proven to
+// work. It costs about 35% more chunks on a transfer that happens rarely, which
+// is a trade worth making for one that completes.
+static const uint16_t ESPNOW_OTA_CHUNK_BYTES = 160;
 
 struct __attribute__((packed)) EspNowOtaBeginPacket {
   uint32_t magic;
@@ -6086,7 +6119,7 @@ static_assert(sizeof(EspNowOtaBeginPacket) == 20, "OTA begin layout drifted from
 static_assert(sizeof(EspNowOtaDataHeader) == 10, "OTA data header layout drifted from the dock");
 static_assert(sizeof(EspNowOtaEndPacket) == 8, "OTA end layout drifted from the dock");
 static_assert(sizeof(EspNowOtaAckPacket) == 9, "OTA ack layout drifted from the dock");
-static_assert(sizeof(EspNowOtaDataHeader) + ESPNOW_OTA_CHUNK_BYTES == 250,
+static_assert(sizeof(EspNowOtaDataHeader) + ESPNOW_OTA_CHUNK_BYTES == 170,
               "OTA data frame must exactly fill the ESP-NOW payload");
 
 static const char DOCK_FIRMWARE_PATH[] = "/dock/firmware.bin";
