@@ -1,0 +1,1 @@
+Themes explicitly added to the Default library are stored in this folder.

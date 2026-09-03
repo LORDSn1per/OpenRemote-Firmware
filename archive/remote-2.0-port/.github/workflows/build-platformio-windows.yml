@@ -1,0 +1,75 @@
+name: Windows build
+
+on: [push,workflow_dispatch,pull_request]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { sys: xtensa }
+          - { sys: mingw64, env: x86_64 }
+          - { sys: mingw32, env: i686 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.platformio/.cache
+          key: ${{ runner.os }}-pio
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install MSYS2 MINGW64/32 and SDL2
+        if: ${{matrix.sys != 'xtensa'}}
+        uses: msys2/setup-msys2@v2
+        with:
+          update: true
+          msystem: ${{matrix.sys}}
+          install: >-
+            mingw-w64-${{matrix.env}}-gcc
+            mingw-w64-${{matrix.env}}-SDL2
+            ${{ matrix.sys == 'mingw64' && format('mingw-w64-{0}-SDL2_image', matrix.env) || '' }}
+      - name: Install MSYS2 MINGW32 SDL2_image
+        if: ${{matrix.sys == 'mingw32'}}
+        shell: msys2 {0}
+        run: |
+          pacman --noconfirm -U https://repo.msys2.org/mingw/mingw32/mingw-w64-i686-SDL2_image-2.8.8-1-any.pkg.tar.zst
+      - name: Add paths mingw64
+        if: ${{matrix.sys == 'mingw64'}}
+        run: |
+          echo "${{runner.temp}}\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          echo "${{runner.temp}}\msys64\usr\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Add paths mingw32
+        if: ${{matrix.sys == 'mingw32'}}
+        run: |
+          echo "${{runner.temp}}\msys64\mingw32\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          echo "${{runner.temp}}\msys64\usr\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Install PlatformIO Core
+        run: pip install --upgrade platformio
+
+      - name: Build PlatformIO env:ESP32-Rev1toRev4
+        run: pio run -e esp32-Rev1toRev4
+
+      - name: Build PlatformIO env:ESP32_testboard-Rev1toRev4
+        run: pio run -e esp32_testboard-Rev1toRev4
+
+      - name: Build PlatformIO env:ESP32-S3-Rev5andHigher
+        run: pio run -e esp32-s3-Rev5andHigher
+
+      - name: Build PlatformIO env:ESP32-S3_testboard-Rev5andHigher
+        run: pio run -e esp32-s3_testboard-Rev5andHigher
+
+      - name: Build PlatformIO env:windows_64bit
+        if: ${{matrix.sys == 'mingw64'}}
+        run: pio run -e windows_64bit
+
+      - name: Build PlatformIO env:windows_32bit
+        if: ${{matrix.sys == 'mingw32'}}
+        run: pio run -e windows_32bit

@@ -1,0 +1,1 @@
+This folder stores activity exports created by OpenRemote.

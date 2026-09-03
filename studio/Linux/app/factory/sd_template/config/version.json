@@ -1,0 +1,7 @@
+{
+  "firmware": "2.03",
+  "webConfig": "2.04",
+  "schema": 1,
+  "hardware": "OMOTE Rev 5",
+  "irdbMode": "studio-usb"
+}

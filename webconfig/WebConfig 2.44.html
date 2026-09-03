@@ -329,17 +329,18 @@
 .tvRemoteRow{display:flex;gap:6px}
 .tvRemoteRow span{width:12px;height:12px;border-radius:50%;background:#242b33;box-shadow:inset 0 1px 0 rgba(255,255,255,.08)}
 .sourceGarageFob{position:relative;width:56px;height:96px;margin:0 auto;border-radius:16px;background:linear-gradient(165deg,#32393f,#131619 75%);border:1px solid rgba(255,255,255,.14);box-shadow:0 14px 26px rgba(0,0,0,.3);padding:14px 8px 10px;display:flex;flex-direction:column;align-items:center;gap:7px}
-.garageFobAntenna{position:absolute;top:-16px;left:50%;width:2px;height:16px;background:linear-gradient(180deg,rgba(255,214,10,.75),rgba(255,214,10,0));transform:translateX(-50%)}
-.garageFobLed{width:7px;height:7px;border-radius:50%;background:#ffd60a;box-shadow:0 0 8px rgba(255,214,10,.8)}
-.garageFobBtn{width:32px;height:16px;border-radius:8px;background:linear-gradient(180deg,#333b44,#1c2128);box-shadow:inset 0 1px 0 rgba(255,255,255,.1),0 2px 4px rgba(0,0,0,.3)}
+.garageFobAntenna{position:relative;z-index:1;top:-16px;left:50%;width:2px;height:16px;background:linear-gradient(180deg,rgba(255,214,10,.75),rgba(255,214,10,0));transform:translateX(-50%)}
+.garageFobLed{position:relative;z-index:1;width:7px;height:7px;border-radius:50%;background:#ffd60a;box-shadow:0 0 8px rgba(255,214,10,.8)}
+.garageFobBtn{position:relative;z-index:1;width:32px;height:16px;border-radius:8px;background:linear-gradient(180deg,#333b44,#1c2128);box-shadow:inset 0 1px 0 rgba(255,255,255,.1),0 2px 4px rgba(0,0,0,.3)}
 .irBeam{display:flex;justify-content:center;gap:9px}
 .irBeam span{width:8px;height:8px;border-radius:50%;background:#ff453a;box-shadow:0 0 16px rgba(255,69,58,.78);animation:irPulse 1.2s infinite ease-in-out}
 .irBeam span:nth-child(2){animation-delay:.18s}.irBeam span:nth-child(3){animation-delay:.36s}
 @keyframes irPulse{0%,100%{transform:scale(.7);opacity:.38}50%{transform:scale(1.35);opacity:1}}
-.rfWaves{position:relative;width:46px;height:46px;margin:0 auto}
+.rfWaves{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:96px;height:96px;z-index:0;pointer-events:none}
 .rfWaves span{position:absolute;inset:0;border:2px solid #ffd60a;border-radius:50%;opacity:0;box-shadow:0 0 14px rgba(255,214,10,.6);animation:rfPulse 1.8s infinite ease-out}
 .rfWaves span:nth-child(2){animation-delay:.5s}.rfWaves span:nth-child(3){animation-delay:1s}
 @keyframes rfPulse{0%{transform:scale(.22);opacity:.95}100%{transform:scale(1.7);opacity:0}}
+.learnGraphic>[hidden]{display:none!important}
 .learnPrompt{border:1px solid rgba(47,140,255,.24);background:rgba(47,140,255,.10);border-radius:18px;padding:13px;color:#cfe5ff;font-size:13px;line-height:1.35;text-align:center}
 .learnedCodesList{display:grid;gap:10px;margin-top:12px}
 .learnedCodeItem{border:1px solid var(--line2);border-radius:16px;background:rgba(0,0,0,.12);padding:11px;display:flex;align-items:center;justify-content:space-between;gap:10px}
@@ -347,7 +348,7 @@
 .learnedCodeMeta{font-size:11px;color:var(--muted);margin-top:2px}
 .learnActions{display:flex;justify-content:flex-end;gap:10px;margin-top:20px}
 @media(max-width:1050px){.devicesGrid,.learnStepGrid{grid-template-columns:1fr}.learnGraphic{grid-template-columns:90px 1fr 68px}}
-@media(max-width:560px){.devicesCard{padding:20px}.devicesCardHead{display:block}.devicesCardHead .pageActionBtn{margin-top:14px}.learnAddRow{grid-template-columns:1fr}.learnGraphic{grid-template-columns:1fr;justify-items:center}.irBeam{transform:rotate(90deg);margin:6px 0}.rfWaves{margin:6px auto}.learnActions{display:grid}}
+@media(max-width:560px){.devicesCard{padding:20px}.devicesCardHead{display:block}.devicesCardHead .pageActionBtn{margin-top:14px}.learnAddRow{grid-template-columns:1fr}.learnGraphic{grid-template-columns:1fr;justify-items:center}.irBeam{transform:rotate(90deg);margin:6px 0}.learnActions{display:grid}}
 
 
 .activitiesButtonsGrid{display:grid;grid-template-columns:1fr 1fr;gap:22px}
@@ -4729,7 +4730,6 @@
                   <div class="remoteMiniKeys"><span></span><span></span><span></span></div>
                 </div>
                 <div class="irBeam" id="learnIrBeam"><span></span><span></span><span></span></div>
-                <div class="rfWaves" id="learnRfWaves" hidden><span></span><span></span><span></span></div>
                 <div class="sourceTvRemote" id="learnSourceTv">
                   <div class="tvRemoteTip"></div>
                   <div class="tvRemotePower"></div>
@@ -4738,6 +4738,7 @@
                   <div class="tvRemoteRow"><span></span><span></span><span></span></div>
                 </div>
                 <div class="sourceGarageFob" id="learnSourceGarage" hidden>
+                  <div class="rfWaves"><span></span><span></span><span></span></div>
                   <div class="garageFobAntenna"></div>
                   <div class="garageFobLed"></div>
                   <div class="garageFobBtn"></div>
@@ -8164,12 +8165,13 @@
     if(learnIntroText) learnIntroText.textContent=learnMode==="rf"
       ? "Teach OpenRemote each button from the original remote via a paired ESP-NOW dock's RF433 receiver."
       : "Create a device manually by teaching OpenRemote each button from the original remote.";
+    // rfWaves is nested inside learnSourceGarage now (it radiates from the
+    // fob rather than sitting as its own icon between the two devices), so
+    // hiding the fob already hides the waves with it - no separate toggle.
     var learnIrBeam=document.getElementById("learnIrBeam");
-    var learnRfWaves=document.getElementById("learnRfWaves");
     var learnSourceTv=document.getElementById("learnSourceTv");
     var learnSourceGarage=document.getElementById("learnSourceGarage");
     if(learnIrBeam) learnIrBeam.hidden=learnMode==="rf";
-    if(learnRfWaves) learnRfWaves.hidden=learnMode!=="rf";
     if(learnSourceTv) learnSourceTv.hidden=learnMode==="rf";
     if(learnSourceGarage) learnSourceGarage.hidden=learnMode!=="rf";
   }

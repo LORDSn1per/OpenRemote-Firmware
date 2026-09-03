@@ -1,0 +1,1 @@
+User-created themes are stored in this folder.

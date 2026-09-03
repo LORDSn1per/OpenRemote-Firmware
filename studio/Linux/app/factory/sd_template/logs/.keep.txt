@@ -1,0 +1,1 @@
+OpenRemote diagnostic logs may be stored in this folder.

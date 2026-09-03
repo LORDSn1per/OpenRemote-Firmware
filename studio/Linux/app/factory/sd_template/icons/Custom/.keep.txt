@@ -1,0 +1,1 @@
+Custom icons uploaded through WebConfig are stored in this folder.

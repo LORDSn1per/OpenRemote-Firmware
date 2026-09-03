@@ -4662,9 +4662,9 @@
         <div class="learnDialog">
           <div class="learnTop">
             <div>
-              <div class="sectionTitle">Learn IR</div>
+              <div class="sectionTitle" id="learnSectionTitle">Learn IR</div>
               <h2>Learn a new device</h2>
-              <p>Create a device manually by teaching OpenRemote each button from the original remote.</p>
+              <p id="learnIntroText">Create a device manually by teaching OpenRemote each button from the original remote.</p>
             </div>
             <button class="cropCloseBtn" id="learnCloseBtn" type="button">×</button>
           </div>
@@ -4673,6 +4673,21 @@
             <div class="learnSetup">
               <label class="fieldLabel" for="learnDeviceName">Device name</label>
               <input class="textInput" id="learnDeviceName" value="Learned Device" maxlength="40">
+
+              <div class="wizardFormGrid" id="learnModeRow">
+                <label>
+                  <span class="fieldLabel">Signal type</span>
+                  <select class="textInput" id="learnModeSelect">
+                    <option value="ir">Infrared (this remote's receiver)</option>
+                    <option value="rf" id="learnModeRfOption">RF433 (via a paired ESP-NOW dock)</option>
+                  </select>
+                </label>
+                <label id="learnRfDeviceRow" hidden>
+                  <span class="fieldLabel">Dock</span>
+                  <select class="textInput" id="learnRfDeviceSelect"></select>
+                </label>
+              </div>
+              <div class="wizardNotice" id="learnRfHint" hidden>RF433 needs at least one paired ESP-NOW device. Pair a dock in Settings first.</div>
 
               <div class="learnButtonCreator">
                 <label class="fieldLabel" for="learnButtonName">Button name</label>
@@ -5487,6 +5502,7 @@
             if(command.ir && typeof command.ir==="object") runtimeCommand.ir=JSON.parse(JSON.stringify(command.ir));
             if(command.hid && typeof command.hid==="object") runtimeCommand.hid=JSON.parse(JSON.stringify(command.hid));
             if(command.homebridge && typeof command.homebridge==="object") runtimeCommand.homebridge=JSON.parse(JSON.stringify(command.homebridge));
+            if(command.espNow && typeof command.espNow==="object") runtimeCommand.espNow=JSON.parse(JSON.stringify(command.espNow));
             return runtimeCommand;
           })
         };
@@ -6976,6 +6992,15 @@
   var remoteIrdbSearchSeq=0;
   var addedDevices=[];
   var learnDraft=null;
+  var learnMode="ir";
+  var rfLearnPollTimer=null;
+  var learnModeSelect=document.getElementById("learnModeSelect");
+  var learnModeRfOption=document.getElementById("learnModeRfOption");
+  var learnRfDeviceRow=document.getElementById("learnRfDeviceRow");
+  var learnRfDeviceSelect=document.getElementById("learnRfDeviceSelect");
+  var learnRfHint=document.getElementById("learnRfHint");
+  var learnSectionTitle=document.getElementById("learnSectionTitle");
+  var learnIntroText=document.getElementById("learnIntroText");
   var irLearnPollTimer=null;
 
   function cloneCommands(commands){
@@ -8070,6 +8095,38 @@
   }
 
 
+  function updateLearnModeUi(){
+    var canRf=espNowKnownDevices.length>0;
+    if(learnModeRfOption) learnModeRfOption.disabled=!canRf;
+    if(!canRf && learnMode==="rf"){ learnMode="ir"; if(learnModeSelect) learnModeSelect.value="ir"; }
+    if(learnRfHint) learnRfHint.hidden=learnMode!=="rf" || canRf;
+    var showRfDevice=learnMode==="rf" && espNowKnownDevices.length>1;
+    if(learnRfDeviceRow) learnRfDeviceRow.hidden=!showRfDevice;
+    if(learnRfDeviceSelect && showRfDevice){
+      learnRfDeviceSelect.innerHTML="";
+      espNowKnownDevices.forEach(function(device){
+        var opt=document.createElement("option");
+        opt.value=device.mac;
+        opt.textContent=device.name || device.mac;
+        learnRfDeviceSelect.appendChild(opt);
+      });
+    }
+    if(learnSectionTitle) learnSectionTitle.textContent=learnMode==="rf" ? "Learn RF433" : "Learn IR";
+    if(learnIntroText) learnIntroText.textContent=learnMode==="rf"
+      ? "Teach OpenRemote each button from the original remote via a paired ESP-NOW dock's RF433 receiver."
+      : "Create a device manually by teaching OpenRemote each button from the original remote.";
+  }
+
+  if(learnModeSelect) learnModeSelect.addEventListener("change",function(){
+    learnMode=learnModeSelect.value==="rf" ? "rf" : "ir";
+    updateLearnModeUi();
+  },false);
+
+  function currentLearnRfMac(){
+    if(learnRfDeviceSelect && !learnRfDeviceRow.hidden && learnRfDeviceSelect.value) return learnRfDeviceSelect.value;
+    return espNowKnownDevices.length ? espNowKnownDevices[0].mac : "";
+  }
+
   function openLearnModal(existingIndex){
     var modal=document.getElementById("learnModal");
     var nameInput=document.getElementById("learnDeviceName");
@@ -8080,10 +8137,14 @@
       learnDraft.commands=existing.commands.map(function(c){
         var command={id:c.id,name:c.name};
         if(c.ir) command.ir=JSON.parse(JSON.stringify(c.ir));
+        if(c.espNow) command.espNow=JSON.parse(JSON.stringify(c.espNow));
         return command;
       });
     }
     if(nameInput) nameInput.value=learnDraft.name;
+    learnMode="ir";
+    if(learnModeSelect) learnModeSelect.value="ir";
+    loadEspNowDevices().then(updateLearnModeUi).catch(updateLearnModeUi);
     if(modal){
       modal.classList.add("open");
       modal.setAttribute("aria-hidden","false");
@@ -8100,7 +8161,10 @@
     }
     if(irLearnPollTimer) window.clearTimeout(irLearnPollTimer);
     irLearnPollTimer=null;
+    if(rfLearnPollTimer) window.clearTimeout(rfLearnPollTimer);
+    rfLearnPollTimer=null;
     remoteFetch("/api/ir/learn/cancel",{method:"POST"}).catch(function(){});
+    remoteFetch("/api/rf/learn/cancel",{method:"POST"}).catch(function(){});
     learnDraft=null;
   }
 
@@ -8122,7 +8186,8 @@
       item.className="learnedCodeItem";
       var info=document.createElement("div");
       var timingCount=cmd.ir && cmd.ir.timingCount ? " · "+cmd.ir.timingCount+" timings" : "";
-      info.innerHTML='<div class="learnedCodeName">'+cmd.name+'</div><div class="learnedCodeMeta">Real IR signal captured'+timingCount+'</div>';
+      var signalLabel=cmd.espNow && cmd.espNow.transport==="rf433" ? "Real RF433 signal captured" : "Real IR signal captured";
+      info.innerHTML='<div class="learnedCodeName">'+cmd.name+'</div><div class="learnedCodeMeta">'+signalLabel+timingCount+'</div>';
       var actions=document.createElement("div");
       actions.className="deviceActionRow";
       var rename=document.createElement("button");
@@ -8159,6 +8224,7 @@
       setLearnPrompt("This device already has the 50-command maximum.");
       return;
     }
+    if(learnMode==="rf") return learnRfButton();
     var input=document.getElementById("learnButtonName");
     var button=document.getElementById("learnButtonBtn");
     var name=(input && input.value ? input.value.trim() : "") || "Button "+(learnDraft.commands.length+1);
@@ -8200,6 +8266,54 @@
     });
   }
 
+  function learnRfButton(){
+    var mac=currentLearnRfMac();
+    if(!mac){
+      setLearnPrompt("Pair an ESP-NOW device first (Settings > ESP-NOW).");
+      return;
+    }
+    var input=document.getElementById("learnButtonName");
+    var button=document.getElementById("learnButtonBtn");
+    var name=(input && input.value ? input.value.trim() : "") || "Button "+(learnDraft.commands.length+1);
+    if(button) button.disabled=true;
+    setLearnPrompt("Point the original remote at the dock and press “"+name+"”. Listening for 15 seconds…");
+    remoteFetch("/api/rf/learn/start",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({mac:mac})}).then(function(){
+      function poll(){
+        if(!learnDraft) return;
+        remoteFetch("/api/rf/learn/status").then(function(result){
+          if(!learnDraft) return;
+          if(result.state==="listening"){
+            rfLearnPollTimer=window.setTimeout(poll,250);
+            return;
+          }
+          if(result.state==="captured" && result.ir && result.ir.data){
+            learnDraft.commands.push({
+              id:"learn_"+Date.now()+"_"+Math.random().toString(16).slice(2),
+              name:name,
+              ir:result.ir,
+              espNow:{mac:mac,transport:"rf433"}
+            });
+            if(input) input.value="";
+            renderLearnedCodes();
+            setLearnPrompt("Captured the real RF433 signal for “"+name+"”. Add another button or finish the device.");
+          }else{
+            setLearnPrompt(result.error || "No usable RF433 signal was captured. Try again.");
+          }
+          if(button) button.disabled=false;
+          rfLearnPollTimer=null;
+        }).catch(function(error){
+          setLearnPrompt("RF433 learning failed: "+error.message);
+          if(button) button.disabled=false;
+          rfLearnPollTimer=null;
+        });
+      }
+      poll();
+    }).catch(function(error){
+      setLearnPrompt("Could not start the dock's RF433 receiver: "+error.message);
+      if(button) button.disabled=false;
+    });
+  }
+
   function finishLearnDevice(){
     if(!learnDraft) return;
     var nameInput=document.getElementById("learnDeviceName");
@@ -8209,7 +8323,9 @@
       return;
     }
     var device={id:"learned_"+Date.now(),name:name,source:"Learned",transport:"ir",type:"Learned IR device",protocol:"Raw IR",commands:learnDraft.commands.map(function(c){
-      return {id:c.id,name:c.name,ir:c.ir ? JSON.parse(JSON.stringify(c.ir)) : null};
+      var command={id:c.id,name:c.name,ir:c.ir ? JSON.parse(JSON.stringify(c.ir)) : null};
+      if(c.espNow) command.espNow=JSON.parse(JSON.stringify(c.espNow));
+      return command;
     })};
     if(learnDraft.editingIndex!==null){
       addedDevices[learnDraft.editingIndex]=device;

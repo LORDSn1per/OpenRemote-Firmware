@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "webConfigVersion": "2.04",
+  "settings": {
+    "wifiEnabled": true,
+    "bluetoothEnabled": true,
+    "clockEnabled": true,
+    "brightness": 72,
+    "sleepSeconds": 25,
+    "wakeSensitivity": 58,
+    "slideToUnlock": true,
+    "remoteName": "OpenRemote",
+    "city": "Canberra, Australia",
+    "timeZone": "Australia/Sydney",
+    "buttonIconSize": 52,
+    "buttonTextSize": 19,
+    "activityIconSize": 52,
+    "activityTextSize": 24,
+    "buttonBoxesEnabled": true,
+    "activityBoxesEnabled": true
+  },
+  "devices": [],
+  "devicePages": [],
+  "activities": [],
+  "macros": [],
+  "themes": [],
+  "pages": [
+    {
+      "name": "Remote Settings",
+      "pageType": "settings",
+      "theme": "simple",
+      "items": []
+    },
+    {
+      "name": "Activities",
+      "pageType": "activities",
+      "theme": "simple",
+      "items": []
+    }
+  ]
+}

@@ -1,0 +1,70 @@
+name: macOS build
+
+on: [push,workflow_dispatch,pull_request]
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+
+
+
+
+
+
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.platformio/.cache
+          key: ${{ runner.os }}-pio
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install SDL2
+        run: |
+          brew install sdl2 sdl2_image
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      - name: Install PlatformIO Core
+        run: pip install --upgrade platformio
+
+      - name: Build PlatformIO env:ESP32-Rev1toRev4
+        run: pio run -e esp32-Rev1toRev4
+
+      - name: Build PlatformIO env:ESP32_testboard-Rev1toRev4
+        run: pio run -e esp32_testboard-Rev1toRev4
+
+      - name: Build PlatformIO env:ESP32-S3-Rev5andHigher
+        run: pio run -e esp32-s3-Rev5andHigher
+
+      - name: Build PlatformIO env:ESP32-S3_testboard-Rev5andHigher
+        run: pio run -e esp32-s3_testboard-Rev5andHigher
+
+      - name: Build PlatformIO env:macOS
+        run: pio run -e macOS

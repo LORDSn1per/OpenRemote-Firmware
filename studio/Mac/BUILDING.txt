@@ -1,0 +1,90 @@
+Building OpenRemote Studio for macOS
+====================================
+
+The Mac build MUST be universal2 (x86_64 + arm64).
+
+Why this file exists
+--------------------
+2.68, 2.69 and 2.70 shipped arm64-only and could not launch at all on an
+Intel Mac. Only 2.66 and 2.67 worked, which made it look like a macOS version
+problem - it was not. It was CPU architecture. The launcher's minos was 11.0
+in every build, so checking that told you nothing; the difference only shows
+up in the architectures of the bundled binaries.
+
+Two mistakes caused it, and both are easy to repeat:
+
+  1. PyInstaller defaults to the HOST architecture. Built on an M-series Mac
+     without --target-arch universal2, every binary comes out arm64 only.
+
+  2. The Mac build was pointed at Linux/app/vendor, which has no pyobjc or
+     pywebview (Linux does not need them) and is not universal. The Mac needs
+     its own vendor tree with universal2 wheels.
+
+Build
+-----
+Use the UNIVERSAL python, not Homebrew's (that one is arm64 only):
+
+    /Library/Frameworks/Python.framework/Versions/3.14/bin/python3
+
+    python3 -m PyInstaller --noconfirm --clean --windowed \
+      --name "OpenRemote Studio <ver>" \
+      --icon OpenRemote.icns \
+      --target-arch universal2 \
+      --osx-bundle-identifier com.openremote.studio \
+      --paths vendor \
+      --add-data "studio.html:." \
+      --add-data "OpenRemote.png:." \
+      --add-data "OpenRemoteIcon.png:." \
+      --add-data "openremote_product.png:." \
+      --add-data "factory:factory" \
+      --add-data "vendor:vendor" \
+      --collect-all esptool --collect-all serial --collect-all webview \
+      openremote_studio.py
+
+The vendor tree must contain the universal2 pyobjc/pywebview stack. The one
+inside 2.67.app is known good. Copy it with "cp -RL", not "cp -R": PyInstaller
+puts the real binaries in Contents/Frameworks and symlinks them from
+Contents/Resources, so a plain -R copy gives you dangling symlinks.
+
+Verify before shipping - this is the check that would have caught it
+--------------------------------------------------------------------
+Every Mach-O in the bundle must report both architectures:
+
+    find "OpenRemote Studio <ver>.app" -type f | while read -r f; do
+      lipo -archs "$f" 2>/dev/null
+    done | sort | uniq -c
+
+Expect ONE line, "x86_64 arm64". Anything listing arm64 alone will not run on
+an Intel Mac. Do not use "file" for this - it prints an extra line per slice
+for fat binaries and inflates the count.
+
+Also set the version, which PyInstaller leaves at 0.0.0:
+
+    plutil -replace CFBundleShortVersionString -string "<ver>" .../Info.plist
+    plutil -replace CFBundleVersion -string "<ver>" .../Info.plist
+    codesign --force --deep --sign - "OpenRemote Studio <ver>.app"
+
+Editing Info.plist invalidates the signature, so re-sign after, then re-check
+the architectures survived.
+
+Recovery tab: Update Firmware (2.76+)
+-------------------------------------
+Recovery's step 1 installs firmware WITHOUT erasing settings. It writes the
+application alone at 0x10000 and then clears otadata at 0xe000, which is the
+same sequence LOGS/flash-firmware.command on the NAS uses.
+
+Do not confuse it with Set Up a New Remote, which writes a merged image from
+0x0. That path runs straight through NVS at 0x9000-0xE000 and erases every
+setting, saved network and Bluetooth bond - correct for a blank board, wrong
+for an update.
+
+If a merged ("factory") .bin is chosen in Recovery, its first 0x10000 bytes -
+bootloader and partition table - are stripped and only the application is
+written, so either kind of file gives a settings-preserving install.
+
+Distributing to the NAS
+-----------------------
+Zip it with ditto. The NAS is SMB and cannot store extended attributes, so
+copying a .app there directly logs xattr errors and risks a broken bundle:
+
+    ditto -c -k --sequesterRsrc --keepParent "<app>" "<name>.zip"

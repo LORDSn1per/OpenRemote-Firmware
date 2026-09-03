@@ -1,0 +1,5 @@
+python312.zip
+.
+..\app
+..\app\vendor
+import site

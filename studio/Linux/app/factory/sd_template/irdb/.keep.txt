@@ -1,0 +1,1 @@
+Search the IRDB on this computer with OpenRemote Studio. The full database is not copied to the remote.

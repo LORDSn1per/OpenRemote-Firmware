@@ -1,0 +1,1 @@
+This folder stores macro exports created by OpenRemote.

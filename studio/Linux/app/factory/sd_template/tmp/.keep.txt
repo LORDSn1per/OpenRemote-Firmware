@@ -1,0 +1,1 @@
+OpenRemote uses this folder for temporary atomic file transfers.

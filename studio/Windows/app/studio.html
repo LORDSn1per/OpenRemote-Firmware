@@ -1,0 +1,1170 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OpenRemote Studio</title>
+<style>
+:root{
+  --bg:#080b10; --window:#111720; --glass:rgba(20,27,36,.72); --glass2:rgba(10,14,20,.55);
+  --line:rgba(255,255,255,.12); --line2:rgba(255,255,255,.08);
+  --text:#f5f7fb; --muted:#98a2b3; --blue:#2f8cff; --blue2:#0a5fd7; --green:#30d158; --red:#ff453a;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0; color:var(--text);
+  font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","Segoe UI",Roboto,Arial,sans-serif;
+  background:
+    radial-gradient(900px 500px at 25% 10%,rgba(47,140,255,.25),transparent 55%),
+    radial-gradient(700px 500px at 85% 20%,rgba(44,89,162,.16),transparent 55%),
+    linear-gradient(180deg,#0c1118,#05070a);
+}
+.shell{
+  min-height:100%; padding:0; display:block;
+}
+.window{
+  width:100%; min-height:100vh;
+  border:0; border-radius:0; overflow:visible;
+  background:transparent;
+  box-shadow:none;
+  display:grid; grid-template-rows:1fr;
+}
+.titlebar{display:none}
+.traffic{display:flex; gap:9px; padding-left:20px}
+.dot{width:14px;height:14px;border-radius:50%}.red{background:#ff5f57}.yellow{background:#febc2e}.green{background:#28c840}
+.appTitle{text-align:center;font-size:17px;color:#f3f4f6}
+.main{display:grid; grid-template-columns:250px 1fr; min-height:100vh}
+.sidebar{
+  border-right:1px solid var(--line2); background:rgba(8,12,18,.65); padding:26px 20px 20px;
+  display:flex; flex-direction:column; gap:22px;
+}
+.brand{display:flex; flex-direction:column; align-items:center; gap:8px; padding:4px 0 18px}
+.logo{
+  width:68px;height:68px;border-radius:50%; display:grid; place-items:center;
+  background:radial-gradient(circle at 35% 30%,#66b5ff,#0b65e5 58%,#053a83);
+  box-shadow:0 0 26px rgba(47,140,255,.35);
+}
+.logo:before{content:"";width:31px;height:31px;border:10px solid #07101c;border-radius:50%;display:block}
+.brandName{font-size:28px;font-weight:700;letter-spacing:-.03em}
+.brandSub{font-size:12px;letter-spacing:.42em;color:var(--muted);margin-left:.42em}.sidebarVersion{font-size:12px;color:var(--muted);margin-top:-4px;letter-spacing:.05em}
+.nav{display:flex;flex-direction:column;gap:8px}
+.nav button{
+  border:0;background:transparent;color:#d8dee9;text-align:left;border-radius:10px;padding:13px 13px;
+  font-size:16px;display:flex;align-items:center;gap:12px;cursor:pointer;
+}
+.nav button:hover{background:rgba(255,255,255,.06)}
+.nav button.active{background:linear-gradient(180deg,#1f79f2,#0a59cc);color:white;box-shadow:0 8px 22px rgba(47,140,255,.25)}
+.navIcon{width:22px;text-align:center;color:#c5cedb}
+.sideStatus{
+  margin-top:auto; border-top:1px solid var(--line2); padding-top:18px; color:var(--muted); font-size:14px; line-height:1.45;
+}
+.statusDot{display:inline-block;width:11px;height:11px;background:var(--green);border-radius:50%;margin-right:8px;box-shadow:0 0 12px rgba(48,209,88,.5)}
+.statusDot.redStatus{background:#ff453a;box-shadow:0 0 12px rgba(255,69,58,.45)}
+.sideStatus button{width:100%;margin-top:14px;background:transparent;color:#d5dbe7;border:1px solid var(--line);border-radius:9px;padding:10px;cursor:pointer}
+.content{position:relative; min-width:0; min-height:100vh; overflow:auto; padding:32px}
+.view{display:none; animation:fade .18s ease-out}.view.active{display:block}
+@keyframes fade{from{opacity:.4;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
+.gridRemote{display:grid; grid-template-columns:minmax(420px,1.2fr) minmax(360px,.8fr); gap:22px; height:100%}
+.hero,.panel{
+  border:1px solid var(--line); border-radius:18px; background:linear-gradient(180deg,rgba(255,255,255,.05),rgba(255,255,255,.025));
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.06),0 20px 60px rgba(0,0,0,.25);
+}
+.hero{position:relative; overflow:hidden; min-height:680px; padding:34px}
+.hero:before{content:"";position:absolute;inset:-20%;background:radial-gradient(circle at 30% 30%,rgba(47,140,255,.2),transparent 45%);pointer-events:none}
+.heroContent{position:relative; display:grid; grid-template-columns:minmax(210px,360px) 1fr; gap:24px; align-items:center; height:100%}
+.productWrap{display:flex;align-items:center;justify-content:center}
+.product{
+  max-width:100%; max-height:650px; object-fit:contain;
+  filter:drop-shadow(0 34px 28px rgba(0,0,0,.55));
+  border-radius:24px;
+  -webkit-mask-image:linear-gradient(90deg,black 72%,rgba(0,0,0,.72) 88%,transparent 100%);
+  mask-image:linear-gradient(90deg,black 72%,rgba(0,0,0,.72) 88%,transparent 100%);
+}
+.bigLogo{display:flex;align-items:center;gap:18px;margin-bottom:16px}
+.mark{width:72px;height:72px;border-radius:50%;background:radial-gradient(circle at 35% 30%,#6fbdff,#0d75ff 60%,#043777);display:grid;place-items:center}
+.mark:before{content:"";width:34px;height:34px;border:11px solid #08111f;border-radius:50%}
+.hero h1{font-size:56px;line-height:1;margin:0 0 8px;letter-spacing:-.05em}
+.hero .tagline{font-size:18px;letter-spacing:.38em;color:var(--muted);margin-bottom:34px}
+.feature{display:flex;gap:16px;align-items:center;margin:22px 0}
+.featureIcon{font-size:34px;color:var(--blue);width:46px;text-align:center}.wifiIcon svg{width:38px;height:38px;display:block;margin:auto}
+.feature b{font-size:21px}.feature p{margin:4px 0 0;color:var(--muted);font-size:16px}
+.heroBottom{position:absolute;bottom:28px;left:34px;right:34px;text-align:center}
+.heroBottom h2{font-size:34px;margin:0 0 8px;letter-spacing:-.04em}.heroBottom span{color:var(--blue)}
+.heroBottom p{margin:0;color:var(--muted);font-size:17px}
+.connect{padding:32px; display:flex; flex-direction:column; justify-content:flex-start; min-height:680px}
+.connect h2{font-size:34px;margin:0 0 12px;letter-spacing:-.04em}.connect p{color:var(--muted);font-size:16px;margin:0 0 28px}
+.ipRow{display:flex;gap:12px}
+input,textarea{
+  background:rgba(0,0,0,.28); color:var(--text); border:1px solid var(--line); border-radius:9px; padding:15px 16px;
+  outline:none; font:inherit;
+}
+input:focus,textarea:focus{border-color:rgba(47,140,255,.8); box-shadow:0 0 0 3px rgba(47,140,255,.16)}
+.ipRow input,.ipRow select{flex:1;font-size:18px}
+.primary{
+  background:linear-gradient(180deg,#2f8cff,#0b62d8); color:white; border:0; border-radius:9px; padding:0 28px; font-size:17px; cursor:pointer;
+  box-shadow:0 12px 26px rgba(47,140,255,.22);
+}
+.rule{height:1px;background:var(--line2);margin:32px 0}
+.recent{border:1px solid var(--line);border-radius:11px;padding:16px 18px;display:flex;justify-content:space-between;align-items:center;background:rgba(0,0,0,.18)}
+.recent b{font-size:20px}.recent small{display:block;color:var(--muted);margin-top:6px}
+#recentList{display:flex;flex-direction:column;gap:10px}
+.removeRecent{border:0;background:transparent;color:var(--muted);font-size:21px;cursor:pointer;padding:4px 9px;border-radius:8px}
+.removeRecent:hover{background:rgba(255,255,255,.08);color:white}
+.setupIntro{display:flex;gap:13px;align-items:flex-start;margin-bottom:18px}
+.setupMark{width:42px;height:42px;display:grid;place-items:center;flex:0 0 42px;border-radius:10px;background:#176fd8;color:white;font-size:23px}
+.setupIntro h3{margin:0 0 5px;font-size:22px}.setupIntro p{margin:0;font-size:14px;line-height:1.4}
+.setupPortRow{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:9px;margin-bottom:12px}
+.setupPortRow select{min-width:0;background:rgba(0,0,0,.28);color:var(--text);border:1px solid var(--line);border-radius:9px;padding:12px;font:inherit}
+.setupSteps{display:flex;flex-direction:column;gap:9px}
+.setupStep{display:grid;grid-template-columns:30px 1fr auto;gap:11px;align-items:center;padding:12px 0;border-top:1px solid var(--line2)}
+.stepNumber{width:30px;height:30px;border-radius:50%;display:grid;place-items:center;background:rgba(47,140,255,.15);border:1px solid rgba(47,140,255,.48);color:#8fc5ff;font-weight:800}
+.setupStep b{display:block;font-size:15px}.setupStep small{display:block;color:var(--muted);margin-top:3px;line-height:1.3}
+/* The rule above is for the step title, but it caught every <b> in the step -
+   so each inline <b>/devices</b> or <b>.ir</b> inside a description broke onto
+   its own line, splitting one sentence across four. Keep those inline. */
+.setupStep small b{display:inline;font-size:inherit;color:inherit}
+.setupStep button{white-space:nowrap}
+.setupStep.locked{opacity:.42}
+.setupStep.locked .stepNumber{background:rgba(255,255,255,.06);border-color:var(--line2);color:var(--muted)}
+.setupStepAlt{margin:6px 0 0 41px}
+.setupStepAlt button{font-size:12px}
+.setupChoices{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin:2px 0 5px 41px}
+.setupChoices[hidden]{display:none}.setupChoice{display:grid;grid-template-columns:auto 1fr;gap:10px;align-items:center;border:1px solid var(--line2);border-radius:10px;padding:10px;background:rgba(255,255,255,.025)}
+.setupSensorChoice{grid-column:1/-1}
+.setupChoice button{white-space:nowrap}.setupChoice span{min-width:0;color:var(--muted);font-size:12px;line-height:1.3;overflow-wrap:anywhere}.setupChoice strong{display:block;color:#dce7f5;margin-bottom:2px}
+.setupProgress{margin-top:14px}.setupProgress .progress{height:12px;margin-top:8px}
+.setupStatus{font-size:13px;color:#dce7f5;line-height:1.4;min-height:19px}.setupStatus.err{color:#ffb4ad}.setupStatus.ok{color:#b9f7c8}
+.setupLog{display:none;margin:9px 0 0;max-height:92px;overflow:auto;white-space:pre-wrap;background:rgba(0,0,0,.24);border:1px solid var(--line2);border-radius:8px;padding:9px;color:var(--muted);font:11px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace}
+.formatNote{margin-top:11px!important;font-size:12px!important;line-height:1.45;color:#aab4c3!important}
+.builderGrid{display:grid;grid-template-columns:1fr 360px;gap:22px}
+.pageTitle{font-size:36px;margin:0 0 8px;letter-spacing:-.04em}.pageLead{color:var(--muted);margin:0 0 20px;font-size:16px}
+.card{border:1px solid var(--line);border-radius:16px;background:linear-gradient(180deg,rgba(255,255,255,.045),rgba(255,255,255,.02));padding:22px}
+.card h3{margin:0 0 14px;color:var(--blue)}
+.source{display:flex;gap:10px;align-items:flex-start;padding:11px;border:1px solid var(--line2);border-radius:12px;margin:8px 0;background:rgba(0,0,0,.12)}
+.source input{width:auto;margin-top:3px}.source small{color:var(--muted)}
+.log{width:100%;height:320px;resize:vertical;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;margin-top:16px}
+.progress{height:22px;background:rgba(0,0,0,.32);border:1px solid var(--line);border-radius:999px;overflow:hidden;margin-top:14px}
+.bar{height:100%;width:0;background:linear-gradient(90deg,#148bff,#30d158);transition:width .2s}
+.metaRow{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;color:var(--muted);margin-top:10px}
+.stats{display:grid;grid-template-columns:repeat(5,minmax(120px,1fr));gap:12px;margin:16px 0}
+.stat{border:1px solid var(--line2);border-radius:14px;padding:14px;background:rgba(0,0,0,.15)}
+.stat .num{font-size:24px;font-weight:800;color:var(--blue)}.stat .label{text-transform:uppercase;letter-spacing:.08em;color:var(--muted);font-size:12px}
+.resultsLayout{display:grid;grid-template-columns:1fr 380px;gap:18px}
+.result{border:1px solid var(--line2);border-radius:13px;background:rgba(0,0,0,.16);padding:13px;margin:10px 0;cursor:pointer}
+.result:hover{border-color:rgba(47,140,255,.7)}
+.resultHead{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap}
+.tag{display:inline-block;background:rgba(255,255,255,.08);border-radius:999px;padding:4px 8px;margin:4px;font-size:12px}
+#searchBox{width:min(760px,100%);display:block;margin-top:14px}
+.countLine{font-size:18px;font-weight:800;color:var(--blue);margin:12px 0}
+.detailTitle{font-size:22px;font-weight:800;color:var(--blue)}.detailKV{color:var(--muted);font-size:14px;margin:8px 0}
+.usbPanel{margin-top:16px;border:1px solid var(--line);border-radius:14px;background:rgba(47,140,255,.08);padding:14px}
+.usbRow{display:grid;grid-template-columns:1fr auto auto;gap:10px;align-items:center;margin-top:10px}
+.usbRow select{background:rgba(0,0,0,.28);color:var(--text);border:1px solid var(--line);border-radius:9px;padding:12px;min-width:0}
+.secondary{background:rgba(255,255,255,.08);color:white;border:1px solid var(--line);border-radius:9px;padding:12px 14px;cursor:pointer}
+.usbStatus{color:var(--muted);font-size:13px;margin-top:10px;line-height:1.35}
+.usbStatus.ok{color:#b9f7c8}.usbStatus.err{color:#ffb4ad}
+.footer{display:none}
+@media(max-width:1100px){.window{height:auto;min-height:calc(100vh - 24px)}.main{grid-template-columns:1fr}.sidebar{display:none}.gridRemote,.heroContent,.builderGrid,.resultsLayout{grid-template-columns:1fr}.hero,.connect{min-height:auto}.stats{grid-template-columns:1fr 1fr}.ipRow{flex-direction:column}.primary{padding:14px}}
+@media(min-width:1101px) and (max-width:1450px){.gridRemote{grid-template-columns:1fr}.gridRemote .hero{display:none}.connect{width:min(760px,100%);margin:0 auto}}
+@media(max-width:560px){.content{padding:16px}.connect{padding:22px}.setupStep{grid-template-columns:30px 1fr}.setupStep button{grid-column:2;width:100%}.setupPortRow{grid-template-columns:1fr}.setupChoices{grid-template-columns:1fr;margin-left:41px}.setupChoice{grid-template-columns:1fr}.setupChoice button{width:100%}.hero{display:none}}
+
+/* v2.27: use supplied transparent OpenRemote.png with no black backing */
+.remoteShot,
+.productShot,
+.heroImage,
+.remoteMockup,
+.deviceMockup,
+.mockupWrap,
+.productWrap,
+.remoteVisual,
+.heroMockup {
+  background: transparent !important;
+  background-color: transparent !important;
+  box-shadow: none !important;
+}
+.remoteShot img,
+.productShot img,
+.heroImage img,
+.remoteMockup img,
+.deviceMockup img,
+.mockupWrap img,
+.productWrap img,
+.remoteVisual img,
+.heroMockup img {
+  background: transparent !important;
+  box-shadow: none !important;
+  object-fit: contain !important;
+}
+
+</style>
+</head>
+<body>
+<div class="shell">
+  <div class="window">
+    <div class="titlebar">
+      <div class="traffic"><span class="dot red"></span><span class="dot yellow"></span><span class="dot green"></span></div>
+      <div class="appTitle">OpenRemote Studio v2.45</div>
+      <div></div>
+    </div>
+    <div class="main">
+      <aside class="sidebar">
+        <div class="brand"><div class="logo"></div><div class="brandName">OpenRemote</div><div class="brandSub">STUDIO</div><div class="sidebarVersion" id="sidebarVersion">v…</div></div>
+        <nav class="nav">
+          <button class="navBtn active" data-view="remote"><span class="navIcon">▣</span> Remote Config</button>
+          <button class="navBtn" data-view="builder"><span class="navIcon">◉</span> IRDB Builder</button>
+          <button class="navBtn" data-view="browser"><span class="navIcon">◎</span> IRDB Browser</button>
+          <button class="navBtn" data-view="setup"><span class="navIcon">↧</span> Setup New Remote</button>
+          <button class="navBtn" data-view="dock"><span class="navIcon">⊞</span> Set Up a New Dock</button>
+          <button class="navBtn" data-view="recovery"><span class="navIcon">✚</span> Recovery</button>
+        </nav>
+        <div class="sideStatus">
+          <div id="sideLoaded"><span class="statusDot redStatus"></span>No database loaded</div>
+          <div id="sideDbName" style="margin-top:10px">OpenRemote.irdb</div>
+          <div id="sideDbDate" style="margin-top:6px">Created: —</div>
+        </div>
+      </aside>
+
+      <main class="content">
+        <section id="remote" class="view active">
+          <div class="gridRemote">
+            <div class="hero">
+              <div class="heroContent">
+                <div class="productWrap"><img class="product" src="/OpenRemote.png" alt="OpenRemote product"></div>
+                <div>
+                  <div class="bigLogo"><div class="mark"></div><div><h1>OpenRemote</h1><div class="tagline">CONTROL EVERYTHING</div></div></div>
+                  <div class="feature"><div class="featureIcon">◎</div><div><b>Open Source</b><p>Built for everyone</p></div></div>
+                  <div class="feature"><div class="featureIcon wifiIcon">
+      <svg viewBox="0 0 64 64" aria-hidden="true">
+        <path d="M8 24c13.5-12.5 34.5-12.5 48 0" fill="none" stroke="currentColor" stroke-width="6" stroke-linecap="round"/>
+        <path d="M18 34c8-7 20-7 28 0" fill="none" stroke="currentColor" stroke-width="6" stroke-linecap="round"/>
+        <path d="M28 45c2.4-2 5.6-2 8 0" fill="none" stroke="currentColor" stroke-width="6" stroke-linecap="round"/>
+        <circle cx="32" cy="53" r="4" fill="currentColor"/>
+      </svg>
+    </div><div><b>Wi‑Fi Enabled</b><p>Local control</p></div></div>
+                  <div class="feature"><div class="featureIcon">▦</div><div><b>Customisable</b><p>Make it your own</p></div></div>
+                  <div class="feature"><div class="featureIcon">☁︎</div><div><b>No Cloud</b><p>100% private</p></div></div>
+                </div>
+              </div>
+              <div class="heroBottom"><h2>Open. Powerful. <span>Yours.</span></h2><p>The open source universal remote for everyone.</p></div>
+            </div>
+
+            <div class="panel connect">
+              <h2>Connect to Remote</h2>
+              <p>Enter the IP address of your OpenRemote. WebConfig opens directly from the ESP32 over Wi-Fi.</p>
+              <div class="ipRow">
+                <input id="remoteIp" placeholder="eg. 192.168.1.55" autocomplete="off">
+                <button class="primary" onclick="connectRemote()">Connect</button>
+              </div>
+              <div class="rule"></div>
+              <h3>Recent Connections</h3>
+              <div id="recentList"></div>
+
+            </div>
+          </div>
+              <div class="setupProgress">
+                <div id="remoteStatus" class="setupStatus">Ready.</div>
+                <div class="progress"><div id="remoteBar" class="bar"></div></div>
+                <pre id="remoteLog" class="setupLog"></pre>
+              </div>
+        </section>
+
+        <section id="setup" class="view">
+          <div class="card">
+            <div class="setupIntro">
+              <div class="setupMark">↧</div>
+              <div><h3>Set Up a New Remote</h3><p>Turn a blank ESP32-S3 into a working OpenRemote. Leave the SD card in the remote.</p></div>
+            </div>
+            <div class="setupPortRow">
+              <select id="setupPort"><option value="">Scanning for USB boards…</option></select>
+              <button class="secondary" id="setupRefresh" onclick="loadSetupPorts()">Refresh USB</button>
+            </div>
+            <div class="setupSteps">
+              <div class="setupStep" id="setupStep1"><span class="stepNumber">1</span><div><b>Check the board</b><small>Confirm that the selected USB device is an ESP32-S3, then choose the files to install.</small></div><button class="secondary setupAction" onclick="detectSetupBoard()">Detect</button></div>
+              <div id="setupChoices" class="setupChoices" hidden>
+                <div class="setupChoice"><button class="secondary setupAction" onclick="chooseSetupFirmware()">Choose Firmware</button><span id="setupFirmwareChoice"></span></div>
+                <div class="setupChoice"><button class="secondary setupAction" onclick="chooseSetupWebConfig()">Choose WebConfig</button><span id="setupWebConfigChoice"></span></div>
+                <div class="setupChoice setupSensorChoice"><button id="setupSensorInstall" class="secondary setupAction" onclick="flashSensorTest()" disabled>Install Sensor Test</button><span>Install the included Rev 5 hardware diagnostic instead. You can install OpenRemote afterwards.</span></div>
+              </div>
+              <div class="setupStep locked" id="setupStep2"><span class="stepNumber">2</span><div><b>Install OpenRemote</b><small id="setupFirmwareText">Installs the firmware, waits for the remote to restart, then prepares the SD card inside it.</small></div><button id="setupInstall" class="primary setupAction" style="padding:12px 16px" onclick="installEverything()" disabled>Install</button></div>
+            </div>
+            <div class="setupProgress">
+              <div id="setupStatus" class="setupStatus">Ready to set up a new remote.</div>
+              <div class="progress"><div id="setupBar" class="bar"></div></div>
+              <pre id="setupLog" class="setupLog"></pre>
+            </div>
+            <p class="formatNote"><b>The SD card stays inside the remote.</b> The card must already be <b>FAT32 / MS-DOS (FAT)</b> with <b>Master Boot Record</b> - a card formatted NTFS or exFAT cannot be reformatted over USB, so if Studio reports the card is unreadable, format it on this computer first, put it back, and finish from the Recovery tab. No firmware .bin is copied to the card; the remote runs from its internal flash.</p>
+          </div>
+        </section>
+        <section id="dock" class="view">
+          <div class="card">
+            <div class="setupIntro">
+              <div class="setupMark">⊞</div>
+              <div><h3>Set Up a New Dock</h3><p>Turn a blank ESP32-C3 Super Mini into an OpenRemote dock. The dock has no SD card and no WebConfig - it is firmware and nothing else.</p></div>
+            </div>
+            <div class="setupPortRow">
+              <select id="dockPort"><option value="">Scanning for USB boards…</option></select>
+              <button class="secondary" id="dockRefresh" onclick="loadDockPorts()">Refresh USB</button>
+            </div>
+            <div class="setupSteps">
+              <div class="setupStep" id="dockStep1"><span class="stepNumber">1</span><div><b>Check the board</b><small>Confirms the selected USB device is an ESP32-C3. A remote is an ESP32-S3 and will be reported as such rather than flashed by mistake.</small></div><button class="secondary setupAction" onclick="detectDockBoard()">Detect</button></div>
+              <div id="dockChoices" class="setupChoices" hidden>
+                <div class="setupChoice"><button class="secondary setupAction" onclick="chooseDockFirmware()">Choose Dock Firmware</button><span id="dockFirmwareChoice"></span></div>
+              </div>
+              <div class="setupStep locked" id="dockStep2"><span class="stepNumber">2</span><div><b>Install dock firmware</b><small id="dockFirmwareText">Writes the firmware to the dock and restarts it.</small></div><button id="dockInstall" class="primary setupAction" style="padding:12px 16px" onclick="installDock()" disabled>Install</button></div>
+            </div>
+            <div class="setupProgress">
+              <div id="dockStatus" class="setupStatus">Ready to set up a new dock.</div>
+              <div class="progress"><div id="dockBar" class="bar"></div></div>
+              <pre id="dockLog" class="setupLog"></pre>
+            </div>
+            <p class="formatNote"><b>One file does both jobs.</b> Choose the dock <i>.bin</i>; Studio adds the bootloader and partition table a blank ESP32-C3 needs, so this sets the board up from nothing. The very same file sent from WebConfig over ESP-NOW goes into the dock's spare firmware slot instead and keeps its pairing - exactly how the remote's own .bin behaves in Studio versus WebConfig. Pair the dock once over USB and later updates need no cable at all.</p>
+          </div>
+        </section>
+        <section id="recovery" class="view">
+          <div class="card">
+            <div class="setupIntro">
+              <div class="setupMark">✚</div>
+              <div><h3>Recovery</h3><p>Repair a remote over USB when its WebConfig page cannot be reached. The SD card stays inside the remote.</p></div>
+            </div>
+            <div class="setupPortRow">
+              <select id="recoveryPort"><option value="">Scanning for USB boards…</option></select>
+              <button class="secondary" onclick="loadRecoveryPorts()">Refresh USB</button>
+            </div>
+            <div class="setupSteps">
+              <div class="setupStep"><span class="stepNumber">1</span><div><b>Update Firmware</b><small>Installs a firmware <b>.bin</b> over USB and <b>keeps every setting</b> - saved Wi-Fi, Bluetooth pairings, devices, activities and display options all survive. Use this when WebConfig cannot be reached to do it wirelessly. This is not Set Up a New Remote: that writes a blank board from scratch and erases the lot.</small></div><button id="recoveryFirmwareBtn" class="primary setupAction" style="padding:12px 16px" onclick="document.getElementById('recoveryFirmwareFile').click()">Choose Firmware</button></div>
+              <input type="file" id="recoveryFirmwareFile" accept=".bin" hidden onchange="flashFirmwareOverUsb(this)">
+              <div class="setupStep"><span class="stepNumber">2</span><div><b>Install WebConfig</b><small>Writes a WebConfig .html to the SD card as <b>www/index.html</b>. Use this when a WebConfig installed incompletely - the remote's own web page cannot replace itself once it is broken.</small></div><button id="webConfigUsbBtn" class="primary setupAction" style="padding:12px 16px" onclick="document.getElementById('webConfigUsbFile').click()">Choose WebConfig</button></div>
+              <div class="setupStep"><span class="stepNumber">3</span><div><b>Prepare SD Card</b><small>Creates any missing folders and installs WebConfig, Default icons and Default themes onto the card inside the remote. Existing files are skipped and your data is left alone. Choose a firmware and WebConfig on Remote Config first. Useful if setup step 3 could not finish - for example the card had to be reformatted to FAT32 on a computer.</small></div><button id="recoveryPrepareSd" class="primary setupAction" style="padding:12px 16px" onclick="prepareRemoteSdCard(recoveryPortValue(),true)">Prepare over USB</button></div>
+              <div class="setupStep"><span class="stepNumber">4</span><div><b>Load Backup</b><small>Copies an OpenRemote backup to <b>/backups</b> on the card and offers to apply it. Full backups replace the configuration; single-category exports (devices, learned, activities, macros, icons, themes) and WebConfig's per-device learned <b>.ir</b> exports merge into it, leaving everything else alone. Anything unrecognised is rejected before sending.</small></div><button id="recoveryLoadBackupBtn" class="secondary setupAction" onclick="document.getElementById('recoveryBackupFile').click()">Choose Backup</button></div>
+              <input type="file" id="recoveryBackupFile" accept=".json,.ir,application/json" hidden onchange="loadBackupOverUsb(this)">
+              <div class="setupStep"><span class="stepNumber">5</span><div><b>Load .IR File</b><small>Copies a Flipper-format <b>.ir</b> signals file straight into <b>/devices</b>, where the remote picks it up as a device. You are warned before overwriting a file of the same name. A WebConfig-exported learned device is OpenRemote JSON rather than a Flipper file, so it is sent to <b>/backups</b> and applied instead - either slot accepts either kind.</small></div><button id="recoveryLoadIrBtn" class="secondary setupAction" onclick="document.getElementById('recoveryIrFile').click()">Choose .IR File</button></div>
+              <input type="file" id="recoveryIrFile" accept=".ir,.json,application/json" hidden onchange="loadIrFileOverUsb(this)">
+              <div class="setupStep"><span class="stepNumber">6</span><div><b>Restore Factory Settings</b><small>Erases devices, activities, macros, custom icons and themes, saved Wi-Fi and settings from the SD card, then rebuilds the empty folders. WebConfig, firmware, SD backups and the Default libraries are kept. The remote restarts afterwards.</small></div><button id="recoveryResetBtn" class="secondary setupAction" onclick="factoryResetOverUsb()">Erase User Data</button></div>
+            </div>
+            <input type="file" id="webConfigUsbFile" accept=".html,.htm" hidden onchange="installWebConfigOverUsb(this)">
+            <div class="setupProgress">
+              <div id="recoveryStatus" class="setupStatus">Ready.</div>
+              <div class="progress"><div id="recoveryBar" class="bar"></div></div>
+              <pre id="recoveryLog" class="setupLog"></pre>
+            </div>
+            <p class="formatNote">Close the Arduino Serial Monitor before using these actions, or the USB port will be busy. Recovery talks to the remote over USB serial only - it does not need Wi-Fi.</p>
+          </div>
+        </section>
+        <section id="builder" class="view">
+          <h2 class="pageTitle">IRDB Builder</h2>
+          <p class="pageLead">Build a single <b>OpenRemote.irdb</b> file for the remote SD card. Activities, device setup and button layouts stay on the ESP32 web configurator.</p>
+          <div class="builderGrid">
+            <div class="card">
+              <button class="primary" id="buildBtn" onclick="startBuild()">Build OpenRemote.irdb</button>
+              <textarea id="log" class="log" readonly>Ready.</textarea>
+              <div class="progress"><div id="bar" class="bar"></div></div>
+              <div class="metaRow"><span id="status">Ready.</span><span><b id="mb">0.0</b> MB downloaded • <b id="pct">0</b>%</span></div>
+              <div class="metaRow"><span>Devices: <b id="records">0</b></span><span>OpenRemote.irdb: <b id="binmb">0.0</b> MB</span></div>
+            </div>
+            <div class="card">
+              <h3>Sources</h3>
+              <label class="source"><input type="checkbox" class="src" value="Lucaslhm-Flipper-IRDB" checked><div><b>Flipper IRDB</b><br><small>Community Flipper .ir database.</small></div></label>
+              <label class="source"><input type="checkbox" class="src" value="Flipper-Firmware-Official" checked><div><b>Official Flipper Firmware IR</b><br><small>Official bundled Flipper IR files.</small></div></label>
+              <label class="source"><input type="checkbox" class="src" value="probonopd-irdb" checked><div><b>probonopd/irdb</b><br><small>Classic compact protocol/device/function database.</small></div></label>
+              <label class="source"><input type="checkbox" class="src" value="probonopd-lirc-remotes" checked><div><b>LIRC Remotes</b><br><small>Linux Infrared Remote Control database.</small></div></label>
+            </div>
+          </div>
+              <div class="setupProgress">
+                <div id="builderStatus" class="setupStatus">Ready.</div>
+                <div class="progress"><div id="builderBar" class="bar"></div></div>
+                <pre id="builderLog" class="setupLog"></pre>
+              </div>
+        </section>
+
+        <section id="browser" class="view">
+          <h2 class="pageTitle">IRDB Browser</h2>
+          <p class="pageLead">Browse the currently loaded <b>OpenRemote.irdb</b>. Search filters live as you type.</p>
+          <div class="card">
+            <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+              <input id="dbFile" type="file" accept=".irdb,.bin">
+              <button class="primary" onclick="uploadDb()">Load OpenRemote.irdb</button>
+            </div>
+            <div id="dbInfo" class="detailKV">No database loaded yet.</div>
+      <div id="browserStatusCard" class="card dbStatusCard">
+        <div id="browserStatusLine"><span class="statusDot redStatus"></span>No database loaded</div>
+        <div id="browserDbName" class="detailKV">OpenRemote.irdb</div>
+        <div id="browserDbDate" class="detailKV">Created: —</div>
+      </div>
+            <div id="stats" class="stats"></div>
+            <input id="searchBox" placeholder="Search e.g. Hisense 85S8, Sony STR, Fetch, volume" oninput="searchDb()">
+            <div id="countLine" class="countLine"></div>
+          </div>
+          <div class="resultsLayout">
+            <div id="results"></div>
+            <div class="card" id="details"><div class="detailTitle">Device details</div><p class="detailKV">Select a device to preview its buttons and IR data.</p></div>
+          </div>
+              <div class="setupProgress">
+                <div id="browserStatus" class="setupStatus">Ready.</div>
+                <div class="progress"><div id="browserBar" class="bar"></div></div>
+                <pre id="browserLog" class="setupLog"></pre>
+              </div>
+        </section>
+      </main>
+    </div>
+    <footer class="footer"><div><span class="statusDot"></span><span id="footerStatus">Ready</span></div><div>Version 2.45</div></footer>
+  </div>
+</div>
+
+<script>
+document.querySelectorAll('.navBtn').forEach(btn=>btn.onclick=()=>{
+  document.querySelectorAll('.navBtn,.view').forEach(x=>x.classList.remove('active'));
+  btn.classList.add('active');
+  document.getElementById(btn.dataset.view).classList.add('active');
+  if(btn.dataset.view==='browser'){loadInfo();syncBrowserDbCard();searchDb();setTimeout(syncBrowserDbCard,300);}
+  if(btn.dataset.view==='recovery'){loadRecoveryPorts();}
+  if(btn.dataset.view==='setup'){loadSetupPorts();loadSetupInfo();}
+  if(btn.dataset.view==='dock'){loadDockPorts();}
+});
+function cleanIp(ip){return ip.trim().replace(/^https?:\/\//,'').replace(/\/.*$/,'')}
+function getRecent(){try{return JSON.parse(localStorage.getItem('openremoteRecent')||'[]')}catch(e){return[]}}
+function saveRecent(list){localStorage.setItem('openremoteRecent',JSON.stringify(list.slice(0,3)));renderRecent()}
+function addRecent(ip){ip=cleanIp(ip);let list=getRecent().filter(x=>x!==ip);list.unshift(ip);saveRecent(list)}
+function removeRecent(ip,e){e.stopPropagation();saveRecent(getRecent().filter(x=>x!==ip))}
+function renderRecent(){let list=getRecent();let el=document.getElementById('recentList');if(!el)return;el.innerHTML=list.length?list.map(ip=>`<div class="recent" onclick="quickConnect('${ip}')"><div><b>${ip}</b><small>OpenRemote device</small></div><button class="removeRecent" onclick="removeRecent('${ip}',event)">×</button></div>`).join(''):'<p style="color:var(--muted)">No recent connections yet.</p>'}
+function connectRemote(){let ip=cleanIp(document.getElementById('remoteIp').value);if(!ip){alert('Enter an IP address first');return;}addRecent(ip);window.open('http://'+ip,'_blank')}
+function quickConnect(ip){document.getElementById('remoteIp').value=ip;addRecent(ip);window.open('http://'+ip,'_blank')}
+renderRecent();
+
+let setupBusy=false,setupSelection={boardDetected:false,detectedPort:'',firmwareInstalled:false,firmware:null,webConfig:null};
+function setupPortValue(){return(document.getElementById('setupPort')?.value||'').trim()}
+function setSetupMessage(message,type=''){ setViewMessage('setup',message,type); }
+function setSetupBusy(busy){
+  setupBusy=busy;
+  document.querySelectorAll('.setupAction,#setupRefresh').forEach(button=>button.disabled=busy);
+  let select=document.getElementById('setupPort');if(select)select.disabled=busy;
+  if(!busy)renderSetupSelection();
+}
+function renderSetupSelection(){
+  let boardChecked=!!setupSelection.boardDetected;
+  let boardReady=boardChecked&&setupSelection.detectedPort===setupPortValue();
+  let choices=document.getElementById('setupChoices');if(choices)choices.hidden=!boardReady;
+  let firmware=setupSelection.firmware,web=setupSelection.webConfig;
+  /* Must be declared before any use: it was previously defined further down,
+     so every reference above it hit the let temporal dead zone and threw,
+     aborting renderSetupSelection() - which is why step 2 never un-greyed. */
+  let readyToInstall=boardReady&&firmware&&web&&setupPortValue();
+  let firmwareChoice=document.getElementById('setupFirmwareChoice');
+  if(firmwareChoice)firmwareChoice.innerHTML=firmware?`<strong>Firmware ${esc(firmware.version)}</strong>${esc(firmware.name)}${firmware.bundled?' · included':''}`:'No firmware selected';
+  let webChoice=document.getElementById('setupWebConfigChoice');
+  if(webChoice)webChoice.innerHTML=web?`<strong>WebConfig ${esc(web.version)}</strong>${esc(web.name)}${web.bundled?' · included':''}`:'No WebConfig selected';
+  let install=document.getElementById('setupInstall');if(install)install.disabled=setupBusy||!readyToInstall;
+  let firmwareText=document.getElementById('setupFirmwareText');
+  if(firmwareText){
+    let blockers=[];
+    if(!boardReady)blockers.push('detect the board');
+    if(!firmware)blockers.push('choose a firmware .bin');
+    /* Named explicitly: picking the remote .bin with a dock plugged in is the
+       likeliest mistake, and the install would refuse it anyway. */
+    if(firmware&&setupSelection.detectedDevice&&firmware.device&&
+       firmware.device!==setupSelection.detectedDevice){
+      blockers.push('choose '+(setupSelection.detectedDevice==='dock'?'dock':'remote')+
+                    ' firmware - the selected file is for the '+
+                    (firmware.device==='dock'?'dock':'remote'));
+    }
+    if(!web)blockers.push('choose a WebConfig .html');
+    if(!setupPortValue())blockers.push('select the USB port');
+    firmwareText.textContent=blockers.length
+      ? 'Waiting on: '+blockers.join(', ')+'.'
+      : `Installs firmware ${firmware.version}, waits for the remote to restart, then prepares its SD card with WebConfig ${web.version}, Default icons and themes.`;
+  }
+  let webText=document.getElementById('setupWebConfigText');
+  let step2=document.getElementById('setupStep2');
+  if(step2)step2.classList.toggle('locked',!readyToInstall);
+  if(webText){
+    /* Gating used to be invisible: the step simply stayed grey with no
+       indication of what was missing, which reads as a bug. Name the
+       outstanding prerequisite instead. */
+    let blockers=[];
+    if(!boardChecked)blockers.push('detect the board (step 1)');
+    if(!firmware)blockers.push('choose a firmware .bin');
+    if(!setupSelection.firmwareInstalled)blockers.push('install the firmware (step 2)');
+    if(!web)blockers.push('choose a WebConfig .html');
+    if(!setupPortValue())blockers.push('select the USB port');
+    webText.textContent='';
+  }
+  let sensorInstall=document.getElementById('setupSensorInstall');if(sensorInstall)sensorInstall.disabled=setupBusy||!boardReady;
+
+  /* Dim a step until the one before it is done, so the order is obvious
+     rather than only being enforced by a disabled button. */
+
+
+}
+/* ---- Set Up a New Dock -------------------------------------------------
+   Shares the server's detection and file selection with the remote tab -
+   there is only ever one board plugged in - but keeps its own controls, so
+   nothing here asks for a WebConfig or an SD card the dock does not have. */
+function dockPortValue(){ let el=document.getElementById('dockPort'); return el?el.value.trim():''; }
+function setDockMessage(text,kind){
+  let el=document.getElementById('dockStatus'); if(!el) return;
+  el.className='setupStatus'+(kind==='err'?' err':(kind==='ok'?' ok':''));
+  el.textContent=text;
+}
+function renderDockSelection(){
+  let detected=setupSelection.detectedDevice;
+  let boardReady=!!setupSelection.boardDetected&&setupSelection.detectedPort===dockPortValue();
+  let isDock=boardReady&&detected==='dock';
+  let choices=document.getElementById('dockChoices'); if(choices)choices.hidden=!isDock;
+  let firmware=setupSelection.firmware;
+  let firmwareIsDock=!!firmware&&firmware.device==='dock';
+  let choice=document.getElementById('dockFirmwareChoice');
+  if(choice)choice.innerHTML=firmware?`<strong>${firmwareIsDock?'Dock firmware':'NOT dock firmware'} ${esc(firmware.version)}</strong>${esc(firmware.name)}`:'No dock firmware selected';
+  let install=document.getElementById('dockInstall');
+  let ready=!setupBusy&&isDock&&firmwareIsDock&&!!dockPortValue();
+  if(install)install.disabled=!ready;
+  /* The step carries .locked, which is opacity .42 on everything inside it -
+     the button included. Enabling the button without clearing that left it
+     genuinely clickable but looking disabled, which is worse than either. */
+  let step=document.getElementById('dockStep2');
+  if(step)step.classList.toggle('locked',!ready);
+  let text=document.getElementById('dockFirmwareText');
+  if(text){
+    let blockers=[];
+    if(!boardReady)blockers.push('detect the board');
+    else if(!isDock)blockers.push('plug in a dock - the board found is '+(detected==='remote'?'an OpenRemote remote (ESP32-S3)':'not a dock'));
+    if(isDock&&!firmware)blockers.push('choose a dock .bin');
+    if(isDock&&firmware&&!firmwareIsDock)blockers.push('choose DOCK firmware - the selected file is for the remote');
+    text.textContent=blockers.length?('Still to do: '+blockers.join(', ')+'.'):'Writes the firmware to the dock and restarts it.';
+  }
+}
+async function loadDockPorts(){
+  if(setupBusy)return;
+  let select=document.getElementById('dockPort'); if(!select)return;
+  let previous=select.value; select.innerHTML='<option value="">Scanning for USB boards…</option>';
+  let data=await fetch('/usb-ports?ts='+Date.now()).then(r=>r.json()).catch(()=>({ports:[]}));
+  let ports=data.ports||[];
+  select.innerHTML=ports.length?ports.map(port=>`<option value="${esc(port)}">${esc(port)}</option>`).join(''):'<option value="">No USB serial ports found</option>';
+  if(previous&&ports.includes(previous))select.value=previous;
+  select.onchange=renderDockSelection;
+  let info=await fetch('/setup/info?ts='+Date.now()).then(r=>r.json()).catch(()=>({}));
+  if(info.selection)setupSelection=info.selection;
+  renderDockSelection();
+}
+async function detectDockBoard(){
+  let port=dockPortValue(); if(!port){setDockMessage('Plug the dock in and choose its USB serial port.','err');return;}
+  setSetupBusy(true); setDockMessage('Checking the USB board…');
+  try{
+    let data=await setupPost('/setup/detect',{port});
+    if(data.selection)setupSelection=data.selection;
+    if(data.error){ setDockMessage(data.error,'err'); }
+    else if(setupSelection.detectedDevice==='dock'){ setDockMessage('ESP32-C3 detected. Choose the dock firmware.','ok'); }
+    else { setDockMessage('That is an OpenRemote remote (ESP32-S3), not a dock. Use Setup New Remote for it.','err'); }
+  }catch(error){ setDockMessage(error.message,'err'); }
+  setSetupBusy(false); renderDockSelection();
+}
+async function chooseDockFirmware(){
+  if(setupBusy)return; setSetupBusy(true); setDockMessage('Choose a dock firmware .bin file…');
+  try{
+    let data=await setupPost('/setup/choose-firmware');
+    if(data.selection)setupSelection=data.selection;
+    if(data.error)setDockMessage(data.error,'err');
+    else if(data.cancelled)setDockMessage('Firmware selection cancelled.');
+    else if(setupSelection.firmware&&setupSelection.firmware.device!=='dock')
+      setDockMessage('That is remote firmware ('+esc(setupSelection.firmware.chip)+'). Choose a dock .bin built for the ESP32-C3.','err');
+    else setDockMessage('Dock firmware '+setupSelection.firmware.version+' selected.','ok');
+  }catch(error){ setDockMessage(error.message,'err'); }
+  setSetupBusy(false); renderDockSelection();
+}
+async function installDock(){
+  let port=dockPortValue(); if(!port){setDockMessage('Plug the dock in and choose its USB serial port.','err');return;}
+  let fw=setupSelection.firmware?.version||'selected';
+  if(!confirm('Install OpenRemote Dock firmware '+fw+'?\n\nThis writes the bootloader, partition table and firmware, setting the dock up from scratch. Any existing pairing is erased, so you will pair it with the remote again afterwards.\n\nTo update a dock that is already paired, send this same .bin from WebConfig instead - that keeps the pairing.'))return;
+  setupBusy=false; setupSummaryShown=false;
+  renderJobProgress('dock',{progress:0,status:'Installing dock firmware…',log:[]});
+  try{ setSetupBusy(true); }catch(e){ setupBusy=true; }
+  setDockMessage('Installing dock firmware…');
+  try{
+    let data=await setupPost('/setup/flash',{port});
+    if(data.error){ setupBusy=false; try{setSetupBusy(false);}catch(e){}
+      setDockMessage(data.error,'err'); alert('Install could not start\n\n'+data.error); }
+  }catch(error){ setupBusy=false; try{setSetupBusy(false);}catch(e){}
+    setDockMessage(error.message,'err'); }
+}
+async function loadSetupInfo(){
+  let data=await fetch('/setup/info?ts='+Date.now()).then(r=>r.json()).catch(()=>({}));
+  if(data.selection)setupSelection=data.selection;
+  renderSetupSelection();
+  /* Both tabs read the same server-side selection, so a detect or install done
+     from either has to repaint the other - otherwise the dock tab still shows
+     the board it found before the remote tab replaced it. */
+  if(typeof renderDockSelection==='function')renderDockSelection();
+}
+async function loadSetupPorts(){
+  if(setupBusy)return;
+  let select=document.getElementById('setupPort');if(!select)return;
+  let previous=select.value;select.innerHTML='<option value="">Scanning for USB boards…</option>';
+  let data=await fetch('/usb-ports?ts='+Date.now()).then(r=>r.json()).catch(()=>({ports:[]}));
+  let ports=data.ports||[];
+  select.innerHTML=ports.length?ports.map(port=>`<option value="${esc(port)}">${esc(port)}</option>`).join(''):'<option value="">No USB serial ports found</option>';
+  if(previous&&ports.includes(previous))select.value=previous;
+  select.onchange=renderSetupSelection;renderSetupSelection();
+}
+async function setupPost(path,payload={}){
+  let response=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+  let data=await response.json().catch(()=>({error:'OpenRemote Studio returned an unreadable response.'}));
+  if(!response.ok&&!data.error)data.error='The setup operation could not be completed.';
+  return data;
+}
+async function detectSetupBoard(){
+  let port=setupPortValue();if(!port){setSetupMessage('Plug in the remote and choose its USB serial port.','err');return;}
+  setSetupBusy(true);setSetupMessage('Checking the USB board…');
+  try{
+    let data=await setupPost('/setup/detect',{port});
+    if(data.selection)setupSelection=data.selection;
+    setSetupMessage(data.error||'ESP32-S3 detected. Choose the firmware and WebConfig files.',data.error?'err':'ok');
+  }catch(error){setSetupMessage(error.message,'err');}
+  setSetupBusy(false);
+}
+async function chooseSetupFirmware(){
+  if(setupBusy)return;setSetupBusy(true);setSetupMessage('Choose an OpenRemote firmware .bin file…');
+  try{let data=await setupPost('/setup/choose-firmware');if(data.selection)setupSelection=data.selection;
+    if(data.error)setSetupMessage(data.error,'err');else if(data.cancelled)setSetupMessage('Firmware selection cancelled.');else setSetupMessage(`Firmware ${setupSelection.firmware.version} selected.`,'ok');
+  }catch(error){setSetupMessage(error.message,'err');}setSetupBusy(false);
+}
+async function chooseSetupWebConfig(){
+  if(setupBusy)return;setSetupBusy(true);setSetupMessage('Choose an OpenRemote WebConfig .html file…');
+  try{let data=await setupPost('/setup/choose-webconfig');if(data.selection)setupSelection=data.selection;
+    if(data.error)setSetupMessage(data.error,'err');else if(data.cancelled)setSetupMessage('WebConfig selection cancelled.');else setSetupMessage(`WebConfig ${setupSelection.webConfig.version} selected.`,'ok');
+  }catch(error){setSetupMessage(error.message,'err');}setSetupBusy(false);
+}
+async function installEverything(){
+  let port=setupPortValue();
+  if(!port){setSetupMessage('Plug in the remote and choose its USB serial port.','err');return;}
+  let fw=setupSelection.firmware?.version||'selected';
+  let wc=setupSelection.webConfig?.version||'selected';
+  if(!confirm(`Install OpenRemote ${fw} and prepare the SD card?\n\nThis replaces the ESP32-S3 internal flash, then creates any missing folders on the card and installs WebConfig ${wc}, Default icons and themes. Existing devices, activities and backups are left alone.\n\nLeave the SD card in the remote and close Arduino Serial Monitor.`))return;
+  /* Clear anything left over from a previous failure so a retry always
+     starts clean - a stuck busy flag or stale progress used to make Install
+     look dead until Studio was restarted. */
+  setupBusy=false; setupSummaryShown=false;
+  renderJobProgress('setup',{progress:0,status:'Installing firmware…',log:[]});
+  try{ setSetupBusy(true); }catch(e){ setupBusy=true; }
+  setSetupMessage('Installing firmware…');
+  try{
+    let data=await setupPost('/setup/install-all',{port});
+    if(data.error){setupBusy=false;try{setSetupBusy(false);}catch(e){}
+      setSetupMessage(data.error,'err');alert('Install could not start\n\n'+data.error+'\n\nPress Install again to retry.');}
+  }catch(error){setupBusy=false;try{setSetupBusy(false);}catch(e){}
+    setSetupMessage(error.message,'err');alert('Install could not start\n\n'+error.message+'\n\nPress Install again to retry.');}
+}
+async function flashSetupBoard(){
+  let port=setupPortValue();if(!port){setSetupMessage('Plug in the remote and choose its USB serial port.','err');return;}
+  let version=setupSelection.firmware?.version||'selected';
+  if(!confirm(`Install OpenRemote firmware ${version} on this ESP32-S3? This replaces everything currently stored in the board's internal flash. The SD card is handled in step 3.`))return;
+  setSetupBusy(true);setSetupMessage('Starting firmware installation…');
+  try{
+    let data=await setupPost('/setup/flash',{port});
+    if(data.error){setSetupMessage(data.error,'err');setSetupBusy(false);}
+  }catch(error){setSetupMessage(error.message,'err');setSetupBusy(false);}
+}
+async function flashSensorTest(){
+  let port=setupPortValue();if(!port){setSetupMessage('Plug in the remote and choose its USB serial port.','err');return;}
+  if(!confirm('Install the bundled Sensor Test on this ESP32-S3? This temporarily replaces OpenRemote in internal flash. Your SD card is not changed.'))return;
+  setSetupBusy(true);setSetupMessage('Starting Sensor Test installation…');
+  try{
+    let data=await setupPost('/setup/flash-sensor',{port});
+    if(data.error){setSetupMessage(data.error,'err');setSetupBusy(false);}
+  }catch(error){setSetupMessage(error.message,'err');setSetupBusy(false);}
+}
+async function prepareSetupSd(){
+  setSetupBusy(true);setSetupMessage('Choose the SD card inserted into this computer…');
+  try{
+    let data=await setupPost('/setup/prepare-sd');
+    if(data.error){setSetupMessage(data.error,'err');setSetupBusy(false);}
+    else if(data.cancelled){setSetupMessage('SD card selection cancelled.');setSetupBusy(false);}
+  }catch(error){setSetupMessage(error.message,'err');setSetupBusy(false);}
+}
+async function pollSetup(){
+  try{
+    let state=await fetch('/setup/status?ts='+Date.now()).then(r=>r.json());
+    let view=jobView(state);
+    /* Only paint while a job is live, or on the tick it finishes. This used
+       to repaint the last finished job's state every 500ms forever, which
+       fought with pollWebConfigUsb() over the same Recovery elements - the
+       bar flicked between 0% and 100% and the KB/MB counter was overwritten
+       before it could ever be read. */
+    if(state.running||setupBusy) renderJobProgress(view,state);
+    if(state.running){
+      try{ setSetupBusy(true); }catch(e){ setupBusy=true; }
+      setupSummaryShown=false;
+    }else if(setupBusy){
+      try{ setSetupBusy(false); }catch(e){ setupBusy=false; }
+      let sdJob=(state.operation==='remote-sd'||state.operation==='install-all');
+      if(sdJob&&!setupSummaryShown){ setupSummaryShown=true; showRemoteSdSummary(state); }
+      if(state.done){
+        loadSetupInfo();
+        if(state.operation==='flash'||state.operation==='sensor')setTimeout(loadSetupPorts,1200);
+      }
+    }
+  }catch(error){}
+  setTimeout(pollSetup,500);
+}
+loadSetupPorts();loadSetupInfo();pollSetup();
+
+async function startBuild(){
+  document.getElementById('buildBtn').disabled=true;
+  let sources=[...document.querySelectorAll('.src:checked')].map(x=>x.value);
+  let r=await fetch('/start-build',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sources})}).then(r=>r.json());
+  if(r.error){alert(r.error);document.getElementById('buildBtn').disabled=false;}
+}
+async function poll(){
+  try{
+    let s=await fetch('/status').then(r=>r.json());
+    log.value=(s.log||[]).join('\n');log.scrollTop=log.scrollHeight;
+    bar.style.width=(s.progress||0)+'%';pct.textContent=s.progress||0;mb.textContent=(s.downloaded_mb||0).toFixed(1);
+    status.textContent=s.current||'';footerStatus.textContent=s.current||'Ready';records.textContent=s.records||0;binmb.textContent=(s.bin_mb||0).toFixed(1);
+    
+    if(s.done){document.getElementById('buildBtn').disabled=false;loadInfo();searchDb();}
+    if(s.error){status.textContent='ERROR: '+s.error;document.getElementById('buildBtn').disabled=false;}
+  }catch(e){}
+  setTimeout(poll,500);
+}
+poll();
+function stat(label,num){return `<div class="stat"><div class="num">${num}</div><div class="label">${label}</div></div>`}
+async function loadInfo(){
+  let info=await fetch('/db-info?ts='+Date.now()).then(r=>r.json());
+  if(info.error){
+    stats.innerHTML='';
+    dbInfo.textContent=info.error;
+    sideLoaded.innerHTML='<span class="statusDot redStatus"></span>No database loaded';
+    sideDbName.textContent='OpenRemote.irdb';
+    sideDbDate.textContent='Created: —';
+    if(typeof browserStatusLine!=='undefined' && browserStatusLine){
+      browserStatusLine.innerHTML='<span class="statusDot redStatus"></span>No database loaded';
+      browserDbName.textContent='OpenRemote.irdb';
+      browserDbDate.textContent='Created: —';
+    }
+    countLine.textContent='';
+    return false;
+  }
+  dbInfo.textContent='Loaded database: '+info.path;
+  sideLoaded.innerHTML='<span class="statusDot"></span>Database Loaded';
+  sideDbName.textContent='OpenRemote.irdb ('+(info.size_mb||0).toFixed(1)+' MB)';
+  sideDbDate.textContent='Created: '+(info.build_date_short||'—');
+  if(typeof browserStatusLine!=='undefined' && browserStatusLine){
+    browserStatusLine.innerHTML='<span class="statusDot"></span>Database Loaded';
+    browserDbName.textContent='OpenRemote.irdb ('+(info.size_mb||0).toFixed(1)+' MB)';
+    browserDbDate.textContent='Created: '+(info.build_date_short||'—');
+  }
+  stats.innerHTML=stat('Devices',info.devices)+stat('Brands',info.brands)+stat('Buttons',info.buttons)+stat('Version',info.version||'—')+stat('Created',info.build_date_short||'—');
+  countLine.textContent=info.devices+' devices';
+  return true;
+}
+
+async function triggerSearchWakeup(){
+  let box=document.getElementById('searchBox');
+  if(!box) return;
+  box.value='s';
+  box.dispatchEvent(new Event('input',{bubbles:true}));
+  searchDb();
+  setTimeout(()=>{
+    box.value='';
+    box.dispatchEvent(new Event('input',{bubbles:true}));
+    searchDb();
+    setTimeout(syncBrowserDbCard,300);
+  },450);
+}
+
+async function uploadDb(){
+  let f=document.getElementById('dbFile').files[0];if(!f){alert('Choose an OpenRemote.irdb file first');return;}
+  let r=await fetch('/upload-db',{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:f}).then(r=>r.json());
+  if(r.error){
+    alert(r.error);
+  }else{
+    await loadInfo();
+    syncBrowserDbCard();
+    triggerSearchWakeup();
+  }
+}
+
+let selectedDeviceId=null;
+let timer=null;function searchDb(){clearTimeout(timer);timer=setTimeout(async()=>{
+  let q=document.getElementById('searchBox').value;
+  let data=await fetch('/search?q='+encodeURIComponent(q)+'&ts='+Date.now()).then(r=>r.json());
+  let out=document.getElementById('results');
+  if(data.error){out.innerHTML='<p>'+data.error+'</p>';countLine.textContent='';return;}
+
+  // Refresh database status without calling loadInfo(), because loadInfo() resets
+  // countLine back to the full database count and causes the search count to flicker.
+  fetch('/db-info?ts='+Date.now()).then(r=>r.json()).then(info=>{
+    if(!info.error){
+      sideLoaded.innerHTML='<span class="statusDot"></span>Database Loaded';
+      sideDbName.textContent='OpenRemote.irdb ('+(info.size_mb||0).toFixed(1)+' MB)';
+      sideDbDate.textContent='Created: '+(info.build_date_short||'—');
+      if(typeof browserStatusLine!=='undefined' && browserStatusLine){
+        browserStatusLine.innerHTML='<span class="statusDot"></span>Database Loaded';
+        browserDbName.textContent='OpenRemote.irdb ('+(info.size_mb||0).toFixed(1)+' MB)';
+        browserDbDate.textContent='Created: '+(info.build_date_short||'—');
+      }
+      dbInfo.textContent='Loaded database: '+info.path;
+    }
+  }).catch(()=>{});
+
+  countLine.textContent=data.total+(data.total===1?' device':' devices')+(q.trim()?' matching "'+q.trim()+'"':'');
+  out.innerHTML=(data.results||[]).map(r=>`<div class=result onclick="details('${r.id}')"><div class=resultHead><b>${esc(r.brand)} ${esc(r.model)}</b><small>${esc(r.category)} • ${esc(r.source)} • ${esc(r.format)}</small></div><div>${(r.protocols||[]).map(x=>`<span class=tag>${esc(x)}</span>`).join('')}</div><div>${(r.buttons||[]).slice(0,24).map(x=>`<span class=tag>${esc(x)}</span>`).join('')}</div></div>`).join('')||'<p>No results.</p>';
+},120)}
+
+async function details(id){
+  selectedDeviceId=id;
+  let d=await fetch('/device?id='+encodeURIComponent(id)).then(r=>r.json()); if(d.error)return;
+  let cmds=(d.ir||[]).slice(0,80).map(c=>`<div class=result><b>${esc(c.name||'Command')}</b><div class=detailKV>${c.protocol?'Protocol: '+esc(c.protocol)+' ':''}${c.address?'Address: '+esc(c.address)+' ':''}${c.command?'Command: '+esc(c.command):''}${c.code?'Code: '+esc(c.code):''}</div></div>`).join('');
+  document.getElementById('details').innerHTML=`<div class=detailTitle>${esc(d.brand)} ${esc(d.model)}</div><div class=detailKV>${esc(d.category)} • ${esc(d.source)} • ${esc(d.format)}</div><div>${(d.protocols||[]).map(x=>`<span class=tag>${esc(x)}</span>`).join('')}</div><div class=usbPanel><b>Send to OpenRemote over USB</b><div class=detailKV>Choose the remote's USB serial port and close Arduino Serial Monitor before sending this selected IR device.</div><div class=usbRow><select id=usbPortSelect><option>Scanning…</option></select><button class=secondary onclick="loadUsbPorts()">Refresh</button><button class=primary onclick="sendSelectedToUsb()">Send</button></div><div class=usbStatus id=usbStatus>Ready.</div></div><h3>Available buttons (${(d.buttons||[]).length})</h3><div>${(d.buttons||[]).map(x=>`<span class=tag>${esc(x)}</span>`).join('')}</div><h3>IR command preview</h3>${cmds||'<p class=detailKV>No command details stored for this source.</p>'}`;
+  loadUsbPorts();
+}
+
+async function loadUsbPorts(){
+  let select=document.getElementById('usbPortSelect');
+  if(!select) return;
+  select.innerHTML='<option>Scanning…</option>';
+  let data=await fetch('/usb-ports?ts='+Date.now()).then(r=>r.json()).catch(()=>({ports:[]}));
+  let ports=data.ports||[];
+  select.innerHTML=ports.length?ports.map(p=>`<option value="${esc(p)}">${esc(p)}</option>`).join(''):'<option value="">No USB serial ports found</option>';
+}
+async function sendSelectedToUsb(){
+  let select=document.getElementById('usbPortSelect');
+  let status=document.getElementById('usbStatus');
+  let port=select&&select.value;
+  if(!selectedDeviceId || !port){if(status){status.className='usbStatus err';status.textContent='Choose a device and USB serial port first.';}return;}
+  if(status){status.className='usbStatus';status.textContent='Sending selected IR device over USB…';}
+  let data=await fetch('/usb/import-device',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:selectedDeviceId,port})}).then(r=>r.json()).catch(e=>({error:e.message}));
+  if(data.error){
+    if(status){status.className='usbStatus err';status.textContent=data.error;}
+  }else{
+    let countText=Number.isFinite(Number(data.deviceFileCount))?' Remote now has '+Number(data.deviceFileCount)+' .ir device file(s).':'';
+    if(status){status.className='usbStatus ok';status.textContent='Sent '+(data.device||'device')+' with '+(data.commands||0)+' command(s). The remote saved '+(data.filename||'the .ir file')+' to '+(data.path||'/devices')+'.'+countText;}
+  }
+}
+
+function syncBrowserDbCard(){
+  if(typeof browserStatusLine==='undefined' || !browserStatusLine) return;
+  if(typeof sideLoaded!=='undefined' && sideLoaded) browserStatusLine.innerHTML=sideLoaded.innerHTML;
+  if(typeof sideDbName!=='undefined' && sideDbName) browserDbName.textContent=sideDbName.textContent;
+  if(typeof sideDbDate!=='undefined' && sideDbDate) browserDbDate.textContent=sideDbDate.textContent;
+}
+setInterval(syncBrowserDbCard,500);
+
+function esc(s){return(s||'').toString().replace(/[&<>"]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[m]));}
+loadInfo();
+
+function formatUsbBytes(n){
+  n=Number(n)||0;
+  if(n>=1048576) return (n/1048576).toFixed(2)+' MB';
+  if(n>=1024) return (n/1024).toFixed(0)+' KB';
+  return n+' B';
+}
+function setWebConfigUsbProgress(sent,total,message,cls){
+  var bar=document.getElementById('recoveryBar');
+  var status=document.getElementById('recoveryStatus');
+  var pct=total>0?Math.min(100,Math.round(sent*100/total)):0;
+  if(bar) bar.style.width=pct+'%';
+  if(status){
+    status.className='setupStatus'+(cls?' '+cls:'');
+    status.textContent=total>0
+      ? message+'  '+formatUsbBytes(sent)+' / '+formatUsbBytes(total)+'  ('+pct+'%)'
+      : message;
+  }
+}
+async function pollWebConfigUsb(){
+  try{
+    var st=await fetch('/usb/webconfig-state').then(r=>r.json());
+    if(st.error){
+      setWebConfigUsbProgress(st.sent,st.total,st.status||'Install failed.','err');
+      ['webConfigUsbBtn','recoveryLoadBackupBtn','recoveryLoadIrBtn'].forEach(function(id){
+        var b=document.getElementById(id); if(b)b.disabled=false; });
+      return;
+    }
+    setWebConfigUsbProgress(st.sent,st.total,st.status||'Sending…');
+    if(st.running){ setTimeout(pollWebConfigUsb,300); return; }
+    if(st.done){
+      setWebConfigUsbProgress(st.total,st.total,st.status||'Installed.','ok');
+      if(pendingBackupInstall && !st.error){
+        var job=pendingBackupInstall; pendingBackupInstall=null;
+        maybeInstallBackup(job);
+      }else{ pendingBackupInstall=null; }
+      ['webConfigUsbBtn','recoveryLoadBackupBtn','recoveryLoadIrBtn'].forEach(function(id){
+        var b=document.getElementById(id); if(b)b.disabled=false; });
+    }
+  }catch(e){
+    setWebConfigUsbProgress(0,0,'Lost contact with Studio: '+e.message,'err');
+    document.getElementById('webConfigUsbBtn').disabled=false;
+  }
+}
+async function installWebConfigOverUsb(input){
+  var file=input.files&&input.files[0];
+  input.value='';
+  if(!file) return;
+  var port=recoveryPortValue();
+  if(!port){ setWebConfigUsbProgress(0,0,'Choose the remote\'s USB serial port above first.','err'); return; }
+  if(!confirm('Install '+file.name+' as www/index.html on the remote\'s SD card?\n\nClose Arduino Serial Monitor first.')) return;
+  var btn=document.getElementById('webConfigUsbBtn');
+  btn.disabled=true;
+  setWebConfigUsbProgress(0,file.size,'Preparing…');
+  try{
+    var buffer=await file.arrayBuffer();
+    var res=await fetch('/usb/install-webconfig?port='+encodeURIComponent(port),{
+      method:'POST',headers:{'Content-Type':'text/html'},body:buffer
+    }).then(r=>r.json());
+    if(!res.ok){
+      setWebConfigUsbProgress(0,0,res.error||'Could not start the install.','err');
+      btn.disabled=false; return;
+    }
+    pollWebConfigUsb();
+  }catch(e){
+    setWebConfigUsbProgress(0,0,'Could not read that file: '+e.message,'err');
+    btn.disabled=false;
+  }
+}
+
+function recoveryPortValue(){
+  var sel=document.getElementById('recoveryPort');
+  return sel && sel.value ? sel.value : '';
+}
+function setRecoveryMessage(message,type){ setViewMessage('recovery',message,type); }
+async function loadRecoveryPorts(){
+  var sel=document.getElementById('recoveryPort');
+  if(!sel) return;
+  var keep=sel.value;
+  sel.innerHTML='<option value="">Scanning…</option>';
+  var ports=[];
+  try{ ports=(await fetch('/usb-ports').then(r=>r.json())).ports||[]; }catch(e){ ports=[]; }
+  sel.innerHTML=ports.length
+    ? ports.map(p=>`<option value="${esc(p)}">${esc(p)}</option>`).join('')
+    : '<option value="">No USB serial ports found</option>';
+  if(keep && ports.indexOf(keep)>=0) sel.value=keep;
+}
+async function flashFirmwareOverUsb(input){
+  var file=input.files&&input.files[0];
+  input.value='';
+  if(!file) return;
+  var port=recoveryPortValue();
+  if(!port){ setViewMessage('recovery',"Choose the remote's USB serial port above first.",'err'); return; }
+  if(!confirm('Install '+file.name+' on the remote?\n\nSettings, saved Wi-Fi and Bluetooth pairings are kept - only the firmware is replaced.\n\nClose Arduino Serial Monitor first.')) return;
+  var btn=document.getElementById('recoveryFirmwareBtn');
+  btn.disabled=true;
+  setupBusy=false; setupSummaryShown=false;
+  try{ setSetupBusy(true); }catch(e){ setupBusy=true; }
+  renderJobProgress('recovery',{progress:0,status:'Reading firmware…',log:[]});
+  try{
+    var buffer=await file.arrayBuffer();
+    var res=await fetch('/usb/flash-firmware?port='+encodeURIComponent(port),{
+      method:'POST',headers:{'Content-Type':'application/octet-stream'},body:buffer
+    }).then(r=>r.json());
+    if(!res.ok){
+      setViewMessage('recovery',res.error||'Could not start the install.','err');
+      setSetupBusy(false);
+      alert('Firmware install could not start\n\n'+(res.error||'Unknown error'));
+    }
+    /* pollSetup() renders the rest: the job reports itself against the
+       recovery view, so progress, log and completion all land here. */
+  }catch(e){
+    setViewMessage('recovery','Could not read that file: '+e.message,'err');
+    setSetupBusy(false);
+  }
+  btn.disabled=false;
+}
+
+async function factoryResetOverUsb(){
+  var port=recoveryPortValue();
+  if(!port){ setWebConfigUsbProgress(0,0,'Choose the remote\'s USB serial port above first.','err'); return; }
+  if(!confirm('Erase user data on the remote?\n\nDevices, activities, macros, custom icons and themes, saved Wi-Fi and settings are removed from the SD card. WebConfig, firmware, SD backups and Default libraries are kept.\n\nThe remote restarts afterwards.')) return;
+  var btn=document.getElementById('recoveryResetBtn');
+  btn.disabled=true;
+  setWebConfigUsbProgress(0,0,'Erasing user data on the remote…');
+  try{
+    var res=await fetch('/usb/factory-reset',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({port})}).then(r=>r.json());
+    if(res.error) setWebConfigUsbProgress(0,0,'Factory reset failed: '+res.error,'err');
+    else setWebConfigUsbProgress(0,0,'User data erased. The remote is restarting.','ok');
+  }catch(e){
+    setWebConfigUsbProgress(0,0,'Factory reset failed: '+e.message,'err');
+  }
+  btn.disabled=false;
+}
+
+/* Version comes from the running app, so the sidebar can never drift from
+   APP_VERSION the way the hard-coded value did. */
+fetch('/app/ping').then(r=>r.json()).then(d=>{
+  var el=document.getElementById('sidebarVersion');
+  if(el && d && d.version) el.textContent='v'+d.version;
+}).catch(()=>{});
+
+async function prepareRemoteSdCard(port,fromRecovery){
+  port=(port||setupPortValue()||recoveryPortValue()||'').trim();
+  /* The Recovery tab has its own status line; writing to the Remote Config
+     one meant an error there was completely invisible - which is why running
+     this from Recovery appeared to do nothing at all. */
+  var view=fromRecovery?'recovery':'setup';
+  var say=function(m,t){setViewMessage(view,m,t);};
+  if(!port){say("Choose the remote's USB serial port first.",'err');if(fromRecovery)alert("Choose the remote's USB serial port first.");return;}
+  if(!confirm('Prepare the SD card inside the remote?\n\nStudio creates any missing folders and installs WebConfig, Default icons and Default themes. Files already present are skipped, and your devices, activities and backups are left alone.\n\nClose Arduino Serial Monitor first.'))return;
+  setupBusy=false; setupSummaryShown=false;
+  try{ setSetupBusy(true); }catch(e){ setupBusy=true; }
+  renderJobProgress(view,{progress:0,status:'Starting…',log:[]});
+  say('Preparing the SD card inside the remote…');
+  try{
+    let data=await setupPost('/setup/prepare-remote-sd',{port,recovery:!!fromRecovery});
+    if(data.error){
+      say(data.error,'err');setSetupBusy(false);
+      alert('Prepare SD Card could not start\n\n'+data.error+
+        '\n\nChoose a firmware .bin and a WebConfig .html on the Remote Config tab first - they tell Studio what to install.');
+    }
+  }catch(error){
+    say(error.message,'err');setSetupBusy(false);
+    alert('Prepare SD Card could not start\n\n'+error.message);
+  }
+}
+
+let setupSummaryShown=false;
+function formatSummaryBytes(n){
+  n=Number(n)||0;
+  if(n>=1048576) return (n/1048576).toFixed(2)+' MB';
+  if(n>=1024) return (n/1024).toFixed(0)+' KB';
+  return n+' bytes';
+}
+function showRemoteSdSummary(state){
+  if(state.error){
+    alert('Prepare SD Card failed\n\n'+state.error+
+      '\n\nIf the card cannot be read at all it is probably not FAT32. Format it on this computer as FAT32 / MS-DOS (FAT) with Master Boot Record, put it back in the remote, and run this again from the Recovery tab.');
+    return;
+  }
+  var foldersCreated=Number(state.foldersCreated)||0;
+  var foldersTotal=Number(state.foldersTotal)||0;
+  var copied=Number(state.filesInstalled)||0;
+  var skipped=Number(state.filesSkipped)||0;
+  var bytes=Number(state.bytesInstalled)||0;
+  var cardMb=Number(state.cardMb)||0;
+  var lines=[
+    'SD card prepared over USB.','',
+    'Folders created:  '+foldersCreated+(foldersTotal?(' of '+foldersTotal+' required'):''),
+    'Folders already present:  '+(foldersTotal?Math.max(0,foldersTotal-foldersCreated):'—'),
+    'Files copied:  '+copied+(copied?('  ('+formatSummaryBytes(bytes)+')'):''),
+    'Files skipped (already present):  '+skipped
+  ];
+  if(cardMb) lines.push('Card size:  '+cardMb+' MB');
+  lines.push('');
+  lines.push(copied||foldersCreated
+    ? 'The remote is ready. Reboot it if it is not already showing the OpenRemote UI.'
+    : 'Nothing needed changing - the card was already complete.');
+  alert(lines.join('\n'));
+}
+
+/*
+  One renderer per view. Every tab owns a <view>Status / <view>Bar /
+  <view>Log trio, and a job carries the view that started it, so progress can
+  only ever be written to the tab that owns it. Setup and Recovery previously
+  shared one job channel with each element routed by hand, which leaked the
+  bar, the status line and the log into the wrong tab on three separate
+  occasions - this makes that structurally impossible.
+*/
+function jobView(state){ return (state&&state.view)||'setup'; }
+function renderJobProgress(view,state){
+  var bar=document.getElementById(view+'Bar');
+  var status=document.getElementById(view+'Status');
+  var log=document.getElementById(view+'Log');
+  var done=state.done&&!state.error;
+  if(bar)bar.style.width=(done?100:(state.progress||0))+'%';
+  if(status){
+    status.className='setupStatus'+(state.error?' err':(done?' ok':''));
+    var text=state.error||state.status||'Ready.';
+    /* Show the KB/MB counter while bytes are actually moving, so a large
+       file (index.html is ~1.5 MB) does not look stalled. */
+    if(!state.error&&!done&&state.bytesTotal>0){
+      text+='  '+formatUsbBytes(state.bytesSent||0)+' / '+formatUsbBytes(state.bytesTotal);
+    }
+    status.textContent=text;
+  }
+  if(log){
+    var lines=state.log||[];
+    log.textContent=lines.join('\n');
+    log.style.display=lines.length?'block':'none';
+    log.scrollTop=log.scrollHeight;
+  }
+}
+function setViewMessage(view,message,type){
+  var status=document.getElementById(view+'Status');
+  if(!status)return;
+  status.className='setupStatus'+(type?' '+type:'');
+  status.textContent=message||'Ready.';
+}
+
+/*
+  Both Recovery file slots share this. The server decides from the contents
+  whether a file is a Flipper signals file (-> /devices) or OpenRemote JSON
+  (-> /backups, then offer to apply it), so the only difference between the
+  two slots is which button to re-enable and what to call the failure.
+*/
+async function sendRecoveryFile(input,options){
+  var file=input.files&&input.files[0]; input.value='';
+  if(!file) return;
+  var port=recoveryPortValue();
+  if(!port){ setRecoveryMessage("Choose the remote's USB serial port first.",'err'); alert("Choose the remote's USB serial port first."); return; }
+  var btn=document.getElementById(options.button); btn.disabled=true;
+  setWebConfigUsbProgress(0,file.size,'Checking the file…');
+  try{
+    var buffer=await file.arrayBuffer();
+    /*
+      Only a Flipper .ir can collide with an existing file in /devices, and
+      only the file's contents tell us that - so read the first line here
+      rather than trusting the extension.
+    */
+    var head=new TextDecoder().decode(buffer.slice(0,64));
+    if(head.indexOf('Filetype: IR signals file')===0){
+      var probe=await fetch('/usb/ir-exists?port='+encodeURIComponent(port)+'&name='+encodeURIComponent(file.name))
+        .then(r=>r.json()).catch(()=>({exists:false}));
+      if(probe.exists && !confirm('"'+file.name+'" already exists in /devices on this remote.\n\nOverwrite it?')){
+        setWebConfigUsbProgress(0,0,'Cancelled - the existing device was kept.'); btn.disabled=false; return;
+      }
+    }
+    var res=await fetch(options.endpoint+'?port='+encodeURIComponent(port)+'&name='+encodeURIComponent(file.name),
+      {method:'POST',headers:{'Content-Type':'application/octet-stream'},body:buffer}).then(r=>r.json());
+    if(!res.ok){ setWebConfigUsbProgress(0,0,res.error||'Could not load that file.','err'); alert(options.title+' failed\n\n'+(res.error||'Unknown error')); btn.disabled=false; return; }
+    if(res.backup){
+      setRecoveryMessage('Sending '+res.name+' — '+res.summary);
+      pendingBackupInstall={port:port,name:res.name,summary:res.summary};
+    }else{
+      setRecoveryMessage('Sending '+res.name+'…');
+    }
+    pollWebConfigUsb();
+  }catch(e){
+    setWebConfigUsbProgress(0,0,'Could not read that file: '+e.message,'err'); btn.disabled=false;
+  }
+}
+function loadBackupOverUsb(input){
+  return sendRecoveryFile(input,{endpoint:'/usb/load-backup',button:'recoveryLoadBackupBtn',title:'Load Backup'});
+}
+function loadIrFileOverUsb(input){
+  return sendRecoveryFile(input,{endpoint:'/usb/load-ir',button:'recoveryLoadIrBtn',title:'Load .IR File'});
+}
+
+let pendingBackupInstall=null;
+async function maybeInstallBackup(job){
+  /*
+    A full backup replaces the configuration; every other category merges into
+    it. Describing a merge as a replacement scared people off applying a
+    single learned device, which is the common case.
+  */
+  var isFull=/^Full backup/.test(job.summary||'');
+  var effect=isFull
+    ? 'This replaces the current devices, activities, macros, icons and themes.'
+    : 'This merges into the configuration already on the remote - matching items are updated, new ones are added, and every other category is left alone.';
+  if(!confirm('Copied to the SD card.\n\n'+job.summary+'\n\nApply it to the remote now?\n\n'+effect+' Choose Cancel to leave the file on the card and apply it later.')) {
+    setRecoveryMessage('Copied '+job.name+' to /backups. Not applied.','ok');
+    return;
+  }
+  setRecoveryMessage('Applying '+job.name+' on the remote…');
+  try{
+    var res=await fetch('/usb/restore-backup',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({port:job.port,name:job.name})}).then(r=>r.json());
+    if(res.error){ setRecoveryMessage('Restore failed: '+res.error,'err'); alert('Restore failed\n\n'+res.error); }
+    else{ setRecoveryMessage('Restored '+job.name+'. The remote is reloading its configuration.','ok');
+          alert('Backup applied.\n\nThe remote is reloading its configuration now.'); }
+  }catch(e){ setRecoveryMessage('Restore failed: '+e.message,'err'); }
+}
+</script>
+</body>
+</html>

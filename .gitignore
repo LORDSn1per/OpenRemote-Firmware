@@ -1,10 +1,43 @@
-.pio
-managed_components/
-.DS_Store
-.cache
-.dummy
+# Build outputs and caches - regenerable from source, and large.
+.pio/
 .vscode/.browse.c_cpp.db*
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
 compile_commands.json
+managed_components/
+.cache
+.dummy
+.DS_Store
+
+# Compiled firmware images. Every version is archived on disk under releases/
+# and mirrored to the NAS, but they are build products of the source in this
+# repo and would add ~1.8GB of history that no clone needs. Unlike the
+# WebConfig HTML - which is near-identical between versions and packs 120MB
+# down to 1MB - compiled binaries do not delta-compress, so they would stay
+# that size forever.
+releases/
+*.bin
+
+# Built desktop applications. The Studio .app bundles are 85MB each and 32 of
+# them exist; the old Studio repo tracked 23,392 files from inside them, which
+# is why its history alone was 237MB. Source lives in studio/, builds do not.
+*.app/
+*.AppImage
+studio/Mac/*.app/
+studio/Linux/*.AppImage
+
+# Python bytecode from the Studio sources.
+__pycache__/
+*.pyc
+
+# Local safety net from the reorganisation: full git bundles of the four
+# repositories that existed before everything was consolidated here. They stay
+# on disk so any of those histories can be cloned back, but a 121MB bundle
+# exceeds GitHub's hard per-file limit and nothing in a clone needs them.
+archive/git-history/*.bundle
+
+# Upstream OMOTE firmware, kept locally for reference. It is someone else's
+# repository and does not belong inside this history; the fork relationship is
+# recorded by the "upstream" remote instead.
+archive/reference-projects/Official OMOTE Firmware References/OMOTE-Firmware-official/

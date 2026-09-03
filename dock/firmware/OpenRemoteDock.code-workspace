@@ -1,0 +1,13 @@
+{
+	"folders": [
+		{
+			"name": "OpenRemote Dock (Firmware)",
+			"path": "."
+		},
+		{
+			"name": "OpenRemote Remote (Firmware)",
+			"path": "../../../../SOFTWARE/Platformio:Arduino/OpenRemote/OpenRemote_1.0"
+		}
+	],
+	"settings": {}
+}

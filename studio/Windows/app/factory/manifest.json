@@ -1,0 +1,20 @@
+{
+  "hardware": "OMOTE Rev 5",
+  "chip": "ESP32-S3",
+  "flashSize": "16MB",
+  "flashMode": "dio",
+  "flashFrequency": "80m",
+  "firmwareVersion": "2.03",
+  "webConfigVersion": "2.04",
+  "factoryImage": "OpenRemote_2.03_factory.bin",
+  "factoryImageBytes": 2363872,
+  "factoryImageSha256": "17344e4151d7afa64a3b1d07ba06e7db830aadfeb3c439eb12cc8c50b7cac16e",
+  "sensorTestImage": "OpenRemote_Sensor_Test_2.10_factory.bin",
+  "sensorTestImageBytes": 539456,
+  "sensorTestImageSha256": "46c44f676b8042364dbd1bb5dad5636d223629fccc14e442cbb1115e967a4acf",
+  "dockChip": "ESP32-C3",
+  "dockFlashSize": "4MB",
+  "dockBootstrapImage": "OpenRemote_Dock_bootstrap.bin",
+  "dockBootstrapBytes": 65536,
+  "dockBootstrapSha256": "a81e941d2398c39af1353564d0a22b83930b65cb92c7ad31eac2ec200a3ba405"
+}
