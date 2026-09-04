@@ -1,6 +1,40 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.03 - 2026-09-04
+    - Adds "ST-7789" as a third Display Module, with a real LovyanGFX
+      Panel_ST7789 behind it. Until now an ST7789 panel could only be driven by
+      picking "BuyDisplay", which changes no driver at all - it merely forced
+      colour inversion on. Those panels came up only under Arduino_GFX, whose
+      ILI9341 init is loose enough that an ST7789 tolerates it, so anyone
+      fitting one had to give up LovyanGFX and the frame rate that goes with
+      it. LovyanGFX's ILI9341 init is stricter and would not start them at all.
+    - offset_rotation is 0 for the ST7789 where the ILI9341 uses 2. That is a
+      property of the controller, not of this board: upstream OMOTE also uses 2
+      for its ILI9341, and the known-working ST7789 port of the same Rev 5
+      hardware changes precisely this field to 0. Copying the ILI9341's value
+      would have landed the image rotated.
+    - Choosing ST-7789 also writes a 20MHz bus default. The ILI9341 runs at
+      40MHz; the working ST7789 port uses 20, and a panel that does not come up
+      is worse than one at half the clock. LCD Clock still overrides it, and the
+      write only happens if the current setting is faster.
+    - Both panels are configured in the same class and one is chosen at boot by
+      selectPanel(), called before setBusFrequency()/init() because LovyanGFX
+      binds the panel when the bus starts. Both derive from Panel_LCD, so the
+      existing 8-bit parallel bus drives either - nothing about the wiring
+      changes.
+    - Invert Colours is now its own switch, next to Display Module in both menu
+      styles. The module dropdown no longer writes it. That coupling existed to
+      cancel out the wrong driver's colours on a BuyDisplay panel; with a real
+      ST7789 driver the compensation is wrong, and a dropdown silently changing
+      a setting the user can also change themselves meant the two disagreed.
+    - Removed the Split Line switch and the five saved-row-position dropdowns
+      from the Debug page in both menu styles. Row calibration is long settled
+      and the saved values still drive the layout - only the controls are gone.
+      The now-unreachable makeDebugRowDropdown() went with them.
+    - The boot log names the module and says when the ST7789 driver is actually
+      in use, so a wrong pairing is visible rather than inferred from colours.
+
   4.02 - 2026-09-02
     - Reports why the chunk retry is not firing. In the last capture exactly one
       chunk went out and nothing was resent for fifteen seconds, when the data
@@ -4693,7 +4727,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.02"
+#define OPENREMOTE_VERSION_STRING "4.03"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -5083,9 +5117,26 @@ static const uint8_t BLE_HID_REPORT_MAP[] = {
 };
 static const uint8_t BLE_HID_INPUT_BYTES = 10;
 
+static const uint8_t DISPLAY_MODULE_ADAFRUIT = 0;
+static const uint8_t DISPLAY_MODULE_BUYDISPLAY = 1;
+static const uint8_t DISPLAY_MODULE_ST7789 = 2;
+// 20MHz rather than the 40MHz the ILI9341 runs at. The working ST7789 port of
+// this hardware uses 20, and a panel that will not come up at all is a worse
+// outcome than one running at half the clock - it can be raised afterwards
+// from LCD Frequency if it proves stable.
+static const uint32_t ST7789_DEFAULT_BUS_HZ = 20000000UL;
+
 class OpenRemoteDisplay : public lgfx::LGFX_Device {
  private:
   lgfx::Panel_ILI9341 panel;
+  // The ST7789 panels (BuyDisplay's 2.8" ST7789V and similar) were until now
+  // driven by the ILI9341 driver above, which works only because the two
+  // controllers share most MIPI DCS commands - and only under Arduino_GFX,
+  // whose init sequence is loose enough to be tolerated. LovyanGFX's ILI9341
+  // init is stricter and those panels would not come up on it at all, which
+  // is why anyone fitting one had to give up LovyanGFX and its frame rate.
+  // Both panels derive from Panel_LCD, so the same parallel bus drives either.
+  lgfx::Panel_ST7789 panelSt7789;
   lgfx::Bus_Parallel8 bus;
 
  public:
@@ -5117,6 +5168,47 @@ class OpenRemoteDisplay : public lgfx::LGFX_Device {
     panelConfig.offset_rotation = 2;
     panel.config(panelConfig);
     setPanel(&panel);
+
+    // The ST7789 alternative, configured now and selected at boot by
+    // selectPanel() once the saved module choice has been read.
+    panelSt7789.setBus(&bus);
+    auto st7789Config = panelSt7789.config();
+    st7789Config.pin_cs = PIN_LCD_CS;
+    st7789Config.pin_rst = PIN_LCD_RST;
+    st7789Config.pin_busy = -1;
+    st7789Config.memory_width = LCD_W;
+    st7789Config.memory_height = LCD_H;
+    st7789Config.panel_width = LCD_W;
+    st7789Config.panel_height = LCD_H;
+    st7789Config.offset_x = 0;
+    st7789Config.offset_y = 0;
+    // Zero, not the 2 the ILI9341 above uses. That difference is a property of
+    // the controller rather than of this board: upstream OMOTE also uses 2 for
+    // its ILI9341, and the working ST7789 port of that same Rev 5 hardware
+    // changes precisely this field to 0. Copying the ILI9341's 2 here would
+    // land the image rotated.
+    st7789Config.offset_rotation = 0;
+    st7789Config.dummy_read_pixel = 8;
+    st7789Config.dummy_read_bits = 1;
+    // These panels are wired write-only on this board, so nothing reads back.
+    st7789Config.readable = false;
+    // Left off deliberately. The old BuyDisplay module option forced inversion
+    // ON to cancel out the wrong driver's colours; with a real ST7789 driver
+    // the panel is already the right way round, and inversion is now a switch
+    // the user owns rather than something a dropdown sets behind their back.
+    st7789Config.invert = false;
+    st7789Config.rgb_order = false;
+    st7789Config.dlen_16bit = false;
+    st7789Config.bus_shared = false;
+    panelSt7789.config(st7789Config);
+  }
+
+  // Called from setup() after Preferences has been read and BEFORE init(),
+  // because LovyanGFX binds the panel when the bus starts.
+  void selectPanel(uint8_t moduleChoice) {
+    setPanel(moduleChoice == DISPLAY_MODULE_ST7789
+               ? static_cast<lgfx::Panel_Device *>(&panelSt7789)
+               : static_cast<lgfx::Panel_Device *>(&panel));
   }
 
   // Called from setup() after Preferences has been read, before init(), so
@@ -23004,36 +23096,6 @@ void styleDebugDropdown(lv_obj_t *dropdown) {
   lv_obj_add_flag(dropdown, LV_OBJ_FLAG_GESTURE_BUBBLE);
 }
 
-void makeDebugRowDropdown(uint8_t row, int y) {
-  char title[10];
-  snprintf(title, sizeof(title), "Row %u", row + 1);
-  lv_obj_t *panel = lv_obj_create(content);
-  lv_obj_set_pos(panel, 8, y);
-  lv_obj_set_size(panel, 224, 42);
-  lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_clear_flag(panel, LV_OBJ_FLAG_CLICKABLE);
-  stylePanel(panel, lvRgb(34, 35, 39), lvRgb(54, 56, 62));
-  makeLabel(panel, title, 8, 7, &lv_font_montserrat_14, textPrimary());
-
-  int minimum = max(0, (int)debugRowPixels[row] - 10);
-  int maximum = min(LCD_H - 1, (int)debugRowPixels[row] + 10);
-  debugRowDropdownMinimums[row] = minimum;
-  String options;
-  for (int value = minimum; value <= maximum; value++) {
-    if (options.length()) options += '\n';
-    options += String(value) + " px";
-  }
-  lv_obj_t *dropdown = lv_dropdown_create(panel);
-  debugRowDropdowns[row] = dropdown;
-  lv_obj_set_pos(dropdown, 116, 1);
-  lv_obj_set_size(dropdown, 92, 32);
-  styleDebugDropdown(dropdown);
-  lv_dropdown_set_options(dropdown, options.c_str());
-  lv_dropdown_set_selected(dropdown, debugRowPixels[row] - minimum);
-  lv_obj_add_event_cb(dropdown, debugRowDropdownEvent, LV_EVENT_VALUE_CHANGED,
-                      (void *)(uintptr_t)row);
-  addPhysicalNavFocusable(dropdown);
-}
 
 void microphoneSourceDropdownEvent(lv_event_t *e) {
   microphoneTestAudioEnabled = lv_dropdown_get_selected(lv_event_get_target(e)) == 1;
@@ -23119,28 +23181,26 @@ void displayModuleDropdownEvent(lv_event_t *e) {
   if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
   uint16_t selected = lv_dropdown_get_selected(lv_event_get_target(e));
   displayModuleChoice = (uint8_t)selected;
-  // BuyDisplay's panel needs Invert Colours on; Adafruit's needs it off.
-  // This sets that default so picking a module is a one-step fix rather
-  // than requiring the separate manual switch to be found and flipped too -
-  // that switch still overrides it afterwards if the user wants to.
-  bool invertDefault = displayModuleChoice == 1;
+  // Colour inversion is no longer forced from here. It used to be set as a
+  // side effect of the module choice, because BuyDisplay's ST7789 panel driven
+  // by the ILI9341 driver came out inverted and this cancelled it. With a real
+  // ST7789 driver that compensation is wrong, and silently rewriting a setting
+  // the user can also change themselves made the two disagree. Invert Colours
+  // is its own switch on this page now and nothing else touches it.
   preferences.begin(PREFERENCES_NAMESPACE, false);
   preferences.putUChar("dispMod", displayModuleChoice);
-  preferences.putBool("invert", invertDefault);
-  preferences.end();
-  displayInverted = invertDefault;
-  // displayInverted is also synced through settings{} in runtime.json on
-  // the SD card (WebConfig's Display page toggle writes/reads it there),
-  // unlike dispDrv/touchDrv above which are NVS-only hardware config. At
-  // boot, applySettingsJson() reads that SD copy and treats it as
-  // authoritative - including calling saveSettings(), which writes
-  // whatever it just read straight back over the NVS value above. Setting
-  // NVS alone here left the SD copy stale, so the very next boot's
-  // applySettingsJson() silently reverted this to whatever was already
-  // saved there (confirmed on real hardware: BuyDisplay stayed inverted
-  // after reboot). persistSettingsToRuntimeConfig() writes the current
-  // in-memory displayInverted to the SD copy immediately, before the
-  // reboot prompt below can be confirmed, so both copies agree.
+  // The ST7789 wants a slower bus than the ILI9341. Written as a default the
+  // moment the module is chosen so the panel comes up on the next boot without
+  // the user having to know that, and still changeable from LCD Frequency.
+  if (displayModuleChoice == DISPLAY_MODULE_ST7789 && lcdFreqHz > ST7789_DEFAULT_BUS_HZ) {
+    preferences.putULong("lcdFreqHz", ST7789_DEFAULT_BUS_HZ);
+    lcdFreqHz = ST7789_DEFAULT_BUS_HZ;
+  }
+  // Settings that live in settings{} in runtime.json on the SD card are read
+  // back at boot by applySettingsJson() and treated as authoritative, so an
+  // NVS-only write here would be silently reverted on the next boot. This
+  // pushes the in-memory values to the SD copy immediately, before the reboot
+  // prompt below can be confirmed, so the two cannot disagree.
   persistSettingsToRuntimeConfig();
   lastWakeMs = millis();
   showDebugRebootConfirmation(true);
@@ -23158,7 +23218,7 @@ void makeDisplayModuleRow(int y) {
   lv_obj_set_pos(dropdown, 104, 1);
   lv_obj_set_size(dropdown, 112, 32);
   styleDebugDropdown(dropdown);
-  lv_dropdown_set_options(dropdown, "Adafruit\nBuyDisplay");
+  lv_dropdown_set_options(dropdown, "Adafruit\nBuyDisplay\nST-7789");
   lv_dropdown_set_selected(dropdown, displayModuleChoice);
   lv_obj_add_event_cb(dropdown, displayModuleDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
   addPhysicalNavFocusable(dropdown);
@@ -23359,15 +23419,13 @@ void renderDebugPageOmote() {
   // y=44, not 4 - clears the back button's (8,6)-(50,36) footprint.
   int y = 44;
 
-  lv_obj_t *togglesCard = makeOmoteCard(content, y, 4 * rowH + 3);
-  makeOmoteRow(togglesCard, "Split Line", "Show live first-row Y position", 0, rowH, &debugSplitEnabled);
+  lv_obj_t *togglesCard = makeOmoteCard(content, y, 3 * rowH + 2);
+  makeOmoteRow(togglesCard, "Touch", "Live reticle, coordinates and trail", 0, rowH, &debugTouchEnabled);
   makeOmoteDivider(togglesCard, rowH);
-  makeOmoteRow(togglesCard, "Touch", "Live reticle, coordinates and trail", rowH + 1, rowH, &debugTouchEnabled);
+  makeOmoteRow(togglesCard, "CPU / RAM", "Processor load and heap used/free", rowH + 1, rowH, &debugCpuRamEnabled);
   makeOmoteDivider(togglesCard, 2 * rowH + 1);
-  makeOmoteRow(togglesCard, "CPU / RAM", "Processor load and heap used/free", 2 * rowH + 2, rowH, &debugCpuRamEnabled);
-  makeOmoteDivider(togglesCard, 3 * rowH + 2);
-  makeOmoteRow(togglesCard, "FPS", "Display frames per second", 3 * rowH + 3, rowH, &debugFpsEnabled);
-  y += 4 * rowH + 3 + 12;
+  makeOmoteRow(togglesCard, "FPS", "Display frames per second", 2 * rowH + 2, rowH, &debugFpsEnabled);
+  y += 3 * rowH + 2 + 12;
 
   lv_obj_t *accelCard = makeOmoteCard(content, y, rowH);
   makeOmoteRow(accelCard, "Accelerometer", "Live X,Y,Z tilt samples", 0, rowH, &debugAccelerometerEnabled);
@@ -23377,30 +23435,6 @@ void renderDebugPageOmote() {
   makeOmoteRow(bleSleepCard, "Bluetooth Sleep", "On disconnects BLE - may pause casting",
               0, rowH, &bluetoothSleepEnabled);
   y += rowH + 12;
-
-  lv_obj_t *rowsLabel = makeLabel(content, "Saved row positions", 8, y, &lv_font_montserrat_12, textPrimary());
-  lv_obj_set_style_text_opa(rowsLabel, LV_OPA_60, 0);
-  y += 22;
-  lv_obj_t *calibCard = makeOmoteCard(content, y, 5 * calibRowH + 4);
-  for (uint8_t row = 0; row < 5; row++) {
-    char title[10];
-    snprintf(title, sizeof(title), "Row %u", row + 1);
-    int minimum = max(0, (int)debugRowPixels[row] - 10);
-    int maximum = min(LCD_H - 1, (int)debugRowPixels[row] + 10);
-    debugRowDropdownMinimums[row] = minimum;
-    String options;
-    for (int value = minimum; value <= maximum; value++) {
-      if (options.length()) options += '\n';
-      options += String(value) + " px";
-    }
-    lv_obj_t *dropdown = makeOmoteDropdownRow(calibCard, title, row * (calibRowH + 1), calibRowH, 92);
-    debugRowDropdowns[row] = dropdown;
-    lv_dropdown_set_options(dropdown, options.c_str());
-    lv_dropdown_set_selected(dropdown, debugRowPixels[row] - minimum);
-    lv_obj_add_event_cb(dropdown, debugRowDropdownEvent, LV_EVENT_VALUE_CHANGED, (void *)(uintptr_t)row);
-    if (row < 4) makeOmoteDivider(calibCard, (row + 1) * (calibRowH + 1) - 1);
-  }
-  y += 5 * calibRowH + 4 + 12;
 
   lv_obj_t *micCard = makeOmoteCard(content, y, calibRowH);
   lv_obj_t *micDropdown = makeOmoteDropdownRow(micCard, "Microphone", 0, calibRowH, 104);
@@ -23414,20 +23448,26 @@ void renderDebugPageOmote() {
   lv_obj_set_style_text_opa(driverLabel, LV_OPA_60, 0);
   y += 22;
 
-  int driverRows = displayDriverChoice == 0 ? 5 : 2;
+  // One row taller than before: Invert Colours joins Module and LCD Driver
+  // rather than being written silently by the module dropdown.
+  int driverRows = displayDriverChoice == 0 ? 6 : 3;
   lv_obj_t *driverCard = makeOmoteCard(content, y, driverRows * calibRowH + (driverRows - 1));
   lv_obj_t *moduleDropdown = makeOmoteDropdownRow(driverCard, "Module", 0, calibRowH, 112);
-  lv_dropdown_set_options(moduleDropdown, "Adafruit\nBuyDisplay");
+  lv_dropdown_set_options(moduleDropdown, "Adafruit\nBuyDisplay\nST-7789");
   lv_dropdown_set_selected(moduleDropdown, displayModuleChoice);
   lv_obj_add_event_cb(moduleDropdown, displayModuleDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
 
   makeOmoteDivider(driverCard, calibRowH);
-  lv_obj_t *driverDropdown = makeOmoteDropdownRow(driverCard, "LCD Driver", calibRowH + 1, calibRowH, 112);
+  makeOmoteRow(driverCard, "Invert Colours", "Flip the panel's colour polarity",
+               calibRowH + 1, calibRowH, &displayInverted);
+
+  makeOmoteDivider(driverCard, 2 * calibRowH + 1);
+  lv_obj_t *driverDropdown = makeOmoteDropdownRow(driverCard, "LCD Driver", 2 * (calibRowH + 1), calibRowH, 112);
   lv_dropdown_set_options(driverDropdown, "LovyanGFX\nArduino_GFX");
   lv_dropdown_set_selected(driverDropdown, displayDriverChoice);
   lv_obj_add_event_cb(driverDropdown, displayDriverDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
 
-  int rowIndex = 2;
+  int rowIndex = 3;
   if (displayDriverChoice == 0) {
     makeOmoteDivider(driverCard, rowIndex * (calibRowH + 1) - 1);
     lv_obj_t *freqDropdown = makeOmoteDropdownRow(driverCard, "LCD Clock", rowIndex * (calibRowH + 1), calibRowH, 112);
@@ -23706,26 +23746,30 @@ void renderDebugPage() {
     return;
   }
 
-  makeSettingRow("Split Line", "Show live first-row Y position", 44,
-                 &debugSplitEnabled);
-  makeLabel(content, "Saved row positions", 10, 94,
-            &lv_font_montserrat_12, lvRgb(170, 178, 190));
-  for (uint8_t row = 0; row < 5; row++) makeDebugRowDropdown(row, 116 + row * 46);
-  makeSettingRow("Touch", "Live reticle, coordinates and trail", 352,
+  // The Split Line switch and the five saved-row-position dropdowns were
+  // removed: row calibration is settled, and the values still drive the layout
+  // from their saved defaults - only the controls are gone. Everything below
+  // moves up by the 308px they occupied.
+  makeSettingRow("Touch", "Live reticle, coordinates and trail", 44,
                  &debugTouchEnabled);
-  makeSettingRow("CPU / RAM", "Processor load and heap used/free", 402,
+  makeSettingRow("CPU / RAM", "Processor load and heap used/free", 94,
                  &debugCpuRamEnabled);
-  makeSettingRow("Accelerometer", "Live X,Y,Z tilt samples", 452,
+  makeSettingRow("Accelerometer", "Live X,Y,Z tilt samples", 144,
                  &debugAccelerometerEnabled);
-  makeSettingRow("FPS", "Display frames per second", 502, &debugFpsEnabled);
-  makeSettingRow("Bluetooth Sleep", "On disconnects BLE - may pause casting", 552,
+  makeSettingRow("FPS", "Display frames per second", 194, &debugFpsEnabled);
+  makeSettingRow("Bluetooth Sleep", "On disconnects BLE - may pause casting", 244,
                  &bluetoothSleepEnabled);
-  makeMicrophoneSourceRow(602);
+  makeMicrophoneSourceRow(294);
 
-  makeLabel(content, "Display driver (reboot required)", 10, 654,
+  makeLabel(content, "Display driver (reboot required)", 10, 346,
             &lv_font_montserrat_12, lvRgb(170, 178, 190));
-  int driverSectionY = 676;
+  int driverSectionY = 368;
   makeDisplayModuleRow(driverSectionY);
+  driverSectionY += 50;
+  // Its own switch now, next to the module it relates to, rather than a value
+  // the module dropdown wrote on the user's behalf.
+  makeSettingRow("Invert Colours", "Flip the panel's colour polarity",
+                 driverSectionY, &displayInverted);
   driverSectionY += 50;
   makeDisplayDriverRow(driverSectionY);
   driverSectionY += 50;
@@ -26471,6 +26515,9 @@ void setup() {
     }
     agfx->fillScreen(0x0000);
   } else {
+    // Before setBusFrequency()/init(): LovyanGFX binds whichever panel is set
+    // when the bus starts, so choosing it afterwards would have no effect.
+    tft.selectPanel(displayModuleChoice);
     tft.setBusFrequency(lcdFreqHz);
     tft.init();
     applyLcdDriveStrength();
@@ -26485,7 +26532,13 @@ void setup() {
                   (String(", ") + String(lcdFreqHz / 1000000UL) + "MHz, " +
                    (lcdBufferMode ? "double buffer" : "single buffer") +
                    ", drive=" + String(lcdDriveStrength)).c_str());
-  Serial.printf("Touch: %s (Wire)\n", displayModuleChoice == 1 ? "BuyDisplay" : "Adafruit");
+  const char *moduleName = displayModuleChoice == DISPLAY_MODULE_ST7789 ? "ST-7789"
+                         : displayModuleChoice == DISPLAY_MODULE_BUYDISPLAY ? "BuyDisplay"
+                         : "Adafruit";
+  Serial.printf("Display module: %s%s\n", moduleName,
+                displayModuleChoice == DISPLAY_MODULE_ST7789 && displayDriverChoice == 0
+                  ? " (LovyanGFX Panel_ST7789)" : "");
+  Serial.printf("Touch: %s (Wire)\n", moduleName);
   uint32_t panelBlackMs = millis();
   IrSender.begin();
   IrReceiver.begin(PIN_IR_RX, DISABLE_LED_FEEDBACK);
