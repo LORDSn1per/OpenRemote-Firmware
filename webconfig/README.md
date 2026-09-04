@@ -69,7 +69,7 @@ itself. The upload is checksummed on arrival **and read back off the SD card
 afterwards**, so a card that drops bytes is caught rather than leaving you with
 a half-written configurator you would need a cable to fix.
 
-[**Download the latest WebConfig →**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-WebConfig.html)
+[**Download the latest WebConfig →**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-WebConfig-2.56.html)
 
 ---
 

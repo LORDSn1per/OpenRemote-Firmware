@@ -11,10 +11,12 @@ existing **Settings → Dock** screens and through WebConfig.
 
 Current firmware: **1.30**. Source in [`firmware/`](firmware/).
 
-[**Download the latest dock firmware →**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-Dock-Firmware.bin)
+[**Download the latest dock firmware →**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-Dock-Firmware-1.30.bin)
 
-You do not need to build it. Send it to a paired dock wirelessly from
-WebConfig, or flash a brand-new dock over USB with OpenRemote Studio.
+You do not need to build it. There are two ways to install it, and either is
+fine: send it to a paired dock **wirelessly from WebConfig**, or flash it
+**over USB from Studio** using *New Dock*. A dock that has never been flashed
+needs the Studio route once; after that both work.
 
 ---
 
@@ -168,8 +170,9 @@ The Super Mini has no USB-serial bridge — the C3's own USB port is the only on
 appearing as `/dev/cu.usbmodem*`. If it does not appear, hold **BOOT**, tap
 **RESET**, release **BOOT** to force the bootloader.
 
-A new board needs one USB flash. After that, updates go over the air from
-WebConfig and the cable is only needed to recover a dock that will not boot.
+A dock that has never been flashed needs one pass over USB - from Studio's
+*New Dock* tab, or with `pio run -t upload` above. After that you can update it
+either way: wirelessly from WebConfig, or over USB from Studio again.
 
 ---
 
