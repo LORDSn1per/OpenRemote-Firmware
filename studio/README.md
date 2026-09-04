@@ -20,8 +20,8 @@ No installation, no accounts, and nothing to compile. Always the newest build:
 
 | Platform | Download |
 |---|---|
-| **macOS** — Intel and Apple Silicon | [**Download for macOS**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-Studio-2.76-macOS.zip) |
-| **Windows** — 10 and 11, 64-bit | [**Download for Windows**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-Studio-2.70-Windows.zip) |
+| **macOS** — Intel and Apple Silicon | [**Download for macOS**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-Studio-2.77-macOS.zip) |
+| **Windows** — 10 and 11, 64-bit | [**Download for Windows**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-Studio-2.77-Windows.zip) |
 | **Linux** — x86_64 | [**Download for Linux**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-Studio-2.70-Linux.AppImage) |
 
 **macOS** — unzip and drag to Applications. The build is universal, so it runs

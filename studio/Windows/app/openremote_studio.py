@@ -4,7 +4,7 @@ import contextlib, datetime as dt, glob, hashlib, io, json, os, re, select, shut
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-APP_VERSION="2.76"
+APP_VERSION="2.77"
 SERIAL_BAUD=460800
 # 2.68 adds Linux as a third supported platform. Until now every non-Windows
 # branch in this file assumed macOS outright - AppleScript dialogs, diskutil,
@@ -718,18 +718,42 @@ def linux_dialog(prompt,directory=False,file_filter=None):
     result=subprocess.run(command,capture_output=True,text=True)
     return result.stdout.strip() if result.returncode==0 else ""
 
+def windows_dialog(create, result_property):
+    """Show a Windows common dialog and return the chosen path, or "".
+
+    The dialog is given an explicit owner window, and that is the whole point
+    of this helper. ShowDialog() with no owner parents itself to the calling
+    thread's active window - but that thread belongs to a PowerShell process
+    started with CREATE_NO_WINDOW, which has no window at all. Windows then has
+    nothing to place the dialog above, so it opens BEHIND the browser and the
+    user has to minimise the browser to find a dialog they did not know was
+    waiting.
+
+    A TopMost owner fixes it: a modal dialog inherits its owner's z-order band,
+    so it is drawn above ordinary windows whether or not this process is
+    allowed to take focus. That last part matters - a background process cannot
+    steal foreground on Windows, so Activate() alone would not be enough and is
+    only a best effort here. TopMost is what actually does the work.
+    """
+    script = ("Add-Type -AssemblyName System.Windows.Forms; " + create + " "
+              "$owner=New-Object System.Windows.Forms.Form; "
+              "$owner.TopMost=$true; $owner.ShowInTaskbar=$false; $owner.Opacity=0; "
+              "$owner.Show(); $owner.Activate(); "
+              "$result=$dialog.ShowDialog($owner); $owner.Close(); "
+              "if($result -eq [System.Windows.Forms.DialogResult]::OK){$dialog." + result_property + "}")
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    return subprocess.check_output(
+        ["powershell.exe", "-NoProfile", "-STA", "-Command", script],
+        text=True, creationflags=flags).strip()
+
 def choose_folder():
     if IS_LINUX:
         return linux_dialog("Choose where to save the OpenRemote.irdb release folder",directory=True)
     if os.name=="nt":
-        script=("Add-Type -AssemblyName System.Windows.Forms; "
-                "$dialog=New-Object System.Windows.Forms.FolderBrowserDialog; "
-                "$dialog.Description='Choose where to save the OpenRemote.irdb release folder'; "
-                "if($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK){$dialog.SelectedPath}")
-        flags=getattr(subprocess,"CREATE_NO_WINDOW",0)
-        return subprocess.check_output(
-            ["powershell.exe","-NoProfile","-STA","-Command",script],
-            text=True,creationflags=flags).strip()
+        return windows_dialog(
+            "$dialog=New-Object System.Windows.Forms.FolderBrowserDialog; "
+            "$dialog.Description='Choose where to save the OpenRemote.irdb release folder';",
+            "SelectedPath")
     script='try\nset f to choose folder with prompt "Choose where to save the OpenRemote.irdb release folder:"\nPOSIX path of f\non error\nreturn ""\nend try'
     return subprocess.check_output(["/usr/bin/osascript","-e",script],text=True).strip()
 
@@ -741,14 +765,10 @@ def choose_setup_file(kind):
     if os.name=="nt":
         file_filter=("ESP32 firmware (*.bin)|*.bin" if kind=="firmware" else
                      "OpenRemote WebConfig (*.html;*.htm)|*.html;*.htm")
-        script=("Add-Type -AssemblyName System.Windows.Forms; "
-                "$dialog=New-Object System.Windows.Forms.OpenFileDialog; "
-                "$dialog.Title='"+title+"'; $dialog.Filter='"+file_filter+"'; "
-                "if($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK){$dialog.FileName}")
-        flags=getattr(subprocess,"CREATE_NO_WINDOW",0)
-        return subprocess.check_output(
-            ["powershell.exe","-NoProfile","-STA","-Command",script],
-            text=True,creationflags=flags).strip()
+        return windows_dialog(
+            "$dialog=New-Object System.Windows.Forms.OpenFileDialog; "
+            "$dialog.Title='"+title+"'; $dialog.Filter='"+file_filter+"';",
+            "FileName")
     script='try\nset f to choose file with prompt "'+title+'"\nPOSIX path of f\non error\nreturn ""\nend try'
     return subprocess.check_output(["/usr/bin/osascript","-e",script],text=True).strip()
 
@@ -756,14 +776,10 @@ def choose_sd_folder():
     if IS_LINUX:
         return linux_dialog("Choose the OpenRemote SD card (FAT32)",directory=True)
     if os.name=="nt":
-        script=("Add-Type -AssemblyName System.Windows.Forms; "
-                "$dialog=New-Object System.Windows.Forms.FolderBrowserDialog; "
-                "$dialog.Description='Choose the root of the mounted OpenRemote SD card'; "
-                "if($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK){$dialog.SelectedPath}")
-        flags=getattr(subprocess,"CREATE_NO_WINDOW",0)
-        return subprocess.check_output(
-            ["powershell.exe","-NoProfile","-STA","-Command",script],
-            text=True,creationflags=flags).strip()
+        return windows_dialog(
+            "$dialog=New-Object System.Windows.Forms.FolderBrowserDialog; "
+            "$dialog.Description='Choose the root of the mounted OpenRemote SD card';",
+            "SelectedPath")
     script='try\nset f to choose folder with prompt "Choose the OpenRemote SD card (MS-DOS FAT / FAT32):"\nPOSIX path of f\non error\nreturn ""\nend try'
     return subprocess.check_output(["/usr/bin/osascript","-e",script],text=True).strip()
 
