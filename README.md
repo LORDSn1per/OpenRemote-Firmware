@@ -1,57 +1,164 @@
-# OpenRemote
+<div align="center">
+  <img src="docs/images/openremote-ecosystem.jpg" alt="OpenRemote — the complete open-source remote ecosystem" width="100%">
 
-A universal remote built on the ESP32-S3, with a mains-powered dock that
-extends its reach. A fork of the OMOTE hardware that has since grown its own
-firmware, configurator and desktop tooling.
+  ### Build your remote. Keep it local.
+
+  A universal remote you own outright — no cloud, no accounts, no app store.
+  Design it on your computer, configure it from your phone, and control
+  everything in the room from the remote itself.
+
+  <a href="#download">Download</a> ·
+  <a href="#the-software">The software</a> ·
+  <a href="https://github.com/LORDSn1per/OpenRemote-Hardware">Hardware</a> ·
+  <a href="#how-it-fits-together">How it fits together</a>
+</div>
+
+---
+
+## You never have to write code
+
+Everything is done through **OpenRemote Studio** on your computer or
+**WebConfig** in a browser. Adding devices, building activities, designing
+screens, changing icons and themes, and installing new firmware are all
+point-and-click. The source in this repository is here because the project is
+open, not because you are expected to compile it.
+
+---
+
+## Download
+
+Every link below always fetches the **newest build** — the filenames never
+change, so they are safe to bookmark.
+
+### Get started — install this first
+
+| | Download |
+|---|---|
+| **macOS** — Intel and Apple Silicon | [**OpenRemote Studio for macOS**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-Studio-macOS.zip) |
+| **Windows** — 10 and 11 | [**OpenRemote Studio for Windows**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-Studio-Windows.zip) |
+| **Linux** — x86_64 | [**OpenRemote Studio for Linux**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-Studio-Linux.AppImage) |
+
+> On Windows, unzip the **whole folder** and run the `.exe` from inside it — the
+> app and runtime folders must stay beside it.
+
+### Firmware and configurator
+
+Studio installs these for you, so you only need them for a manual update.
+
+| | Download |
+|---|---|
+| Remote firmware — ESP32-S3 | [**OpenRemote-Remote-Firmware.bin**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-Remote-Firmware.bin) |
+| Dock firmware — ESP32-C3 | [**OpenRemote-Dock-Firmware.bin**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-Dock-Firmware.bin) |
+| WebConfig — browser configurator | [**OpenRemote-WebConfig.html**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-WebConfig.html) |
+
+**[See all downloads and version numbers →](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest)**
+
+---
+
+## The software
+
+### OpenRemote Studio — the desktop toolkit
+
+<img src="docs/images/openremote-studio.jpg" alt="OpenRemote Studio" width="100%">
+
+Sets up a new remote from a blank board, holds a 100 MB infrared database you
+can search for your equipment, and repairs a remote that will not start. This
+is the tool that turns a bare circuit board into a working remote.
+
+[Read more →](studio/README.md)
+
+### WebConfig — configure from any screen
+
+<img src="docs/images/openremote-webconfig.jpg" alt="OpenRemote WebConfig" width="100%">
+
+Served by the remote itself over your Wi-Fi. Open its address on a laptop or
+phone and design screens, build activities and macros, assign the physical
+buttons, and change icons and themes — with the remote updating live as you
+work. Nothing to install, and it works on any device with a browser.
+
+[Read more →](webconfig/README.md)
+
+### Remote firmware — on-device control
+
+<img src="docs/images/openremote-firmware.jpg" alt="OpenRemote firmware" width="100%">
+
+Runs on the remote: a colour touchscreen, physical buttons, infrared, Bluetooth
+for Android TV and Chromecast — including voice search through the built-in
+microphone — plus Wi-Fi for Home Assistant and Homebridge.
+
+[Read more →](remote/README.md)
+
+### Dock firmware — reach the rooms the remote cannot
+
+Mains powered, sits with your equipment, and relays commands from the remote
+over its own radio link. It fires infrared into a closed cabinet or a second
+room, and sends **RF433** to gates, garage doors and sockets by learning the
+signal from your existing remote. Updates itself wirelessly once paired.
+
+[Read more →](dock/README.md)
+
+---
+
+## Hardware
+
+Boards, schematics, cases and build instructions live in a separate repository:
+
+<div align="center">
+
+### [**OpenRemote Hardware →**](https://github.com/LORDSn1per/OpenRemote-Hardware)
+
+</div>
+
+---
+
+## How it fits together
+
+    Studio (computer) ──USB──►  Remote  ◄──Wi-Fi──► WebConfig (browser)
+                                   │
+                                   ├── infrared ──► your equipment
+                                   ├── Bluetooth ─► Android TV / Chromecast
+                                   └── radio ─────► Dock ──► infrared + RF433
+
+**Studio** does the jobs needing a cable: first setup, recovery, and the
+infrared database. **WebConfig** does everything else, wirelessly. The
+**dock** extends the remote's reach without extending your arm.
+
+---
+
+## For developers
 
 | Component | Version | Source |
 |---|---|---|
-| Remote firmware — ESP32-S3 | **4.02** | [`remote/`](remote/) |
-| Dock firmware — ESP32-C3 | **1.30** | [`dock/`](dock/) |
-| WebConfig — browser configurator | **2.56** | [`webconfig/`](webconfig/) |
-| OpenRemote Studio — desktop app | **2.76** | [`studio/`](studio/) |
-
-## Layout
+| Remote firmware — ESP32-S3 | 4.02 | [`remote/`](remote/) |
+| Dock firmware — ESP32-C3 | 1.30 | [`dock/`](dock/) |
+| WebConfig | 2.56 | [`webconfig/`](webconfig/) |
+| OpenRemote Studio | 2.76 | [`studio/`](studio/) |
 
     remote/       ESP32-S3 remote firmware (PlatformIO)
-    dock/         ESP32-C3 dock firmware (PlatformIO) - see dock/README.md
-    webconfig/    single-file HTML configurator, served off the remote's SD card
-    studio/       desktop app for flashing and SD setup (Mac, Windows, Linux)
-    sd-card/      template of the remote's SD card layout
-    tools/        build helpers
-    docs/         handoff notes and configuration backups
-    releases/     built firmware images, one archived per version (not in git)
-    archive/      superseded projects, kept rather than deleted
+    dock/         ESP32-C3 dock firmware (PlatformIO)
+    webconfig/    single-file HTML configurator
+    studio/       desktop app sources (Mac, Windows, Linux)
+    sd-card/      template of the remote's SD card
+    tools/ docs/  build helpers and notes
+    releases/     archived builds, one per version (not in git)
 
-## Why one repository
+Both firmwares build with [PlatformIO](https://platformio.org/):
 
-The remote and the dock share an ESP-NOW wire format, and every shared struct
-is pinned by `static_assert` in **both** firmwares. A field added to one and
-not the other fails the build instead of letting the two misread each other on
-air. Versioning them together is what makes that guarantee hold — they cannot
-drift apart unnoticed.
+    cd remote && pio run -t upload
+    cd dock/firmware && pio run -t upload
 
-## What is not in git, and why
+The remote and dock share an ESP-NOW wire format whose every struct is pinned
+by `static_assert` in **both** firmwares, which is why they live in one
+repository — a field added to one and not the other fails the build instead of
+letting the two misread each other on air.
 
-**Compiled firmware** (`releases/`) — build products of the source here, about
-1.8GB across every archived version, and they do not delta-compress. Each
-version is archived on disk and mirrored to the NAS instead.
+---
 
-**Built desktop apps** (`studio/Mac/*.app`, `*.AppImage`) — 85MB per bundle,
-32 of them. The previous standalone Studio repository tracked 23,392 files from
-inside these bundles, which is why its history alone came to 237MB.
+<div align="center">
 
-Every **WebConfig** version *is* tracked, because successive versions are nearly
-identical and 120MB of them packs down to about 1MB.
+**Open. Powerful. Yours.**
 
-## Getting started
+A fork of [OMOTE](https://github.com/OMOTE-Community/OMOTE-Firmware), grown
+into its own firmware, configurator and desktop toolkit.
 
-    cd remote && pio run -t upload      # flash the remote
-    cd dock/firmware && pio run -t upload   # flash a dock over USB
-
-After a dock is paired once, later dock updates go over the air from WebConfig.
-
-## Related
-
-Upstream hardware: [OMOTE](https://github.com/OMOTE-Community/OMOTE-Firmware),
-tracked as the `upstream` remote.
+</div>

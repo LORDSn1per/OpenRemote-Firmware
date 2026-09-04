@@ -9,8 +9,12 @@ It is a real ESP-NOW peer, not a stand-in: it speaks the wire format the remote
 firmware implements, so it pairs and takes commands through the remote's
 existing **Settings → Dock** screens and through WebConfig.
 
-Current firmware: **1.30**. Source in [`firmware/`](firmware/), built images
-archived under [`../releases/dock-bin/`](../releases/dock-bin/).
+Current firmware: **1.30**. Source in [`firmware/`](firmware/).
+
+[**Download the latest dock firmware →**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-Dock-Firmware.bin)
+
+You do not need to build it. Send it to a paired dock wirelessly from
+WebConfig, or flash a brand-new dock over USB with OpenRemote Studio.
 
 ---
 
