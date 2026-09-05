@@ -1,6 +1,32 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.04 - 2026-09-04
+    - The ST-7789 bus is locked to 20MHz, not merely defaulted to it.
+      Confirmed on real hardware: at 27MHz and at 40MHz that panel corrupts
+      into bands of noise and stops responding. The ILI9341 panels are
+      unaffected and keep every clock option they had.
+    - The lock is applied where the bus is actually started, through a new
+      effectiveLcdBusHz(), rather than by writing the preference when the
+      module is chosen. A write would miss the cases that matter - a value
+      already in NVS from an ILI9341, or a backup restored later - and those
+      are exactly the ones that would hand an ST7789 a 40MHz bus. The user's
+      own choice stays saved and returns intact on a panel that can use it.
+    - The LCD Clock row is hidden entirely when ST-7789 is selected, in both
+      menu styles, rather than shown as a control that cannot do anything. The
+      Omote card shrinks by that row and its divider goes with it, so no gap or
+      stray line is left behind.
+    - lcdFreqDropdownEvent() also refuses a value above 20MHz on an ST-7789.
+      The row is hidden, so this is only reachable by physical navigation or a
+      stale screen - but a setting that makes the display unreadable until it
+      is found again is worth blocking in more than one place.
+    - The default clock everywhere is now 20MHz instead of 40, including the
+      compiled-in bus value used before any preference is read and the
+      factory-reset path. A fresh flash comes up at a speed every supported
+      panel tolerates; an ILI9341 can still be raised to 40 and will keep it.
+    - The boot log reports the clock actually in use and says when it has been
+      held down for the ST-7789.
+
   4.03 - 2026-09-04
     - Adds "ST-7789" as a third Display Module, with a real LovyanGFX
       Panel_ST7789 behind it. Until now an ST7789 panel could only be driven by
@@ -4727,7 +4753,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.03"
+#define OPENREMOTE_VERSION_STRING "4.04"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -5120,11 +5146,11 @@ static const uint8_t BLE_HID_INPUT_BYTES = 10;
 static const uint8_t DISPLAY_MODULE_ADAFRUIT = 0;
 static const uint8_t DISPLAY_MODULE_BUYDISPLAY = 1;
 static const uint8_t DISPLAY_MODULE_ST7789 = 2;
-// 20MHz rather than the 40MHz the ILI9341 runs at. The working ST7789 port of
-// this hardware uses 20, and a panel that will not come up at all is a worse
-// outcome than one running at half the clock - it can be raised afterwards
-// from LCD Frequency if it proves stable.
-static const uint32_t ST7789_DEFAULT_BUS_HZ = 20000000UL;
+// The ST7789 is LOCKED to 20MHz, not merely defaulted to it. Confirmed on real
+// hardware: at 27MHz and at 40MHz the panel corrupts into bands of noise and
+// stops responding. The ILI9341 is happy at 40 and keeps its own setting; this
+// ceiling applies to the ST7789 alone.
+static const uint32_t ST7789_BUS_HZ = 20000000UL;
 
 class OpenRemoteDisplay : public lgfx::LGFX_Device {
  private:
@@ -5142,7 +5168,12 @@ class OpenRemoteDisplay : public lgfx::LGFX_Device {
  public:
   OpenRemoteDisplay() {
     auto busConfig = bus.config();
-    busConfig.freq_write = 40000000;
+    // 20MHz, not 40. This is the value the bus carries before any saved
+    // preference is applied, so it is what an unconfigured or mid-boot panel
+    // sees - and a display that comes up readable and slow is a better failure
+    // than one showing bands of noise. setBusFrequency() raises it afterwards
+    // for panels that have asked for more.
+    busConfig.freq_write = 20000000;
     busConfig.pin_wr = PIN_LCD_WR;
     busConfig.pin_rd = PIN_LCD_RD;
     busConfig.pin_rs = PIN_LCD_DC;
@@ -5250,7 +5281,20 @@ uint8_t displayDriverChoice = 0;
 uint8_t displayModuleChoice = 0;
 // LovyanGFX parallel-bus write clock in Hz. Arduino_GFX has no equivalent
 // setting (its ESP32 8-bit parallel bus runs at a fixed rate).
-uint32_t lcdFreqHz = 40000000;
+uint32_t lcdFreqHz = 20000000;
+
+// The clock the bus is really driven at. Everything that starts or reports the
+// bus goes through here rather than reading lcdFreqHz directly, so a stored
+// 40MHz - left over from an ILI9341, restored from a backup, or written before
+// the module was switched - cannot reach an ST7789 and corrupt it. The saved
+// preference is deliberately left alone: switch back to a panel that can take
+// 40MHz and the old choice returns intact.
+uint32_t effectiveLcdBusHz() {
+  if (displayModuleChoice == DISPLAY_MODULE_ST7789 && lcdFreqHz > ST7789_BUS_HZ) {
+    return ST7789_BUS_HZ;
+  }
+  return lcdFreqHz;
+}
 // LovyanGFX only: 0 = single draw buffer, 1 = double draw buffer. Arduino_GFX
 // is synchronous and always effectively single-buffered regardless of this.
 uint8_t lcdBufferMode = 1;
@@ -8611,7 +8655,10 @@ void loadSettings() {
   // deliberately selects otherwise in Settings > Debug.
   displayDriverChoice = preferences.getUChar("dispDrv", 1);
   displayModuleChoice = preferences.getUChar("dispMod", 0);
-  lcdFreqHz = preferences.getULong("lcdFreqHz", 40000000UL);
+  // Defaults to 20MHz. A fresh flash or a factory reset therefore comes up at
+  // the speed every supported panel is known to tolerate; anyone running an
+  // ILI9341 can raise it to 40 in LCD Clock and that choice is then kept.
+  lcdFreqHz = preferences.getULong("lcdFreqHz", 20000000UL);
   lcdBufferMode = preferences.getUChar("lcdBufMode", 1);
   lcdDriveStrength = constrain((int)preferences.getUChar("lcdDriveStr", 2), 0, 3);
   backlightPwmHz = preferences.getULong("blPwmHz", BACKLIGHT_PWM_HZ);
@@ -16385,7 +16432,7 @@ bool performFactoryReset() {
   preferences.begin(PREFERENCES_NAMESPACE, false);
   uint8_t savedDisplayDriverChoice = preferences.getUChar("dispDrv", 1);
   uint8_t savedDisplayModuleChoice = preferences.getUChar("dispMod", 0);
-  uint32_t savedLcdFreqHz = preferences.getULong("lcdFreqHz", 40000000UL);
+  uint32_t savedLcdFreqHz = preferences.getULong("lcdFreqHz", 20000000UL);
   uint8_t savedLcdBufferMode = preferences.getUChar("lcdBufMode", 1);
   uint8_t savedLcdDriveStrength = preferences.getUChar("lcdDriveStr", 2);
   uint32_t savedBacklightPwmHz = preferences.getULong("blPwmHz", BACKLIGHT_PWM_HZ);
@@ -19930,6 +19977,7 @@ void styleOmoteDropdown(lv_obj_t *dropdown) {
   lv_obj_set_style_text_color(list, lvRgb(0xAC, 0xAC, 0xAC), 0);
   lv_obj_set_style_bg_color(list, lvRgb(0x21, 0x96, 0xF3), LV_PART_SELECTED);
   lv_obj_set_style_text_color(list, lv_color_white(), LV_PART_SELECTED);
+
 }
 
 void styleOmoteRoller(lv_obj_t *roller) {
@@ -23189,13 +23237,11 @@ void displayModuleDropdownEvent(lv_event_t *e) {
   // is its own switch on this page now and nothing else touches it.
   preferences.begin(PREFERENCES_NAMESPACE, false);
   preferences.putUChar("dispMod", displayModuleChoice);
-  // The ST7789 wants a slower bus than the ILI9341. Written as a default the
-  // moment the module is chosen so the panel comes up on the next boot without
-  // the user having to know that, and still changeable from LCD Frequency.
-  if (displayModuleChoice == DISPLAY_MODULE_ST7789 && lcdFreqHz > ST7789_DEFAULT_BUS_HZ) {
-    preferences.putULong("lcdFreqHz", ST7789_DEFAULT_BUS_HZ);
-    lcdFreqHz = ST7789_DEFAULT_BUS_HZ;
-  }
+  // Nothing written here for the clock. effectiveLcdBusHz() enforces the
+  // ST7789's 20MHz ceiling wherever the bus is actually started, which covers
+  // the cases a write here would miss - a backup restored later, or a value
+  // already sitting in NVS from an ILI9341. The user's own choice stays saved
+  // and comes back if they switch to a panel that can use it.
   // Settings that live in settings{} in runtime.json on the SD card are read
   // back at boot by applySettingsJson() and treated as authoritative, so an
   // NVS-only write here would be silently reverted on the next boot. This
@@ -23239,6 +23285,11 @@ void lcdFreqDropdownEvent(lv_event_t *e) {
   static const uint32_t options[] = {40000000UL, 27000000UL, 20000000UL, 16000000UL, 10000000UL};
   uint16_t selected = lv_dropdown_get_selected(lv_event_get_target(e));
   if (selected >= 5) return;
+  // Refused outright on an ST7789. The row below is locked and disabled, so
+  // this is only reachable via physical navigation or a stale screen - but a
+  // setting that bricks the display until it is found again is worth blocking
+  // in more than one place.
+  if (displayModuleChoice == DISPLAY_MODULE_ST7789 && options[selected] > ST7789_BUS_HZ) return;
   preferences.begin(PREFERENCES_NAMESPACE, false);
   preferences.putULong("lcdFreqHz", options[selected]);
   preferences.end();
@@ -23450,7 +23501,9 @@ void renderDebugPageOmote() {
 
   // One row taller than before: Invert Colours joins Module and LCD Driver
   // rather than being written silently by the module dropdown.
-  int driverRows = displayDriverChoice == 0 ? 6 : 3;
+  int driverRows = displayDriverChoice == 0
+                     ? (displayModuleChoice == DISPLAY_MODULE_ST7789 ? 5 : 6)
+                     : 3;
   lv_obj_t *driverCard = makeOmoteCard(content, y, driverRows * calibRowH + (driverRows - 1));
   lv_obj_t *moduleDropdown = makeOmoteDropdownRow(driverCard, "Module", 0, calibRowH, 112);
   lv_dropdown_set_options(moduleDropdown, "Adafruit\nBuyDisplay\nST-7789");
@@ -23469,15 +23522,21 @@ void renderDebugPageOmote() {
 
   int rowIndex = 3;
   if (displayDriverChoice == 0) {
-    makeOmoteDivider(driverCard, rowIndex * (calibRowH + 1) - 1);
-    lv_obj_t *freqDropdown = makeOmoteDropdownRow(driverCard, "LCD Clock", rowIndex * (calibRowH + 1), calibRowH, 112);
-    lv_dropdown_set_options(freqDropdown, "40 MHz\n27 MHz\n20 MHz\n16 MHz\n10 MHz");
-    static const uint32_t freqOptions[] = {40000000UL, 27000000UL, 20000000UL, 16000000UL, 10000000UL};
-    uint16_t selectedFreqIndex = 0;
-    for (uint16_t i = 0; i < 5; i++) if (freqOptions[i] == lcdFreqHz) { selectedFreqIndex = i; break; }
-    lv_dropdown_set_selected(freqDropdown, selectedFreqIndex);
-    lv_obj_add_event_cb(freqDropdown, lcdFreqDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
-    rowIndex++;
+    // Hidden on the ST-7789, whose clock is fixed at 20MHz. The divider that
+    // separates this row from the one above belongs INSIDE the check: left
+    // outside it drew a stray line where the hidden row used to be, and
+    // pairing it with a second divider drew two when the row was shown.
+    if (displayModuleChoice != DISPLAY_MODULE_ST7789) {
+      makeOmoteDivider(driverCard, rowIndex * (calibRowH + 1) - 1);
+      lv_obj_t *freqDropdown = makeOmoteDropdownRow(driverCard, "LCD Clock", rowIndex * (calibRowH + 1), calibRowH, 112);
+      lv_dropdown_set_options(freqDropdown, "40 MHz\n27 MHz\n20 MHz\n16 MHz\n10 MHz");
+      static const uint32_t freqOptions[] = {40000000UL, 27000000UL, 20000000UL, 16000000UL, 10000000UL};
+      uint16_t selectedFreqIndex = 0;
+      for (uint16_t i = 0; i < 5; i++) if (freqOptions[i] == lcdFreqHz) { selectedFreqIndex = i; break; }
+      lv_dropdown_set_selected(freqDropdown, selectedFreqIndex);
+      lv_obj_add_event_cb(freqDropdown, lcdFreqDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
+      rowIndex++;
+    }
 
     makeOmoteDivider(driverCard, rowIndex * (calibRowH + 1) - 1);
     lv_obj_t *bufferDropdown = makeOmoteDropdownRow(driverCard, "Buffering", rowIndex * (calibRowH + 1), calibRowH, 112);
@@ -23774,8 +23833,12 @@ void renderDebugPage() {
   makeDisplayDriverRow(driverSectionY);
   driverSectionY += 50;
   if (displayDriverChoice == 0) {
-    makeLcdFrequencyRow(driverSectionY);
-    driverSectionY += 50;
+    // Hidden, not disabled, on the ST-7789: the clock is fixed at 20MHz for
+    // that panel, and a control that cannot change anything is only clutter.
+    if (displayModuleChoice != DISPLAY_MODULE_ST7789) {
+      makeLcdFrequencyRow(driverSectionY);
+      driverSectionY += 50;
+    }
     makeLcdBufferRow(driverSectionY);
     driverSectionY += 50;
     makeLcdDriveStrengthRow(driverSectionY);
@@ -26518,7 +26581,7 @@ void setup() {
     // Before setBusFrequency()/init(): LovyanGFX binds whichever panel is set
     // when the bus starts, so choosing it afterwards would have no effect.
     tft.selectPanel(displayModuleChoice);
-    tft.setBusFrequency(lcdFreqHz);
+    tft.setBusFrequency(effectiveLcdBusHz());
     tft.init();
     applyLcdDriveStrength();
     tft.initDMA();
@@ -26529,7 +26592,8 @@ void setup() {
   Serial.printf("LCD driver: %s%s\n",
                 displayDriverChoice == 1 ? "Arduino_GFX (synchronous)" : "LovyanGFX (DMA)",
                 displayDriverChoice == 1 ? "" :
-                  (String(", ") + String(lcdFreqHz / 1000000UL) + "MHz, " +
+                  (String(", ") + String(effectiveLcdBusHz() / 1000000UL) + "MHz" +
+                   (effectiveLcdBusHz() != lcdFreqHz ? " (locked for ST-7789)" : "") + ", " +
                    (lcdBufferMode ? "double buffer" : "single buffer") +
                    ", drive=" + String(lcdDriveStrength)).c_str());
   const char *moduleName = displayModuleChoice == DISPLAY_MODULE_ST7789 ? "ST-7789"
