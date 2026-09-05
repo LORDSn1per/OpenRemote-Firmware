@@ -4,7 +4,7 @@ import contextlib, datetime as dt, glob, hashlib, io, json, os, re, select, shut
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-APP_VERSION="2.77"
+APP_VERSION="2.78"
 SERIAL_BAUD=460800
 # 2.68 adds Linux as a third supported platform. Until now every non-Windows
 # branch in this file assumed macOS outright - AppleScript dialogs, diskutil,
@@ -719,28 +719,46 @@ def linux_dialog(prompt,directory=False,file_filter=None):
     return result.stdout.strip() if result.returncode==0 else ""
 
 def windows_dialog(create, result_property):
-    """Show a Windows common dialog and return the chosen path, or "".
+    """Show a Windows common dialog in FRONT of the browser, and return the
+    chosen path, or "".
 
-    The dialog is given an explicit owner window, and that is the whole point
-    of this helper. ShowDialog() with no owner parents itself to the calling
-    thread's active window - but that thread belongs to a PowerShell process
-    started with CREATE_NO_WINDOW, which has no window at all. Windows then has
-    nothing to place the dialog above, so it opens BEHIND the browser and the
-    user has to minimise the browser to find a dialog they did not know was
-    waiting.
+    ShowDialog() with no owner parents the dialog to the calling thread's
+    active window. That thread belongs to a PowerShell process started with
+    CREATE_NO_WINDOW, which has no window at all, so Windows has nothing to
+    place the dialog above and it opens behind the browser - the user has to
+    minimise the browser to find a dialog they did not know was waiting.
 
-    A TopMost owner fixes it: a modal dialog inherits its owner's z-order band,
-    so it is drawn above ordinary windows whether or not this process is
-    allowed to take focus. That last part matters - a background process cannot
-    steal foreground on Windows, so Activate() alone would not be enough and is
-    only a best effort here. TopMost is what actually does the work.
+    The owner is the browser's own window, found with GetForegroundWindow().
+    A dialog owned by a real, already-visible window is drawn above it, which
+    is what makes this reliable.
+
+    An earlier attempt used a synthetic Form with TopMost set, and it did not
+    work on real hardware. The likely reason is that a zero-opacity Form shown
+    without a message pump is never properly realised as a top-level window, so
+    TopMost had nothing to apply to. Owning to a window that genuinely exists
+    avoids the whole question. That Form is kept only as a fallback for the
+    case where there is no foreground window to borrow.
     """
-    script = ("Add-Type -AssemblyName System.Windows.Forms; " + create + " "
-              "$owner=New-Object System.Windows.Forms.Form; "
-              "$owner.TopMost=$true; $owner.ShowInTaskbar=$false; $owner.Opacity=0; "
-              "$owner.Show(); $owner.Activate(); "
-              "$result=$dialog.ShowDialog($owner); $owner.Close(); "
-              "if($result -eq [System.Windows.Forms.DialogResult]::OK){$dialog." + result_property + "}")
+    script = (
+        "Add-Type -AssemblyName System.Windows.Forms; "
+        "Add-Type -Namespace ORNative -Name Win -MemberDefinition '"
+        "[DllImport(\"user32.dll\")] public static extern System.IntPtr GetForegroundWindow();"
+        "'; "
+        + create + " "
+        "$fg=[ORNative.Win]::GetForegroundWindow(); "
+        "if($fg -ne [System.IntPtr]::Zero){"
+        "$owner=New-Object System.Windows.Forms.NativeWindow; "
+        "$owner.AssignHandle($fg); "
+        "$result=$dialog.ShowDialog($owner); "
+        "$owner.ReleaseHandle();"
+        "}else{"
+        "$fallback=New-Object System.Windows.Forms.Form; "
+        "$fallback.TopMost=$true; $fallback.ShowInTaskbar=$false; $fallback.Opacity=0; "
+        "$fallback.Show(); $fallback.Activate(); "
+        "$result=$dialog.ShowDialog($fallback); $fallback.Close();"
+        "} "
+        "if($result -eq [System.Windows.Forms.DialogResult]::OK){$dialog."
+        + result_property + "}")
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     return subprocess.check_output(
         ["powershell.exe", "-NoProfile", "-STA", "-Command", script],
