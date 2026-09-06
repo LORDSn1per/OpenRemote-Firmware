@@ -1,6 +1,22 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.07 - 2026-09-06
+    - The dock's Wi-Fi and Homebridge credentials are re-sent when they are
+      needed, instead of only once when the switch was turned on. Pushing on
+      that transition alone meant a dock that was on older firmware, asleep, or
+      out of range at that moment never received them - and flipping the switch
+      again did nothing, because the remote believed it had already sent them.
+      There was no way out of that state from the UI.
+    - Two triggers now. A dock reporting a firmware version it had not reported
+      before may have rebooted or been reflashed, so its credentials cannot be
+      assumed and are pushed again. And a command that fails with the dock
+      saying it has no Homebridge details or is not on Wi-Fi is treated as
+      proof they never landed: the remote pushes them, waits for the dock to
+      join, and retries the command once.
+    - Both are queued and run from loop(), never from the receive callback,
+      which runs on the Wi-Fi task.
+
   4.06 - 2026-09-06
     - Holds the ESP-NOW radio while a Homebridge command is waiting on the
       dock's reply. That reply arrives over this radio, so releasing it
@@ -4788,7 +4804,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.06"
+#define OPENREMOTE_VERSION_STRING "4.07"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -5798,6 +5814,7 @@ bool dockLedOnTransmit = true;
 // and quietly changing where commands originate would be a poor surprise.
 bool homebridgeViaDock = false;
 volatile bool homebridgeDockPending = false;
+volatile bool homebridgeConfigPushWanted = false;
 volatile bool homebridgeDockOk = false;
 volatile int homebridgeDockStatus = 0;
 char homebridgeDockErrorText[64] = {0};
@@ -12648,6 +12665,31 @@ bool transmitHomebridgeViaDock(const DeviceCommand &command) {
   if (!homebridgeDockOk) {
     Serial.printf("Homebridge via dock: %s\n",
                   homebridgeDockErrorText[0] ? homebridgeDockErrorText : "failed");
+    // A dock that says it has no details, or is not on Wi-Fi, is telling us the
+    // credentials never landed - it was on older firmware, asleep, or out of
+    // range when the switch was flipped, and pushing only on that transition
+    // meant there was no second chance. Push them now and try once more, so
+    // the user is not left toggling a switch that has already "done" its job.
+    if (strstr(homebridgeDockErrorText, "no Homebridge details") ||
+        strstr(homebridgeDockErrorText, "not on Wi-Fi")) {
+      Serial.println("Homebridge via dock: re-sending credentials and retrying");
+      sendHomebridgeConfigToDock();
+      delay(1200);                       // Let it join before asking again.
+      homebridgeDockPending = true;
+      homebridgeDockOk = false;
+      homebridgeDockErrorText[0] = '\0';
+      if (sendEspNowWithRetry(espNowDevices[0].mac, (const uint8_t *)&packet, sizeof(packet))) {
+        unsigned long retryStart = millis();
+        while (homebridgeDockPending && (millis() - retryStart) < 8000UL) delay(5);
+        if (!homebridgeDockPending && homebridgeDockOk) {
+          Serial.println("Homebridge via dock: succeeded after re-sending credentials");
+          return true;
+        }
+      }
+      homebridgeDockPending = false;
+      Serial.printf("Homebridge via dock: still failing - %s\n",
+                    homebridgeDockErrorText[0] ? homebridgeDockErrorText : "no answer");
+    }
     return false;
   }
   Serial.printf("Homebridge via dock: %s %s ok (HTTP %d) in %lums\n",
@@ -18387,6 +18429,10 @@ void onEspNowDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int 
       if (strcmp(dockReportedVersion, dockInfo.version) != 0) {
         strlcpy(dockReportedVersion, dockInfo.version, sizeof(dockReportedVersion));
         Serial.printf("Dock: reports firmware %s\n", dockReportedVersion);
+        // A dock that has just introduced itself may have rebooted or been
+        // reflashed, so its credentials cannot be assumed. Flagged here and
+        // pushed from loop(), never from this callback.
+        if (homebridgeViaDock) homebridgeConfigPushWanted = true;
       }
       return;
     }
@@ -23847,6 +23893,7 @@ void serviceDockSettingsSync() {
   // moment the user will try it. Pushing here means it works on the first
   // press rather than after some later event happens to sync it.
   if (relayChanged && homebridgeViaDock) sendHomebridgeConfigToDock();
+
   saveSettings();
   scheduleRuntimeSettingsSave();
   // Only the dock's own settings need sending; wake-warm is the remote's
@@ -26997,6 +27044,10 @@ void loop() {
   serviceDockLink(now);
   serviceEspNowLinkLog(now);
   serviceDockSettingsSync();
+  if (homebridgeConfigPushWanted) {
+    homebridgeConfigPushWanted = false;
+    if (homebridgeViaDock) sendHomebridgeConfigToDock();
+  }
   if (dockLinkIndicatorDirty) { dockLinkIndicatorDirty = false; refreshDockLinkIndicator(); }
   serviceEspNowDevicesModal(now);
   serviceEspNowSearchOverlay(now);
