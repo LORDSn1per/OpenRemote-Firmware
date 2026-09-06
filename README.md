@@ -47,7 +47,7 @@ Studio installs these for you, so you only need them for a manual update.
 
 | | Download |
 |---|---|
-| Remote firmware — ESP32-S3 | [**OpenRemote-Remote-Firmware-4.06.bin**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-Remote-Firmware-4.06.bin) |
+| Remote firmware — ESP32-S3 | [**OpenRemote-Remote-Firmware-4.07.bin**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-Remote-Firmware-4.07.bin) |
 | Dock firmware — ESP32-C3 | [**OpenRemote-Dock-Firmware-1.32.bin**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-Dock-Firmware-1.32.bin) |
 | WebConfig — browser configurator | [**OpenRemote-WebConfig-2.58.html**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-WebConfig-2.58.html) |
 
