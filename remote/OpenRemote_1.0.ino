@@ -1,6 +1,23 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.09 - 2026-09-06
+    - Homebridge discovery no longer stops at 40 accessories. The cap was
+      arbitrary - it matched no storage or protocol limit, and
+      MAX_DEVICE_COMMANDS has been 200 for a long time - and it stopped
+      silently, so a large Homebridge setup showed part of its list with
+      nothing to say why. Raised to 200, and the response now reports when it
+      truncates rather than simply ending.
+    - The reply also carries how many services Homebridge returned and how many
+      were skipped as read-only. Sensors have nothing this remote can send, so
+      they are correctly not offered, but "some of my devices are missing" and
+      "those devices cannot be controlled" look identical from the UI. Now the
+      count says which.
+    - Discovery logs the same three numbers to serial.
+    - A non-string entry in a characteristic's perms array no longer reaches
+      strcmp() as a null pointer. Malformed data from Homebridge should not
+      take the remote down mid-discovery.
+
   4.08 - 2026-09-06
     - /api/homebridge/status now reports passwordSaved, so WebConfig can tell
       the user their Homebridge password is already stored and does not need
@@ -4814,7 +4831,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.08"
+#define OPENREMOTE_VERSION_STRING "4.09"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -17658,7 +17675,11 @@ void handleCommandTest() {
 bool homebridgeCharacteristicWritable(JsonObjectConst characteristic) {
   if (characteristic["canWrite"] | false) return true;
   for (JsonVariantConst permission : characteristic["perms"].as<JsonArrayConst>()) {
-    if (strcmp(permission.as<const char *>(), "pw") == 0) return true;
+    // Guarded: a non-string entry returns nullptr here, and strcmp(nullptr, ..)
+    // is undefined - a malformed reply from Homebridge should not crash the
+    // remote mid-discovery.
+    const char *text = permission.as<const char *>();
+    if (text && strcmp(text, "pw") == 0) return true;
   }
   return false;
 }
@@ -17746,14 +17767,27 @@ void handleHomebridgeDiscover() {
   response["ok"] = true;
   response["address"] = address;
   JsonArray accessories = response["accessories"].to<JsonArray>();
+  // 200 rather than 40. The old cap was arbitrary - it matched nothing, and
+  // MAX_DEVICE_COMMANDS is already 200 - and it stopped silently, so anyone
+  // with a large Homebridge setup saw part of their list and no explanation.
+  // The response is built in PSRAM, so the size is not the constraint it would
+  // be on the heap.
+  static const size_t MAX_DISCOVERED = 200;
+  size_t servicesSeen = 0;
+  size_t readOnlySkipped = 0;
+  bool truncated = false;
   for (JsonObjectConst service : services) {
-    if (accessories.size() >= 40) break;
+    servicesSeen++;
+    if (accessories.size() >= MAX_DISCOVERED) { truncated = true; continue; }
     JsonArrayConst characteristics = service["serviceCharacteristics"].as<JsonArrayConst>();
     uint8_t writableCount = 0;
     for (JsonObjectConst characteristic : characteristics) {
       if (homebridgeCharacteristicWritable(characteristic)) writableCount++;
     }
-    if (!writableCount) continue;
+    // Read-only services - temperature, motion, contact sensors - have nothing
+    // this remote could send, so they are not offered. Counted, so the UI can
+    // say how many were left out instead of the user wondering where they went.
+    if (!writableCount) { readOnlySkipped++; continue; }
     JsonObject accessory = accessories.add<JsonObject>();
     accessory["uniqueId"] = service["uniqueId"] | "";
     const char *name = service["serviceName"] | "";
@@ -17784,6 +17818,12 @@ void handleHomebridgeDiscover() {
     }
   }
   response["count"] = accessories.size();
+  response["servicesSeen"] = servicesSeen;
+  response["readOnlySkipped"] = readOnlySkipped;
+  response["truncated"] = truncated;
+  Serial.printf("Homebridge discovery: %u service(s), %u controllable, %u read-only%s\n",
+                (unsigned)servicesSeen, (unsigned)accessories.size(),
+                (unsigned)readOnlySkipped, truncated ? ", LIST TRUNCATED" : "");
   saveHomebridgeCredentials(address, username, password);
   homebridgeToken = token;
   String body;
