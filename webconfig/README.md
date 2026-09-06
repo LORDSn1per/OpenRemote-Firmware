@@ -81,6 +81,11 @@ If a [dock](../dock/README.md) is paired, WebConfig gains its controls:
 - **Dock RF433** — enable the 433 MHz transmitter, and **learn** a signal from
   an existing gate, garage or socket remote.
 - **Dock LED** and **Tx Power** — brightness and range behaviour.
+- **Homebridge via dock** — let the dock send your Homebridge commands instead
+  of the remote. It is mains powered, so it stays on Wi-Fi permanently and the
+  command goes out on a connection that is already open; the remote has to wake
+  its radio and join the network first, which takes seconds. Turning it on
+  sends the dock your Wi-Fi and Homebridge details automatically.
 - **Update the dock wirelessly** — send new dock firmware over the radio link.
   A dock only ever needs a cable for its very first flash.
 

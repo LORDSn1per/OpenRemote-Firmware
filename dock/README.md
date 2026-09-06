@@ -32,6 +32,28 @@ rather than a decoded protocol, which is what lets it reproduce codes nothing
 recognises. Learning is driven from WebConfig; the dock opens a receive window,
 captures the burst, and sends the timings back over ESP-NOW.
 
+**Sends Homebridge commands, and sends them fast.** With *Homebridge via dock*
+switched on, the remote hands the command to the dock over ESP-NOW and the dock
+issues the HTTP call itself.
+
+This is worth more than it sounds, and the reason is simply what the dock is.
+Being mains powered, it has no reason to sleep: it joins your Wi-Fi once and
+**stays joined, permanently, with power save off**, so a command is one HTTP
+round trip on a connection that is already open and already authenticated. The
+remote runs on a battery and cannot do that - it has to power its radio, join
+the network and log in before it can send anything, which costs seconds every
+single time.
+
+The gain is largest where you would least expect it. *Toggle* and *step*
+operations have to read the current value before writing the new one, so
+through the dock that is two round trips on a warm link, against an association
+plus two on a cold one.
+
+The dock logs in and keeps its own token, re-authenticating whenever it
+expires. No token is ever sent between the two, so there is no shared expiry
+for them to disagree about. Turn the switch off, or unpair the dock, and the
+remote goes back to sending them itself.
+
 **Updates over the air.** New dock firmware is uploaded through WebConfig,
 stored on the remote's SD card, then pushed to the dock over ESP-NOW in 160-byte
 chunks. The dock writes to its spare flash slot and verifies the whole image
@@ -145,6 +167,10 @@ seconds after the last use, so an idle remote is not paying to hold a link open.
 | remote → dock | `ORPG` | keepalive ping, carries the remote's channel |
 | dock → remote | `ORDI` | dock info: firmware version |
 | remote → dock | `ORDS` | dock settings: RF on/off, LED on transmit |
+| remote → dock | `ORWC` | Wi-Fi credentials for the dock |
+| remote → dock | `ORHC` | Homebridge address and login |
+| remote → dock | `ORHB` | one Homebridge command |
+| dock → remote | `ORHR` | the result of it |
 | remote → dock | `ORLD` | link going down |
 | remote → dock | `ORLS` | open an RF433 receive window |
 | dock → remote | `ORLR` | captured RF timings |

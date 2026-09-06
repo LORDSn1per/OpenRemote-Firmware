@@ -95,6 +95,12 @@ over its own radio link. It fires infrared into a closed cabinet or a second
 room, and sends **RF433** to gates, garage doors and sockets by learning the
 signal from your existing remote.
 
+It can also send your **Homebridge** commands, and they arrive noticeably
+faster. Because it is mains powered it stays joined to your Wi-Fi permanently,
+so a command is one HTTP call on an already-open connection - where the remote,
+running on a battery, must wake its radio, join the network and log in first.
+Optional, and off until you turn it on.
+
 Update it whichever way suits: **wirelessly from WebConfig**, or **over USB
 from Studio**.
 
