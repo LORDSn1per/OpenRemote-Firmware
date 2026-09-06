@@ -1,6 +1,24 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.10 - 2026-09-06
+    - Homebridge discovery no longer loses accessories on a large setup. It
+      buffered the whole accessory list into a heap String with getString(),
+      and a house with around sixty services and their full characteristics
+      runs to hundreds of kilobytes against roughly 135KB of free heap. The
+      list came back cut short, so the entries at the start were all present
+      and the later ones simply absent - which reads as "some of my devices are
+      missing" and looks nothing like a memory limit.
+    - The list is now parsed straight off the socket. ArduinoJson reads from
+      the stream and builds into PSRAM, so nothing has to hold the whole reply
+      at once, and a filter discards every field discovery does not use while
+      parsing rather than afterwards.
+    - Worth recording: the 40-accessory cap removed in 4.09 was NOT this. That
+      cap was real and would have bitten a larger setup, but 16 accessories
+      were being found, nowhere near it. The screenshot of the Homebridge page
+      is what showed the discovered ones were all from the beginning of the
+      list - the ordering, not the count, was the clue.
+
   4.09 - 2026-09-06
     - Homebridge discovery no longer stops at 40 accessories. The cap was
       arbitrary - it matched no storage or protocol limit, and
@@ -4831,7 +4849,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.09"
+#define OPENREMOTE_VERSION_STRING "4.10"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -17717,6 +17735,69 @@ bool homebridgeCommandFromJson(JsonObjectConst spec, DeviceCommand &command,
   return true;
 }
 
+// Parses Homebridge's accessory list straight off the socket.
+//
+// The ordinary path buffers a reply into a String with http.getString(), which
+// is fine for the small ones. The accessory list is not small: a house with
+// sixty services and their full characteristics runs to hundreds of kilobytes,
+// and this remote has around 135KB of free heap. The buffer could not hold it,
+// and the list came back cut short - which looked exactly like "some of my
+// devices are missing" while the earliest entries were all present and the
+// later ones simply gone.
+//
+// Streaming removes the ceiling: ArduinoJson reads from the socket and builds
+// the document in PSRAM, so nothing has to hold the whole reply at once. The
+// filter throws away every field discovery does not use while parsing, rather
+// than after, which cuts what is kept to a fraction of what arrives.
+int homebridgeFetchAccessories(const String &base, const String &token,
+                               JsonDocument &target, String &error) {
+  HTTPClient http;
+  http.setConnectTimeout(4000);
+  http.setTimeout(15000);              // A long list takes longer to send.
+  if (!http.begin(base + "/api/accessories")) {
+    error = "Could not reach Homebridge";
+    return HTTPC_ERROR_CONNECTION_REFUSED;
+  }
+  http.addHeader("Accept", "application/json");
+  if (token.length()) http.addHeader("Authorization", "Bearer " + token);
+  int status = http.GET();
+  if (status < 200 || status >= 300) {
+    error = String("Accessory discovery failed (HTTP ") + status + ")";
+    http.end();
+    return status;
+  }
+
+  JsonDocument filter(&psramJsonAllocator);
+  JsonObject service = filter.add<JsonObject>();
+  service["uniqueId"] = true;
+  service["serviceName"] = true;
+  service["displayName"] = true;
+  service["name"] = true;
+  service["type"] = true;
+  service["serviceType"] = true;
+  JsonObject characteristic = service["serviceCharacteristics"].add<JsonObject>();
+  characteristic["type"] = true;
+  characteristic["displayName"] = true;
+  characteristic["description"] = true;
+  characteristic["format"] = true;
+  characteristic["value"] = true;
+  characteristic["canWrite"] = true;
+  characteristic["perms"] = true;
+  characteristic["minValue"] = true;
+  characteristic["maxValue"] = true;
+  characteristic["minStep"] = true;
+  characteristic["validValues"] = true;
+
+  DeserializationError parse = deserializeJson(target, http.getStream(),
+                                               DeserializationOption::Filter(filter));
+  http.end();
+  if (parse) {
+    error = String("Homebridge returned unreadable accessory data (") + parse.c_str() + ")";
+    return -1;
+  }
+  return status;
+}
+
 void handleHomebridgeDiscover() {
   if (!requestAuthorized()) {
     sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
@@ -17743,22 +17824,17 @@ void handleHomebridgeDiscover() {
     return;
   }
 
-  String raw;
-  int status = homebridgeHttp(address, "GET", "/api/accessories", "", token, raw);
+  JsonDocument source(&psramJsonAllocator);
+  String fetchError;
+  int status = homebridgeFetchAccessories(address, token, source, fetchError);
   if (status < 200 || status >= 300) {
     JsonDocument response;
     response["ok"] = false;
-    response["error"] = homebridgeResponseError(raw,
-      String("Accessory discovery failed (HTTP ") + status + ")");
+    response["error"] = fetchError.length() ? fetchError
+                                            : String("Accessory discovery failed (HTTP ") + status + ")";
     String body;
     serializeJson(response, body);
     sendJson(status == 400 ? 400 : 502, body);
-    return;
-  }
-
-  JsonDocument source(&psramJsonAllocator);
-  if (deserializeJson(source, raw)) {
-    sendJson(502, "{\"ok\":false,\"error\":\"Homebridge returned invalid accessory data\"}");
     return;
   }
   JsonArrayConst services = source.as<JsonArrayConst>();
