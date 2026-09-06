@@ -1,6 +1,22 @@
 /*
   OpenRemote Dock firmware change log (newest first)
 
+  1.33 - 2026-09-06
+    - Fixes the Homebridge relay failing with "login failed (HTTP -1)". The
+      dock hardcoded "http://" in front of the configured address, so an
+      address that already carried a scheme became
+      "http://http://192.168.x.x:8581/..." and the dock tried to resolve a host
+      literally named "http". Its own log said so plainly once both boards were
+      captured on one clock:
+        hostByName(): DNS Failed for 'http' with error '-54'
+    - The address is now normalised exactly as the remote has always normalised
+      it - scheme added only when missing, any trailing path or slash removed.
+      The remote had this from the start; the dock simply never got it, which
+      is what a second implementation of the same thing tends to cost.
+    - Failures now name the URL they tried. A bare "HTTP -1" sent this
+      investigation toward credentials and Wi-Fi when the address was malformed
+      all along.
+
   1.32 - 2026-09-06
     - Keeps the Wi-Fi association awake, which is the entire point of relaying
       Homebridge through the dock. 1.31 set WIFI_PS_NONE at boot, but that is
@@ -675,7 +691,7 @@ static inline bool serialHostAttached() {
 }
 
 
-#define OPENREMOTE_DOCK_VERSION_STRING "1.32"
+#define OPENREMOTE_DOCK_VERSION_STRING "1.33"
 
 // A literal in the built image, so a tool holding the .bin can tell what it is
 // without running it. The remote firmware carries the same idea under
@@ -2383,19 +2399,47 @@ void serviceHomebridgeWifi(unsigned long now) {
   }
 }
 
+// Normalises the Homebridge address the same way the remote does.
+//
+// The address the user types may or may not already carry a scheme, and may
+// have a trailing path or slash. Hardcoding "http://" in front of it produced
+// "http://http://192.168.x.x:8581/..." for anyone who typed the scheme, and the
+// dock then tried to resolve a host literally called "http":
+//   hostByName(): DNS Failed for 'http' with error '-54'
+// which surfaced as a bare "login failed (HTTP -1)" with no hint of the cause.
+// The remote has always normalised this; the dock simply did not.
+String normaliseHomebridgeAddress(String address) {
+  address.trim();
+  if (!address.length()) return "";
+  if (!address.startsWith("http://") && !address.startsWith("https://")) {
+    address = "http://" + address;
+  }
+  int schemeEnd = address.indexOf("://");
+  int pathStart = address.indexOf('/', schemeEnd + 3);
+  if (pathStart >= 0) address.remove(pathStart);
+  while (address.endsWith("/")) address.remove(address.length() - 1);
+  return address;
+}
+
 // Logs in and stores the token. Homebridge issues a bearer token that expires,
 // so this is called again whenever a request comes back 401 or 403.
 bool homebridgeLogin(String &error) {
   HTTPClient http;
-  String url = "http://" + hbAddress + "/api/auth/login";
-  if (!http.begin(url)) { error = "Could not reach Homebridge"; return false; }
+  String url = normaliseHomebridgeAddress(hbAddress) + "/api/auth/login";
+  if (!http.begin(url)) {
+    error = String("Bad Homebridge URL: ") + url;
+    return false;
+  }
   http.addHeader("Content-Type", "application/json");
   String body = String("{\"username\":\"") + hbUser + "\",\"password\":\"" + hbPass + "\"}";
   int code = http.POST(body);
   String reply = http.getString();
   http.end();
   if (code != 200 && code != 201) {
-    error = String("Homebridge login failed (HTTP ") + code + ")";
+    // The URL is included because a bare status number sent the last
+    // investigation looking at credentials when the address was malformed.
+    error = String("Login failed HTTP ") + code + " at " + url;
+    if (serialHostAttached()) Serial.printf("Dock: %s\n", error.c_str());
     return false;
   }
   // Pulled out by hand rather than with a JSON parser: this is one known field
@@ -2413,7 +2457,7 @@ bool homebridgeLogin(String &error) {
 int homebridgeRequest(const char *method, const String &path, const String &body,
                       String &reply) {
   HTTPClient http;
-  String url = "http://" + hbAddress + path;
+  String url = normaliseHomebridgeAddress(hbAddress) + path;
   if (!http.begin(url)) return -1;
   http.addHeader("Content-Type", "application/json");
   http.addHeader("Authorization", "Bearer " + hbToken);
