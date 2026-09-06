@@ -1,6 +1,16 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.08 - 2026-09-06
+    - /api/homebridge/status now reports passwordSaved, so WebConfig can tell
+      the user their Homebridge password is already stored and does not need
+      typing again to add another accessory.
+    - The password itself is still never sent back to the browser, and nothing
+      about how discovery works has changed: it has always treated an empty
+      password as "use the saved one". WebConfig simply had no way to know that
+      was on offer, so it asked again every time - the field even clears itself
+      after a successful connect, which made a saved password look absent.
+
   4.07 - 2026-09-06
     - The dock's Wi-Fi and Homebridge credentials are re-sent when they are
       needed, instead of only once when the switch was turned on. Pushing on
@@ -4804,7 +4814,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.07"
+#define OPENREMOTE_VERSION_STRING "4.08"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -17791,6 +17801,10 @@ void handleHomebridgeStatus() {
   response["configured"] = homebridgeAddress.length() && homebridgeUsername.length();
   response["address"] = homebridgeAddress;
   response["username"] = homebridgeUsername;
+  // Whether a password is stored - never the password itself. Discovery
+  // already treats an empty password as "use the saved one", but WebConfig had
+  // no way to know that was on offer, so it asked for it again every time.
+  response["passwordSaved"] = homebridgePassword.length() > 0;
   response["connected"] = false;
   if (response["configured"].as<bool>() && WiFi.status() == WL_CONNECTED) {
     String raw;
