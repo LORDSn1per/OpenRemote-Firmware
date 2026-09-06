@@ -1,6 +1,37 @@
 /*
   OpenRemote Dock firmware change log (newest first)
 
+  1.31 - 2026-09-06
+    - Relays Homebridge for the remote. The remote can now hand a Homebridge
+      command to this dock instead of issuing it itself, chosen by a switch and
+      off by default.
+    - Worth doing because of what the dock is: mains powered, so it holds its
+      Wi-Fi association open permanently and a command is one HTTP round trip
+      on an already-warm connection. The remote has to power a radio and
+      associate first, which costs seconds every single time. Toggle and step
+      operations gain most, since those need a read before the write - two
+      round trips on a warm link rather than an association plus two on a cold
+      one.
+    - The dock logs in and keeps its own bearer token, re-logging in whenever a
+      request comes back 401 or 403. The remote never sends a token, so there
+      is no shared expiry for the two ends to disagree about.
+    - The login reply is parsed by hand rather than with a JSON library. It is
+      one known field in one known response, and a parser would have cost far
+      more flash than it saved on a part already at three quarters of its
+      partition.
+    - Joining Wi-Fi pins the radio to the router's channel, which is the same
+      channel the remote already states in every keepalive ping, so the two
+      stay in step. If the association moves the radio, the dock relocks
+      ESP-NOW to wherever it landed.
+    - Credentials arrive as two ESP-NOW frames - Wi-Fi and Homebridge details
+      separately - because the pair does not fit in one 250 byte frame. They
+      are stored in NVS and applied from loop(), never from the receive
+      callback, which runs on the Wi-Fi task and must not write NVS.
+    - Flash use rises from 77% to 90% of the app partition, almost entirely
+      HTTPClient. It fits, and both OTA slots still hold it, but there is now
+      about 128KB of headroom rather than 297KB. The unused 1408KB SPIFFS
+      partition is the room to reclaim if that ever becomes tight.
+
   1.30 - 2026-09-02
     - Keeps the ESP32-C3 Super Mini's onboard GPIO8 status LED and GPIO9 BOOT
       button intact while adding the Rev 6 PCB's external D5 status LED and SW1
@@ -603,6 +634,7 @@
 #include <IRremote.hpp>
 #include <esp_ota_ops.h>
 #include <esp_rom_crc.h>
+#include <HTTPClient.h>
 #if DOCK_RF_CS_PIN >= 0
 // Asynchronous serial mode, not the packet engine: a gate or garage remote is
 // a raw OOK edge train with no framing the CC1101 could parse for us. GDO0
@@ -627,7 +659,7 @@ static inline bool serialHostAttached() {
 }
 
 
-#define OPENREMOTE_DOCK_VERSION_STRING "1.30"
+#define OPENREMOTE_DOCK_VERSION_STRING "1.31"
 
 // A literal in the built image, so a tool holding the .bin can tell what it is
 // without running it. The remote firmware carries the same idea under
@@ -804,6 +836,13 @@ static const uint32_t ESPNOW_DOCK_LINK_DOWN_MAGIC = 0x4F524C44UL;  // "ORLD"
 // is already happening every 5 seconds while the link is up - so the answer
 // costs nothing extra and is always current.
 static const uint32_t ESPNOW_DOCK_INFO_MAGIC = 0x4F524449UL;  // "ORDI"
+// Homebridge relayed through this dock instead of the remote. Byte-identical
+// to the remote's definitions - the static_asserts below fail the build if
+// either side drifts.
+static const uint32_t ESPNOW_DOCK_WIFI_MAGIC   = 0x4F525743UL;  // "ORWC"
+static const uint32_t ESPNOW_DOCK_HBCFG_MAGIC  = 0x4F524843UL;  // "ORHC"
+static const uint32_t ESPNOW_HOMEBRIDGE_MAGIC  = 0x4F524842UL;  // "ORHB"
+static const uint32_t ESPNOW_HOMEBRIDGE_RESULT_MAGIC = 0x4F524852UL;  // "ORHR"
 
 struct __attribute__((packed)) EspNowDockInfoPacket {
   uint32_t magic;
@@ -837,6 +876,40 @@ struct __attribute__((packed)) EspNowCommandHeader {
   uint16_t rawCount;
 };
 
+
+struct __attribute__((packed)) EspNowDockWifiPacket {
+  uint32_t magic;
+  char ssid[33];
+  char password[65];
+};
+
+struct __attribute__((packed)) EspNowDockHomebridgePacket {
+  uint32_t magic;
+  char address[65];
+  char username[33];
+  char password[65];
+};
+
+struct __attribute__((packed)) EspNowHomebridgePacket {
+  uint32_t magic;
+  uint8_t operation;    // 0 = set, 1 = toggle, 2 = step
+  uint8_t valueType;    // 0 = string, 1 = bool, 2 = number
+  float value;
+  float step;
+  float minimum;
+  float maximum;
+  char accessoryId[72];
+  char characteristic[40];
+  char stringValue[28];
+};
+
+struct __attribute__((packed)) EspNowHomebridgeResultPacket {
+  uint32_t magic;
+  uint8_t ok;
+  int16_t httpStatus;
+  char error[64];
+};
+
 struct __attribute__((packed)) EspNowRfLearnStartPacket {
   uint32_t magic;
   uint32_t timeoutMs;
@@ -854,6 +927,10 @@ struct __attribute__((packed)) EspNowRfLearnResultHeader {
 static_assert(sizeof(EspNowAnnouncePacket) == 28, "announce packet layout drifted from the remote");
 static_assert(sizeof(EspNowCommandHeader) == 35, "command header layout drifted from the remote");
 static_assert(sizeof(EspNowRfLearnStartPacket) == 8, "RF learn start layout drifted from the remote");
+static_assert(sizeof(EspNowDockWifiPacket) == 102, "dock Wi-Fi config layout drifted from the remote");
+static_assert(sizeof(EspNowDockHomebridgePacket) == 167, "dock Homebridge config layout drifted from the remote");
+static_assert(sizeof(EspNowHomebridgePacket) == 162, "Homebridge command layout drifted from the remote");
+static_assert(sizeof(EspNowHomebridgeResultPacket) == 71, "Homebridge result layout drifted from the remote");
 static_assert(sizeof(EspNowRfLearnResultHeader) == 7, "RF learn result layout drifted from the remote");
 static_assert(sizeof(EspNowOtaBeginPacket) == 20, "OTA begin layout drifted from the remote");
 static_assert(sizeof(EspNowOtaDataHeader) == 10, "OTA data header layout drifted from the remote");
@@ -901,6 +978,31 @@ bool dockRfEnabled = true;
 // ---------------------------------------------------------------------------
 // CC1101 433MHz
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Homebridge relay
+// ---------------------------------------------------------------------------
+// The remote can hand Homebridge commands to this dock instead of issuing them
+// itself. It is worth doing because the dock is mains powered: it holds its
+// Wi-Fi association open permanently, so a command is one HTTP round trip on an
+// already-warm connection, where the remote has to power a radio and associate
+// first - seconds, every single time.
+//
+// The dock logs in and keeps its own token. The remote never sends one, so
+// there is no shared expiry to keep in step.
+String hbSsid, hbPassword, hbAddress, hbUser, hbPass, hbToken;
+bool wifiConfigured = false;
+bool wifiJoined = false;
+unsigned long wifiNextAttemptMs = 0;
+static const uint32_t WIFI_RETRY_MS = 20000;
+
+volatile bool pendingHomebridge = false;
+volatile bool pendingWifiConfigReady = false;
+volatile bool pendingHbConfigReady = false;
+EspNowDockWifiPacket pendingWifiConfig;
+EspNowDockHomebridgePacket pendingHbConfig;
+EspNowHomebridgePacket pendingHomebridgeCommand;
+uint8_t pendingHomebridgeMac[6] = {0};
+
 bool rfPresent = false;
 // 250 bytes is the ESP-NOW ceiling and the result header eats 7, so at two
 // bytes a timing only 121 can ever be sent back. Capturing more than that
@@ -1591,7 +1693,17 @@ void loadRemote() {
   lockedChannel = prefs.getUChar("channel", 0);
   dockRfEnabled = prefs.getBool("rf", true);
   dockLedOnTransmit = prefs.getBool("ledTx", true);
+  hbSsid = prefs.getString("wifiSsid", "");
+  hbPassword = prefs.getString("wifiPass", "");
+  hbAddress = prefs.getString("hbAddr", "");
+  hbUser = prefs.getString("hbUser", "");
+  hbPass = prefs.getString("hbPass", "");
+  wifiConfigured = hbSsid.length() > 0;
   prefs.end();
+  if (wifiConfigured) {
+    Serial.printf("Dock: Wi-Fi configured for '%s'%s\n", hbSsid.c_str(),
+                  hbAddress.length() ? ", Homebridge relay ready" : "");
+  }
   if (remoteKnown) {
     Serial.printf("Dock: paired with %s on channel %u - LED will rest lit\n",
                   macToString(remoteMac).c_str(), lockedChannel);
@@ -1703,6 +1815,42 @@ void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len)
     memcpy(otaFrame, data, n);
     otaFrameLen = n;
     pendingOta = true;
+    return;
+  }
+
+  if (magic == ESPNOW_DOCK_WIFI_MAGIC && len >= (int)sizeof(EspNowDockWifiPacket)) {
+    if (!remoteKnown || memcmp(info->src_addr, remoteMac, 6) != 0) return;
+    EspNowDockWifiPacket packet;
+    memcpy(&packet, data, sizeof(packet));
+    packet.ssid[sizeof(packet.ssid) - 1] = '\0';
+    packet.password[sizeof(packet.password) - 1] = '\0';
+    memcpy(&pendingWifiConfig, &packet, sizeof(packet));
+    pendingWifiConfigReady = true;   // Applied from loop(): this writes NVS.
+    return;
+  }
+
+  if (magic == ESPNOW_DOCK_HBCFG_MAGIC && len >= (int)sizeof(EspNowDockHomebridgePacket)) {
+    if (!remoteKnown || memcmp(info->src_addr, remoteMac, 6) != 0) return;
+    EspNowDockHomebridgePacket packet;
+    memcpy(&packet, data, sizeof(packet));
+    packet.address[sizeof(packet.address) - 1] = '\0';
+    packet.username[sizeof(packet.username) - 1] = '\0';
+    packet.password[sizeof(packet.password) - 1] = '\0';
+    memcpy(&pendingHbConfig, &packet, sizeof(packet));
+    pendingHbConfigReady = true;
+    return;
+  }
+
+  if (magic == ESPNOW_HOMEBRIDGE_MAGIC && len >= (int)sizeof(EspNowHomebridgePacket)) {
+    if (!remoteKnown || memcmp(info->src_addr, remoteMac, 6) != 0) return;
+    if (pendingHomebridge) return;   // loop() has not taken the last one yet.
+    memcpy(&pendingHomebridgeCommand, data, sizeof(pendingHomebridgeCommand));
+    pendingHomebridgeCommand.accessoryId[sizeof(pendingHomebridgeCommand.accessoryId) - 1] = '\0';
+    pendingHomebridgeCommand.characteristic[sizeof(pendingHomebridgeCommand.characteristic) - 1] = '\0';
+    pendingHomebridgeCommand.stringValue[sizeof(pendingHomebridgeCommand.stringValue) - 1] = '\0';
+    memcpy(pendingHomebridgeMac, info->src_addr, 6);
+    // Handled from loop(): an HTTP round trip cannot run on the Wi-Fi task.
+    pendingHomebridge = true;
     return;
   }
 
@@ -2159,6 +2307,220 @@ void serviceChannelMove() {
   rememberRemote(remoteMac, target);
 }
 
+// Joins the configured Wi-Fi and keeps it joined.
+//
+// ESP-NOW and the station share one radio and therefore one channel. Joining an
+// access point pins that channel to the router's, which is exactly what the
+// remote already states in every keepalive ping - so the two stay in step
+// rather than fighting. Nothing here changes the ESP-NOW channel directly.
+void serviceHomebridgeWifi(unsigned long now) {
+  if (!wifiConfigured || otaActive) return;
+  bool up = WiFi.status() == WL_CONNECTED;
+  if (up != wifiJoined) {
+    wifiJoined = up;
+    if (up) {
+      Serial.printf("Dock: Wi-Fi joined '%s' as %s on channel %u\n",
+                    hbSsid.c_str(), WiFi.localIP().toString().c_str(),
+                    (unsigned)WiFi.channel());
+      // The association may have moved the radio. Whatever channel it landed
+      // on is now the one ESP-NOW must use as well.
+      uint8_t primary = WiFi.channel();
+      if (primary >= CHANNEL_MIN && primary <= CHANNEL_MAX && primary != lockedChannel &&
+          remoteKnown) {
+        Serial.printf("Dock: following Wi-Fi onto channel %u (was %u)\n",
+                      (unsigned)primary, (unsigned)lockedChannel);
+        rememberRemote(remoteMac, primary);
+      }
+    } else {
+      Serial.println("Dock: Wi-Fi lost - retrying");
+      hbToken = "";
+    }
+  }
+  if (!up && (long)(now - wifiNextAttemptMs) >= 0) {
+    wifiNextAttemptMs = now + WIFI_RETRY_MS;
+    WiFi.begin(hbSsid.c_str(), hbPassword.c_str());
+  }
+}
+
+// Logs in and stores the token. Homebridge issues a bearer token that expires,
+// so this is called again whenever a request comes back 401 or 403.
+bool homebridgeLogin(String &error) {
+  HTTPClient http;
+  String url = "http://" + hbAddress + "/api/auth/login";
+  if (!http.begin(url)) { error = "Could not reach Homebridge"; return false; }
+  http.addHeader("Content-Type", "application/json");
+  String body = String("{\"username\":\"") + hbUser + "\",\"password\":\"" + hbPass + "\"}";
+  int code = http.POST(body);
+  String reply = http.getString();
+  http.end();
+  if (code != 200 && code != 201) {
+    error = String("Homebridge login failed (HTTP ") + code + ")";
+    return false;
+  }
+  // Pulled out by hand rather than with a JSON parser: this is one known field
+  // in one known reply, and a parser would cost far more flash than it saves
+  // on a part that is already at three quarters of its partition.
+  int at = reply.indexOf("\"access_token\"");
+  if (at < 0) { error = "Homebridge login returned no token"; return false; }
+  int start = reply.indexOf('"', reply.indexOf(':', at)) + 1;
+  int end = reply.indexOf('"', start);
+  if (start <= 0 || end <= start) { error = "Homebridge token could not be read"; return false; }
+  hbToken = reply.substring(start, end);
+  return true;
+}
+
+int homebridgeRequest(const char *method, const String &path, const String &body,
+                      String &reply) {
+  HTTPClient http;
+  String url = "http://" + hbAddress + path;
+  if (!http.begin(url)) return -1;
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Authorization", "Bearer " + hbToken);
+  int code = strcmp(method, "GET") == 0 ? http.GET() : http.PUT(body);
+  reply = http.getString();
+  http.end();
+  return code;
+}
+
+// Reads one characteristic's current value, needed for toggle and step.
+bool homebridgeReadValue(const EspNowHomebridgePacket &cmd, float &value, String &error) {
+  String reply;
+  int code = homebridgeRequest("GET", String("/api/accessories/") + cmd.accessoryId, "", reply);
+  if (code == 401 || code == 403) {
+    if (!homebridgeLogin(error)) return false;
+    code = homebridgeRequest("GET", String("/api/accessories/") + cmd.accessoryId, "", reply);
+  }
+  if (code != 200) { error = String("Homebridge read failed (HTTP ") + code + ")"; return false; }
+  int at = reply.indexOf(cmd.characteristic);
+  if (at < 0) { error = "Characteristic not found on that accessory"; return false; }
+  int vpos = reply.indexOf("\"value\"", at);
+  if (vpos < 0) { error = "Characteristic had no value"; return false; }
+  int colon = reply.indexOf(':', vpos);
+  if (colon < 0) { error = "Characteristic value was malformed"; return false; }
+  String raw = reply.substring(colon + 1, colon + 24);
+  raw.trim();
+  if (raw.startsWith("true")) value = 1.0f;
+  else if (raw.startsWith("false")) value = 0.0f;
+  else value = raw.toFloat();
+  return true;
+}
+
+void sendHomebridgeResult(const uint8_t *mac, bool ok, int status, const char *error) {
+  EspNowHomebridgeResultPacket result = {};
+  result.magic = ESPNOW_HOMEBRIDGE_RESULT_MAGIC;
+  result.ok = ok ? 1 : 0;
+  result.httpStatus = (int16_t)status;
+  if (error) strlcpy(result.error, error, sizeof(result.error));
+  for (uint8_t attempt = 0; attempt < 3; attempt++) {
+    if (esp_now_send(mac, (const uint8_t *)&result, sizeof(result)) == ESP_OK) return;
+    delay(2);
+  }
+}
+
+// Stores config pushed by the remote. Called from loop() because the receive
+// callback runs on the Wi-Fi task and these write NVS.
+void serviceHomebridgeConfig() {
+  if (pendingWifiConfigReady) {
+    pendingWifiConfigReady = false;
+    String ssid = pendingWifiConfig.ssid;
+    String pass = pendingWifiConfig.password;
+    if (ssid != hbSsid || pass != hbPassword) {
+      hbSsid = ssid; hbPassword = pass;
+      wifiConfigured = hbSsid.length() > 0;
+      prefs.begin("dock", false);
+      prefs.putString("wifiSsid", hbSsid);
+      prefs.putString("wifiPass", hbPassword);
+      prefs.end();
+      Serial.printf("Dock: Wi-Fi details received for '%s'\n", hbSsid.c_str());
+      hbToken = "";
+      wifiNextAttemptMs = 0;          // Join now rather than after the retry gap.
+      if (WiFi.status() == WL_CONNECTED) WiFi.disconnect();
+    }
+  }
+  if (pendingHbConfigReady) {
+    pendingHbConfigReady = false;
+    String addr = pendingHbConfig.address;
+    String user = pendingHbConfig.username;
+    String pass = pendingHbConfig.password;
+    if (addr != hbAddress || user != hbUser || pass != hbPass) {
+      hbAddress = addr; hbUser = user; hbPass = pass;
+      hbToken = "";                   // Credentials changed; the old token is void.
+      prefs.begin("dock", false);
+      prefs.putString("hbAddr", hbAddress);
+      prefs.putString("hbUser", hbUser);
+      prefs.putString("hbPass", hbPass);
+      prefs.end();
+      Serial.printf("Dock: Homebridge details received for %s\n", hbAddress.c_str());
+    }
+  }
+}
+
+void serviceHomebridge(unsigned long now) {
+  (void)now;
+  if (!pendingHomebridge) return;
+  pendingHomebridge = false;
+  EspNowHomebridgePacket cmd = pendingHomebridgeCommand;
+  uint8_t mac[6];
+  memcpy(mac, pendingHomebridgeMac, 6);
+
+  String error;
+  if (!hbAddress.length()) {
+    sendHomebridgeResult(mac, false, 0, "Dock has no Homebridge details");
+    return;
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    sendHomebridgeResult(mac, false, 0, "Dock is not on Wi-Fi");
+    return;
+  }
+  if (!hbToken.length() && !homebridgeLogin(error)) {
+    sendHomebridgeResult(mac, false, 0, error.c_str());
+    return;
+  }
+
+  // Toggle and step need the current value first, which is the whole reason
+  // this work belongs on the dock: two round trips on a warm connection rather
+  // than an association plus two on a cold one.
+  float target = cmd.value;
+  if (cmd.operation == 1 || cmd.operation == 2) {
+    float current = 0.0f;
+    if (!homebridgeReadValue(cmd, current, error)) {
+      sendHomebridgeResult(mac, false, 0, error.c_str());
+      return;
+    }
+    if (cmd.operation == 1) {
+      target = current >= 0.5f ? 0.0f : 1.0f;
+    } else {
+      target = current + cmd.step;
+      if (target < cmd.minimum) target = cmd.minimum;
+      if (target > cmd.maximum) target = cmd.maximum;
+    }
+  }
+
+  String body = String("{\"characteristicType\":\"") + cmd.characteristic + "\",\"value\":";
+  if (cmd.operation == 0 && cmd.valueType == 0) {
+    body += String("\"") + cmd.stringValue + "\"";
+  } else if (cmd.valueType == 1 || cmd.operation == 1) {
+    body += (target >= 0.5f) ? "true" : "false";
+  } else {
+    body += String(target, 2);
+  }
+  body += "}";
+
+  String reply;
+  int code = homebridgeRequest("PUT", String("/api/accessories/") + cmd.accessoryId, body, reply);
+  if (code == 401 || code == 403) {
+    if (!homebridgeLogin(error)) { sendHomebridgeResult(mac, false, code, error.c_str()); return; }
+    code = homebridgeRequest("PUT", String("/api/accessories/") + cmd.accessoryId, body, reply);
+  }
+  bool ok = code >= 200 && code < 300;
+  if (serialHostAttached()) {
+    Serial.printf("Dock: Homebridge %s %s -> HTTP %d\n", cmd.accessoryId,
+                  cmd.characteristic, code);
+  }
+  sendHomebridgeResult(mac, ok, code,
+                       ok ? "" : (String("Homebridge returned HTTP ") + code).c_str());
+}
+
 void serviceOta(unsigned long now) {
   if (pendingOta) {
     // Copied out and the flag cleared BEFORE the handler runs, not after.
@@ -2355,6 +2717,9 @@ void loop() {
   serviceButton(now);
   servicePairing(now);
   serviceChannelMove();
+  serviceHomebridgeConfig();
+  serviceHomebridgeWifi(now);
+  serviceHomebridge(now);
   serviceOta(now);
   serviceRfLearn(now);
   serviceSettings();

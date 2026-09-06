@@ -1,6 +1,31 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.05 - 2026-09-06
+    - Homebridge commands can now be sent through a paired dock instead of by
+      this remote, chosen by a "Homebridge via dock" switch on the Dock page in
+      both menu styles and in WebConfig. Off by default.
+    - The point is what the dock is: mains powered, so it holds its Wi-Fi
+      association open and issues the command immediately. This remote has to
+      power a radio and join the network first, which costs seconds every time.
+      Toggle and step gain most - those read the current value before writing
+      it, so it is two round trips on a warm connection rather than an
+      association plus two on a cold one.
+    - The remote pushes the Wi-Fi profile it is using and the Homebridge
+      address, username and password to the dock as two ESP-NOW frames, because
+      the pair does not fit in one. Pushed whenever the switch is turned on
+      rather than only at pairing, so a dock that was asleep, re-paired or
+      reflashed is not left holding stale credentials with no way to say so.
+      The dock logs in and manages its own token; no token is ever sent.
+    - The command waits for the dock's verdict rather than being fired and
+      forgotten, because the caller's return value drives the UI, and a
+      Homebridge command that silently did nothing is worse than one that
+      reports a failure. Six seconds, which only matters when something is
+      genuinely wrong.
+    - Everything falls back cleanly. The switch only takes effect with a dock
+      actually paired, and with it off - or the dock unpaired - the remote's own
+      path runs exactly as before.
+
   4.04 - 2026-09-04
     - The ST-7789 bus is locked to 20MHz, not merely defaulted to it.
       Confirmed on real hardware: at 27MHz and at 40MHz that panel corrupts
@@ -4753,7 +4778,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.04"
+#define OPENREMOTE_VERSION_STRING "4.05"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -5450,6 +5475,14 @@ static const uint32_t ESPNOW_DOCK_LINK_DOWN_MAGIC = 0x4F524C44UL;  // "ORLD"
 // Dock -> remote, in reply to a ping. Without it the remote knows a dock is
 // there but nothing about what it is running.
 static const uint32_t ESPNOW_DOCK_INFO_MAGIC = 0x4F524449UL;  // "ORDI"
+// Homebridge relayed through the dock. The dock is mains powered and holds its
+// Wi-Fi association open, so it can issue the HTTP call immediately, where the
+// remote would have to bring a radio up and associate first - seconds, every
+// time.
+static const uint32_t ESPNOW_DOCK_WIFI_MAGIC   = 0x4F525743UL;  // "ORWC"
+static const uint32_t ESPNOW_DOCK_HBCFG_MAGIC  = 0x4F524843UL;  // "ORHC"
+static const uint32_t ESPNOW_HOMEBRIDGE_MAGIC  = 0x4F524842UL;  // "ORHB"
+static const uint32_t ESPNOW_HOMEBRIDGE_RESULT_MAGIC = 0x4F524852UL;  // "ORHR"
 
 struct __attribute__((packed)) EspNowDockInfoPacket {
   uint32_t magic;
@@ -5749,6 +5782,15 @@ String remoteName = "OpenRemote";
 uint8_t irRoute = IR_ROUTE_REMOTE;
 bool dockRfEnabled = true;
 bool dockLedOnTransmit = true;
+
+// Send Homebridge commands through the dock rather than from here. Off by
+// default: it only works once the dock has the Wi-Fi and Homebridge details,
+// and quietly changing where commands originate would be a poor surprise.
+bool homebridgeViaDock = false;
+volatile bool homebridgeDockPending = false;
+volatile bool homebridgeDockOk = false;
+volatile int homebridgeDockStatus = 0;
+char homebridgeDockErrorText[64] = {0};
 // Bring the dock link up when the remote wakes, rather than waiting for the
 // first command. Off by default: picking the remote off a table is not a
 // commitment to send anything - the accelerometer sees every nudge - so this
@@ -6430,6 +6472,52 @@ struct __attribute__((packed)) EspNowPairAckPacket {
 // Sent remote -> dock to open an RF433 receive window - dock firmware
 // doesn't exist yet, so this is only ever transmitted, never answered, until
 // it does. See the 3.08 changelog entry.
+
+// --- Homebridge over the dock ---------------------------------------------
+// Wi-Fi credentials and Homebridge details travel as two packets rather than
+// one, so each stays comfortably inside a single 250-byte ESP-NOW frame.
+struct __attribute__((packed)) EspNowDockWifiPacket {
+  uint32_t magic;
+  char ssid[33];
+  char password[65];
+};
+static_assert(sizeof(EspNowDockWifiPacket) == 102, "dock Wi-Fi config layout drifted from the dock");
+
+// The dock logs in and manages its own token, so the remote never has to hand
+// one over or keep it fresh.
+struct __attribute__((packed)) EspNowDockHomebridgePacket {
+  uint32_t magic;
+  char address[65];
+  char username[33];
+  char password[65];
+};
+static_assert(sizeof(EspNowDockHomebridgePacket) == 167, "dock Homebridge config layout drifted from the dock");
+
+// Mirrors the Homebridge fields DeviceCommand carries, so the dock can perform
+// set, toggle and relative-step itself rather than the remote reading a value
+// first and sending only the answer.
+struct __attribute__((packed)) EspNowHomebridgePacket {
+  uint32_t magic;
+  uint8_t operation;    // 0 = set, 1 = toggle, 2 = step
+  uint8_t valueType;    // 0 = string, 1 = bool, 2 = number
+  float value;
+  float step;
+  float minimum;
+  float maximum;
+  char accessoryId[72];
+  char characteristic[40];
+  char stringValue[28];
+};
+static_assert(sizeof(EspNowHomebridgePacket) == 162, "Homebridge command layout drifted from the dock");
+
+struct __attribute__((packed)) EspNowHomebridgeResultPacket {
+  uint32_t magic;
+  uint8_t ok;
+  int16_t httpStatus;
+  char error[64];
+};
+static_assert(sizeof(EspNowHomebridgeResultPacket) == 71, "Homebridge result layout drifted from the dock");
+
 struct __attribute__((packed)) EspNowRfLearnStartPacket {
   uint32_t magic;
   uint32_t timeoutMs;
@@ -8634,6 +8722,7 @@ void loadSettings() {
   espNowChannel = preferences.getUChar("enChan", 0);
   dockRfEnabled = preferences.getBool("dockRf", true);
   dockLedOnTransmit = preferences.getBool("dockLed", true);
+  homebridgeViaDock = preferences.getBool("hbViaDock", false);
   espNowTxPower = preferences.getUChar("enTxPwr", 2);
   if (espNowTxPower > 2) espNowTxPower = 2;
   clockEnabled = preferences.getBool("clock", true);
@@ -8778,6 +8867,7 @@ void saveSettings() {
   preferences.putUChar("irRoute", irRoute);
   preferences.putBool("dockRf", dockRfEnabled);
   preferences.putBool("dockLed", dockLedOnTransmit);
+  preferences.putBool("hbViaDock", homebridgeViaDock);
   preferences.putUChar("enTxPwr", espNowTxPower);
   preferences.putBool("clock", clockEnabled);
   preferences.putBool("ntp", clockUseInternetTime);
@@ -11104,6 +11194,7 @@ String buildStatusJson() {
   doc["irRoute"] = irRoute;
   doc["dockRfEnabled"] = dockRfEnabled;
   doc["dockLedOnTransmit"] = dockLedOnTransmit;
+  doc["homebridgeViaDock"] = homebridgeViaDock;
   doc["dockConnected"] = dockConnected();
   if (espNowDeviceCount > 0) {
     doc["dockName"] = espNowDevices[0].name;
@@ -11408,6 +11499,7 @@ void applySettingsJson(JsonVariantConst settings) {
   bool previousRf = dockRfEnabled, previousLed = dockLedOnTransmit;
   dockRfEnabled = settings["dockRfEnabled"] | dockRfEnabled;
   dockLedOnTransmit = settings["dockLedOnTransmit"] | dockLedOnTransmit;
+  homebridgeViaDock = settings["homebridgeViaDock"] | homebridgeViaDock;
   // Push straight to the dock when either changed, so WebConfig's switches
   // take effect immediately rather than at the next reboot.
   if (previousRf != dockRfEnabled || previousLed != dockLedOnTransmit) sendDockSettings();
@@ -12466,8 +12558,100 @@ bool readHomebridgeCharacteristic(const DeviceCommand &command, JsonVariant valu
   return false;
 }
 
+// Hands the dock the Wi-Fi and Homebridge details it needs to act on our
+// behalf. Sent as two frames because the pair does not fit in one, and pushed
+// whenever they change or the link comes up rather than once at pairing - a
+// dock that was asleep, re-paired, or reflashed would otherwise be left with
+// stale credentials and no way to say so.
+void sendHomebridgeConfigToDock() {
+  if (!espNowEnabled || espNowDeviceCount == 0) return;
+  if (!ensureEspNowLink()) return;
+
+  EspNowDockWifiPacket wifi = {};
+  wifi.magic = ESPNOW_DOCK_WIFI_MAGIC;
+  // The profile the remote itself is set to use. The dock has to join the same
+  // network the Homebridge server is on, which is by definition this one.
+  int profile = findWifiProfile(selectedWifiSsid);
+  strlcpy(wifi.ssid, selectedWifiSsid.c_str(), sizeof(wifi.ssid));
+  strlcpy(wifi.password, profile >= 0 ? wifiProfiles[profile].password.c_str() : "",
+          sizeof(wifi.password));
+  sendEspNowWithRetry(espNowDevices[0].mac, (const uint8_t *)&wifi, sizeof(wifi));
+
+  EspNowDockHomebridgePacket hb = {};
+  hb.magic = ESPNOW_DOCK_HBCFG_MAGIC;
+  strlcpy(hb.address, homebridgeAddress.c_str(), sizeof(hb.address));
+  strlcpy(hb.username, homebridgeUsername.c_str(), sizeof(hb.username));
+  strlcpy(hb.password, homebridgePassword.c_str(), sizeof(hb.password));
+  sendEspNowWithRetry(espNowDevices[0].mac, (const uint8_t *)&hb, sizeof(hb));
+  Serial.printf("Dock: pushed Wi-Fi '%s' and Homebridge %s\n",
+                wifi.ssid, hb.address[0] ? hb.address : "(not configured)");
+}
+
+// True when a Homebridge command should leave via the dock instead of from
+// here. Requires the switch AND a paired dock - with no dock the setting is
+// meaningless and the command must still work.
+bool homebridgeShouldUseDock() {
+  return homebridgeViaDock && espNowEnabled && espNowDeviceCount > 0;
+}
+
+// Sends one command to the dock and waits for its verdict.
+//
+// Waits, rather than firing and forgetting, because the caller returns a
+// success/failure that drives the UI - and a Homebridge command that silently
+// did nothing is worse than one that says it failed. The dock answers as soon
+// as its HTTP call completes, which on a warm connection is quick; the timeout
+// only matters when something is genuinely wrong.
+bool transmitHomebridgeViaDock(const DeviceCommand &command) {
+  EspNowHomebridgePacket packet = {};
+  packet.magic = ESPNOW_HOMEBRIDGE_MAGIC;
+  packet.operation = command.homebridgeOperation;
+  packet.valueType = command.homebridgeValueType;
+  packet.value = command.homebridgeValue;
+  packet.step = command.homebridgeStep;
+  packet.minimum = command.homebridgeMin;
+  packet.maximum = command.homebridgeMax;
+  strlcpy(packet.accessoryId, command.homebridgeAccessoryId, sizeof(packet.accessoryId));
+  strlcpy(packet.characteristic, command.homebridgeCharacteristic, sizeof(packet.characteristic));
+  strlcpy(packet.stringValue, command.homebridgeStringValue, sizeof(packet.stringValue));
+
+  if (!ensureEspNowLink()) {
+    Serial.println("Homebridge via dock: could not bring the link up");
+    return false;
+  }
+  homebridgeDockPending = true;
+  homebridgeDockOk = false;
+  homebridgeDockStatus = 0;
+  homebridgeDockErrorText[0] = '\0';
+  if (!sendEspNowWithRetry(espNowDevices[0].mac, (const uint8_t *)&packet, sizeof(packet))) {
+    homebridgeDockPending = false;
+    Serial.println("Homebridge via dock: the command did not reach the dock");
+    return false;
+  }
+  // Generous, because the dock may have to log in and read a value first.
+  unsigned long waitStart = millis();
+  while (homebridgeDockPending && (millis() - waitStart) < 6000UL) delay(5);
+  if (homebridgeDockPending) {
+    homebridgeDockPending = false;
+    Serial.println("Homebridge via dock: the dock did not answer in time");
+    return false;
+  }
+  if (!homebridgeDockOk) {
+    Serial.printf("Homebridge via dock: %s\n",
+                  homebridgeDockErrorText[0] ? homebridgeDockErrorText : "failed");
+    return false;
+  }
+  Serial.printf("Homebridge via dock: %s %s ok (HTTP %d) in %lums\n",
+                packet.accessoryId, packet.characteristic, homebridgeDockStatus,
+                (unsigned long)(millis() - waitStart));
+  return true;
+}
+
 bool transmitHomebridgeCommand(const DeviceCommand &command) {
   if (!command.homebridgeAccessoryId[0] || !command.homebridgeCharacteristic[0]) return false;
+  // Through the dock when asked. Everything below is the remote's own path and
+  // stays the fallback, so turning the switch off - or unpairing the dock -
+  // returns to exactly the behaviour that was there before.
+  if (homebridgeShouldUseDock()) return transmitHomebridgeViaDock(command);
   JsonDocument body;
   body["characteristicType"] = command.homebridgeCharacteristic;
   if (command.homebridgeOperation == 1 || command.homebridgeOperation == 2) {
@@ -13350,6 +13534,7 @@ bool persistSettingsToRuntimeConfig() {
   settings["irRoute"] = irRoute;
   settings["dockRfEnabled"] = dockRfEnabled;
   settings["dockLedOnTransmit"] = dockLedOnTransmit;
+  settings["homebridgeViaDock"] = homebridgeViaDock;
   JsonArray espNowDevicesOut = settings["espNowDevices"].to<JsonArray>();
   for (uint8_t i = 0; i < espNowDeviceCount; i++) {
     JsonObject entry = espNowDevicesOut.add<JsonObject>();
@@ -18193,6 +18378,20 @@ void onEspNowDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int 
         strlcpy(dockReportedVersion, dockInfo.version, sizeof(dockReportedVersion));
         Serial.printf("Dock: reports firmware %s\n", dockReportedVersion);
       }
+      return;
+    }
+  }
+
+  if (homebridgeDockPending && (size_t)len >= sizeof(EspNowHomebridgeResultPacket) &&
+      espNowDeviceCount > 0 && memcmp(espNowDevices[0].mac, info->src_addr, 6) == 0) {
+    EspNowHomebridgeResultPacket result;
+    memcpy(&result, data, sizeof(result));
+    if (result.magic == ESPNOW_HOMEBRIDGE_RESULT_MAGIC) {
+      result.error[sizeof(result.error) - 1] = '\0';
+      homebridgeDockOk = result.ok != 0;
+      homebridgeDockStatus = result.httpStatus;
+      strlcpy(homebridgeDockErrorText, result.error, sizeof(homebridgeDockErrorText));
+      homebridgeDockPending = false;   // Releases the waiting sender.
       return;
     }
   }
@@ -23622,10 +23821,17 @@ void serviceDockSettingsSync() {
     lastRf = dockRfEnabled; lastLed = dockLedOnTransmit;
     return;
   }
+  static bool lastHbViaDock = false;
   bool dockSideChanged = dockRfEnabled != lastRf || dockLedOnTransmit != lastLed;
-  if (!dockSideChanged) return;
+  bool relayChanged = homebridgeViaDock != lastHbViaDock;
+  if (!dockSideChanged && !relayChanged) return;
   lastRf = dockRfEnabled;
   lastLed = dockLedOnTransmit;
+  lastHbViaDock = homebridgeViaDock;
+  // Turning the relay on is the moment the dock needs the credentials, and the
+  // moment the user will try it. Pushing here means it works on the first
+  // press rather than after some later event happens to sync it.
+  if (relayChanged && homebridgeViaDock) sendHomebridgeConfigToDock();
   saveSettings();
   scheduleRuntimeSettingsSave();
   // Only the dock's own settings need sending; wake-warm is the remote's
@@ -23656,7 +23862,7 @@ void renderDockPageOmote() {
   // Only shown once a dock exists to apply them to - three dead controls on a
   // page with nothing paired explains nothing and invites fiddling.
   if (espNowDeviceCount > 0) {
-    lv_obj_t *dockCard = makeOmoteCard(content, y, 4 * rowH + 3);
+    lv_obj_t *dockCard = makeOmoteCard(content, y, 5 * rowH + 4);
     lv_obj_t *routeDropdown = makeOmoteDropdownRow(dockCard, "Transmit IR from", 0, rowH, 132);
     lv_dropdown_set_options(routeDropdown, IR_ROUTE_OPTIONS);
     lv_dropdown_set_selected(routeDropdown, irRoute);
@@ -23668,12 +23874,16 @@ void renderDockPageOmote() {
     makeOmoteRow(dockCard, "Dock LED", "Blink the dock's LED as it transmits",
                  2 * rowH + 2, rowH, &dockLedOnTransmit);
     makeOmoteDivider(dockCard, 3 * rowH + 2);
+    makeOmoteRow(dockCard, "Homebridge via dock",
+                 "The dock sends them - far quicker than this remote can",
+                 3 * rowH + 3, rowH, &homebridgeViaDock);
+    makeOmoteDivider(dockCard, 4 * rowH + 3);
     lv_obj_t *txDropdown = makeOmoteDropdownRow(dockCard, "Tx Power",
-                                               3 * rowH + 3, rowH, 132);
+                                               4 * rowH + 4, rowH, 132);
     lv_dropdown_set_options(txDropdown, ESPNOW_TX_POWER_OPTIONS);
     lv_dropdown_set_selected(txDropdown, espNowTxPower);
     lv_obj_add_event_cb(txDropdown, espNowTxPowerDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
-    y += 4 * rowH + 3 + 14;
+    y += 5 * rowH + 4 + 14;
   }
 
   lv_obj_t *hint = makeLabel(content,
@@ -23765,7 +23975,9 @@ void renderDockPage() {
     addPhysicalNavFocusable(routeDropdown);
     makeSettingRow("Dock RF433", "Let the dock send RF433", 252, &dockRfEnabled);
     makeSettingRow("Dock LED", "Blink as the dock transmits", 302, &dockLedOnTransmit);
-    lv_obj_t *txRow = makeSettingRow("Tx Power", "", 352, nullptr, nullptr);
+    makeSettingRow("Homebridge via dock", "Dock sends them - far quicker", 352,
+                   &homebridgeViaDock);
+    lv_obj_t *txRow = makeSettingRow("Tx Power", "", 402, nullptr, nullptr);
     lv_obj_t *txDropdown = lv_dropdown_create(txRow);
     lv_obj_set_pos(txDropdown, 112, 8);
     lv_obj_set_size(txDropdown, 100, 32);
@@ -23774,7 +23986,7 @@ void renderDockPage() {
     lv_dropdown_set_selected(txDropdown, espNowTxPower);
     lv_obj_add_event_cb(txDropdown, espNowTxPowerDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
     addPhysicalNavFocusable(txDropdown);
-    hintY = 404;
+    hintY = 454;
   }
   lv_obj_t *hint = makeLabel(content,
     espNowDeviceCount > 0
