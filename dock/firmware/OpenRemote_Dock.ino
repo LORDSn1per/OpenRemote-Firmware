@@ -1,6 +1,22 @@
 /*
   OpenRemote Dock firmware change log (newest first)
 
+  1.32 - 2026-09-06
+    - Keeps the Wi-Fi association awake, which is the entire point of relaying
+      Homebridge through the dock. 1.31 set WIFI_PS_NONE at boot, but that is
+      before the station associates - and associating puts the Arduino default
+      WIFI_PS_MIN_MODEM back. A station in modem sleep parks its radio between
+      beacons, which would have slowed every HTTP call and lost ESP-NOW frames
+      arriving during a nap. The same fault the remote hit in 3.93, and it
+      would have quietly undone the benefit the relay exists to provide.
+    - Power save is now cleared when the association comes up AND re-asserted
+      every five seconds while it holds, because a reconnect handled inside the
+      SDK never comes back through the join branch and would silently restore
+      modem sleep.
+    - setAutoReconnect(true), so a brief access point outage is recovered by the
+      SDK rather than waiting for the twenty second retry loop, which stays as
+      the backstop for when it gives up entirely.
+
   1.31 - 2026-09-06
     - Relays Homebridge for the remote. The remote can now hand a Homebridge
       command to this dock instead of issuing it itself, chosen by a switch and
@@ -659,7 +675,7 @@ static inline bool serialHostAttached() {
 }
 
 
-#define OPENREMOTE_DOCK_VERSION_STRING "1.31"
+#define OPENREMOTE_DOCK_VERSION_STRING "1.32"
 
 // A literal in the built image, so a tool holding the .bin can tell what it is
 // without running it. The remote firmware carries the same idea under
@@ -993,6 +1009,7 @@ String hbSsid, hbPassword, hbAddress, hbUser, hbPass, hbToken;
 bool wifiConfigured = false;
 bool wifiJoined = false;
 unsigned long wifiNextAttemptMs = 0;
+unsigned long wifiPsAssertMs = 0;
 static const uint32_t WIFI_RETRY_MS = 20000;
 
 volatile bool pendingHomebridge = false;
@@ -2319,7 +2336,18 @@ void serviceHomebridgeWifi(unsigned long now) {
   if (up != wifiJoined) {
     wifiJoined = up;
     if (up) {
-      Serial.printf("Dock: Wi-Fi joined '%s' as %s on channel %u\n",
+      // Power save OFF again, now that the station has associated.
+      //
+      // This is the whole point of relaying through the dock: the association
+      // must stay up and awake so a command is one HTTP round trip with no
+      // waiting. WIFI_PS_NONE was set at boot, but associating puts the
+      // Arduino default WIFI_PS_MIN_MODEM back, and a station in modem sleep
+      // parks its radio between beacons - which would both slow the HTTP call
+      // and lose ESP-NOW frames arriving during a nap. Exactly the fault the
+      // remote hit in 3.93, and it would have quietly undone the benefit here.
+      WiFi.setSleep(false);
+      esp_wifi_set_ps(WIFI_PS_NONE);
+      Serial.printf("Dock: Wi-Fi joined '%s' as %s on channel %u, staying awake\n",
                     hbSsid.c_str(), WiFi.localIP().toString().c_str(),
                     (unsigned)WiFi.channel());
       // The association may have moved the radio. Whatever channel it landed
@@ -2338,7 +2366,20 @@ void serviceHomebridgeWifi(unsigned long now) {
   }
   if (!up && (long)(now - wifiNextAttemptMs) >= 0) {
     wifiNextAttemptMs = now + WIFI_RETRY_MS;
+    // The SDK's own reconnect is faster than this retry loop and handles a
+    // brief AP outage without help; this remains as the backstop for when it
+    // gives up entirely.
+    WiFi.setAutoReconnect(true);
+    WiFi.persistent(false);
     WiFi.begin(hbSsid.c_str(), hbPassword.c_str());
+  }
+
+  // Re-asserted while connected, not just at the moment of joining. A
+  // reconnect handled inside the SDK does not come back through the branch
+  // above, and would silently restore modem sleep.
+  if (up && (long)(now - wifiPsAssertMs) > 5000) {
+    wifiPsAssertMs = now;
+    esp_wifi_set_ps(WIFI_PS_NONE);
   }
 }
 

@@ -1,6 +1,16 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.06 - 2026-09-06
+    - Holds the ESP-NOW radio while a Homebridge command is waiting on the
+      dock's reply. That reply arrives over this radio, so releasing it
+      mid-wait would lose the verdict and report a failure for a command that
+      had actually succeeded. It happened to be safe already because the sender
+      blocks loop() and the release therefore never ran - but relying on that
+      is the kind of accident that breaks the moment the wait stops blocking.
+      Now stated explicitly, in both the hold-expiry check and
+      releaseEspNowLink() itself.
+
   4.05 - 2026-09-06
     - Homebridge commands can now be sent through a paired dock instead of by
       this remote, chosen by a "Homebridge via dock" switch on the Dock page in
@@ -4778,7 +4788,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.05"
+#define OPENREMOTE_VERSION_STRING "4.06"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -18821,7 +18831,12 @@ void releaseEspNowLink(const char *reason) {
   // indefinitely once a WebConfig visit had brought ESP-NOW up, and why a
   // firmware upload during that same visit never got the memory back either.
   if (!espNowRadioActive) return;
-  if (espNowScanActive || rfLearnActive || dockOtaBusy()) return;
+  // A Homebridge command in flight is waiting on the dock's reply, which
+  // arrives over this radio. Dropping it mid-wait would lose the verdict and
+  // report a failure for a command that actually succeeded. It happens to be
+  // safe today because the sender blocks loop(), but relying on that is the
+  // kind of accident that breaks the moment the wait becomes non-blocking.
+  if (espNowScanActive || rfLearnActive || dockOtaBusy() || homebridgeDockPending) return;
   if (espNowDeviceCount > 0) {
     // Retried, not fired blindly. This one packet is what puts the dock's LED
     // out at the same instant the pill goes white; if it is lost the dock
@@ -18887,7 +18902,7 @@ void serviceEspNow(unsigned long now) {
   // the station, so this cannot disturb a station the remote needs for
   // something else.
   if (espNowRadioActive && !holding && !espNowScanActive && !rfLearnActive &&
-      !dockOtaBusy()) {
+      !dockOtaBusy() && !homebridgeDockPending) {
     releaseEspNowLink("hold expired");
   }
   if (espNowScanActive && now - espNowScanStartedMs >= ESPNOW_SCAN_TIMEOUT_MS) {
