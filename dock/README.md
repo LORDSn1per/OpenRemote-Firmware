@@ -11,7 +11,7 @@ existing **Settings → Dock** screens and through WebConfig.
 
 Current firmware: **1.30**. Source in [`firmware/`](firmware/).
 
-[**Download the latest dock firmware →**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-Dock-Firmware-1.30.bin)
+[**Download the latest dock firmware →**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-Dock-Firmware-1.31.bin)
 
 You do not need to build it. There are two ways to install it, and either is
 fine: send it to a paired dock **wirelessly from WebConfig**, or flash it
