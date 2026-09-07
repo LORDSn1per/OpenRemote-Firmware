@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="docs/images/openremote-ecosystem.jpg" alt="OpenRemote — the complete open-source remote ecosystem" width="100%">
+  <img src="docs/images/openremote-rev6.jpg" alt="OpenRemote Rev 6 — universal, powerful, open, for everyone" width="100%">
 
   ### Build your remote. Keep it local.
 
@@ -9,6 +9,7 @@
 
   <a href="#download">Download</a> ·
   <a href="#the-software">The software</a> ·
+  <a href="#smart-home">Smart home</a> ·
   <a href="https://github.com/LORDSn1per/OpenRemote-Hardware">Hardware</a> ·
   <a href="#how-it-fits-together">How it fits together</a>
 </div>
@@ -47,9 +48,9 @@ Studio installs these for you, so you only need them for a manual update.
 
 | | Download |
 |---|---|
-| Remote firmware — ESP32-S3 | [**OpenRemote-Remote-Firmware-4.10.bin**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-Remote-Firmware-4.10.bin) |
-| Dock firmware — ESP32-C3 | [**OpenRemote-Dock-Firmware-1.33.bin**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-Dock-Firmware-1.33.bin) |
-| WebConfig — browser configurator | [**OpenRemote-WebConfig-2.60.html**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-WebConfig-2.60.html) |
+| Remote firmware — ESP32-S3 | [**OpenRemote-Remote-Firmware-4.20.bin**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-Remote-Firmware-4.20.bin) |
+| Dock firmware — ESP32-C3 | [**OpenRemote-Dock-Firmware-1.36.bin**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-Dock-Firmware-1.36.bin) |
+| WebConfig — browser configurator | [**OpenRemote-WebConfig-2.67.html**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-WebConfig-2.67.html) |
 
 **[See all downloads and version numbers →](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest)**
 
@@ -95,16 +96,69 @@ over its own radio link. It fires infrared into a closed cabinet or a second
 room, and sends **RF433** to gates, garage doors and sockets by learning the
 signal from your existing remote.
 
-It can also send your **Homebridge** commands, and they arrive noticeably
-faster. Because it is mains powered it stays joined to your Wi-Fi permanently,
-so a command is one HTTP call on an already-open connection - where the remote,
-running on a battery, must wake its radio, join the network and log in first.
-Optional, and off until you turn it on.
+It can also carry your **Home Assistant**, **MQTT** and **Homebridge**
+commands, and they arrive noticeably faster. Because it is mains powered it
+stays joined to your Wi-Fi permanently, so a command goes out on an
+already-open connection — where the remote, running on a battery, must wake its
+radio and join the network first.
+
+That permanent connection buys something the remote cannot do alone: the dock
+holds a Home Assistant WebSocket and an MQTT subscription open, so a tile
+showing whether a light is on stays right even while the remote sleeps. All of
+it is optional and off until you turn it on.
 
 Update it whichever way suits: **wirelessly from WebConfig**, or **over USB
 from Studio**.
 
 [Read more →](dock/README.md)
+
+---
+
+## Smart home
+
+Three integrations, each answering a different question. Turn on whichever you
+use — they are independent, and none of them requires the others.
+
+### Home Assistant
+
+OpenRemote reads your entity list straight from the server, so you tick the
+lights, switches and scenes you want rather than typing anything. A light
+arrives already knowing what it is and how to turn it on.
+
+Tiles show **live state** — a light tile reads *on* or *off* from the server
+rather than assuming your last press worked, and a cover reads *open*, because
+Home Assistant does not use the same word for every kind of thing.
+
+You need a **long-lived access token**, created at the bottom of your Home
+Assistant profile page. It is stored on the remote itself and never appears in
+a backup file.
+
+### MQTT
+
+A broker is a message noticeboard on your network. OpenRemote publishes a topic
+and a payload, and anything listening reacts. It reaches hardware no hub knows
+about — a bare ESP32 in the shed, a Tasmota plug, an MQTT-native doorbell — and
+needs no hub at all.
+
+Give a button a **state topic** as well and its tile shows the last value the
+broker reported, so a garage button can read *OPEN*.
+
+### Homebridge
+
+Import accessories from a Homebridge server on your network, the same way as
+Home Assistant entities. Useful if Homebridge is already your hub.
+
+### With or without the dock
+
+Every one of these works without a dock. Each has a switch deciding whether the
+**dock** or the **remote** does the talking, and the settings page tells you
+what the choice costs in your particular setup:
+
+| | Through the dock | From the remote |
+|---|---|---|
+| Sending a command | Immediate | A few seconds to wake Wi-Fi |
+| Live tile state | Arrives the moment it changes, even while the remote sleeps | Polled every few seconds, only while the screen is awake |
+| Battery | Costs nothing | Costs Wi-Fi time |
 
 ---
 
@@ -126,7 +180,11 @@ Boards, schematics, cases and build instructions live in a separate repository:
                                    │
                                    ├── infrared ──► your equipment
                                    ├── Bluetooth ─► Android TV / Chromecast
+                                   ├── Wi-Fi ─────► Home Assistant / MQTT / Homebridge
                                    └── radio ─────► Dock ──► infrared + RF433
+                                                      │
+                                                      └──► the same smart home,
+                                                           faster, and always on
 
 **Studio** does the jobs needing a cable: first setup, recovery, and the
 infrared database. **WebConfig** does everything else, wirelessly. The
