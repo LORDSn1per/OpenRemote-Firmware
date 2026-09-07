@@ -1,7 +1,7 @@
-OpenRemote Studio 2.70 for Linux
+OpenRemote Studio 2.79 for Linux
 ================================
 
-    OpenRemote Studio 2.70 x86_64.AppImage
+    OpenRemote Studio 2.79 x86_64.AppImage
 
 That single file is the whole program. It is the Linux equivalent of a .app on
 Mac or a .exe on Windows. There is no installer and nothing to set up.
@@ -23,8 +23,8 @@ Studio opens in your web browser. No terminal window appears.
 
 If you would rather use a terminal, this does exactly the same thing:
 
-    chmod +x "OpenRemote Studio 2.70 x86_64.AppImage"
-    ./"OpenRemote Studio 2.70 x86_64.AppImage"
+    chmod +x "OpenRemote Studio 2.79 x86_64.AppImage"
+    ./"OpenRemote Studio 2.79 x86_64.AppImage"
 
 Every AppImage from every vendor works this way. It is a Linux security rule,
 not something specific to this program.
@@ -138,11 +138,17 @@ card is in the remote.
 
 PLEASE READ - TESTING STATUS
 ----------------------------
-This is the first Linux release and it has not yet been run on an actual Linux
-machine. It was built and checked carefully on a Mac, and its contents were
-verified in detail, but verifying a file is not the same as running it.
+This build has still not been run on an actual Linux machine. It is assembled
+on a Mac: the Linux Python runtime inside it is reused unchanged from the
+previous build, and the application on top of it is replaced. Its structure is
+verified in detail - the archive is unpacked again after building and every
+file read back - but verifying a file is not the same as running it.
 
 USB flashing and SD card setup in particular are untested on Linux.
+
+ARM (Raspberry Pi and similar) is still not supported. The Python runtime
+inside this file is x86_64 only, and producing an ARM one needs an ARM Linux
+machine to build on. Ask if you need it.
 
 If something does not work, please report it rather than assuming you have done
 something wrong.
