@@ -1,6 +1,23 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.16 - 2026-09-07
+    - The weather widget draws a coloured icon. WebConfig had shown one all
+      along, from an inline SVG in the designer, but the firmware drew no
+      icon at all - so the designer promised something the LCD never had.
+    - Ten icons, chosen from the WMO code the forecast already carries:
+      clear, mainly clear, partly cloudy, overcast, fog, drizzle, rain,
+      showers, snow and thunderstorm, plus a fallback for an unrecognised
+      code.
+    - Built from plain LVGL objects - discs, rounded bars and a stepped
+      staircase for the lightning - rather than from bitmaps. Nothing has to
+      be shipped to the SD card or kept in step with a sync, they cost no
+      flash, and the same fractional geometry serves both the 40px tile icon
+      and the 72px one on the expanded page.
+    - The geometry was drawn in a browser first, at both sizes, because a
+      first attempt at the lightning bolt from three centred rectangles came
+      out as a plus sign and nothing about the source would have said so.
+
   4.15 - 2026-09-07
     - Actually stopped the duplicate forecast fetch on boot. 4.14 aimed at
       the wrong thing: it assumed the clock was unset until NTP landed, so
@@ -4953,7 +4970,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.15"
+#define OPENREMOTE_VERSION_STRING "4.16"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -5806,10 +5823,11 @@ struct WeatherReading {
   float highC;
   float lowC;
   bool rangeValid;
+  int16_t code;          // WMO weather code, -1 when unknown
   char condition[24];
 };
 
-WeatherReading weatherReading = { false, 0, 0.0f, 0.0f, 0.0f, false, "" };
+WeatherReading weatherReading = { false, 0, 0.0f, 0.0f, 0.0f, false, -1, "" };
 uint32_t weatherNextAttemptMs = 0;
 bool weatherWidgetPlaced = false;
 bool weatherFetchWanted = false;
@@ -25684,6 +25702,9 @@ struct WidgetInstance {
   lv_obj_t *right;      // remaining
   lv_obj_t *unit;       // the degree suffix beside a temperature
   int8_t unitOffsetY;
+  lv_obj_t *glyph;      // weather icon container
+  int16_t glyphCode;    // what that icon was drawn for
+  int16_t glyphSize;
   int fillTrackWidth;
   uint8_t kind;
   bool expanded;
@@ -25885,6 +25906,194 @@ void buildWidgetMediaFace(WidgetInstance &instance, lv_obj_t *parent,
     LV_TEXT_ALIGN_RIGHT);
 }
 
+/* ---------------------------------------------------------------- *
+   Weather icons
+
+   Composed from plain LVGL objects - discs, rounded bars, and a stepped
+   staircase for the lightning, since an object cannot be rotated. Nothing
+   has to be shipped to the SD card or kept in step with a sync, and one set
+   of fractions covers both the 40px tile icon and the 72px one on the
+   expanded page.
+
+   Proportions are held in thousandths of the icon's size so the integer
+   maths stays exact at any size.
+ * ---------------------------------------------------------------- */
+static inline int gp(int size, int permille) {
+  return (int)(((long)size * permille) / 1000L);
+}
+
+lv_obj_t *glyphBar(lv_obj_t *parent, int x, int y, int w, int h, int radius,
+                   lv_color_t colour) {
+  lv_obj_t *shape = lv_obj_create(parent);
+  lv_obj_remove_style_all(shape);
+  lv_obj_set_pos(shape, x, y);
+  lv_obj_set_size(shape, w < 1 ? 1 : w, h < 1 ? 1 : h);
+  lv_obj_set_style_radius(shape, radius, 0);
+  lv_obj_set_style_bg_color(shape, colour, 0);
+  lv_obj_set_style_bg_opa(shape, LV_OPA_COVER, 0);
+  lv_obj_clear_flag(shape, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_clear_flag(shape, LV_OBJ_FLAG_SCROLLABLE);
+  return shape;
+}
+
+lv_obj_t *glyphDisc(lv_obj_t *parent, int x, int y, int diameter, lv_color_t colour) {
+  return glyphBar(parent, x, y, diameter, diameter, LV_RADIUS_CIRCLE, colour);
+}
+
+lv_color_t weatherSunColour()   { return lvRgb(255, 196, 60); }
+lv_color_t weatherCloudColour() { return lvRgb(218, 228, 240); }
+lv_color_t weatherGreyColour()  { return lvRgb(170, 182, 196); }
+lv_color_t weatherRainColour()  { return lvRgb(90, 170, 255); }
+lv_color_t weatherSnowColour()  { return lvRgb(235, 245, 255); }
+lv_color_t weatherBoltColour()  { return lvRgb(255, 214, 64); }
+lv_color_t weatherHazeColour()  { return lvRgb(150, 165, 180); }
+
+void drawGlyphSun(lv_obj_t *box, int size, bool full) {
+  if (!full) {
+    // Peeking out from behind a cloud drawn after it.
+    glyphDisc(box, gp(size, 500), gp(size, 40), gp(size, 400), weatherSunColour());
+    return;
+  }
+  int disc = gp(size, 460);
+  int thick = gp(size, 90);
+  int ray = gp(size, 150);
+  lv_color_t colour = weatherSunColour();
+  glyphBar(box, (size - thick) / 2, 0, thick, ray, thick / 2, colour);
+  glyphBar(box, (size - thick) / 2, size - ray, thick, ray, thick / 2, colour);
+  glyphBar(box, 0, (size - thick) / 2, ray, thick, thick / 2, colour);
+  glyphBar(box, size - ray, (size - thick) / 2, ray, thick, thick / 2, colour);
+  glyphDisc(box, (size - disc) / 2, (size - disc) / 2, disc, colour);
+}
+
+/* Returns the y of the cloud's underside, so rain can hang from it. */
+int drawGlyphCloud(lv_obj_t *box, int bx, int by, int bw, lv_color_t colour) {
+  int bh = (bw * 600) / 1000;
+  glyphBar(box, bx, by + (bh * 450) / 1000, bw, (bh * 550) / 1000,
+           (bh * 280) / 1000, colour);
+  glyphDisc(box, bx + (bw * 40) / 1000, by + (bh * 300) / 1000,
+            (bh * 580) / 1000, colour);
+  glyphDisc(box, bx + (bw * 260) / 1000, by, (bh * 800) / 1000, colour);
+  glyphDisc(box, bx + (bw * 620) / 1000, by + (bh * 280) / 1000,
+            (bh * 540) / 1000, colour);
+  return by + bh;
+}
+
+void drawGlyphFall(lv_obj_t *box, int size, int bx, int bw, int y, uint8_t count,
+                   lv_color_t colour, bool flakes) {
+  static const int offsets[3] = {180, 440, 700};
+  for (uint8_t i = 0; i < count && i < 3; i++) {
+    int x = bx + (bw * offsets[i]) / 1000;
+    if (flakes) glyphDisc(box, x, y, gp(size, 110), colour);
+    else glyphBar(box, x, y, gp(size, 70), gp(size, 160), gp(size, 35), colour);
+  }
+}
+
+/*
+  A lightning bolt as a staircase: down-left, jump right, down-left again.
+  LVGL cannot rotate a plain object, so the diagonal is stepped. Three
+  centred rectangles were tried first and drew a plus sign.
+*/
+void drawGlyphBolt(lv_obj_t *box, int x, int y, int w, int h) {
+  static const int steps[6][2] = {
+    {560, 0}, {380, 140}, {200, 280}, {520, 440}, {340, 580}, {160, 720}
+  };
+  int bw = (w * 360) / 1000;
+  int bh = (h * 200) / 1000;
+  int radius = (bh * 250) / 1000;
+  if (radius < 1) radius = 1;
+  for (uint8_t i = 0; i < 6; i++) {
+    glyphBar(box, x + (w * steps[i][0]) / 1000, y + (h * steps[i][1]) / 1000,
+             bw, bh, radius, weatherBoltColour());
+  }
+}
+
+/* WMO interpretation codes, grouped exactly as weatherConditionText groups
+   them so the icon and the words can never describe different weather. */
+void buildWeatherGlyph(lv_obj_t *box, int size, int code) {
+  lv_obj_clean(box);
+  int bottom = 0;
+
+  if (code == 0) { drawGlyphSun(box, size, true); return; }
+
+  if (code == 1 || code == 2) {
+    drawGlyphSun(box, size, false);
+    drawGlyphCloud(box, gp(size, 20), gp(size, 340), gp(size, 800), weatherCloudColour());
+    return;
+  }
+
+  if (code == 3) {
+    drawGlyphCloud(box, gp(size, 60), gp(size, 220), gp(size, 880), weatherGreyColour());
+    return;
+  }
+
+  if (code == 45 || code == 48) {
+    drawGlyphCloud(box, gp(size, 60), gp(size, 100), gp(size, 880), weatherGreyColour());
+    glyphBar(box, gp(size, 120), gp(size, 620), gp(size, 760), gp(size, 80),
+             gp(size, 40), weatherHazeColour());
+    glyphBar(box, gp(size, 120), gp(size, 780), gp(size, 760), gp(size, 80),
+             gp(size, 40), weatherHazeColour());
+    return;
+  }
+
+  if (code >= 51 && code <= 57) {
+    bottom = drawGlyphCloud(box, gp(size, 60), gp(size, 100), gp(size, 880),
+                            weatherCloudColour());
+    drawGlyphFall(box, size, gp(size, 60), gp(size, 880), bottom + gp(size, 60),
+                  2, weatherRainColour(), false);
+    return;
+  }
+
+  if (code >= 61 && code <= 67) {
+    bottom = drawGlyphCloud(box, gp(size, 60), gp(size, 100), gp(size, 880),
+                            weatherCloudColour());
+    drawGlyphFall(box, size, gp(size, 60), gp(size, 880), bottom + gp(size, 60),
+                  3, weatherRainColour(), false);
+    return;
+  }
+
+  if (code >= 80 && code <= 82) {
+    drawGlyphSun(box, size, false);
+    bottom = drawGlyphCloud(box, gp(size, 20), gp(size, 260), gp(size, 780),
+                            weatherCloudColour());
+    drawGlyphFall(box, size, gp(size, 20), gp(size, 780), bottom + gp(size, 40),
+                  3, weatherRainColour(), false);
+    return;
+  }
+
+  if ((code >= 71 && code <= 77) || code == 85 || code == 86) {
+    bottom = drawGlyphCloud(box, gp(size, 60), gp(size, 100), gp(size, 880),
+                            weatherCloudColour());
+    drawGlyphFall(box, size, gp(size, 60), gp(size, 880), bottom + gp(size, 60),
+                  3, weatherSnowColour(), true);
+    return;
+  }
+
+  if (code == 95 || code == 96 || code == 99) {
+    bottom = drawGlyphCloud(box, gp(size, 60), gp(size, 80), gp(size, 880),
+                            weatherGreyColour());
+    drawGlyphBolt(box, gp(size, 300), bottom, gp(size, 400), gp(size, 400));
+    return;
+  }
+
+  // No reading yet, or a code this build does not recognise.
+  glyphBar(box, gp(size, 440), gp(size, 180), gp(size, 120), gp(size, 420),
+           gp(size, 60), weatherHazeColour());
+  glyphBar(box, gp(size, 440), gp(size, 680), gp(size, 120), gp(size, 120),
+           gp(size, 60), weatherHazeColour());
+}
+
+lv_obj_t *makeWeatherGlyph(lv_obj_t *parent, int x, int y, int size, int code) {
+  lv_obj_t *box = lv_obj_create(parent);
+  lv_obj_remove_style_all(box);
+  lv_obj_set_pos(box, x, y);
+  lv_obj_set_size(box, size, size);
+  lv_obj_set_style_bg_opa(box, LV_OPA_TRANSP, 0);
+  lv_obj_clear_flag(box, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+  buildWeatherGlyph(box, size, code);
+  return box;
+}
+
 /* -------------------------------------------------------------- weather */
 void buildWidgetWeatherFace(WidgetInstance &instance, lv_obj_t *parent,
                             int width, int height, bool expanded) {
@@ -25899,9 +26108,17 @@ void buildWidgetWeatherFace(WidgetInstance &instance, lv_obj_t *parent,
     snprintf(temperature, sizeof(temperature), "--");
   }
 
-  instance.primary = makeLabel(parent, temperature, pad, expanded ? 46 : 10,
+  /* -1 means "no reading", which draws the unknown glyph. */
+  instance.glyphCode = haveReading ? weatherReading.code : -1;
+  instance.glyphSize = expanded ? 72 : 40;
+  instance.glyph = makeWeatherGlyph(parent,
+    expanded ? (width - instance.glyphSize) / 2 : width - pad - 44,
+    expanded ? 10 : 8,
+    instance.glyphSize, instance.glyphCode);
+
+  instance.primary = makeLabel(parent, temperature, pad, expanded ? 90 : 10,
     expanded ? &lv_font_montserrat_48 : &lv_font_montserrat_24, textPrimary());
-  if (expanded) lv_obj_align(instance.primary, LV_ALIGN_TOP_MID, -18, 44);
+  if (expanded) lv_obj_align(instance.primary, LV_ALIGN_TOP_MID, -18, 88);
 
   instance.unitOffsetY = expanded ? 8 : 3;
   instance.unit = makeLabel(parent, widgetTemperatureUnit(), 0, 0,
@@ -25914,18 +26131,21 @@ void buildWidgetWeatherFace(WidgetInstance &instance, lv_obj_t *parent,
     : (widgetSettings.weatherValidLocation ? "Waiting for Wi-Fi" : "No location set");
 
   if (expanded) {
-    instance.secondary = makeWidgetLabel(parent, condition, pad, 128,
+    instance.secondary = makeWidgetLabel(parent, condition, pad, 156,
       &lv_font_montserrat_18, textPrimary(), width - pad * 2, LV_TEXT_ALIGN_CENTER);
     makeWidgetLabel(parent,
       widgetSettings.weatherLocation[0] ? widgetSettings.weatherLocation : "Set a location in WebConfig",
-      pad, 156, &lv_font_montserrat_12, widgetMutedColour(), width - pad * 2,
+      pad, 182, &lv_font_montserrat_12, widgetMutedColour(), width - pad * 2,
       LV_TEXT_ALIGN_CENTER);
   } else {
+    // Kept clear of the high/low, which is right-aligned under the icon:
+    // a long condition ("Thunderstorm, hail") would otherwise reach it.
+    int textWidth = width - pad - 100;
     instance.secondary = makeWidgetLabel(parent, condition, pad, 44,
-      &lv_font_montserrat_12, textPrimary(), width - pad - 74, LV_TEXT_ALIGN_LEFT);
+      &lv_font_montserrat_12, textPrimary(), textWidth, LV_TEXT_ALIGN_LEFT);
     makeWidgetLabel(parent,
       widgetSettings.weatherLocation[0] ? widgetSettings.weatherLocation : "No location",
-      pad, 62, &lv_font_montserrat_10, widgetMutedColour(), width - pad - 74,
+      pad, 62, &lv_font_montserrat_10, widgetMutedColour(), textWidth,
       LV_TEXT_ALIGN_LEFT);
   }
 
@@ -25936,11 +26156,13 @@ void buildWidgetWeatherFace(WidgetInstance &instance, lv_obj_t *parent,
            (int)lroundf(widgetDisplayTemperature(weatherReading.highC)), widgetTemperatureUnit(),
            (int)lroundf(widgetDisplayTemperature(weatherReading.lowC)), widgetTemperatureUnit());
   if (expanded) {
-    makeWidgetLabel(parent, range, pad, 196, &lv_font_openremote_20,
+    makeWidgetLabel(parent, range, pad, 210, &lv_font_openremote_20,
                     widgetMutedColour(), width - pad * 2, LV_TEXT_ALIGN_CENTER);
   } else {
-    makeWidgetLabel(parent, range, width - pad - 80, 38, &lv_font_openremote_16,
-                    widgetMutedColour(), 80, LV_TEXT_ALIGN_RIGHT);
+    // Under the icon rather than beside it, now that the icon holds the
+    // top-right corner of the tile.
+    makeWidgetLabel(parent, range, width - pad - 84, 56, &lv_font_openremote_16,
+                    widgetMutedColour(), 84, LV_TEXT_ALIGN_RIGHT);
   }
 }
 
@@ -26042,6 +26264,9 @@ void buildWidgetFace(WidgetInstance &instance, lv_obj_t *parent, uint8_t kind,
   instance.right = nullptr;
   instance.unit = nullptr;
   instance.unitOffsetY = 0;
+  instance.glyph = nullptr;
+  instance.glyphCode = -32768;
+  instance.glyphSize = 0;
   instance.fillTrackWidth = 0;
   if (kind == WIDGET_WEATHER) buildWidgetWeatherFace(instance, parent, width, height, expanded);
   else if (kind == WIDGET_BATTERY) buildWidgetBatteryFace(instance, parent, width, height, expanded);
@@ -26108,6 +26333,17 @@ void refreshWidgetInstance(WidgetInstance &instance) {
   }
 
   if (instance.kind == WIDGET_WEATHER && weatherReading.valid) {
+    /*
+      Redrawn only when the reported weather actually changes - which after
+      a cold boot means once, as the first forecast replaces the unknown
+      glyph. Rebuilding it every second would churn a dozen objects for a
+      value that moves a few times a day.
+    */
+    if (instance.glyph && lv_obj_is_valid(instance.glyph) &&
+        instance.glyphCode != weatherReading.code) {
+      instance.glyphCode = weatherReading.code;
+      buildWeatherGlyph(instance.glyph, instance.glyphSize, instance.glyphCode);
+    }
     if (instance.primary && lv_obj_is_valid(instance.primary)) {
       char temperature[12];
       snprintf(temperature, sizeof(temperature), "%d",
@@ -26510,6 +26746,7 @@ void serviceWeatherWidget(uint32_t now) {
   }
 
   weatherReading.temperatureC = readings["temperature_2m"] | 0.0f;
+  weatherReading.code = (int16_t)(readings["weather_code"] | -1);
   strlcpy(weatherReading.condition,
           weatherConditionText(readings["weather_code"] | -1),
           sizeof(weatherReading.condition));
