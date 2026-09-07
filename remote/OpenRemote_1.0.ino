@@ -1,6 +1,35 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.12 - 2026-09-07
+    - Fixed a widget drawing on top of the tile beside it. A widget is three
+      columns wide, so it can only begin a row, but the slot number WebConfig
+      stored was a plain running total: four single tiles then a widget gave
+      the widget slot 4, and slot 4 is row 1 column 1 - the same row as the
+      button at slot 3. The designer looked correct throughout because CSS
+      grid will not split a three-column item across two rows and silently
+      moved it down, so the picture and the number disagreed. WebConfig 2.62
+      rounds a full-width item up to the next row, and this build rounds any
+      unaligned widget or activity slot up as well, so a config synced by an
+      older WebConfig draws correctly without being re-synced.
+    - Widget text no longer wraps onto a second line. The labels are given a
+      one-line height, which is what LV_LABEL_LONG_DOT needs before it will
+      shorten anything - without it the label simply grew taller and a long
+      place name ran into the row underneath.
+    - The weather widget now actually fetches. It only ever ran when Wi-Fi
+      happened to already be connected, and on a battery remote it never is,
+      so the tile sat on "Waiting for Wi-Fi" indefinitely. It now brings the
+      radio up briefly by itself and drops it again afterwards, the same way
+      the daily clock sync does.
+    - Added a refresh interval: 1, 2, 4, 6, 12 or 24 hours, counted from 2am,
+      so 24 hours means once at 2am and 6 hours means 2am, 8am, 2pm and 8pm.
+      Every choice divides 24, so the times are the same every day.
+    - The forecast is also fetched immediately on a sync from WebConfig,
+      which is the one moment the radio is certainly already up.
+    - Location names are stored as town and country. The full name still
+      shows in WebConfig, but "Canberra, Australian Capital Territory,
+      Australia" has nowhere to go on a 224px tile.
+
   4.11 - 2026-09-07
     - Added widgets: live tiles that occupy three grid columns and two rows on
       an activity or device page, added from WebConfig's Screen designer.
@@ -4871,7 +4900,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.11"
+#define OPENREMOTE_VERSION_STRING "4.12"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -5696,6 +5725,7 @@ struct WidgetSettings {
   bool weatherValidLocation;
   bool weatherFahrenheit;
   bool weatherShowRange;
+  uint8_t weatherIntervalHours;
 
   bool batteryShowPercent;
   bool batteryShowVoltage;
@@ -5711,7 +5741,7 @@ struct WidgetSettings {
 /* Defaults must match defaultWidgetSettings() in WebConfig, so a remote that
    has never been synced draws the same thing WebConfig previews. */
 WidgetSettings widgetSettings = {
-  "", 0.0f, 0.0f, false, false, true,
+  "", 0.0f, 0.0f, false, false, true, 6,
   true, false, 20,
   false, "", true, true, true
 };
@@ -5729,6 +5759,10 @@ struct WeatherReading {
 WeatherReading weatherReading = { false, 0, 0.0f, 0.0f, 0.0f, false, "" };
 uint32_t weatherNextAttemptMs = 0;
 bool weatherWidgetPlaced = false;
+bool weatherFetchWanted = false;
+bool weatherOwnsRadio = false;
+uint32_t weatherRadioStartedMs = 0;
+time_t weatherLastSlotEpoch = 0;
 
 /*
   What is playing on the device a Media widget points at.
@@ -9138,6 +9172,7 @@ void scheduleNetworkShutdown(uint32_t delayMs = NETWORK_IDLE_SHUTDOWN_MS) {
     (settingsView == SETTINGS_WIFI || settingsView == SETTINGS_WIFI_PASSWORD ||
      settingsView == SETTINGS_WIFI_QR);
   if (wifiUiActive || ntpSyncPending || wifiScanPending || wifiConnectPending) return;
+  if (weatherOwnsRadio) return;
   networkShutdownAtMs = millis() + delayMs;
 }
 
@@ -9273,7 +9308,8 @@ void serviceNetworkPower(unsigned long now) {
   bool wifiUiActive = pages[currentPage].kind == PAGE_REMOTE_SETTINGS &&
     (settingsView == SETTINGS_WIFI || settingsView == SETTINGS_WIFI_PASSWORD ||
      settingsView == SETTINGS_WIFI_QR);
-  if (!wifiUiActive && !ntpSyncPending && !wifiScanPending && !wifiConnectPending) {
+  if (!wifiUiActive && !ntpSyncPending && !wifiScanPending && !wifiConnectPending &&
+      !weatherOwnsRadio) {
     if (bluetoothActivitySessionRequired()) parkNetworkStackForBle();
     else stopNetworkStack();
   }
@@ -13188,6 +13224,20 @@ void applyRuntimeThemeRowCalibration() {
   }
 }
 
+/*
+  A widget is three columns wide and an activity fills a row, so neither can
+  begin part-way along one - makeWidgetTile() and makeNestedActivitySlider()
+  both derive their row from slot/3 and would otherwise draw over whatever
+  sits beside them. WebConfig 2.62 stores an aligned slot; this rounds up
+  anything written by an older one so it draws correctly unsynced.
+*/
+uint8_t alignSlotToRow(uint8_t slot) {
+  uint8_t offset = slot % 3;
+  if (!offset) return slot;
+  int aligned = (int)slot + (3 - offset);
+  return (uint8_t)constrain(aligned, 0, 254);
+}
+
 uint8_t widgetKindFromName(const char *name) {
   if (!name) return WIDGET_MEDIA;
   if (strcmp(name, "weather") == 0) return WIDGET_WEATHER;
@@ -13231,6 +13281,12 @@ void applyWidgetSettingsJson(JsonObjectConst widgets) {
     widgetSettings.weatherValidLocation = hasLatitude && hasLongitude;
     widgetSettings.weatherFahrenheit = strcmp(weather["units"] | "c", "f") == 0;
     widgetSettings.weatherShowRange = weather["showRange"] | true;
+    int interval = weather["intervalHours"] | 6;
+    // Only values that divide 24, so the schedule lands on the same clock
+    // times every day rather than drifting.
+    widgetSettings.weatherIntervalHours =
+      (interval == 1 || interval == 2 || interval == 4 || interval == 6 ||
+       interval == 12 || interval == 24) ? (uint8_t)interval : 6;
     if (moved) {
       weatherReading.valid = false;
       weatherNextAttemptMs = 0;
@@ -13254,6 +13310,8 @@ void applyWidgetSettingsJson(JsonObjectConst widgets) {
     widgetSettings.mediaAutoExpand = media["autoExpand"] | true;
     widgetSettings.mediaArtwork = media["artwork"] | true;
   }
+
+  if (weatherWidgetPlaced && widgetSettings.weatherValidLocation) weatherFetchWanted = true;
 
   Serial.printf("Widgets: weather=%s battery(warn %u%%) media(%s, %s)\n",
                 widgetSettings.weatherValidLocation ? widgetSettings.weatherLocation : "no location",
@@ -13568,6 +13626,9 @@ void loadRuntimeModel(JsonDocument &doc) {
          (strcmp(itemType, "widget") == 0 ? Tile::WIDGET : Tile::COMMAND));
       tile.widgetKind = widgetKindFromName(item["widget"] | "media");
       tile.slot = constrain((int)(item["slot"] | slotCursor), 0, 254);
+      if (tile.kind == Tile::WIDGET || tile.kind == Tile::ACTIVITY) {
+        tile.slot = alignSlotToRow(tile.slot);
+      }
       int nextSlot = (int)tile.slot +
         (tile.kind == Tile::WIDGET ? 6 : (tile.kind == Tile::ACTIVITY ? 3 : 1));
       slotCursor = (uint8_t)constrain(max((int)slotCursor, nextSlot), 0, 254);
@@ -13695,7 +13756,7 @@ void loadRuntimeModel(JsonDocument &doc) {
         off and needs its own small list.
       */
       if (strcmp(item["type"] | "", "widget") == 0) {
-        uint8_t widgetSlot = constrain((int)(item["slot"] | slotCursor), 0, 254);
+        uint8_t widgetSlot = alignSlotToRow(constrain((int)(item["slot"] | slotCursor), 0, 254));
         slotCursor = (uint8_t)constrain((int)widgetSlot + 6, 0, 254);
         if (device->widgetCount >= MAX_DEVICE_WIDGETS) continue;
         DeviceWidget &placement = device->widgets[device->widgetCount++];
@@ -25597,6 +25658,10 @@ lv_obj_t *makeWidgetLabel(lv_obj_t *parent, const char *text, int x, int y,
   lv_obj_t *label = makeLabel(parent, text, x, y, font, colour);
   if (width > 0) {
     lv_obj_set_width(label, width);
+    // Height as well as width: LV_LABEL_LONG_DOT shortens text that does not
+    // fit the label's size, and a label with no fixed height simply grows to
+    // fit instead, wrapping over whatever is underneath.
+    lv_obj_set_height(label, lv_font_get_line_height(font));
     lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_align(label, align, 0);
   }
@@ -26200,23 +26265,97 @@ const char *weatherConditionText(int code) {
 }
 
 /*
+  The epoch at which the current refresh slot began.
+
+  Slots are anchored at 2am local and repeat every intervalHours; because
+  every selectable interval divides 24, the boundaries fall on the same clock
+  times every day. Returning the slot's start as an absolute epoch (rather
+  than an hour-of-day) means day, month and year rollover need no special
+  handling: a slot we have already fetched simply has the same start time.
+*/
+time_t weatherSlotStart(time_t epoch, uint8_t intervalHours) {
+  if (intervalHours < 1) intervalHours = 1;
+  tm local = {};
+  localtime_r(&epoch, &local);
+  int hoursSinceAnchor = (local.tm_hour - 2 + 24) % 24;
+  int intoSlot = hoursSinceAnchor % (int)intervalHours;
+  return epoch - (time_t)intoSlot * 3600 -
+         (time_t)local.tm_min * 60 - (time_t)local.tm_sec;
+}
+
+/*
+  Brings Wi-Fi up for a forecast, exactly as requestInternetTimeSync() does
+  for the clock - including granting wifiOn, because startNetworkStack()
+  refuses to do anything while it is false and the user's own Wi-Fi toggle
+  being off must not silently disable a scheduled fetch.
+*/
+void requestWeatherRadio() {
+  if (!hasAnyWifiProfile()) return;
+  wifiOn = true;
+  ensureSelectedWifiProfile();
+  weatherOwnsRadio = true;
+  weatherRadioStartedMs = millis();
+  networkShutdownAtMs = 0;
+  if (!setupApActive || WiFi.status() != WL_CONNECTED) startNetworkStack();
+  Serial.println("Weather: radio requested for a forecast");
+}
+
+void releaseWeatherRadio() {
+  if (!weatherOwnsRadio) return;
+  weatherOwnsRadio = false;
+  scheduleNetworkShutdown();
+}
+
+/*
   Open-Meteo needs no API key and takes plain coordinates, which is why
   WebConfig resolves the town name to a latitude and longitude at setup time
   and stores those - geocoding from the remote would mean a second request
   and a second thing to fail with the radio only briefly up.
 
-  Fetched at most every fifteen minutes, and only while the screen is awake:
-  a forecast nobody is looking at is not worth the Wi-Fi.
+  4.11 only ever fetched when Wi-Fi happened to already be connected. On a
+  battery remote it never is - the radio is off by design - so the tile sat
+  on "Waiting for Wi-Fi" forever. The fetch now brings the radio up itself
+  and drops it again afterwards, and runs whether or not the screen is awake
+  so a 2am slot is not missed simply because nobody is holding the remote.
 */
 void serviceWeatherWidget(uint32_t now) {
-  static const uint32_t WEATHER_REFRESH_MS = 15UL * 60UL * 1000UL;
-  static const uint32_t WEATHER_RETRY_MS = 2UL * 60UL * 1000UL;
+  static const uint32_t WEATHER_RETRY_MS = 5UL * 60UL * 1000UL;
+  static const uint32_t WEATHER_RADIO_TIMEOUT_MS = 45000UL;
 
-  if (!weatherWidgetPlaced || !widgetSettings.weatherValidLocation) return;
-  if (displaySleeping) return;
-  if (!wifiOn || WiFi.status() != WL_CONNECTED) return;
-  if (weatherNextAttemptMs && (int32_t)(now - weatherNextAttemptMs) < 0) return;
-  if (weatherReading.valid && (now - weatherReading.fetchedAtMs) < WEATHER_REFRESH_MS) return;
+  if (!weatherWidgetPlaced || !widgetSettings.weatherValidLocation) {
+    releaseWeatherRadio();
+    return;
+  }
+
+  time_t epoch = time(nullptr);
+  bool clockUsable = epoch > 1700000000;
+  time_t slot = clockUsable
+    ? weatherSlotStart(epoch, widgetSettings.weatherIntervalHours) : 0;
+  if (clockUsable && slot != weatherLastSlotEpoch) weatherFetchWanted = true;
+
+  if (!weatherFetchWanted) {
+    releaseWeatherRadio();
+    return;
+  }
+  if (weatherNextAttemptMs && (int32_t)(now - weatherNextAttemptMs) < 0) {
+    releaseWeatherRadio();
+    return;
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    if (!weatherOwnsRadio) {
+      requestWeatherRadio();
+      // hasAnyWifiProfile() may have refused. Back off rather than spin.
+      if (!weatherOwnsRadio) weatherNextAttemptMs = now + WEATHER_RETRY_MS;
+      return;
+    }
+    if ((uint32_t)(now - weatherRadioStartedMs) > WEATHER_RADIO_TIMEOUT_MS) {
+      Serial.println("Weather: gave up waiting for Wi-Fi to associate");
+      weatherNextAttemptMs = now + WEATHER_RETRY_MS;
+      releaseWeatherRadio();
+    }
+    return;
+  }
 
   char url[220];
   snprintf(url, sizeof(url),
@@ -26236,6 +26375,7 @@ void serviceWeatherWidget(uint32_t now) {
   http.setTimeout(8000);
   if (!http.begin(secure, url)) {
     weatherNextAttemptMs = now + WEATHER_RETRY_MS;
+    releaseWeatherRadio();
     Serial.println("Weather: could not open the forecast connection");
     return;
   }
@@ -26244,6 +26384,7 @@ void serviceWeatherWidget(uint32_t now) {
   if (status < 200 || status >= 300) {
     http.end();
     weatherNextAttemptMs = now + WEATHER_RETRY_MS;
+    releaseWeatherRadio();
     Serial.printf("Weather: forecast request failed (HTTP %d)\n", status);
     return;
   }
@@ -26262,6 +26403,7 @@ void serviceWeatherWidget(uint32_t now) {
   http.end();
   if (parse) {
     weatherNextAttemptMs = now + WEATHER_RETRY_MS;
+    releaseWeatherRadio();
     Serial.printf("Weather: unreadable forecast (%s)\n", parse.c_str());
     return;
   }
@@ -26269,6 +26411,7 @@ void serviceWeatherWidget(uint32_t now) {
   JsonObjectConst readings = doc["current"].as<JsonObjectConst>();
   if (readings.isNull() || !readings["temperature_2m"].is<float>()) {
     weatherNextAttemptMs = now + WEATHER_RETRY_MS;
+    releaseWeatherRadio();
     Serial.println("Weather: the forecast carried no current temperature");
     return;
   }
@@ -26289,10 +26432,19 @@ void serviceWeatherWidget(uint32_t now) {
   weatherReading.valid = true;
   weatherReading.fetchedAtMs = now;
   weatherNextAttemptMs = 0;
-  Serial.printf("Weather: %s %.1fC (%.1f/%.1f) for %s\n",
+  weatherFetchWanted = false;
+  /*
+    Only record the slot when the clock is actually set. Marking a slot done
+    against an unset clock would suppress the first real scheduled fetch
+    after NTP finally lands.
+  */
+  if (clockUsable) weatherLastSlotEpoch = slot;
+  releaseWeatherRadio();
+  Serial.printf("Weather: %s %.1fC (%.1f/%.1f) for %s, next slot in %u hour(s)\n",
                 weatherReading.condition, weatherReading.temperatureC,
                 weatherReading.highC, weatherReading.lowC,
-                widgetSettings.weatherLocation);
+                widgetSettings.weatherLocation,
+                widgetSettings.weatherIntervalHours);
 
   for (uint8_t i = 0; i < widgetInstanceCount; i++) refreshWidgetInstance(widgetInstances[i]);
   if (widgetExpandedOverlay && !widgetExpandedClosing) {
@@ -28207,10 +28359,8 @@ void loop() {
   serviceInternetTime(now);
   serviceNetworkPower(now);
   serviceBatteryHistory(now);
-  if (!displaySleeping) {
-    serviceWidgets(now);
-    serviceWeatherWidget(now);
-  }
+  if (!displaySleeping) serviceWidgets(now);
+  serviceWeatherWidget(now);
   if (pendingRuntimeReload && (int32_t)(now - runtimeReloadAfterMs) >= 0) {
     pendingRuntimeReload = false;
     bool wasSleeping = displaySleeping;
