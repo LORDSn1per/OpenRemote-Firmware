@@ -1,0 +1,22 @@
+# OpenRemote dock partition table.
+#
+# The Arduino default for a 4MB board spends 1.5MB on a SPIFFS partition the
+# dock has never used - it has no filesystem at all, and every setting it
+# keeps lives in NVS. That left two 1.25MB app slots, and adding the Home
+# Assistant WebSocket client took the image to 98.2% of one, with no room for
+# anything after it.
+#
+# nvs and otadata keep the offsets and sizes the default table gave them, so
+# a dock reflashed onto this layout keeps its pairing, Wi-Fi, Homebridge,
+# MQTT and Home Assistant settings. Only the app slots grow and SPIFFS goes.
+#
+# NOTE: changing the table needs one USB flash. A dock still running the old
+# layout cannot receive this over the air, because its slots are the smaller
+# ones. Wireless updates work normally again afterwards.
+#
+# Name,     Type, SubType,  Offset,   Size,     Flags
+nvs,        data, nvs,      0x9000,   0x5000,
+otadata,    data, ota,      0xe000,   0x2000,
+app0,       app,  ota_0,    0x10000,  0x1E0000,
+app1,       app,  ota_1,    0x1F0000, 0x1E0000,
+coredump,   data, coredump, 0x3D0000, 0x10000,

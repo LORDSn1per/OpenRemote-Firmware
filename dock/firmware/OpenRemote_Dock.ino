@@ -668,6 +668,7 @@
 #include <esp_rom_crc.h>
 #include <HTTPClient.h>
 #include <PubSubClient.h>
+#include <WebSocketsClient.h>
 #if DOCK_RF_CS_PIN >= 0
 // Asynchronous serial mode, not the packet engine: a gate or garage remote is
 // a raw OOK edge train with no framing the CC1101 could parse for us. GDO0
@@ -692,7 +693,7 @@ static inline bool serialHostAttached() {
 }
 
 
-#define OPENREMOTE_DOCK_VERSION_STRING "1.35"
+#define OPENREMOTE_DOCK_VERSION_STRING "1.36"
 
 // A literal in the built image, so a tool holding the .bin can tell what it is
 // without running it. The remote firmware carries the same idea under
@@ -886,6 +887,8 @@ static const uint32_t ESPNOW_DOCK_HACFG_MAGIC   = 0x4F524143UL;  // "ORAC"
 static const uint32_t ESPNOW_DOCK_HATOKEN_MAGIC = 0x4F524154UL;  // "ORAT"
 static const uint32_t ESPNOW_HA_CALL_MAGIC      = 0x4F524148UL;  // "ORAH"
 static const uint32_t ESPNOW_HA_RESULT_MAGIC    = 0x4F524152UL;  // "ORAR"
+static const uint32_t ESPNOW_HA_WATCH_MAGIC    = 0x4F524157UL;  // "ORAW"
+static const uint32_t ESPNOW_HA_STATE_MAGIC    = 0x4F524153UL;  // "ORAS"
 static const uint32_t ESPNOW_HOMEBRIDGE_RESULT_MAGIC = 0x4F524852UL;  // "ORHR"
 
 struct __attribute__((packed)) EspNowDockInfoPacket {
@@ -1039,6 +1042,23 @@ struct __attribute__((packed)) EspNowHaResultPacket {
 };
 static_assert(sizeof(EspNowHaResultPacket) == 71, "HA result layout drifted from the remote");
 
+/* Which entities the remote wants watched. One per frame, numbered, so a
+   shrinking list replaces the old one instead of accumulating. */
+struct __attribute__((packed)) EspNowHaWatchPacket {
+  uint32_t magic;
+  uint8_t index;
+  uint8_t total;
+  char entityId[64];
+};
+static_assert(sizeof(EspNowHaWatchPacket) == 70, "HA watch layout drifted from the remote");
+
+struct __attribute__((packed)) EspNowHaStatePacket {
+  uint32_t magic;
+  char entityId[64];
+  char state[48];
+};
+static_assert(sizeof(EspNowHaStatePacket) == 116, "HA state layout drifted from the remote");
+
 struct __attribute__((packed)) EspNowRfLearnStartPacket {
   uint32_t magic;
   uint32_t timeoutMs;
@@ -1165,6 +1185,32 @@ EspNowDockHaTokenPacket pendingHaToken;
 volatile bool pendingHaCall = false;
 EspNowHaCallPacket pendingHaCallPacket;
 uint8_t pendingHaMac[6];
+
+/*
+  Live entity state over Home Assistant's WebSocket API.
+
+  This lives on the dock for the same reason the MQTT subscriptions do: a
+  subscription that only exists while someone is holding the remote cannot
+  report a change that happened an hour ago. The dock is mains powered and
+  already associated, so it simply keeps the socket open.
+
+  Subscribed with subscribe_trigger rather than subscribe_events, because a
+  state trigger filters server-side. Subscribing to every state_changed event
+  in a house and discarding almost all of it would spend the C3's RAM and the
+  Wi-Fi airtime on entities nobody put on a page.
+*/
+WebSocketsClient haWs;
+bool haWsStarted = false;
+bool haWsAuthed = false;
+uint16_t haWsNextId = 1;
+unsigned long haWsRetryAtMs = 0;
+bool haPrimeWanted = false;
+
+static const uint8_t MAX_HA_ENTITIES = 16;
+char haEntities[MAX_HA_ENTITIES][64];
+uint8_t haEntityCount = 0;
+volatile bool pendingHaWatchReady = false;
+EspNowHaWatchPacket pendingHaWatch;
 bool wifiJoined = false;
 unsigned long wifiNextAttemptMs = 0;
 unsigned long wifiPsAssertMs = 0;
@@ -2067,6 +2113,14 @@ void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len)
     return;
   }
 
+  if (magic == ESPNOW_HA_WATCH_MAGIC && len >= (int)sizeof(EspNowHaWatchPacket)) {
+    if (!remoteKnown || memcmp(info->src_addr, remoteMac, 6) != 0) return;
+    memcpy(&pendingHaWatch, data, sizeof(pendingHaWatch));
+    pendingHaWatch.entityId[sizeof(pendingHaWatch.entityId) - 1] = '\0';
+    pendingHaWatchReady = true;
+    return;
+  }
+
   if (magic == ESPNOW_DOCK_MQTTCFG_MAGIC && len >= (int)sizeof(EspNowDockMqttPacket)) {
     if (!remoteKnown || memcmp(info->src_addr, remoteMac, 6) != 0) return;
     memcpy(&pendingMqttConfig, data, sizeof(pendingMqttConfig));
@@ -2713,6 +2767,206 @@ void sendHomebridgeResult(const uint8_t *mac, bool ok, int status, const char *e
   }
 }
 
+/* Splits "http://homeassistant.local:8123" into its parts. Home Assistant is
+   almost always plain http on a LAN, but a reverse-proxied https install is
+   common enough that failing silently on it would be unkind. */
+bool parseHaUrl(const String &url, String &host, uint16_t &port, bool &secure) {
+  String working = url;
+  working.trim();
+  secure = working.startsWith("https://");
+  if (secure) working = working.substring(8);
+  else if (working.startsWith("http://")) working = working.substring(7);
+  int slash = working.indexOf('/');
+  if (slash >= 0) working = working.substring(0, slash);
+  port = secure ? 443 : 8123;
+  int colon = working.lastIndexOf(':');
+  if (colon > 0) {
+    port = (uint16_t)working.substring(colon + 1).toInt();
+    working = working.substring(0, colon);
+    if (!port) port = secure ? 443 : 8123;
+  }
+  host = working;
+  return host.length() > 0;
+}
+
+/* Reads one "key":"value" out of a JSON fragment without a parser. The dock
+   has no ArduinoJson - it extracts the Homebridge token the same way - and
+   pulling one in for two fields would cost more flash than the whole
+   WebSocket client did. */
+String jsonStringField(const String &text, const char *key, int from) {
+  String needle = String("\"") + key + "\":\"";
+  int at = text.indexOf(needle, from);
+  if (at < 0) return "";
+  at += needle.length();
+  int end = at;
+  // charAt(), not operator[] - Arduino's String::operator[] returns a
+  // non-const char& and will not bind to a const String&.
+  while (end < (int)text.length() && text.charAt(end) != '"') {
+    if (text.charAt(end) == '\\') end++;    // Skip an escaped character.
+    end++;
+  }
+  if (end > (int)text.length()) return "";
+  return text.substring(at, end);
+}
+
+void sendHaState(const char *entityId, const char *state) {
+  if (!remoteKnown) return;
+  EspNowHaStatePacket packet = {};
+  packet.magic = ESPNOW_HA_STATE_MAGIC;
+  strlcpy(packet.entityId, entityId, sizeof(packet.entityId));
+  strlcpy(packet.state, state, sizeof(packet.state));
+  for (uint8_t attempt = 0; attempt < 3; attempt++) {
+    if (esp_now_send(remoteMac, (const uint8_t *)&packet, sizeof(packet)) == ESP_OK) return;
+    delay(2);
+  }
+}
+
+// By value, not const reference: WebSocketsClient::sendTXT takes a non-const
+// String& and will not accept one.
+void haWsSend(String message) {
+  haWs.sendTXT(message);
+}
+
+void haWsSubscribeTriggers() {
+  if (!haEntityCount) return;
+  String entities;
+  for (uint8_t i = 0; i < haEntityCount; i++) {
+    if (i) entities += ",";
+    entities += "\"" + String(haEntities[i]) + "\"";
+  }
+  String message = String("{\"id\":") + haWsNextId++ +
+    ",\"type\":\"subscribe_trigger\",\"trigger\":{\"platform\":\"state\",\"entity_id\":[" +
+    entities + "]}}";
+  haWsSend(message);
+  Serial.printf("Dock: HA watching %u entit%s\n", (unsigned)haEntityCount,
+                haEntityCount == 1 ? "y" : "ies");
+}
+
+void haWsEvent(WStype_t type, uint8_t *payload, size_t length) {
+  if (type == WStype_DISCONNECTED) {
+    if (haWsAuthed) Serial.println("Dock: HA WebSocket closed");
+    haWsAuthed = false;
+    return;
+  }
+  if (type == WStype_CONNECTED) {
+    Serial.println("Dock: HA WebSocket open, waiting for the auth challenge");
+    return;
+  }
+  if (type != WStype_TEXT || !payload) return;
+
+  String text;
+  text.reserve(length + 1);
+  for (size_t i = 0; i < length; i++) text += (char)payload[i];
+
+  if (text.indexOf("\"type\":\"auth_required\"") >= 0) {
+    haWsSend(String("{\"type\":\"auth\",\"access_token\":\"") + haToken + "\"}");
+    return;
+  }
+  if (text.indexOf("\"type\":\"auth_invalid\"") >= 0) {
+    Serial.println("Dock: HA rejected the access token - live state is off until it is fixed");
+    haWsAuthed = false;
+    haWs.disconnect();
+    haWsStarted = false;
+    // A bad token will not fix itself, so back off hard rather than
+    // reconnecting in a loop and hammering the server's auth log.
+    haWsRetryAtMs = millis() + 300000UL;
+    return;
+  }
+  if (text.indexOf("\"type\":\"auth_ok\"") >= 0) {
+    haWsAuthed = true;
+    Serial.println("Dock: HA WebSocket authenticated");
+    haWsSubscribeTriggers();
+    haPrimeWanted = true;   // Current values are fetched over REST from loop().
+    return;
+  }
+  if (text.indexOf("\"type\":\"event\"") < 0) return;
+
+  /* A state trigger's payload carries the new value under "to_state". */
+  int at = text.indexOf("\"to_state\":{");
+  if (at < 0) return;
+  String entityId = jsonStringField(text, "entity_id", at);
+  String state = jsonStringField(text, "state", at);
+  if (!entityId.length() || !state.length()) return;
+  Serial.printf("Dock: HA %s = %s\n", entityId.c_str(), state.c_str());
+  sendHaState(entityId.c_str(), state.c_str());
+}
+
+/* Current values for everything being watched, over REST. get_states on the
+   socket would return the whole house in one frame, which is exactly the
+   sort of thing a C3 cannot hold. */
+void haPrimeStates() {
+  haPrimeWanted = false;
+  for (uint8_t i = 0; i < haEntityCount; i++) {
+    HTTPClient http;
+    http.setConnectTimeout(3000);
+    http.setTimeout(6000);
+    if (!http.begin(haBaseUrl + "/api/states/" + haEntities[i])) continue;
+    http.addHeader("Authorization", "Bearer " + haToken);
+    int status = http.GET();
+    if (status >= 200 && status < 300) {
+      String body = http.getString();
+      String state = jsonStringField(body, "state", 0);
+      if (state.length()) sendHaState(haEntities[i], state.c_str());
+    }
+    http.end();
+    delay(20);
+  }
+}
+
+void serviceHaWebSocket(unsigned long now) {
+  if (pendingHaWatchReady) {
+    pendingHaWatchReady = false;
+    if (pendingHaWatch.index == 0) haEntityCount = 0;
+    if (pendingHaWatch.total && haEntityCount < MAX_HA_ENTITIES &&
+        pendingHaWatch.entityId[0]) {
+      strlcpy(haEntities[haEntityCount], pendingHaWatch.entityId, sizeof(haEntities[0]));
+      haEntityCount++;
+    }
+    // Re-subscribe once the whole list has landed.
+    if (pendingHaWatch.total && pendingHaWatch.index + 1 >= pendingHaWatch.total) {
+      if (haWsAuthed) {
+        haWsSubscribeTriggers();
+        haPrimeWanted = true;
+      }
+    }
+    if (!pendingHaWatch.total && haWsStarted) {
+      haWs.disconnect();
+      haWsStarted = false;
+      haWsAuthed = false;
+    }
+  }
+
+  bool wanted = haEnabled && haBaseUrl.length() && haToken.length() &&
+                haEntityCount > 0 && !otaActive && WiFi.status() == WL_CONNECTED;
+  if (!wanted) {
+    if (haWsStarted) {
+      haWs.disconnect();
+      haWsStarted = false;
+      haWsAuthed = false;
+    }
+    return;
+  }
+
+  if (!haWsStarted) {
+    if (haWsRetryAtMs && (long)(now - haWsRetryAtMs) < 0) return;
+    String host;
+    uint16_t port = 8123;
+    bool secure = false;
+    if (!parseHaUrl(haBaseUrl, host, port, secure)) return;
+    haWs.onEvent(haWsEvent);
+    haWs.setReconnectInterval(15000);
+    if (secure) haWs.beginSSL(host.c_str(), port, "/api/websocket");
+    else haWs.begin(host.c_str(), port, "/api/websocket");
+    haWsStarted = true;
+    haWsRetryAtMs = 0;
+    Serial.printf("Dock: HA WebSocket connecting to %s:%u%s\n", host.c_str(),
+                  (unsigned)port, secure ? " (TLS)" : "");
+  }
+
+  haWs.loop();
+  if (haPrimeWanted && haWsAuthed) haPrimeStates();
+}
+
 void sendHaResult(const uint8_t *mac, bool ok, int status, const char *error) {
   EspNowHaResultPacket result = {};
   result.magic = ESPNOW_HA_RESULT_MAGIC;
@@ -3293,6 +3547,7 @@ void loop() {
   serviceMqtt(now);
   serviceMqttUnavailable();
   serviceHomeAssistant(now);
+  serviceHaWebSocket(now);
   serviceOta(now);
   serviceRfLearn(now);
   serviceSettings();

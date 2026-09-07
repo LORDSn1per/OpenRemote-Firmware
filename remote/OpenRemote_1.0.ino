@@ -1,6 +1,30 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.19 - 2026-09-07
+    - Home Assistant tiles now show live state. A light's tile reads "on" or
+      "off" from the server rather than assuming the last press worked, the
+      same way an MQTT tile already read its state topic.
+    - The dock holds a Home Assistant WebSocket open and subscribes with
+      subscribe_trigger, which filters server-side. Subscribing to every
+      state_changed event in a house and discarding almost all of it would
+      spend the C3's RAM and the airtime on entities nobody put on a page.
+    - Current values are primed over REST, one entity at a time, rather than
+      with get_states on the socket - that would return the whole house in a
+      single frame, which is exactly what a C3 cannot hold.
+    - The state cache is now shared. An MQTT topic and an entity id are both
+      unique names for "the thing this tile is about", so one cache serves
+      both and the tile drawing code never has to know which integration
+      filled it in.
+    - The dock needed a partition table to fit this. The Arduino default for
+      a 4MB board spends 1.5MB on a SPIFFS partition the dock has never used
+      - it has no filesystem, every setting is in NVS - which left the image
+      at 98.2% of a 1.25MB app slot. Reclaiming it gives two 1.87MB slots and
+      takes the same image to 65.5%. nvs and otadata keep their old offsets,
+      so a reflashed dock keeps its pairing and credentials, but the change
+      itself needs one USB flash: a dock on the old layout has slots too
+      small to receive it over the air.
+
   4.18 - 2026-09-07
     - Added Home Assistant as a device transport, alongside Homebridge, MQTT,
       IR, Bluetooth and ESP-NOW. WebConfig reads the entity list from the
@@ -5016,7 +5040,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.18"
+#define OPENREMOTE_VERSION_STRING "4.19"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -5697,8 +5721,10 @@ struct DeviceCommand {
   char *haEntityId;
   char *haService;      // "light.turn_on" - domain and service together
   char *haDataKey;      // optional single extra field, e.g. "brightness_pct"
+  char *haStateOnValue; // the state that counts as "on" for this domain
   float haDataValue;
   bool haHasData;
+  bool haShowState;     // whether this tile reports the entity's live state
   enum Kind : uint8_t { NONE, PARSED, RAW, BLE_HID, HOMEBRIDGE, ESPNOW, MQTT,
                         HOMEASSISTANT } kind;
 };
@@ -5755,6 +5781,8 @@ static const uint32_t ESPNOW_DOCK_HACFG_MAGIC  = 0x4F524143UL;  // "ORAC"
 static const uint32_t ESPNOW_DOCK_HATOKEN_MAGIC = 0x4F524154UL; // "ORAT"
 static const uint32_t ESPNOW_HA_CALL_MAGIC     = 0x4F524148UL;  // "ORAH"
 static const uint32_t ESPNOW_HA_RESULT_MAGIC   = 0x4F524152UL;  // "ORAR"
+static const uint32_t ESPNOW_HA_WATCH_MAGIC    = 0x4F524157UL;  // "ORAW"
+static const uint32_t ESPNOW_HA_STATE_MAGIC    = 0x4F524153UL;  // "ORAS"
 
 struct __attribute__((packed)) EspNowDockInfoPacket {
   uint32_t magic;
@@ -7016,6 +7044,23 @@ struct __attribute__((packed)) EspNowHaResultPacket {
   char error[64];
 };
 static_assert(sizeof(EspNowHaResultPacket) == 71, "HA result layout drifted from the dock");
+
+/* Which entities the dock should watch. One per frame, numbered, so a
+   shrinking list replaces the old one rather than accumulating. */
+struct __attribute__((packed)) EspNowHaWatchPacket {
+  uint32_t magic;
+  uint8_t index;
+  uint8_t total;
+  char entityId[64];
+};
+static_assert(sizeof(EspNowHaWatchPacket) == 70, "HA watch layout drifted from the dock");
+
+struct __attribute__((packed)) EspNowHaStatePacket {
+  uint32_t magic;
+  char entityId[64];
+  char state[48];
+};
+static_assert(sizeof(EspNowHaStatePacket) == 116, "HA state layout drifted from the dock");
 
 struct __attribute__((packed)) EspNowRfLearnStartPacket {
   uint32_t magic;
@@ -12117,16 +12162,17 @@ void clearRuntimeCommands() {
         free(devices[deviceIndex].commands[commandIndex].iconPath);
         devices[deviceIndex].commands[commandIndex].iconPath = nullptr;
       }
-      char **mqttStrings[7] = {
+      char **mqttStrings[8] = {
         &devices[deviceIndex].commands[commandIndex].mqttTopic,
         &devices[deviceIndex].commands[commandIndex].mqttPayload,
         &devices[deviceIndex].commands[commandIndex].mqttStateTopic,
         &devices[deviceIndex].commands[commandIndex].mqttStateOnValue,
         &devices[deviceIndex].commands[commandIndex].haEntityId,
         &devices[deviceIndex].commands[commandIndex].haService,
-        &devices[deviceIndex].commands[commandIndex].haDataKey
+        &devices[deviceIndex].commands[commandIndex].haDataKey,
+        &devices[deviceIndex].commands[commandIndex].haStateOnValue
       };
-      for (uint8_t s = 0; s < 7; s++) {
+      for (uint8_t s = 0; s < 8; s++) {
         if (*mqttStrings[s]) {
           free(*mqttStrings[s]);
           *mqttStrings[s] = nullptr;
@@ -13101,19 +13147,24 @@ volatile bool mqttDockOk = false;
 char mqttDockErrorText[64] = "";
 
 /*
-  Last known value of every subscribed topic. Small and fixed: a page can
-  only show so many live tiles, and an unbounded cache on a device with no
-  way to evict it is a slow leak.
+  Last known value of everything being watched, whatever reported it.
+
+  Keyed by a plain string: an MQTT topic and a Home Assistant entity id are
+  both unique names for "the thing this tile is about", so one cache serves
+  both and the tile code never has to care which integration filled it in.
+
+  Small and fixed: a page can only show so many live tiles, and an unbounded
+  cache on a device with no way to evict it is a slow leak.
 */
-struct MqttStateEntry {
+struct LiveStateEntry {
   char topic[96];
   char value[48];
   bool valid;
 };
-static const uint8_t MAX_MQTT_STATES = 16;
-MqttStateEntry mqttStates[MAX_MQTT_STATES];
-uint8_t mqttStateCount = 0;
-bool mqttStateDirty = false;
+static const uint8_t MAX_LIVE_STATES = 16;
+LiveStateEntry liveStates[MAX_LIVE_STATES];
+uint8_t liveStateCount = 0;
+bool liveStateDirty = false;
 
 String mqttEffectiveClientId() {
   if (mqttClientId.length()) return mqttClientId;
@@ -13130,32 +13181,32 @@ bool mqttShouldUseDock() {
   return mqttViaDock && espNowEnabled && espNowDeviceCount > 0;
 }
 
-const char *mqttStateFor(const char *topic) {
+const char *liveStateFor(const char *topic) {
   if (!topic || !topic[0]) return nullptr;
-  for (uint8_t i = 0; i < mqttStateCount; i++) {
-    if (mqttStates[i].valid && strcmp(mqttStates[i].topic, topic) == 0) {
-      return mqttStates[i].value;
+  for (uint8_t i = 0; i < liveStateCount; i++) {
+    if (liveStates[i].valid && strcmp(liveStates[i].topic, topic) == 0) {
+      return liveStates[i].value;
     }
   }
   return nullptr;
 }
 
-void setMqttState(const char *topic, const char *value) {
+void setLiveState(const char *topic, const char *value) {
   if (!topic || !topic[0]) return;
-  for (uint8_t i = 0; i < mqttStateCount; i++) {
-    if (strcmp(mqttStates[i].topic, topic) != 0) continue;
-    if (strcmp(mqttStates[i].value, value ? value : "") == 0) return;
-    strlcpy(mqttStates[i].value, value ? value : "", sizeof(mqttStates[i].value));
-    mqttStates[i].valid = true;
-    mqttStateDirty = true;
+  for (uint8_t i = 0; i < liveStateCount; i++) {
+    if (strcmp(liveStates[i].topic, topic) != 0) continue;
+    if (strcmp(liveStates[i].value, value ? value : "") == 0) return;
+    strlcpy(liveStates[i].value, value ? value : "", sizeof(liveStates[i].value));
+    liveStates[i].valid = true;
+    liveStateDirty = true;
     return;
   }
-  if (mqttStateCount >= MAX_MQTT_STATES) return;
-  MqttStateEntry &entry = mqttStates[mqttStateCount++];
+  if (liveStateCount >= MAX_LIVE_STATES) return;
+  LiveStateEntry &entry = liveStates[liveStateCount++];
   strlcpy(entry.topic, topic, sizeof(entry.topic));
   strlcpy(entry.value, value ? value : "", sizeof(entry.value));
   entry.valid = true;
-  mqttStateDirty = true;
+  liveStateDirty = true;
 }
 
 /* Walks the model for every state topic a command asks to watch. */
@@ -13181,7 +13232,7 @@ void mqttMessageArrived(char *topic, byte *payload, unsigned int length) {
   unsigned int copy = length < sizeof(value) - 1 ? length : sizeof(value) - 1;
   memcpy(value, payload, copy);
   value[copy] = '\0';
-  setMqttState(topic, value);
+  setLiveState(topic, value);
   Serial.printf("MQTT: %s = %s\n", topic, value);
 }
 
@@ -13234,8 +13285,8 @@ bool mqttConnectDirect(String &error) {
   Serial.printf("MQTT: connected to %s:%u as %s\n", mqttHost.c_str(),
                 (unsigned)mqttPort, clientId.c_str());
 
-  const char *topics[MAX_MQTT_STATES];
-  uint8_t count = collectMqttStateTopics(topics, MAX_MQTT_STATES);
+  const char *topics[MAX_LIVE_STATES];
+  uint8_t count = collectMqttStateTopics(topics, MAX_LIVE_STATES);
   for (uint8_t i = 0; i < count; i++) mqttClient.subscribe(topics[i]);
   if (count) Serial.printf("MQTT: subscribed to %u state topic(s)\n", count);
   return true;
@@ -13271,8 +13322,8 @@ void sendMqttSubscriptionsToDock() {
   if (!espNowEnabled || espNowDeviceCount == 0) return;
   if (!ensureEspNowLink()) return;
 
-  const char *topics[MAX_MQTT_STATES];
-  uint8_t count = collectMqttStateTopics(topics, MAX_MQTT_STATES);
+  const char *topics[MAX_LIVE_STATES];
+  uint8_t count = collectMqttStateTopics(topics, MAX_LIVE_STATES);
 
   EspNowMqttSubscribePacket packet = {};
   packet.magic = ESPNOW_MQTT_SUBSCRIBE_MAGIC;
@@ -13402,8 +13453,8 @@ void serviceMqtt(uint32_t now) {
      and the radio is up. Reconnect on that basis rather than holding the
      radio permanently, which is the whole reason the dock path exists. */
   bool wantSubscriptions = false;
-  const char *topics[MAX_MQTT_STATES];
-  if (!displaySleeping && collectMqttStateTopics(topics, MAX_MQTT_STATES)) {
+  const char *topics[MAX_LIVE_STATES];
+  if (!displaySleeping && collectMqttStateTopics(topics, MAX_LIVE_STATES)) {
     wantSubscriptions = true;
   }
   if (!wantSubscriptions) {
@@ -13437,6 +13488,7 @@ volatile bool haDockOk = false;
 volatile int16_t haDockStatus = 0;
 char haDockErrorText[64] = "";
 volatile bool haConfigPushWanted = false;
+bool haWatchListPushed = false;
 
 String normaliseHomeAssistantUrl(const String &raw) {
   String url = raw;
@@ -13624,6 +13676,50 @@ bool callHomeAssistantViaDock(const DeviceCommand &command) {
   Serial.printf("Home Assistant via dock: %s on %s ok (HTTP %d)\n",
                 packet.service, packet.entityId, (int)haDockStatus);
   return true;
+}
+
+/* Every entity a tile on any page wants to watch. Deduplicated, because an
+   On and an Off button for the same light both report it. */
+uint8_t collectHomeAssistantEntities(const char *entities[], uint8_t maximum) {
+  uint8_t count = 0;
+  for (uint8_t d = 0; d < DEVICE_COUNT && count < maximum; d++) {
+    for (uint16_t c = 0; c < devices[d].commandCount && count < maximum; c++) {
+      const DeviceCommand &command = devices[d].commands[c];
+      if (command.kind != DeviceCommand::HOMEASSISTANT) continue;
+      if (!command.haShowState || !command.haEntityId || !command.haEntityId[0]) continue;
+      bool seen = false;
+      for (uint8_t i = 0; i < count; i++) {
+        if (strcmp(entities[i], command.haEntityId) == 0) { seen = true; break; }
+      }
+      if (!seen) entities[count++] = command.haEntityId;
+    }
+  }
+  return count;
+}
+
+void sendHomeAssistantWatchListToDock() {
+  if (!espNowEnabled || espNowDeviceCount == 0) return;
+  if (!ensureEspNowLink()) return;
+
+  const char *entities[MAX_LIVE_STATES];
+  uint8_t count = collectHomeAssistantEntities(entities, MAX_LIVE_STATES);
+
+  EspNowHaWatchPacket packet = {};
+  packet.magic = ESPNOW_HA_WATCH_MAGIC;
+  packet.total = count;
+  if (!count) {
+    packet.index = 0;
+    sendEspNowWithRetry(espNowDevices[0].mac, (const uint8_t *)&packet, sizeof(packet));
+  }
+  for (uint8_t i = 0; i < count; i++) {
+    packet.index = i;
+    strlcpy(packet.entityId, entities[i], sizeof(packet.entityId));
+    sendEspNowWithRetry(espNowDevices[0].mac, (const uint8_t *)&packet, sizeof(packet));
+    delay(12);   // Let the dock take each one before the next arrives.
+  }
+  haWatchListPushed = true;
+  Serial.printf("Dock: pushed %u Home Assistant entit%s to watch\n",
+                (unsigned)count, count == 1 ? "y" : "ies");
 }
 
 bool transmitHomeAssistantCommand(const DeviceCommand &command) {
@@ -14510,6 +14606,8 @@ void loadRuntimeModel(JsonDocument &doc) {
         runtimeCommand.haEntityId = duplicateRuntimeString(String(assistant["entityId"] | ""));
         runtimeCommand.haService = duplicateRuntimeString(String(assistant["service"] | ""));
         runtimeCommand.haDataKey = duplicateRuntimeString(String(assistant["dataKey"] | ""));
+        runtimeCommand.haStateOnValue = duplicateRuntimeString(String(assistant["onState"] | "on"));
+        runtimeCommand.haShowState = assistant["showState"] | true;
         runtimeCommand.haHasData = assistant["value"].is<float>();
         runtimeCommand.haDataValue = assistant["value"] | 0.0f;
         if (runtimeCommand.haEntityId && runtimeCommand.haService) {
@@ -19422,11 +19520,11 @@ void handleMqttStatusApi() {
   response["usingDock"] = mqttShouldUseDock();
   response["connected"] = mqttClient.connected();
   JsonArray states = response["states"].to<JsonArray>();
-  for (uint8_t i = 0; i < mqttStateCount; i++) {
-    if (!mqttStates[i].valid) continue;
+  for (uint8_t i = 0; i < liveStateCount; i++) {
+    if (!liveStates[i].valid) continue;
     JsonObject entry = states.add<JsonObject>();
-    entry["topic"] = mqttStates[i].topic;
-    entry["value"] = mqttStates[i].value;
+    entry["topic"] = liveStates[i].topic;
+    entry["value"] = liveStates[i].value;
   }
   String body;
   serializeJson(response, body);
@@ -20152,6 +20250,19 @@ void onEspNowDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int 
     }
   }
 
+  /* Unsolicited: the dock forwards whatever Home Assistant reports. */
+  if ((size_t)len >= sizeof(EspNowHaStatePacket) &&
+      espNowDeviceCount > 0 && memcmp(espNowDevices[0].mac, info->src_addr, 6) == 0) {
+    EspNowHaStatePacket state;
+    memcpy(&state, data, sizeof(state));
+    if (state.magic == ESPNOW_HA_STATE_MAGIC) {
+      state.entityId[sizeof(state.entityId) - 1] = '\0';
+      state.state[sizeof(state.state) - 1] = '\0';
+      setLiveState(state.entityId, state.state);
+      return;
+    }
+  }
+
   if (haDockPending && (size_t)len >= sizeof(EspNowHaResultPacket) &&
       espNowDeviceCount > 0 && memcmp(espNowDevices[0].mac, info->src_addr, 6) == 0) {
     EspNowHaResultPacket result;
@@ -20189,7 +20300,7 @@ void onEspNowDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int 
     if (state.magic == ESPNOW_MQTT_STATE_MAGIC) {
       state.topic[sizeof(state.topic) - 1] = '\0';
       state.value[sizeof(state.value) - 1] = '\0';
-      setMqttState(state.topic, state.value);
+      setLiveState(state.topic, state.value);
       return;
     }
   }
@@ -26879,18 +26990,18 @@ void tileEvent(lv_event_t *e) {
   strings, which live exactly as long as the tiles do - both are torn down
   together when a page is rebuilt.
 */
-struct MqttTileBinding {
+struct LiveTileBinding {
   lv_obj_t *valueLabel;
-  const char *topic;
+  const char *key;        // MQTT topic, or Home Assistant entity id
   const char *onValue;
 };
-static const uint8_t MAX_MQTT_TILES = 12;
-MqttTileBinding mqttTileBindings[MAX_MQTT_TILES];
-uint8_t mqttTileBindingCount = 0;
+static const uint8_t MAX_LIVE_TILES = 16;
+LiveTileBinding liveTileBindings[MAX_LIVE_TILES];
+uint8_t liveTileBindingCount = 0;
 
-void applyMqttTileState(const MqttTileBinding &binding) {
+void applyLiveTileState(const LiveTileBinding &binding) {
   if (!binding.valueLabel || !lv_obj_is_valid(binding.valueLabel)) return;
-  const char *value = mqttStateFor(binding.topic);
+  const char *value = liveStateFor(binding.key);
   // "--" rather than blank: nothing heard yet is a different thing from a
   // topic whose value really is empty, and the user can tell them apart.
   lv_label_set_text(binding.valueLabel, value && value[0] ? value : "--");
@@ -26900,16 +27011,19 @@ void applyMqttTileState(const MqttTileBinding &binding) {
                               on ? lvRgb(48, 209, 88) : lvRgb(150, 165, 182), 0);
 }
 
-void refreshMqttStateTiles() {
-  for (uint8_t i = 0; i < mqttTileBindingCount; i++) applyMqttTileState(mqttTileBindings[i]);
+void refreshLiveTiles() {
+  for (uint8_t i = 0; i < liveTileBindingCount; i++) applyLiveTileState(liveTileBindings[i]);
 }
 
 void makeTile(uint8_t slot, const char *label, const char *iconPath, bool showText,
               uint8_t boxMode, bool repeat, DeviceCommand *command, Macro *macro) {
   uint8_t col = slot % 3;
   uint8_t row = slot / 3;
-  bool showsMqttState = command && command->kind == DeviceCommand::MQTT &&
-                        command->mqttStateTopic && command->mqttStateTopic[0];
+  bool showsLiveState = command &&
+    ((command->kind == DeviceCommand::MQTT &&
+      command->mqttStateTopic && command->mqttStateTopic[0]) ||
+     (command->kind == DeviceCommand::HOMEASSISTANT &&
+      command->haShowState && command->haEntityId && command->haEntityId[0]));
   notePopulatedRemoteRow(row);
   int x = 8 + col * 76;
   int iconPixels = constrain((int)map(buttonIconSize, 20, 64, 16, 40), 16, 40);
@@ -26958,10 +27072,10 @@ void makeTile(uint8_t slot, const char *label, const char *iconPath, bool showTe
     lv_obj_clear_flag(l, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_clear_flag(l, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_center(l);
-    if (showsMqttState) lv_obj_align(l, LV_ALIGN_CENTER, 0, -7);
+    if (showsLiveState) lv_obj_align(l, LV_ALIGN_CENTER, 0, -7);
   }
 
-  if (showsMqttState && mqttTileBindingCount < MAX_MQTT_TILES) {
+  if (showsLiveState && liveTileBindingCount < MAX_LIVE_TILES) {
     lv_obj_t *value = lv_label_create(tile);
     lv_label_set_text(value, "--");
     lv_label_set_long_mode(value, LV_LABEL_LONG_DOT);
@@ -26972,11 +27086,13 @@ void makeTile(uint8_t slot, const char *label, const char *iconPath, bool showTe
     lv_obj_clear_flag(value, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_clear_flag(value, LV_OBJ_FLAG_SCROLLABLE);
 
-    MqttTileBinding &binding = mqttTileBindings[mqttTileBindingCount++];
+    LiveTileBinding &binding = liveTileBindings[liveTileBindingCount++];
     binding.valueLabel = value;
-    binding.topic = command->mqttStateTopic;
-    binding.onValue = command->mqttStateOnValue;
-    applyMqttTileState(binding);
+    binding.key = command->kind == DeviceCommand::HOMEASSISTANT
+      ? command->haEntityId : command->mqttStateTopic;
+    binding.onValue = command->kind == DeviceCommand::HOMEASSISTANT
+      ? command->haStateOnValue : command->mqttStateOnValue;
+    applyLiveTileState(binding);
   }
 }
 
@@ -28397,8 +28513,8 @@ void renderCurrentPage() {
   dismissWidgetFullScreen();
   widgetInstanceCount = 0;
   memset(widgetInstances, 0, sizeof(widgetInstances));
-  mqttTileBindingCount = 0;
-  memset(mqttTileBindings, 0, sizeof(mqttTileBindings));
+  liveTileBindingCount = 0;
+  memset(liveTileBindings, 0, sizeof(liveTileBindings));
   memset(batteryMetricNameLabels, 0, sizeof(batteryMetricNameLabels));
   memset(batteryMetricValueLabels, 0, sizeof(batteryMetricValueLabels));
   memset(displayValueLabels, 0, sizeof(displayValueLabels));
@@ -29975,7 +30091,10 @@ void loop() {
   }
   if (haConfigPushWanted) {
     haConfigPushWanted = false;
-    if (haViaDock) sendHomeAssistantConfigToDock();
+    if (haViaDock) {
+      sendHomeAssistantConfigToDock();
+      haWatchListPushed = false;   // Re-pushed once the link is up again.
+    }
   }
   if (mqttConfigPushWanted) {
     mqttConfigPushWanted = false;
@@ -30009,9 +30128,15 @@ void loop() {
   if (!displaySleeping) serviceWidgets(now);
   serviceWeatherWidget(now);
   serviceMqtt(now);
-  if (mqttStateDirty && !displaySleeping) {
-    mqttStateDirty = false;
-    refreshMqttStateTiles();
+  /* Live Home Assistant state needs the dock: it is the only side that can
+     hold a WebSocket open, because the remote's radio is off. */
+  if (homeAssistantConfigured() && homeAssistantShouldUseDock() &&
+      !haWatchListPushed && dockConnected()) {
+    sendHomeAssistantWatchListToDock();
+  }
+  if (liveStateDirty && !displaySleeping) {
+    liveStateDirty = false;
+    refreshLiveTiles();
   }
   if (pendingRuntimeReload && (int32_t)(now - runtimeReloadAfterMs) >= 0) {
     pendingRuntimeReload = false;
