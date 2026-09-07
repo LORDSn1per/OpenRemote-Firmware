@@ -1,3 +1,7 @@
+<div align="center">
+  <img src="../docs/images/openremote-dock-rev6.jpg" alt="OpenRemote Rev 6 Dock — smart charging, smarter control" width="100%">
+</div>
+
 # OpenRemote Dock
 
 A mains-powered companion to the OpenRemote remote. The remote is a battery
@@ -9,7 +13,7 @@ It is a real ESP-NOW peer, not a stand-in: it speaks the wire format the remote
 firmware implements, so it pairs and takes commands through the remote's
 existing **Settings → Dock** screens and through WebConfig.
 
-Current firmware: **1.30**. Source in [`firmware/`](firmware/).
+Current firmware: **1.36**. Source in [`firmware/`](firmware/).
 
 [**Download the latest dock firmware →**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-Dock-Firmware-1.36.bin)
 
@@ -32,9 +36,9 @@ rather than a decoded protocol, which is what lets it reproduce codes nothing
 recognises. Learning is driven from WebConfig; the dock opens a receive window,
 captures the burst, and sends the timings back over ESP-NOW.
 
-**Sends Homebridge commands, and sends them fast.** With *Homebridge via dock*
-switched on, the remote hands the command to the dock over ESP-NOW and the dock
-issues the HTTP call itself.
+**Carries your smart home, and carries it fast.** **Home Assistant**, **MQTT**
+and **Homebridge** each have a *via dock* switch. With one on, the remote hands
+the command to the dock over ESP-NOW and the dock does the talking itself.
 
 This is worth more than it sounds, and the reason is simply what the dock is.
 Being mains powered, it has no reason to sleep: it joins your Wi-Fi once and
@@ -48,6 +52,17 @@ The gain is largest where you would least expect it. *Toggle* and *step*
 operations have to read the current value before writing the new one, so
 through the dock that is two round trips on a warm link, against an association
 plus two on a cold one.
+
+**Live tiles.** The permanent connection buys something the remote cannot do at
+all on its own. The dock holds a Home Assistant WebSocket and an MQTT
+subscription open, so a tile showing whether a light is on stays right the
+moment it changes — including while the remote is asleep in your hand. It
+subscribes only to the entities and topics your pages actually use, so a house
+full of sensors costs nothing.
+
+Without a dock these tiles still work: the remote polls every few seconds while
+its screen is awake. That is the same information a few seconds later, for some
+Wi-Fi time and some battery.
 
 The dock logs in and keeps its own token, re-authenticating whenever it
 expires. No token is ever sent between the two, so there is no shared expiry
@@ -171,6 +186,17 @@ seconds after the last use, so an idle remote is not paying to hold a link open.
 | remote → dock | `ORHC` | Homebridge address and login |
 | remote → dock | `ORHB` | one Homebridge command |
 | dock → remote | `ORHR` | the result of it |
+| remote → dock | `ORMC` | MQTT broker address and credentials |
+| remote → dock | `ORMP` | publish one topic and payload |
+| dock → remote | `ORMR` | the result of it |
+| remote → dock | `ORMS` | a topic to subscribe to |
+| dock → remote | `ORMT` | a subscribed topic changed |
+| remote → dock | `ORAC` | Home Assistant address |
+| remote → dock | `ORAT` | Home Assistant token, in numbered chunks |
+| remote → dock | `ORAH` | one Home Assistant service call |
+| dock → remote | `ORAR` | the result of it |
+| remote → dock | `ORAW` | an entity to watch |
+| dock → remote | `ORAS` | a watched entity changed |
 | remote → dock | `ORLD` | link going down |
 | remote → dock | `ORLS` | open an RF433 receive window |
 | dock → remote | `ORLR` | captured RF timings |
