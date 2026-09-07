@@ -1,6 +1,29 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.18 - 2026-09-07
+    - Added Home Assistant as a device transport, alongside Homebridge, MQTT,
+      IR, Bluetooth and ESP-NOW. WebConfig reads the entity list from the
+      server and the user ticks what they want, so a light arrives already
+      knowing it is light.lounge and that turning it on is light.turn_on -
+      the same convenience the Homebridge importer gives, against a different
+      hub.
+    - This is what MQTT deliberately is not. MQTT is a noticeboard: it moves
+      a topic and a payload and understands neither. Home Assistant knows
+      what an entity is, so it can be browsed. Both are here because they
+      answer different questions, and neither is built on the other.
+    - Discovery streams and filters /api/states rather than buffering it. A
+      house with a few hundred entities returns far more than the remote's
+      free heap, and 4.10 already learned that lesson painfully with the
+      Homebridge accessory list - the response came back truncated and looked
+      exactly like "some of my devices are missing".
+    - The long-lived access token is a JWT of around 180 characters, which
+      does not fit one 250-byte ESP-NOW frame beside a URL. It is sent to the
+      dock in numbered chunks and reassembled there.
+    - Calls go through the dock by default, for the same reason Homebridge
+      and MQTT do: the dock is mains powered and already associated, so a
+      press is an ESP-NOW burst rather than a Wi-Fi association.
+
   4.17 - 2026-09-07
     - Added MQTT, as a device transport beside IR, Bluetooth, Homebridge and
       ESP-NOW rather than as a mode of its own. A command carries a topic and
@@ -4993,7 +5016,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.17"
+#define OPENREMOTE_VERSION_STRING "4.18"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -5670,7 +5693,14 @@ struct DeviceCommand {
   char *mqttStateOnValue;
   uint8_t mqttQos;
   bool mqttRetain;
-  enum Kind : uint8_t { NONE, PARSED, RAW, BLE_HID, HOMEBRIDGE, ESPNOW, MQTT } kind;
+  /* Home Assistant, on the heap for the same reason as the MQTT strings. */
+  char *haEntityId;
+  char *haService;      // "light.turn_on" - domain and service together
+  char *haDataKey;      // optional single extra field, e.g. "brightness_pct"
+  float haDataValue;
+  bool haHasData;
+  enum Kind : uint8_t { NONE, PARSED, RAW, BLE_HID, HOMEBRIDGE, ESPNOW, MQTT,
+                        HOMEASSISTANT } kind;
 };
 
 // ESP-NOW transport values for DeviceCommand::espNowTransport - what the
@@ -5720,6 +5750,11 @@ static const uint32_t ESPNOW_MQTT_PUBLISH_MAGIC   = 0x4F524D50UL;  // "ORMP"
 static const uint32_t ESPNOW_MQTT_RESULT_MAGIC    = 0x4F524D52UL;  // "ORMR"
 static const uint32_t ESPNOW_MQTT_SUBSCRIBE_MAGIC = 0x4F524D53UL;  // "ORMS"
 static const uint32_t ESPNOW_MQTT_STATE_MAGIC     = 0x4F524D54UL;  // "ORMT"
+// --- Home Assistant over the dock ---
+static const uint32_t ESPNOW_DOCK_HACFG_MAGIC  = 0x4F524143UL;  // "ORAC"
+static const uint32_t ESPNOW_DOCK_HATOKEN_MAGIC = 0x4F524154UL; // "ORAT"
+static const uint32_t ESPNOW_HA_CALL_MAGIC     = 0x4F524148UL;  // "ORAH"
+static const uint32_t ESPNOW_HA_RESULT_MAGIC   = 0x4F524152UL;  // "ORAR"
 
 struct __attribute__((packed)) EspNowDockInfoPacket {
   uint32_t magic;
@@ -6137,6 +6172,19 @@ bool homebridgeViaDock = false;
   backup and restore. The credentials live in NVS beside the Homebridge
   ones and never travel in runtime.json.
 */
+/*
+  Home Assistant.
+
+  A different thing from MQTT rather than a layer on top of it: HA knows what
+  an entity is, so WebConfig can list them and the user can pick. The token is
+  a long-lived access token created in HA's own profile page; it lives in NVS
+  and never travels in runtime.json.
+*/
+bool haEnabled = false;
+String haBaseUrl;
+String haToken;
+bool haViaDock = true;
+
 bool mqttEnabled = false;
 String mqttHost;
 uint16_t mqttPort = 1883;
@@ -6928,6 +6976,46 @@ struct __attribute__((packed)) EspNowMqttStatePacket {
   char value[64];
 };
 static_assert(sizeof(EspNowMqttStatePacket) == 164, "MQTT state layout drifted from the dock");
+
+/* --- Home Assistant over the dock ------------------------------------------
+   The access token is a JWT of roughly 180 characters, which will not fit in
+   one 250-byte frame beside a URL, so it arrives in numbered chunks and is
+   reassembled on the dock. Layouts are pinned on both sides. */
+struct __attribute__((packed)) EspNowDockHaConfigPacket {
+  uint32_t magic;
+  uint8_t enabled;
+  char baseUrl[97];
+};
+static_assert(sizeof(EspNowDockHaConfigPacket) == 102, "dock HA config layout drifted from the dock");
+
+static const uint8_t HA_TOKEN_CHUNK = 120;
+static const uint8_t HA_TOKEN_MAX_CHUNKS = 3;
+
+struct __attribute__((packed)) EspNowDockHaTokenPacket {
+  uint32_t magic;
+  uint8_t index;
+  uint8_t total;
+  char chunk[HA_TOKEN_CHUNK + 1];
+};
+static_assert(sizeof(EspNowDockHaTokenPacket) == 127, "dock HA token layout drifted from the dock");
+
+struct __attribute__((packed)) EspNowHaCallPacket {
+  uint32_t magic;
+  uint8_t hasData;
+  float dataValue;
+  char entityId[64];
+  char service[40];
+  char dataKey[24];
+};
+static_assert(sizeof(EspNowHaCallPacket) == 137, "HA call layout drifted from the dock");
+
+struct __attribute__((packed)) EspNowHaResultPacket {
+  uint32_t magic;
+  uint8_t ok;
+  int16_t httpStatus;
+  char error[64];
+};
+static_assert(sizeof(EspNowHaResultPacket) == 71, "HA result layout drifted from the dock");
 
 struct __attribute__((packed)) EspNowRfLearnStartPacket {
   uint32_t magic;
@@ -9136,6 +9224,8 @@ void loadSettings() {
   homebridgeViaDock = preferences.getBool("hbViaDock", false);
   mqttEnabled = preferences.getBool("mqEn", false);
   mqttViaDock = preferences.getBool("mqViaDock", true);
+  haEnabled = preferences.getBool("haEn", false);
+  haViaDock = preferences.getBool("haViaDock", true);
   espNowTxPower = preferences.getUChar("enTxPwr", 2);
   if (espNowTxPower > 2) espNowTxPower = 2;
   clockEnabled = preferences.getBool("clock", true);
@@ -9210,6 +9300,8 @@ void loadSettings() {
   mqttPassword = preferences.getString("mqPass", "");
   mqttClientId = preferences.getString("mqCid", "");
   mqttPort = (uint16_t)preferences.getUShort("mqPort", 1883);
+  haBaseUrl = preferences.getString("haUrl", "");
+  haToken = preferences.getString("haToken", "");
   remoteName = preferences.getString("remoteName", "OpenRemote");
   preferences.end();
 
@@ -9261,6 +9353,15 @@ void loadSettings() {
   }
   if (migratedWifiProfile) saveWifiProfiles();
   raiseToWake = true;
+}
+
+void saveHomeAssistantCredentials(const String &baseUrl, const String &token) {
+  haBaseUrl = baseUrl;
+  haToken = token;
+  preferences.begin(PREFERENCES_NAMESPACE, false);
+  preferences.putString("haUrl", haBaseUrl);
+  preferences.putString("haToken", haToken);
+  preferences.end();
 }
 
 void saveMqttCredentials(const String &host, uint16_t port, const String &username,
@@ -11940,6 +12041,11 @@ void applySettingsJson(JsonVariantConst settings) {
      them back; the username and password stay in NVS. */
   mqttEnabled = settings["mqttEnabled"] | mqttEnabled;
   mqttViaDock = settings["mqttViaDock"] | mqttViaDock;
+  haEnabled = settings["homeAssistantEnabled"] | haEnabled;
+  haViaDock = settings["homeAssistantViaDock"] | haViaDock;
+  if (settings["homeAssistantUrl"].is<const char *>()) {
+    haBaseUrl = String((const char *)(settings["homeAssistantUrl"] | ""));
+  }
   if (settings["mqttHost"].is<const char *>()) {
     mqttHost = String((const char *)(settings["mqttHost"] | ""));
   }
@@ -12011,13 +12117,16 @@ void clearRuntimeCommands() {
         free(devices[deviceIndex].commands[commandIndex].iconPath);
         devices[deviceIndex].commands[commandIndex].iconPath = nullptr;
       }
-      char **mqttStrings[4] = {
+      char **mqttStrings[7] = {
         &devices[deviceIndex].commands[commandIndex].mqttTopic,
         &devices[deviceIndex].commands[commandIndex].mqttPayload,
         &devices[deviceIndex].commands[commandIndex].mqttStateTopic,
-        &devices[deviceIndex].commands[commandIndex].mqttStateOnValue
+        &devices[deviceIndex].commands[commandIndex].mqttStateOnValue,
+        &devices[deviceIndex].commands[commandIndex].haEntityId,
+        &devices[deviceIndex].commands[commandIndex].haService,
+        &devices[deviceIndex].commands[commandIndex].haDataKey
       };
-      for (uint8_t s = 0; s < 4; s++) {
+      for (uint8_t s = 0; s < 7; s++) {
         if (*mqttStrings[s]) {
           free(*mqttStrings[s]);
           *mqttStrings[s] = nullptr;
@@ -13311,6 +13420,224 @@ void serviceMqtt(uint32_t now) {
   mqttIdleReleaseAtMs = 0;
 }
 
+/* ====================================================================== *
+   Home Assistant
+
+   Deliberately a separate integration from MQTT rather than a layer on it.
+   MQTT moves a topic and a payload and understands neither; Home Assistant
+   knows what an entity is, which is exactly what makes a device list
+   browsable in WebConfig. Someone may run one, the other, or both.
+
+   Calls use the REST API - POST /api/services/<domain>/<service> with the
+   entity in the body - because that is one round trip and needs no session.
+   The WebSocket API would buy live state, which this build does not attempt.
+ * ====================================================================== */
+volatile bool haDockPending = false;
+volatile bool haDockOk = false;
+volatile int16_t haDockStatus = 0;
+char haDockErrorText[64] = "";
+volatile bool haConfigPushWanted = false;
+
+String normaliseHomeAssistantUrl(const String &raw) {
+  String url = raw;
+  url.trim();
+  if (!url.length()) return url;
+  if (!url.startsWith("http://") && !url.startsWith("https://")) url = "http://" + url;
+  while (url.endsWith("/")) url.remove(url.length() - 1);
+  return url;
+}
+
+bool homeAssistantConfigured() {
+  return haEnabled && haBaseUrl.length() && haToken.length();
+}
+
+bool homeAssistantShouldUseDock() {
+  return haViaDock && espNowEnabled && espNowDeviceCount > 0;
+}
+
+/*
+  One authorised request. Kept small deliberately: everything this build asks
+  of Home Assistant is either a connectivity check, the entity list, or a
+  service call.
+*/
+int homeAssistantRequest(const char *method, const String &path, const String &body,
+                         String &response, String &error) {
+  if (!haBaseUrl.length() || !haToken.length()) {
+    error = "Home Assistant has not been set up in WebConfig";
+    return -1;
+  }
+  if (!ensureStationConnected()) {
+    error = "Could not connect OpenRemote to its saved Wi-Fi network";
+    scheduleNetworkShutdown();
+    return -1;
+  }
+  HTTPClient http;
+  http.setConnectTimeout(4000);
+  http.setTimeout(10000);
+  String url = normaliseHomeAssistantUrl(haBaseUrl) + path;
+  if (!http.begin(url)) {
+    error = "Could not reach Home Assistant at " + url;
+    return -1;
+  }
+  http.addHeader("Authorization", "Bearer " + haToken);
+  http.addHeader("Content-Type", "application/json");
+  int status = strcmp(method, "POST") == 0 ? http.POST(body) : http.GET();
+  if (status > 0) response = http.getString();
+  http.end();
+  if (status <= 0) {
+    error = String("Home Assistant did not answer (") + status + ")";
+  } else if (status == 401 || status == 403) {
+    error = "Home Assistant rejected the access token";
+  } else if (status < 200 || status >= 300) {
+    error = String("Home Assistant returned HTTP ") + status;
+  }
+  return status;
+}
+
+/* Splits "light.turn_on" into the two path segments the REST API wants. */
+bool splitHomeAssistantService(const char *service, String &domain, String &action) {
+  if (!service || !service[0]) return false;
+  String full(service);
+  int dot = full.indexOf('.');
+  if (dot <= 0 || dot >= (int)full.length() - 1) return false;
+  domain = full.substring(0, dot);
+  action = full.substring(dot + 1);
+  return true;
+}
+
+String homeAssistantCallBody(const DeviceCommand &command) {
+  JsonDocument body;
+  body["entity_id"] = command.haEntityId;
+  if (command.haHasData && command.haDataKey && command.haDataKey[0]) {
+    body[command.haDataKey] = command.haDataValue;
+  }
+  String text;
+  serializeJson(body, text);
+  return text;
+}
+
+bool callHomeAssistantDirect(const DeviceCommand &command) {
+  String domain, action;
+  if (!splitHomeAssistantService(command.haService, domain, action)) {
+    Serial.printf("Home Assistant: '%s' is not a domain.service\n",
+                  command.haService ? command.haService : "");
+    return false;
+  }
+  String response, error;
+  int status = homeAssistantRequest("POST", "/api/services/" + domain + "/" + action,
+                                    homeAssistantCallBody(command), response, error);
+  scheduleNetworkShutdown();
+  if (status < 200 || status >= 300) {
+    Serial.printf("Home Assistant: %s on %s failed - %s\n", command.haService,
+                  command.haEntityId, error.c_str());
+    return false;
+  }
+  Serial.printf("Home Assistant: %s on %s ok\n", command.haService, command.haEntityId);
+  return true;
+}
+
+/* The dock needs the URL and the token; the token is too long for one frame,
+   so it goes in numbered chunks and is reassembled there. */
+void sendHomeAssistantConfigToDock() {
+  if (!espNowEnabled || espNowDeviceCount == 0) return;
+  if (!ensureEspNowLink()) return;
+
+  EspNowDockHaConfigPacket config = {};
+  config.magic = ESPNOW_DOCK_HACFG_MAGIC;
+  config.enabled = homeAssistantConfigured() ? 1 : 0;
+  strlcpy(config.baseUrl, normaliseHomeAssistantUrl(haBaseUrl).c_str(), sizeof(config.baseUrl));
+  sendEspNowWithRetry(espNowDevices[0].mac, (const uint8_t *)&config, sizeof(config));
+
+  uint16_t length = haToken.length();
+  uint8_t total = length ? (uint8_t)((length + HA_TOKEN_CHUNK - 1) / HA_TOKEN_CHUNK) : 0;
+  if (total > HA_TOKEN_MAX_CHUNKS) total = HA_TOKEN_MAX_CHUNKS;
+  EspNowDockHaTokenPacket chunk = {};
+  chunk.magic = ESPNOW_DOCK_HATOKEN_MAGIC;
+  chunk.total = total;
+  if (!total) {
+    chunk.index = 0;
+    sendEspNowWithRetry(espNowDevices[0].mac, (const uint8_t *)&chunk, sizeof(chunk));
+  }
+  for (uint8_t i = 0; i < total; i++) {
+    chunk.index = i;
+    memset(chunk.chunk, 0, sizeof(chunk.chunk));
+    String part = haToken.substring(i * HA_TOKEN_CHUNK,
+                                    min((int)((i + 1) * HA_TOKEN_CHUNK), (int)length));
+    strlcpy(chunk.chunk, part.c_str(), sizeof(chunk.chunk));
+    sendEspNowWithRetry(espNowDevices[0].mac, (const uint8_t *)&chunk, sizeof(chunk));
+    delay(12);
+  }
+  Serial.printf("Dock: pushed Home Assistant %s (%u token chunk(s))\n",
+                config.baseUrl[0] ? config.baseUrl : "(not configured)", (unsigned)total);
+}
+
+bool callHomeAssistantViaDock(const DeviceCommand &command) {
+  EspNowHaCallPacket packet = {};
+  packet.magic = ESPNOW_HA_CALL_MAGIC;
+  packet.hasData = command.haHasData ? 1 : 0;
+  packet.dataValue = command.haDataValue;
+  strlcpy(packet.entityId, command.haEntityId ? command.haEntityId : "", sizeof(packet.entityId));
+  strlcpy(packet.service, command.haService ? command.haService : "", sizeof(packet.service));
+  strlcpy(packet.dataKey, command.haDataKey ? command.haDataKey : "", sizeof(packet.dataKey));
+
+  if (!ensureEspNowLink()) {
+    Serial.println("Home Assistant via dock: could not bring the link up");
+    return false;
+  }
+  haDockPending = true;
+  haDockOk = false;
+  haDockErrorText[0] = '\0';
+  if (!sendEspNowWithRetry(espNowDevices[0].mac, (const uint8_t *)&packet, sizeof(packet))) {
+    haDockPending = false;
+    Serial.println("Home Assistant via dock: the call did not reach the dock");
+    return false;
+  }
+  unsigned long started = millis();
+  while (haDockPending && (millis() - started) < 6000UL) delay(5);
+  if (haDockPending) {
+    haDockPending = false;
+    Serial.println("Home Assistant via dock: the dock did not answer in time");
+    return false;
+  }
+  if (!haDockOk) {
+    Serial.printf("Home Assistant via dock: %s\n",
+                  haDockErrorText[0] ? haDockErrorText : "failed");
+    /* The same second chance the Homebridge and MQTT relays give - a dock
+       that was reflashed or out of range when the details were pushed has no
+       other way back. */
+    if (strstr(haDockErrorText, "no Home Assistant") || strstr(haDockErrorText, "not on Wi-Fi")) {
+      Serial.println("Home Assistant via dock: re-sending details and retrying");
+      sendHomeAssistantConfigToDock();
+      delay(1200);
+      haDockPending = true;
+      haDockOk = false;
+      haDockErrorText[0] = '\0';
+      if (sendEspNowWithRetry(espNowDevices[0].mac, (const uint8_t *)&packet, sizeof(packet))) {
+        unsigned long retry = millis();
+        while (haDockPending && (millis() - retry) < 6000UL) delay(5);
+        if (!haDockPending && haDockOk) return true;
+      }
+      haDockPending = false;
+    }
+    return false;
+  }
+  Serial.printf("Home Assistant via dock: %s on %s ok (HTTP %d)\n",
+                packet.service, packet.entityId, (int)haDockStatus);
+  return true;
+}
+
+bool transmitHomeAssistantCommand(const DeviceCommand &command) {
+  if (!homeAssistantConfigured()) {
+    Serial.println("Home Assistant: not set up");
+    return false;
+  }
+  if (!command.haEntityId || !command.haService) return false;
+  bool sent = homeAssistantShouldUseDock() ? callHomeAssistantViaDock(command)
+                                           : callHomeAssistantDirect(command);
+  if (sent && homeAssistantShouldUseDock()) flashEspNowCommandFeedback();
+  return sent;
+}
+
 bool homebridgeAuthorizedRequest(const char *method, const String &path,
                                  const String &payload, String &response,
                                  int &status, String &error) {
@@ -13645,6 +13972,9 @@ bool transmitIrCommand(const DeviceCommand &command) {
   }
   if (command.kind == DeviceCommand::MQTT) {
     return transmitMqttCommand(command);
+  }
+  if (command.kind == DeviceCommand::HOMEASSISTANT) {
+    return transmitHomeAssistantCommand(command);
   }
   if (command.kind == DeviceCommand::BLE_HID) {
     if (!bleReady) applyBluetoothState();
@@ -14174,7 +14504,20 @@ void loadRuntimeModel(JsonDocument &doc) {
         }
       }
 
-      if (mqtt.isNull() && homebridge.isNull() &&
+      /* Home Assistant: an entity and the service to call on it. */
+      JsonObjectConst assistant = command["homeAssistant"].as<JsonObjectConst>();
+      if (!assistant.isNull()) {
+        runtimeCommand.haEntityId = duplicateRuntimeString(String(assistant["entityId"] | ""));
+        runtimeCommand.haService = duplicateRuntimeString(String(assistant["service"] | ""));
+        runtimeCommand.haDataKey = duplicateRuntimeString(String(assistant["dataKey"] | ""));
+        runtimeCommand.haHasData = assistant["value"].is<float>();
+        runtimeCommand.haDataValue = assistant["value"] | 0.0f;
+        if (runtimeCommand.haEntityId && runtimeCommand.haService) {
+          runtimeCommand.kind = DeviceCommand::HOMEASSISTANT;
+        }
+      }
+
+      if (mqtt.isNull() && homebridge.isNull() && assistant.isNull() &&
           runtimeCommand.kind == DeviceCommand::NONE) {
         String deviceTransport = device.transport;
         deviceTransport.toLowerCase();
@@ -18811,6 +19154,211 @@ void handleHomebridgeDiscover() {
   runtime.json, exactly as the Homebridge credentials do - a backup carries
   the host and port so a restore puts the setup back, but not the secret.
 */
+/* Domains a remote can actually act on. A sensor has nothing to press, and
+   listing hundreds of them buries the handful of lights the user wants. */
+bool homeAssistantDomainIsControllable(const char *entityId) {
+  static const char *allowed[] = {
+    "light.", "switch.", "fan.", "cover.", "climate.", "media_player.",
+    "scene.", "script.", "input_boolean.", "automation.", "vacuum.",
+    "lock.", "button.", "humidifier.", "water_heater.", "siren."
+  };
+  if (!entityId) return false;
+  for (uint8_t i = 0; i < sizeof(allowed) / sizeof(allowed[0]); i++) {
+    if (strncmp(entityId, allowed[i], strlen(allowed[i])) == 0) return true;
+  }
+  return false;
+}
+
+/* The service that turns a domain on. Everything else the user can adjust in
+   WebConfig, but these defaults mean a light imported from the list works
+   without anyone typing "light.turn_on". */
+const char *homeAssistantDefaultService(const char *entityId, bool on) {
+  if (!entityId) return on ? "homeassistant.turn_on" : "homeassistant.turn_off";
+  if (strncmp(entityId, "scene.", 6) == 0) return "scene.turn_on";
+  if (strncmp(entityId, "script.", 7) == 0) return "script.turn_on";
+  if (strncmp(entityId, "button.", 7) == 0) return "button.press";
+  if (strncmp(entityId, "cover.", 6) == 0) return on ? "cover.open_cover" : "cover.close_cover";
+  if (strncmp(entityId, "lock.", 5) == 0) return on ? "lock.unlock" : "lock.lock";
+  // homeassistant.turn_on works across every remaining domain, so a fan, a
+  // switch and a media player all behave without a per-domain table.
+  return on ? "homeassistant.turn_on" : "homeassistant.turn_off";
+}
+
+void handleHomeAssistantConfigApi() {
+  if (!requestAuthorized()) {
+    sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
+    return;
+  }
+  JsonDocument request(&psramJsonAllocator);
+  if (deserializeJson(request, webServer.arg("plain"))) {
+    sendJson(400, "{\"ok\":false,\"error\":\"Invalid Home Assistant request\"}");
+    return;
+  }
+  String url = normaliseHomeAssistantUrl(
+    String((const char *)(request["url"] | haBaseUrl.c_str())));
+  // An absent token means "keep the stored one", so changing the URL alone
+  // does not force the user to paste a 180-character JWT again.
+  String token = request["token"].is<const char *>()
+    ? String((const char *)(request["token"] | "")) : haToken;
+  token.trim();
+
+  saveHomeAssistantCredentials(url, token);
+  haEnabled = request["enabled"] | haEnabled;
+  haViaDock = request["viaDock"] | haViaDock;
+  preferences.begin(PREFERENCES_NAMESPACE, false);
+  preferences.putBool("haEn", haEnabled);
+  preferences.putBool("haViaDock", haViaDock);
+  preferences.end();
+  if (haViaDock) haConfigPushWanted = true;
+
+  JsonDocument response;
+  response["ok"] = true;
+  response["configured"] = homeAssistantConfigured();
+  String body;
+  serializeJson(response, body);
+  sendJson(200, body);
+  Serial.printf("Home Assistant: settings saved (%s, %s, %s)\n",
+                haBaseUrl.length() ? haBaseUrl.c_str() : "(none)",
+                haEnabled ? "enabled" : "disabled",
+                haViaDock ? "via dock" : "direct");
+}
+
+void handleHomeAssistantStatusApi() {
+  if (!requestAuthorized()) {
+    sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
+    return;
+  }
+  JsonDocument response;
+  response["ok"] = true;
+  response["enabled"] = haEnabled;
+  response["url"] = haBaseUrl;
+  response["tokenSaved"] = haToken.length() > 0;
+  response["viaDock"] = haViaDock;
+  response["configured"] = homeAssistantConfigured();
+  response["usingDock"] = homeAssistantShouldUseDock();
+  response["connected"] = false;
+  if (homeAssistantConfigured() && WiFi.status() == WL_CONNECTED) {
+    String raw, error;
+    int status = homeAssistantRequest("GET", "/api/", "", raw, error);
+    response["connected"] = status >= 200 && status < 300;
+    if (!response["connected"].as<bool>()) response["error"] = error;
+    scheduleNetworkShutdown();
+  }
+  String body;
+  serializeJson(response, body);
+  sendJson(200, body);
+}
+
+/*
+  Entity discovery.
+
+  Streamed and filtered rather than buffered. /api/states returns every
+  entity with all of its attributes, which on a real installation is far
+  more than this remote's free heap - and 4.10 already showed what that looks
+  like from the outside: a list that comes back truncated and reads as
+  "some of my devices are missing" rather than as a memory limit.
+*/
+void handleHomeAssistantDiscover() {
+  if (!requestAuthorized()) {
+    sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
+    return;
+  }
+  JsonDocument request(&psramJsonAllocator);
+  deserializeJson(request, webServer.arg("plain"));
+  String url = normaliseHomeAssistantUrl(
+    String((const char *)(request["url"] | haBaseUrl.c_str())));
+  String token = request["token"].is<const char *>()
+    ? String((const char *)(request["token"] | "")) : haToken;
+  token.trim();
+  if (!token.length()) token = haToken;
+
+  if (!url.length() || !token.length()) {
+    sendJson(400, "{\"ok\":false,\"error\":\"Enter the Home Assistant address and an access token\"}");
+    return;
+  }
+  if (!ensureStationConnected()) {
+    scheduleNetworkShutdown();
+    sendJson(502, "{\"ok\":false,\"error\":\"Could not connect OpenRemote to its saved Wi-Fi network\"}");
+    return;
+  }
+
+  HTTPClient http;
+  http.setConnectTimeout(4000);
+  http.setTimeout(20000);          // A large installation takes a while to send.
+  if (!http.begin(url + "/api/states")) {
+    scheduleNetworkShutdown();
+    sendJson(502, "{\"ok\":false,\"error\":\"Could not reach Home Assistant\"}");
+    return;
+  }
+  http.addHeader("Authorization", "Bearer " + token);
+  http.addHeader("Accept", "application/json");
+  int status = http.GET();
+  if (status < 200 || status >= 300) {
+    http.end();
+    scheduleNetworkShutdown();
+    JsonDocument error;
+    error["ok"] = false;
+    error["error"] = status == 401 || status == 403
+      ? "Home Assistant rejected the access token"
+      : String("Home Assistant returned HTTP ") + status;
+    String body;
+    serializeJson(error, body);
+    sendJson(status == 401 || status == 403 ? 401 : 502, body);
+    return;
+  }
+
+  JsonDocument filter(&psramJsonAllocator);
+  JsonObject entity = filter.add<JsonObject>();
+  entity["entity_id"] = true;
+  entity["state"] = true;
+  entity["attributes"]["friendly_name"] = true;
+
+  JsonDocument source(&psramJsonAllocator);
+  DeserializationError parse = deserializeJson(source, http.getStream(),
+                                               DeserializationOption::Filter(filter));
+  http.end();
+  scheduleNetworkShutdown();
+  if (parse) {
+    JsonDocument error;
+    error["ok"] = false;
+    error["error"] = String("Home Assistant returned unreadable entity data (") + parse.c_str() + ")";
+    String body;
+    serializeJson(error, body);
+    sendJson(502, body);
+    return;
+  }
+
+  JsonDocument response(&psramJsonAllocator);
+  response["ok"] = true;
+  JsonArray entities = response["entities"].to<JsonArray>();
+  uint16_t total = 0;
+  uint16_t skipped = 0;
+  for (JsonObjectConst item : source.as<JsonArrayConst>()) {
+    total++;
+    const char *entityId = item["entity_id"] | "";
+    if (!entityId[0]) continue;
+    if (!homeAssistantDomainIsControllable(entityId)) { skipped++; continue; }
+    JsonObject output = entities.add<JsonObject>();
+    output["entityId"] = entityId;
+    const char *name = item["attributes"]["friendly_name"] | "";
+    output["name"] = name[0] ? name : entityId;
+    output["state"] = item["state"] | "";
+    output["onService"] = homeAssistantDefaultService(entityId, true);
+    output["offService"] = homeAssistantDefaultService(entityId, false);
+  }
+  response["total"] = total;
+  response["skipped"] = skipped;
+  // Saving here rather than only in /config means discovering with typed
+  // details keeps them, exactly as the Homebridge importer does.
+  if (url != haBaseUrl || token != haToken) saveHomeAssistantCredentials(url, token);
+
+  String body;
+  serializeJson(response, body);
+  sendJson(200, body);
+  Serial.printf("Home Assistant: %u entities, %u controllable\n",
+                (unsigned)total, (unsigned)entities.size());
+}
+
 void handleMqttConfigApi() {
   if (!requestAuthorized()) {
     sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
@@ -19089,6 +19637,9 @@ void configureWebServer() {
   webServer.on("/api/config", HTTP_POST, handleRuntimeConfigUpload,
                handleRuntimeConfigUploadData);
   webServer.on("/api/command/test", HTTP_POST, handleCommandTest);
+  webServer.on("/api/homeassistant/config", HTTP_POST, handleHomeAssistantConfigApi);
+  webServer.on("/api/homeassistant/status", HTTP_GET, handleHomeAssistantStatusApi);
+  webServer.on("/api/homeassistant/discover", HTTP_POST, handleHomeAssistantDiscover);
   webServer.on("/api/mqtt/config", HTTP_POST, handleMqttConfigApi);
   webServer.on("/api/mqtt/status", HTTP_GET, handleMqttStatusApi);
   webServer.on("/api/mqtt/test", HTTP_POST, handleMqttTestApi);
@@ -19581,6 +20132,7 @@ void onEspNowDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int 
         // pushed from loop(), never from this callback.
         if (homebridgeViaDock) homebridgeConfigPushWanted = true;
         if (mqttViaDock) mqttConfigPushWanted = true;
+        if (haViaDock) haConfigPushWanted = true;
       }
       return;
     }
@@ -19596,6 +20148,20 @@ void onEspNowDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int 
       homebridgeDockStatus = result.httpStatus;
       strlcpy(homebridgeDockErrorText, result.error, sizeof(homebridgeDockErrorText));
       homebridgeDockPending = false;   // Releases the waiting sender.
+      return;
+    }
+  }
+
+  if (haDockPending && (size_t)len >= sizeof(EspNowHaResultPacket) &&
+      espNowDeviceCount > 0 && memcmp(espNowDevices[0].mac, info->src_addr, 6) == 0) {
+    EspNowHaResultPacket result;
+    memcpy(&result, data, sizeof(result));
+    if (result.magic == ESPNOW_HA_RESULT_MAGIC) {
+      result.error[sizeof(result.error) - 1] = '\0';
+      haDockOk = result.ok != 0;
+      haDockStatus = result.httpStatus;
+      strlcpy(haDockErrorText, result.error, sizeof(haDockErrorText));
+      haDockPending = false;   // Releases the waiting sender.
       return;
     }
   }
@@ -29406,6 +29972,10 @@ void loop() {
   if (homebridgeConfigPushWanted) {
     homebridgeConfigPushWanted = false;
     if (homebridgeViaDock) sendHomebridgeConfigToDock();
+  }
+  if (haConfigPushWanted) {
+    haConfigPushWanted = false;
+    if (haViaDock) sendHomeAssistantConfigToDock();
   }
   if (mqttConfigPushWanted) {
     mqttConfigPushWanted = false;

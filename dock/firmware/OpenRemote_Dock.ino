@@ -692,7 +692,7 @@ static inline bool serialHostAttached() {
 }
 
 
-#define OPENREMOTE_DOCK_VERSION_STRING "1.34"
+#define OPENREMOTE_DOCK_VERSION_STRING "1.35"
 
 // A literal in the built image, so a tool holding the .bin can tell what it is
 // without running it. The remote firmware carries the same idea under
@@ -881,6 +881,11 @@ static const uint32_t ESPNOW_MQTT_PUBLISH_MAGIC   = 0x4F524D50UL;  // "ORMP"
 static const uint32_t ESPNOW_MQTT_RESULT_MAGIC    = 0x4F524D52UL;  // "ORMR"
 static const uint32_t ESPNOW_MQTT_SUBSCRIBE_MAGIC = 0x4F524D53UL;  // "ORMS"
 static const uint32_t ESPNOW_MQTT_STATE_MAGIC     = 0x4F524D54UL;  // "ORMT"
+// --- Home Assistant ---
+static const uint32_t ESPNOW_DOCK_HACFG_MAGIC   = 0x4F524143UL;  // "ORAC"
+static const uint32_t ESPNOW_DOCK_HATOKEN_MAGIC = 0x4F524154UL;  // "ORAT"
+static const uint32_t ESPNOW_HA_CALL_MAGIC      = 0x4F524148UL;  // "ORAH"
+static const uint32_t ESPNOW_HA_RESULT_MAGIC    = 0x4F524152UL;  // "ORAR"
 static const uint32_t ESPNOW_HOMEBRIDGE_RESULT_MAGIC = 0x4F524852UL;  // "ORHR"
 
 struct __attribute__((packed)) EspNowDockInfoPacket {
@@ -994,6 +999,46 @@ struct __attribute__((packed)) EspNowMqttStatePacket {
 };
 static_assert(sizeof(EspNowMqttStatePacket) == 164, "MQTT state layout drifted from the remote");
 
+/* --- Home Assistant --------------------------------------------------------
+   The access token is a JWT of roughly 180 characters and will not fit one
+   frame beside a URL, so it arrives in numbered chunks. Layouts pinned on
+   both sides. */
+struct __attribute__((packed)) EspNowDockHaConfigPacket {
+  uint32_t magic;
+  uint8_t enabled;
+  char baseUrl[97];
+};
+static_assert(sizeof(EspNowDockHaConfigPacket) == 102, "dock HA config layout drifted from the remote");
+
+static const uint8_t HA_TOKEN_CHUNK = 120;
+static const uint8_t HA_TOKEN_MAX_CHUNKS = 3;
+
+struct __attribute__((packed)) EspNowDockHaTokenPacket {
+  uint32_t magic;
+  uint8_t index;
+  uint8_t total;
+  char chunk[HA_TOKEN_CHUNK + 1];
+};
+static_assert(sizeof(EspNowDockHaTokenPacket) == 127, "dock HA token layout drifted from the remote");
+
+struct __attribute__((packed)) EspNowHaCallPacket {
+  uint32_t magic;
+  uint8_t hasData;
+  float dataValue;
+  char entityId[64];
+  char service[40];
+  char dataKey[24];
+};
+static_assert(sizeof(EspNowHaCallPacket) == 137, "HA call layout drifted from the remote");
+
+struct __attribute__((packed)) EspNowHaResultPacket {
+  uint32_t magic;
+  uint8_t ok;
+  int16_t httpStatus;
+  char error[64];
+};
+static_assert(sizeof(EspNowHaResultPacket) == 71, "HA result layout drifted from the remote");
+
 struct __attribute__((packed)) EspNowRfLearnStartPacket {
   uint32_t magic;
   uint32_t timeoutMs;
@@ -1104,6 +1149,22 @@ EspNowMqttPublishPacket pendingMqttPublishPacket;
 uint8_t pendingMqttMac[6];
 volatile bool pendingMqttSubscribeReady = false;
 EspNowMqttSubscribePacket pendingMqttSubscribe;
+
+/* Home Assistant. The token is reassembled from chunks before anything can
+   use it; a half-arrived token would authenticate nothing and the failure
+   would look like a rejected credential rather than a partial transfer. */
+String haBaseUrl, haToken;
+bool haEnabled = false;
+char haTokenParts[HA_TOKEN_MAX_CHUNKS][HA_TOKEN_CHUNK + 1];
+uint8_t haTokenExpected = 0;
+uint8_t haTokenSeen = 0;
+volatile bool pendingHaConfigReady = false;
+EspNowDockHaConfigPacket pendingHaConfig;
+volatile bool pendingHaTokenReady = false;
+EspNowDockHaTokenPacket pendingHaToken;
+volatile bool pendingHaCall = false;
+EspNowHaCallPacket pendingHaCallPacket;
+uint8_t pendingHaMac[6];
 bool wifiJoined = false;
 unsigned long wifiNextAttemptMs = 0;
 unsigned long wifiPsAssertMs = 0;
@@ -1816,6 +1877,9 @@ void loadRemote() {
   mqttClientId = prefs.getString("mqCid", "");
   mqttPort = prefs.getUShort("mqPort", 1883);
   mqttEnabled = prefs.getBool("mqEn", false);
+  haBaseUrl = prefs.getString("haUrl", "");
+  haToken = prefs.getString("haToken", "");
+  haEnabled = prefs.getBool("haEn", false);
   hbUser = prefs.getString("hbUser", "");
   hbPass = prefs.getString("hbPass", "");
   wifiConfigured = hbSsid.length() > 0;
@@ -1971,6 +2035,35 @@ void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len)
     memcpy(pendingHomebridgeMac, info->src_addr, 6);
     // Handled from loop(): an HTTP round trip cannot run on the Wi-Fi task.
     pendingHomebridge = true;
+    return;
+  }
+
+  if (magic == ESPNOW_DOCK_HACFG_MAGIC && len >= (int)sizeof(EspNowDockHaConfigPacket)) {
+    if (!remoteKnown || memcmp(info->src_addr, remoteMac, 6) != 0) return;
+    memcpy(&pendingHaConfig, data, sizeof(pendingHaConfig));
+    pendingHaConfig.baseUrl[sizeof(pendingHaConfig.baseUrl) - 1] = '\0';
+    pendingHaConfigReady = true;
+    return;
+  }
+
+  if (magic == ESPNOW_DOCK_HATOKEN_MAGIC && len >= (int)sizeof(EspNowDockHaTokenPacket)) {
+    if (!remoteKnown || memcmp(info->src_addr, remoteMac, 6) != 0) return;
+    memcpy(&pendingHaToken, data, sizeof(pendingHaToken));
+    pendingHaToken.chunk[sizeof(pendingHaToken.chunk) - 1] = '\0';
+    pendingHaTokenReady = true;
+    return;
+  }
+
+  if (magic == ESPNOW_HA_CALL_MAGIC && len >= (int)sizeof(EspNowHaCallPacket)) {
+    if (!remoteKnown || memcmp(info->src_addr, remoteMac, 6) != 0) return;
+    if (pendingHaCall) return;   // loop() has not taken the last one yet.
+    memcpy(&pendingHaCallPacket, data, sizeof(pendingHaCallPacket));
+    pendingHaCallPacket.entityId[sizeof(pendingHaCallPacket.entityId) - 1] = '\0';
+    pendingHaCallPacket.service[sizeof(pendingHaCallPacket.service) - 1] = '\0';
+    pendingHaCallPacket.dataKey[sizeof(pendingHaCallPacket.dataKey) - 1] = '\0';
+    memcpy(pendingHaMac, info->src_addr, 6);
+    // Handled from loop(): an HTTP round trip cannot run on the Wi-Fi task.
+    pendingHaCall = true;
     return;
   }
 
@@ -2620,6 +2713,121 @@ void sendHomebridgeResult(const uint8_t *mac, bool ok, int status, const char *e
   }
 }
 
+void sendHaResult(const uint8_t *mac, bool ok, int status, const char *error) {
+  EspNowHaResultPacket result = {};
+  result.magic = ESPNOW_HA_RESULT_MAGIC;
+  result.ok = ok ? 1 : 0;
+  result.httpStatus = (int16_t)status;
+  if (error) strlcpy(result.error, error, sizeof(result.error));
+  for (uint8_t attempt = 0; attempt < 3; attempt++) {
+    if (esp_now_send(mac, (const uint8_t *)&result, sizeof(result)) == ESP_OK) return;
+    delay(2);
+  }
+}
+
+void serviceHomeAssistant(unsigned long now) {
+  (void)now;
+
+  if (pendingHaConfigReady) {
+    pendingHaConfigReady = false;
+    String url = pendingHaConfig.baseUrl;
+    bool enabled = pendingHaConfig.enabled != 0;
+    if (url != haBaseUrl || enabled != haEnabled) {
+      haBaseUrl = url;
+      haEnabled = enabled;
+      prefs.begin("dock", false);
+      prefs.putString("haUrl", haBaseUrl);
+      prefs.putBool("haEn", haEnabled);
+      prefs.end();
+      Serial.printf("Dock: Home Assistant %s (%s)\n",
+                    haBaseUrl.length() ? haBaseUrl.c_str() : "(none)",
+                    haEnabled ? "enabled" : "disabled");
+    }
+  }
+
+  if (pendingHaTokenReady) {
+    pendingHaTokenReady = false;
+    if (pendingHaToken.total == 0) {
+      haToken = "";
+      haTokenExpected = 0;
+      haTokenSeen = 0;
+      prefs.begin("dock", false);
+      prefs.putString("haToken", haToken);
+      prefs.end();
+    } else if (pendingHaToken.index < HA_TOKEN_MAX_CHUNKS) {
+      if (pendingHaToken.index == 0) {
+        haTokenSeen = 0;
+        memset(haTokenParts, 0, sizeof(haTokenParts));
+      }
+      haTokenExpected = pendingHaToken.total;
+      strlcpy(haTokenParts[pendingHaToken.index], pendingHaToken.chunk,
+              sizeof(haTokenParts[0]));
+      haTokenSeen++;
+      // Only commit once every chunk has landed - a half-token would fail
+      // authentication and read as a wrong credential rather than a partial
+      // transfer.
+      if (haTokenSeen >= haTokenExpected) {
+        String rebuilt;
+        for (uint8_t i = 0; i < haTokenExpected; i++) rebuilt += haTokenParts[i];
+        if (rebuilt != haToken) {
+          haToken = rebuilt;
+          prefs.begin("dock", false);
+          prefs.putString("haToken", haToken);
+          prefs.end();
+          Serial.printf("Dock: Home Assistant token received (%u chars)\n",
+                        (unsigned)haToken.length());
+        }
+      }
+    }
+  }
+
+  if (!pendingHaCall) return;
+  pendingHaCall = false;
+  EspNowHaCallPacket call = pendingHaCallPacket;
+  uint8_t mac[6];
+  memcpy(mac, pendingHaMac, 6);
+
+  if (!haEnabled || !haBaseUrl.length() || !haToken.length()) {
+    sendHaResult(mac, false, 0, "Dock has no Home Assistant details");
+    return;
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    sendHaResult(mac, false, 0, "Dock is not on Wi-Fi");
+    return;
+  }
+  String service(call.service);
+  int dot = service.indexOf('.');
+  if (dot <= 0 || dot >= (int)service.length() - 1) {
+    sendHaResult(mac, false, 0, "Service is not domain.service");
+    return;
+  }
+
+  String body = String("{\"entity_id\":\"") + call.entityId + "\"";
+  if (call.hasData && call.dataKey[0]) {
+    body += String(",\"") + call.dataKey + "\":" + String(call.dataValue, 2);
+  }
+  body += "}";
+
+  HTTPClient http;
+  http.setConnectTimeout(4000);
+  http.setTimeout(8000);
+  String url = haBaseUrl + "/api/services/" + service.substring(0, dot) + "/" +
+               service.substring(dot + 1);
+  if (!http.begin(url)) {
+    sendHaResult(mac, false, 0, "Could not reach Home Assistant");
+    return;
+  }
+  http.addHeader("Authorization", "Bearer " + haToken);
+  http.addHeader("Content-Type", "application/json");
+  int status = http.POST(body);
+  http.end();
+  bool ok = status >= 200 && status < 300;
+  Serial.printf("Dock: HA %s on %s -> %d\n", call.service, call.entityId, status);
+  if (ok) sendHaResult(mac, true, status, "");
+  else if (status == 401 || status == 403) sendHaResult(mac, false, status, "Home Assistant rejected the token");
+  else sendHaResult(mac, false, status, "Home Assistant call failed");
+}
+
 void sendMqttResult(const uint8_t *mac, bool ok, const char *error) {
   EspNowMqttResultPacket result = {};
   result.magic = ESPNOW_MQTT_RESULT_MAGIC;
@@ -3084,6 +3292,7 @@ void loop() {
   serviceHomebridge(now);
   serviceMqtt(now);
   serviceMqttUnavailable();
+  serviceHomeAssistant(now);
   serviceOta(now);
   serviceRfLearn(now);
   serviceSettings();
