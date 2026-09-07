@@ -1,6 +1,28 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.11 - 2026-09-07
+    - Added widgets: live tiles that occupy three grid columns and two rows on
+      an activity or device page, added from WebConfig's Screen designer.
+      Weather, Battery and Media ship in this build.
+    - Tapping a widget expands it to fill the screen and tapping it again
+      shrinks it back. The expanded layout is built once at its final size and
+      only the container's geometry is animated, so the growth costs one
+      layout pass rather than one per frame - which matters at 240x320 on a
+      single SPI bus.
+    - The Media widget resolves its player from the page it sits on rather
+      than from its own configuration, so the same widget reports a Chromecast
+      on one device page and something else on another. This build renders the
+      full face - artwork, title, source, progress - from a NowPlaying record
+      that no provider fills in yet; the Cast client that populates it is the
+      next piece of work and is deliberately not part of this release.
+    - Weather is fetched from Open-Meteo using coordinates WebConfig resolved
+      at setup time, so the remote never has to geocode. Refreshed at most
+      every fifteen minutes and only while the screen is awake.
+    - Widget settings ride in runtime.json and are covered by backup/restore.
+      A backup written before this build has no widgets section; restoring one
+      leaves the current widget settings alone rather than failing.
+
   4.10 - 2026-09-06
     - Homebridge discovery no longer loses accessories on a large setup. It
       buffered the whole accessory list into a heap String with getString(),
@@ -4849,7 +4871,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.10"
+#define OPENREMOTE_VERSION_STRING "4.11"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -4885,6 +4907,7 @@ static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
 #include <esp_wifi.h>
 #include <esp_rom_crc.h>
 #include <HTTPClient.h>
+#include <NetworkClientSecure.h>
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <ESPmDNS.h>
@@ -5584,6 +5607,13 @@ struct ActivityStep {
   bool delayWhenDevicePoweredOn;
 };
 
+static const uint8_t MAX_DEVICE_WIDGETS = 3;
+
+struct DeviceWidget {
+  uint8_t kind;
+  uint8_t slot;
+};
+
 struct Device {
   char name[32];
   char id[48];
@@ -5591,6 +5621,8 @@ struct Device {
   char themePath[72];
   DeviceCommand commands[MAX_DEVICE_COMMANDS];
   PhysicalBinding physicalBindings[PHYSICAL_BUTTON_COUNT];
+  DeviceWidget widgets[MAX_DEVICE_WIDGETS];
+  uint8_t widgetCount;
   uint8_t commandCount;
   int8_t powerOnCommandIndex;
   int8_t powerOffCommandIndex;
@@ -5619,7 +5651,8 @@ struct Macro {
 };
 
 struct Tile {
-  enum Kind : uint8_t { COMMAND, ACTIVITY, MACRO } kind;
+  enum Kind : uint8_t { COMMAND, ACTIVITY, MACRO, WIDGET } kind;
+  uint8_t widgetKind;
   char label[28];
   char targetActivityId[48];
   char targetMacroId[48];
@@ -5631,6 +5664,94 @@ struct Tile {
   bool showText;
   bool repeat;
 };
+
+/* ---------------------------------------------------------------------- *
+   Widgets
+
+   A widget is a page item that occupies six grid slots - three columns wide
+   and two rows deep - and draws its own face from live data instead of an
+   icon and a label. Tapping one expands it to the whole screen.
+
+   Configuration is global per widget kind rather than per placement: two
+   Media widgets on two different pages are the same widget reporting two
+   different players, and which player that is comes from the page each one
+   sits on, not from settings copied into every instance.
+ * ---------------------------------------------------------------------- */
+enum WidgetKind : uint8_t {
+  WIDGET_MEDIA = 0,
+  WIDGET_WEATHER = 1,
+  WIDGET_BATTERY = 2,
+  WIDGET_KIND_COUNT = 3
+};
+
+static const int WIDGET_TILE_WIDTH = 224;
+// Two 44px grid rows plus the 8px gap between them, matching makeTile()'s
+// 52px row pitch: a widget ends exactly where the row below it would start.
+static const int WIDGET_TILE_HEIGHT = 96;
+
+struct WidgetSettings {
+  char weatherLocation[48];
+  float weatherLatitude;
+  float weatherLongitude;
+  bool weatherValidLocation;
+  bool weatherFahrenheit;
+  bool weatherShowRange;
+
+  bool batteryShowPercent;
+  bool batteryShowVoltage;
+  uint8_t batteryWarnBelow;
+
+  bool mediaUseNamedDevice;
+  char mediaDeviceId[48];
+  bool mediaViaDock;
+  bool mediaAutoExpand;
+  bool mediaArtwork;
+};
+
+/* Defaults must match defaultWidgetSettings() in WebConfig, so a remote that
+   has never been synced draws the same thing WebConfig previews. */
+WidgetSettings widgetSettings = {
+  "", 0.0f, 0.0f, false, false, true,
+  true, false, 20,
+  false, "", true, true, true
+};
+
+struct WeatherReading {
+  bool valid;
+  uint32_t fetchedAtMs;
+  float temperatureC;
+  float highC;
+  float lowC;
+  bool rangeValid;
+  char condition[24];
+};
+
+WeatherReading weatherReading = { false, 0, 0.0f, 0.0f, 0.0f, false, "" };
+uint32_t weatherNextAttemptMs = 0;
+bool weatherWidgetPlaced = false;
+
+/*
+  What is playing on the device a Media widget points at.
+
+  position/duration are in seconds and positionAtMs records when the position
+  was last known to be true, so the progress bar can be advanced locally
+  between updates instead of polling the player once a second. Nothing fills
+  this in yet - the Cast client is the next piece of work - so a Media widget
+  currently draws its "nothing playing" face.
+*/
+struct NowPlaying {
+  bool valid;
+  bool playing;
+  char title[64];
+  char subtitle[48];
+  char source[24];
+  uint32_t position;
+  uint32_t duration;
+  uint32_t positionAtMs;
+  char artworkPath[80];
+};
+
+NowPlaying nowPlaying = { false, false, "", "", "", 0, 0, 0, "" };
 
 struct UiCommandBinding {
   DeviceCommand *command;
@@ -13067,6 +13188,80 @@ void applyRuntimeThemeRowCalibration() {
   }
 }
 
+uint8_t widgetKindFromName(const char *name) {
+  if (!name) return WIDGET_MEDIA;
+  if (strcmp(name, "weather") == 0) return WIDGET_WEATHER;
+  if (strcmp(name, "battery") == 0) return WIDGET_BATTERY;
+  return WIDGET_MEDIA;
+}
+
+const char *widgetKindName(uint8_t kind) {
+  if (kind == WIDGET_WEATHER) return "weather";
+  if (kind == WIDGET_BATTERY) return "battery";
+  return "media";
+}
+
+/*
+  Absent on a config written by a WebConfig older than 2.61, in which case
+  every field keeps its compiled default rather than being zeroed - a remote
+  that has not been re-synced should still draw sensible widgets.
+*/
+void applyWidgetSettingsJson(JsonObjectConst widgets) {
+  if (widgets.isNull()) return;
+
+  JsonObjectConst weather = widgets["weather"].as<JsonObjectConst>();
+  if (!weather.isNull()) {
+    strlcpy(widgetSettings.weatherLocation, weather["location"] | "",
+            sizeof(widgetSettings.weatherLocation));
+    bool hasLatitude = weather["latitude"].is<float>();
+    bool hasLongitude = weather["longitude"].is<float>();
+    float latitude = hasLatitude ? (float)(weather["latitude"] | 0.0f) : 0.0f;
+    float longitude = hasLongitude ? (float)(weather["longitude"] | 0.0f) : 0.0f;
+    /*
+      Only a genuine move invalidates the cached forecast. This runs on every
+      runtime reload - which is every sync, whatever the user actually
+      changed - so discarding unconditionally would refetch the weather
+      because somebody renamed a button, and would clear the retry backoff
+      each time Open-Meteo was unreachable.
+    */
+    bool moved = latitude != widgetSettings.weatherLatitude ||
+                 longitude != widgetSettings.weatherLongitude;
+    widgetSettings.weatherLatitude = latitude;
+    widgetSettings.weatherLongitude = longitude;
+    widgetSettings.weatherValidLocation = hasLatitude && hasLongitude;
+    widgetSettings.weatherFahrenheit = strcmp(weather["units"] | "c", "f") == 0;
+    widgetSettings.weatherShowRange = weather["showRange"] | true;
+    if (moved) {
+      weatherReading.valid = false;
+      weatherNextAttemptMs = 0;
+    }
+  }
+
+  JsonObjectConst battery = widgets["battery"].as<JsonObjectConst>();
+  if (!battery.isNull()) {
+    widgetSettings.batteryShowPercent = battery["showPercent"] | true;
+    widgetSettings.batteryShowVoltage = battery["showVoltage"] | false;
+    widgetSettings.batteryWarnBelow =
+      (uint8_t)constrain((int)(battery["warnBelow"] | 20), 5, 50);
+  }
+
+  JsonObjectConst media = widgets["media"].as<JsonObjectConst>();
+  if (!media.isNull()) {
+    widgetSettings.mediaUseNamedDevice = strcmp(media["source"] | "auto", "device") == 0;
+    strlcpy(widgetSettings.mediaDeviceId, media["deviceId"] | "",
+            sizeof(widgetSettings.mediaDeviceId));
+    widgetSettings.mediaViaDock = media["viaDock"] | true;
+    widgetSettings.mediaAutoExpand = media["autoExpand"] | true;
+    widgetSettings.mediaArtwork = media["artwork"] | true;
+  }
+
+  Serial.printf("Widgets: weather=%s battery(warn %u%%) media(%s, %s)\n",
+                widgetSettings.weatherValidLocation ? widgetSettings.weatherLocation : "no location",
+                widgetSettings.batteryWarnBelow,
+                widgetSettings.mediaUseNamedDevice ? "named device" : "follows the page",
+                widgetSettings.mediaViaDock ? "via dock" : "direct");
+}
+
 RuntimeThemeStyle *findRuntimeThemeStyle(const char *path) {
   if (!path || !path[0]) return nullptr;
   for (uint8_t i = 0; i < runtimeThemeCount; i++) {
@@ -13136,6 +13331,7 @@ void loadRuntimeModel(JsonDocument &doc) {
   bool smartBindingsApplied[MAX_RUNTIME_DEVICES] = {};
   clearRuntimeCommands();
   DEVICE_COUNT = 0;
+  weatherWidgetPlaced = false;
   ACTIVITY_COUNT = 0;
   MACRO_COUNT = 0;
   memset(devices, 0, sizeof(Device) * MAX_RUNTIME_DEVICES);
@@ -13368,15 +13564,30 @@ void loadRuntimeModel(JsonDocument &doc) {
       Tile &tile = activityTiles[activityIndex][activityTileCounts[activityIndex]++];
       const char *itemType = item["type"] | "button";
       tile.kind = strcmp(itemType, "activity") == 0 ? Tile::ACTIVITY :
-        (strcmp(itemType, "macro") == 0 ? Tile::MACRO : Tile::COMMAND);
+        (strcmp(itemType, "macro") == 0 ? Tile::MACRO :
+         (strcmp(itemType, "widget") == 0 ? Tile::WIDGET : Tile::COMMAND));
+      tile.widgetKind = widgetKindFromName(item["widget"] | "media");
       tile.slot = constrain((int)(item["slot"] | slotCursor), 0, 254);
-      int nextSlot = (int)tile.slot + (tile.kind == Tile::ACTIVITY ? 3 : 1);
+      int nextSlot = (int)tile.slot +
+        (tile.kind == Tile::WIDGET ? 6 : (tile.kind == Tile::ACTIVITY ? 3 : 1));
       slotCursor = (uint8_t)constrain(max((int)slotCursor, nextSlot), 0, 254);
       const char *label = item["name"] | "";
       if (!label[0]) label = item["label"] |
         (tile.kind == Tile::ACTIVITY ? "Activity" :
-         (tile.kind == Tile::MACRO ? "Macro" : "Button"));
+         (tile.kind == Tile::MACRO ? "Macro" :
+          (tile.kind == Tile::WIDGET ? "Widget" : "Button")));
       strlcpy(tile.label, label, sizeof(tile.label));
+      if (tile.kind == Tile::WIDGET) {
+        if (tile.widgetKind == WIDGET_WEATHER) weatherWidgetPlaced = true;
+        // Nothing else on a widget is configurable - it draws its own face.
+        tile.iconPath = nullptr;
+        tile.showText = false;
+        tile.boxMode = 0;
+        tile.repeat = false;
+        tile.deviceIndex = 0xFF;
+        tile.commandIndex = 0xFF;
+        continue;
+      }
       if (tile.kind == Tile::ACTIVITY) {
         strlcpy(tile.targetActivityId, item["refId"] | "",
                 sizeof(tile.targetActivityId));
@@ -13478,6 +13689,21 @@ void loadRuntimeModel(JsonDocument &doc) {
         if (slotCursor < 254) slotCursor++;
         continue;
       }
+      /*
+        A device page keeps its layout in the DeviceCommand records themselves
+        rather than in a Tile array, so a widget on one has no command to hang
+        off and needs its own small list.
+      */
+      if (strcmp(item["type"] | "", "widget") == 0) {
+        uint8_t widgetSlot = constrain((int)(item["slot"] | slotCursor), 0, 254);
+        slotCursor = (uint8_t)constrain((int)widgetSlot + 6, 0, 254);
+        if (device->widgetCount >= MAX_DEVICE_WIDGETS) continue;
+        DeviceWidget &placement = device->widgets[device->widgetCount++];
+        placement.kind = widgetKindFromName(item["widget"] | "media");
+        placement.slot = widgetSlot;
+        if (placement.kind == WIDGET_WEATHER) weatherWidgetPlaced = true;
+        continue;
+      }
       DeviceCommand *command = findRuntimeCommand(device, item["commandId"] | "");
       uint8_t itemSlot = constrain((int)(item["slot"] | slotCursor), 0, 254);
       if (slotCursor < 254) slotCursor++;
@@ -13521,6 +13747,7 @@ void loadRuntimeModel(JsonDocument &doc) {
   }
 
   applySettingsJson(doc["settings"]);
+  applyWidgetSettingsJson(doc["widgets"]);
   applyRuntimeThemeRowCalibration();
   rebuildPages();
   requestPageStripRebuild();
@@ -25317,6 +25544,771 @@ void makeTile(uint8_t slot, const char *label, const char *iconPath, bool showTe
   }
 }
 
+/* ====================================================================== *
+   Widget rendering
+
+   One face builder per widget kind draws into a container of a given size,
+   and is told whether it is drawing the small tile or the expanded page.
+   Both the tile on the page and the full-screen overlay go through the same
+   builder, so the two can never drift apart.
+ * ====================================================================== */
+
+// The built-in Montserrat faces carry ASCII only; the degree sign lives in
+// the project's own font, which is why a temperature is drawn as a number in
+// one font with the unit aligned beside it in another.
+extern "C" {
+  LV_FONT_DECLARE(lv_font_openremote_16);
+  LV_FONT_DECLARE(lv_font_openremote_20);
+}
+
+struct WidgetInstance {
+  lv_obj_t *card;
+  lv_obj_t *primary;    // percentage, temperature or title
+  lv_obj_t *secondary;  // meta line, condition or source
+  lv_obj_t *fill;       // progress fill or battery fill
+  lv_obj_t *left;       // elapsed
+  lv_obj_t *right;      // remaining
+  lv_obj_t *unit;       // the degree suffix beside a temperature
+  int8_t unitOffsetY;
+  int fillTrackWidth;
+  uint8_t kind;
+  bool expanded;
+};
+
+static const uint8_t MAX_LIVE_WIDGETS = 6;
+WidgetInstance widgetInstances[MAX_LIVE_WIDGETS];
+uint8_t widgetInstanceCount = 0;
+WidgetInstance widgetExpandedInstance = {};
+
+lv_obj_t *widgetExpandedOverlay = nullptr;
+uint8_t widgetExpandedKind = 0;
+bool widgetExpandedClosing = false;
+lv_area_t widgetExpandFrom = {0, 0, 0, 0};
+lv_area_t widgetExpandTo = {0, 0, 0, 0};
+uint32_t widgetLastServiceMs = 0;
+
+lv_color_t widgetMutedColour() {
+  return lvRgb(150, 165, 182);
+}
+
+lv_obj_t *makeWidgetLabel(lv_obj_t *parent, const char *text, int x, int y,
+                          const lv_font_t *font, lv_color_t colour, int width = 0,
+                          lv_text_align_t align = LV_TEXT_ALIGN_LEFT) {
+  lv_obj_t *label = makeLabel(parent, text, x, y, font, colour);
+  if (width > 0) {
+    lv_obj_set_width(label, width);
+    lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_align(label, align, 0);
+  }
+  return label;
+}
+
+void formatWidgetClock(char *out, size_t size, uint32_t seconds, bool negative) {
+  uint32_t hours = seconds / 3600U;
+  uint32_t minutes = (seconds / 60U) % 60U;
+  uint32_t remainder = seconds % 60U;
+  const char *sign = negative ? "-" : "";
+  if (hours) snprintf(out, size, "%s%lu:%02lu:%02lu", sign, (unsigned long)hours,
+                      (unsigned long)minutes, (unsigned long)remainder);
+  else snprintf(out, size, "%s%lu:%02lu", sign, (unsigned long)minutes,
+                (unsigned long)remainder);
+}
+
+/*
+  Where playback has reached right now. The player tells us a position and we
+  record when that was true, so the bar can be advanced from the local clock
+  instead of asking again every second. Clamped to the duration so a stale
+  record cannot run the bar off the end.
+*/
+uint32_t widgetMediaPosition() {
+  if (!nowPlaying.valid) return 0;
+  uint32_t position = nowPlaying.position;
+  if (nowPlaying.playing && nowPlaying.positionAtMs) {
+    position += (uint32_t)((millis() - nowPlaying.positionAtMs) / 1000UL);
+  }
+  if (nowPlaying.duration && position > nowPlaying.duration) position = nowPlaying.duration;
+  return position;
+}
+
+float widgetDisplayTemperature(float celsius) {
+  return widgetSettings.weatherFahrenheit ? (celsius * 9.0f / 5.0f) + 32.0f : celsius;
+}
+
+const char *widgetTemperatureUnit() {
+  return widgetSettings.weatherFahrenheit ? "\xC2\xB0" "F" : "\xC2\xB0" "C";
+}
+
+/*
+  Which player a Media widget is reporting on.
+
+  The point of the widget is that it follows the page rather than carrying a
+  device of its own: dropped on a Chromecast page it reports the Chromecast,
+  and on an Apple TV page the Apple TV, with no per-copy configuration. Only
+  someone who explicitly wants one fixed player sets it in WebConfig.
+
+  On an activity page there can be several devices in the activity, so a
+  transport that implies a media player wins over one that does not - an
+  activity that dims a light and starts a Chromecast should report the
+  Chromecast.
+*/
+Device *widgetMediaDevice() {
+  if (widgetSettings.mediaUseNamedDevice && widgetSettings.mediaDeviceId[0]) {
+    return findRuntimeDevice(widgetSettings.mediaDeviceId);
+  }
+  if (pages[currentPage].kind == PAGE_DEVICE && activeDevice >= 0 &&
+      activeDevice < (int)DEVICE_COUNT) {
+    return &devices[activeDevice];
+  }
+  if (pages[currentPage].kind == PAGE_ACTIVITY && activeActivity >= 0) {
+    uint16_t mask = activities[activeActivity].deviceMask;
+    Device *fallback = nullptr;
+    for (uint8_t i = 0; i < DEVICE_COUNT && i < 16; i++) {
+      if (!(mask & (uint16_t)(1U << i))) continue;
+      if (!fallback) fallback = &devices[i];
+      // BLE is how this remote drives an Android TV / Chromecast, so it is
+      // the strongest hint available that a device plays something.
+      if (strcasestr(devices[i].transport, "ble") ||
+          strcasestr(devices[i].name, "chromecast") ||
+          strcasestr(devices[i].name, "apple tv") ||
+          strcasestr(devices[i].name, "google tv")) {
+        return &devices[i];
+      }
+    }
+    return fallback;
+  }
+  return nullptr;
+}
+
+/* ---------------------------------------------------------------- media */
+void buildWidgetMediaFace(WidgetInstance &instance, lv_obj_t *parent,
+                          int width, int height, bool expanded) {
+  bool haveMedia = nowPlaying.valid;
+  int pad = expanded ? 14 : 8;
+
+  int artSize = expanded ? 126 : 66;
+  int artX = expanded ? (width - artSize) / 2 : pad;
+  int artY = expanded ? pad : (height - artSize) / 2;
+
+  lv_obj_t *art = lv_obj_create(parent);
+  lv_obj_remove_style_all(art);
+  lv_obj_set_pos(art, artX, artY);
+  lv_obj_set_size(art, artSize, artSize);
+  lv_obj_set_style_radius(art, expanded ? 16 : 10, 0);
+  lv_obj_set_style_bg_color(art, lvRgb(38, 48, 62), 0);
+  lv_obj_set_style_bg_opa(art, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_color(art, lv_color_white(), 0);
+  lv_obj_set_style_border_opa(art, LV_OPA_20, 0);
+  lv_obj_set_style_border_width(art, 1, 0);
+  lv_obj_clear_flag(art, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_clear_flag(art, LV_OBJ_FLAG_SCROLLABLE);
+
+  if (widgetSettings.mediaArtwork && haveMedia && nowPlaying.artworkPath[0]) {
+    lv_obj_t *poster = lv_img_create(art);
+    lv_img_set_src(poster, nowPlaying.artworkPath);
+    lv_obj_center(poster);
+    lv_obj_clear_flag(poster, LV_OBJ_FLAG_CLICKABLE);
+  } else {
+    lv_obj_t *placeholder = makeLabel(art, LV_SYMBOL_IMAGE, 0, 0,
+                                      expanded ? &lv_font_montserrat_24 : &lv_font_montserrat_16,
+                                      widgetMutedColour());
+    lv_obj_center(placeholder);
+  }
+
+  int textX = expanded ? pad : pad + artSize + 10;
+  int textWidth = expanded ? width - pad * 2 : width - textX - pad;
+  int textY = expanded ? pad + artSize + 12 : artY + 2;
+  lv_text_align_t align = expanded ? LV_TEXT_ALIGN_CENTER : LV_TEXT_ALIGN_LEFT;
+
+  instance.primary = makeWidgetLabel(parent,
+    haveMedia && nowPlaying.title[0] ? nowPlaying.title : "Nothing playing",
+    textX, textY, expanded ? &lv_font_montserrat_20 : &lv_font_montserrat_16,
+    textPrimary(), textWidth, align);
+
+  Device *player = widgetMediaDevice();
+  char idle[64];
+  if (player) snprintf(idle, sizeof(idle), "Waiting for %s", player->name);
+  else snprintf(idle, sizeof(idle), "No media device on this page");
+
+  const char *secondary = "";
+  if (haveMedia && nowPlaying.subtitle[0]) secondary = nowPlaying.subtitle;
+  else if (haveMedia && nowPlaying.source[0]) secondary = nowPlaying.source;
+  else secondary = idle;
+  instance.secondary = makeWidgetLabel(parent, secondary, textX,
+    textY + (expanded ? 28 : 21), &lv_font_montserrat_12, widgetMutedColour(),
+    textWidth, align);
+
+  int barY = textY + (expanded ? 58 : 41);
+  int trackWidth = textWidth;
+  lv_obj_t *track = lv_obj_create(parent);
+  lv_obj_remove_style_all(track);
+  lv_obj_set_pos(track, textX, barY);
+  lv_obj_set_size(track, trackWidth, expanded ? 6 : 4);
+  lv_obj_set_style_radius(track, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_color(track, lv_color_white(), 0);
+  lv_obj_set_style_bg_opa(track, LV_OPA_20, 0);
+  lv_obj_clear_flag(track, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_clear_flag(track, LV_OBJ_FLAG_SCROLLABLE);
+
+  instance.fill = lv_obj_create(track);
+  lv_obj_remove_style_all(instance.fill);
+  lv_obj_set_pos(instance.fill, 0, 0);
+  lv_obj_set_size(instance.fill, 0, expanded ? 6 : 4);
+  lv_obj_set_style_radius(instance.fill, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_color(instance.fill, lv_color_white(), 0);
+  lv_obj_set_style_bg_opa(instance.fill, LV_OPA_COVER, 0);
+  lv_obj_clear_flag(instance.fill, LV_OBJ_FLAG_CLICKABLE);
+  instance.fillTrackWidth = trackWidth;
+
+  int timesY = barY + (expanded ? 12 : 9);
+  instance.left = makeWidgetLabel(parent, "0:00", textX, timesY,
+    &lv_font_montserrat_10, widgetMutedColour(), trackWidth / 2, LV_TEXT_ALIGN_LEFT);
+  instance.right = makeWidgetLabel(parent, "0:00", textX + trackWidth / 2, timesY,
+    &lv_font_montserrat_10, widgetMutedColour(), trackWidth - trackWidth / 2,
+    LV_TEXT_ALIGN_RIGHT);
+}
+
+/* -------------------------------------------------------------- weather */
+void buildWidgetWeatherFace(WidgetInstance &instance, lv_obj_t *parent,
+                            int width, int height, bool expanded) {
+  int pad = expanded ? 16 : 10;
+  bool haveReading = weatherReading.valid;
+
+  char temperature[12];
+  if (haveReading) {
+    snprintf(temperature, sizeof(temperature), "%d",
+             (int)lroundf(widgetDisplayTemperature(weatherReading.temperatureC)));
+  } else {
+    snprintf(temperature, sizeof(temperature), "--");
+  }
+
+  instance.primary = makeLabel(parent, temperature, pad, expanded ? 46 : 10,
+    expanded ? &lv_font_montserrat_48 : &lv_font_montserrat_24, textPrimary());
+  if (expanded) lv_obj_align(instance.primary, LV_ALIGN_TOP_MID, -18, 44);
+
+  instance.unitOffsetY = expanded ? 8 : 3;
+  instance.unit = makeLabel(parent, widgetTemperatureUnit(), 0, 0,
+    expanded ? &lv_font_openremote_20 : &lv_font_openremote_16, widgetMutedColour());
+  lv_obj_align_to(instance.unit, instance.primary, LV_ALIGN_OUT_RIGHT_TOP, 3,
+                  instance.unitOffsetY);
+
+  const char *condition = haveReading && weatherReading.condition[0]
+    ? weatherReading.condition
+    : (widgetSettings.weatherValidLocation ? "Waiting for Wi-Fi" : "No location set");
+
+  if (expanded) {
+    instance.secondary = makeWidgetLabel(parent, condition, pad, 128,
+      &lv_font_montserrat_18, textPrimary(), width - pad * 2, LV_TEXT_ALIGN_CENTER);
+    makeWidgetLabel(parent,
+      widgetSettings.weatherLocation[0] ? widgetSettings.weatherLocation : "Set a location in WebConfig",
+      pad, 156, &lv_font_montserrat_12, widgetMutedColour(), width - pad * 2,
+      LV_TEXT_ALIGN_CENTER);
+  } else {
+    instance.secondary = makeWidgetLabel(parent, condition, pad, 44,
+      &lv_font_montserrat_12, textPrimary(), width - pad - 74, LV_TEXT_ALIGN_LEFT);
+    makeWidgetLabel(parent,
+      widgetSettings.weatherLocation[0] ? widgetSettings.weatherLocation : "No location",
+      pad, 62, &lv_font_montserrat_10, widgetMutedColour(), width - pad - 74,
+      LV_TEXT_ALIGN_LEFT);
+  }
+
+  if (!widgetSettings.weatherShowRange || !haveReading || !weatherReading.rangeValid) return;
+
+  char range[28];
+  snprintf(range, sizeof(range), "%d%s / %d%s",
+           (int)lroundf(widgetDisplayTemperature(weatherReading.highC)), widgetTemperatureUnit(),
+           (int)lroundf(widgetDisplayTemperature(weatherReading.lowC)), widgetTemperatureUnit());
+  if (expanded) {
+    makeWidgetLabel(parent, range, pad, 196, &lv_font_openremote_20,
+                    widgetMutedColour(), width - pad * 2, LV_TEXT_ALIGN_CENTER);
+  } else {
+    makeWidgetLabel(parent, range, width - pad - 80, 38, &lv_font_openremote_16,
+                    widgetMutedColour(), 80, LV_TEXT_ALIGN_RIGHT);
+  }
+}
+
+/* -------------------------------------------------------------- battery */
+void buildWidgetBatteryFace(WidgetInstance &instance, lv_obj_t *parent,
+                            int width, int height, bool expanded) {
+  int pad = expanded ? 16 : 10;
+  float percent = readBatteryPercent();
+  float voltage = readBatteryVoltage();
+  int level = percent >= 0.0f ? (int)lroundf(percent) : 0;
+  bool low = percent >= 0.0f && level < (int)widgetSettings.batteryWarnBelow;
+
+  int cellWidth = expanded ? 140 : 58;
+  int cellHeight = expanded ? 62 : 28;
+  int cellX = expanded ? (width - cellWidth) / 2 : pad;
+  int cellY = expanded ? 34 : (height - cellHeight) / 2;
+
+  lv_obj_t *cell = lv_obj_create(parent);
+  lv_obj_remove_style_all(cell);
+  lv_obj_set_pos(cell, cellX, cellY);
+  lv_obj_set_size(cell, cellWidth, cellHeight);
+  lv_obj_set_style_radius(cell, expanded ? 12 : 7, 0);
+  lv_obj_set_style_border_color(cell, lv_color_white(), 0);
+  lv_obj_set_style_border_opa(cell, LV_OPA_40, 0);
+  lv_obj_set_style_border_width(cell, 2, 0);
+  lv_obj_set_style_pad_all(cell, 3, 0);
+  lv_obj_clear_flag(cell, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_clear_flag(cell, LV_OBJ_FLAG_SCROLLABLE);
+
+  int innerWidth = cellWidth - 10;
+  int innerHeight = cellHeight - 10;
+  instance.fill = lv_obj_create(cell);
+  lv_obj_remove_style_all(instance.fill);
+  lv_obj_set_pos(instance.fill, 0, 0);
+  lv_obj_set_size(instance.fill, (innerWidth * level) / 100, innerHeight);
+  lv_obj_set_style_radius(instance.fill, expanded ? 8 : 4, 0);
+  lv_obj_set_style_bg_color(instance.fill, low ? lvRgb(255, 69, 58) : lvRgb(48, 209, 88), 0);
+  lv_obj_set_style_bg_opa(instance.fill, LV_OPA_COVER, 0);
+  lv_obj_clear_flag(instance.fill, LV_OBJ_FLAG_CLICKABLE);
+  instance.fillTrackWidth = innerWidth;
+
+  // The nub on the end of the cell, drawn as its own object so the outline
+  // above stays a plain rounded rectangle.
+  lv_obj_t *nub = lv_obj_create(parent);
+  lv_obj_remove_style_all(nub);
+  lv_obj_set_pos(nub, cellX + cellWidth, cellY + cellHeight / 2 - (expanded ? 10 : 5));
+  lv_obj_set_size(nub, expanded ? 6 : 4, expanded ? 20 : 10);
+  lv_obj_set_style_radius(nub, 3, 0);
+  lv_obj_set_style_bg_color(nub, lv_color_white(), 0);
+  lv_obj_set_style_bg_opa(nub, LV_OPA_40, 0);
+  lv_obj_clear_flag(nub, LV_OBJ_FLAG_CLICKABLE);
+
+  char headline[16];
+  if (widgetSettings.batteryShowPercent && percent >= 0.0f) {
+    snprintf(headline, sizeof(headline), "%d%%", level);
+  } else {
+    snprintf(headline, sizeof(headline), "%s", percent >= 0.0f ? "Battery" : "No gauge");
+  }
+
+  int textX = expanded ? pad : pad + cellWidth + 16;
+  int textWidth = expanded ? width - pad * 2 : width - textX - pad;
+  lv_text_align_t align = expanded ? LV_TEXT_ALIGN_CENTER : LV_TEXT_ALIGN_LEFT;
+  instance.primary = makeWidgetLabel(parent, headline, textX,
+    expanded ? 118 : cellY + 1,
+    expanded ? &lv_font_montserrat_48 : &lv_font_montserrat_24,
+    textPrimary(), textWidth, align);
+
+  char meta[48];
+  const char *state = chargingState ? "Charging" : "Discharging";
+  if (widgetSettings.batteryShowVoltage && voltage >= 0.0f) {
+    snprintf(meta, sizeof(meta), "%.2f V \xE2\x80\xA2 %s", voltage, state);
+  } else {
+    snprintf(meta, sizeof(meta), "%s", state);
+  }
+  instance.secondary = makeWidgetLabel(parent, meta, textX,
+    expanded ? 186 : cellY + 30, &lv_font_montserrat_12, widgetMutedColour(),
+    textWidth, align);
+
+  if (!expanded) return;
+
+  char link[56];
+  if (!espNowEnabled) snprintf(link, sizeof(link), "ESP-NOW off");
+  else if (dockConnected()) snprintf(link, sizeof(link), "Dock linked");
+  else if (espNowDeviceCount) snprintf(link, sizeof(link), "Dock paired, not in range");
+  else snprintf(link, sizeof(link), "No dock paired");
+  makeWidgetLabel(parent, link, pad, 214, &lv_font_montserrat_12,
+                  widgetMutedColour(), width - pad * 2, LV_TEXT_ALIGN_CENTER);
+}
+
+void buildWidgetFace(WidgetInstance &instance, lv_obj_t *parent, uint8_t kind,
+                     int width, int height, bool expanded) {
+  instance.card = parent;
+  instance.kind = kind;
+  instance.expanded = expanded;
+  instance.primary = nullptr;
+  instance.secondary = nullptr;
+  instance.fill = nullptr;
+  instance.left = nullptr;
+  instance.right = nullptr;
+  instance.unit = nullptr;
+  instance.unitOffsetY = 0;
+  instance.fillTrackWidth = 0;
+  if (kind == WIDGET_WEATHER) buildWidgetWeatherFace(instance, parent, width, height, expanded);
+  else if (kind == WIDGET_BATTERY) buildWidgetBatteryFace(instance, parent, width, height, expanded);
+  else buildWidgetMediaFace(instance, parent, width, height, expanded);
+}
+
+/*
+  Refreshes the values inside an already-built widget rather than rebuilding
+  it. A widget that rebuilt itself once a second would re-run layout and
+  re-decode its artwork every time, which on a 240x320 panel behind one SPI
+  bus is plainly visible.
+*/
+void refreshWidgetInstance(WidgetInstance &instance) {
+  if (!instance.card || !lv_obj_is_valid(instance.card)) return;
+
+  if (instance.kind == WIDGET_BATTERY) {
+    float percent = readBatteryPercent();
+    if (percent < 0.0f) return;
+    int level = (int)lroundf(percent);
+    bool low = level < (int)widgetSettings.batteryWarnBelow;
+    if (instance.fill && lv_obj_is_valid(instance.fill)) {
+      lv_obj_set_width(instance.fill, (instance.fillTrackWidth * level) / 100);
+      lv_obj_set_style_bg_color(instance.fill,
+        low ? lvRgb(255, 69, 58) : lvRgb(48, 209, 88), 0);
+    }
+    if (instance.primary && lv_obj_is_valid(instance.primary) &&
+        widgetSettings.batteryShowPercent) {
+      char headline[16];
+      snprintf(headline, sizeof(headline), "%d%%", level);
+      lv_label_set_text(instance.primary, headline);
+    }
+    if (instance.secondary && lv_obj_is_valid(instance.secondary)) {
+      char meta[48];
+      float voltage = readBatteryVoltage();
+      const char *state = chargingState ? "Charging" : "Discharging";
+      if (widgetSettings.batteryShowVoltage && voltage >= 0.0f) {
+        snprintf(meta, sizeof(meta), "%.2f V \xE2\x80\xA2 %s", voltage, state);
+      } else {
+        snprintf(meta, sizeof(meta), "%s", state);
+      }
+      lv_label_set_text(instance.secondary, meta);
+    }
+    return;
+  }
+
+  if (instance.kind == WIDGET_MEDIA) {
+    uint32_t position = widgetMediaPosition();
+    uint32_t duration = nowPlaying.duration;
+    if (instance.fill && lv_obj_is_valid(instance.fill)) {
+      int filled = duration ? (int)((uint64_t)instance.fillTrackWidth * position / duration) : 0;
+      lv_obj_set_width(instance.fill, filled);
+    }
+    char text[16];
+    if (instance.left && lv_obj_is_valid(instance.left)) {
+      formatWidgetClock(text, sizeof(text), position, false);
+      lv_label_set_text(instance.left, nowPlaying.valid ? text : "0:00");
+    }
+    if (instance.right && lv_obj_is_valid(instance.right)) {
+      uint32_t remaining = duration > position ? duration - position : 0;
+      formatWidgetClock(text, sizeof(text), remaining, true);
+      lv_label_set_text(instance.right, nowPlaying.valid && duration ? text : "0:00");
+    }
+    return;
+  }
+
+  if (instance.kind == WIDGET_WEATHER && weatherReading.valid) {
+    if (instance.primary && lv_obj_is_valid(instance.primary)) {
+      char temperature[12];
+      snprintf(temperature, sizeof(temperature), "%d",
+               (int)lroundf(widgetDisplayTemperature(weatherReading.temperatureC)));
+      lv_label_set_text(instance.primary, temperature);
+      if (instance.unit && lv_obj_is_valid(instance.unit)) {
+        lv_obj_align_to(instance.unit, instance.primary, LV_ALIGN_OUT_RIGHT_TOP, 3,
+                        instance.unitOffsetY);
+      }
+    }
+    if (instance.secondary && lv_obj_is_valid(instance.secondary) &&
+        weatherReading.condition[0]) {
+      lv_label_set_text(instance.secondary, weatherReading.condition);
+    }
+  }
+}
+
+/* ------------------------------------------------------- expand/collapse */
+void widgetExpandAnimExec(void *target, int32_t value) {
+  lv_obj_t *overlay = static_cast<lv_obj_t *>(target);
+  if (!overlay || !lv_obj_is_valid(overlay)) return;
+  int32_t fromX = widgetExpandFrom.x1;
+  int32_t fromY = widgetExpandFrom.y1;
+  int32_t fromW = lv_area_get_width(&widgetExpandFrom);
+  int32_t fromH = lv_area_get_height(&widgetExpandFrom);
+  int32_t toX = widgetExpandTo.x1;
+  int32_t toY = widgetExpandTo.y1;
+  int32_t toW = lv_area_get_width(&widgetExpandTo);
+  int32_t toH = lv_area_get_height(&widgetExpandTo);
+  lv_obj_set_pos(overlay,
+                 fromX + ((toX - fromX) * value) / 256,
+                 fromY + ((toY - fromY) * value) / 256);
+  lv_obj_set_size(overlay,
+                  fromW + ((toW - fromW) * value) / 256,
+                  fromH + ((toH - fromH) * value) / 256);
+}
+
+void widgetCollapseReady(lv_anim_t *animation) {
+  (void)animation;
+  if (widgetExpandedOverlay && lv_obj_is_valid(widgetExpandedOverlay)) {
+    lv_obj_del(widgetExpandedOverlay);
+  }
+  widgetExpandedOverlay = nullptr;
+  widgetExpandedClosing = false;
+  memset(&widgetExpandedInstance, 0, sizeof(widgetExpandedInstance));
+}
+
+void closeWidgetFullScreen() {
+  if (!widgetExpandedOverlay || widgetExpandedClosing) return;
+  widgetExpandedClosing = true;
+  // Nothing inside is worth touching once it starts shrinking, and the
+  // pointers go stale the moment the ready callback deletes the overlay.
+  memset(&widgetExpandedInstance, 0, sizeof(widgetExpandedInstance));
+
+  lv_anim_t animation;
+  lv_anim_init(&animation);
+  lv_anim_set_var(&animation, widgetExpandedOverlay);
+  lv_anim_set_exec_cb(&animation, widgetExpandAnimExec);
+  lv_anim_set_values(&animation, 256, 0);
+  lv_anim_set_time(&animation, 200);
+  lv_anim_set_path_cb(&animation, lv_anim_path_ease_in);
+  lv_anim_set_ready_cb(&animation, widgetCollapseReady);
+  lv_anim_start(&animation);
+}
+
+void dismissWidgetFullScreen() {
+  if (!widgetExpandedOverlay) return;
+  lv_anim_del(widgetExpandedOverlay, widgetExpandAnimExec);
+  if (lv_obj_is_valid(widgetExpandedOverlay)) lv_obj_del(widgetExpandedOverlay);
+  widgetExpandedOverlay = nullptr;
+  widgetExpandedClosing = false;
+  memset(&widgetExpandedInstance, 0, sizeof(widgetExpandedInstance));
+}
+
+void widgetOverlayEvent(lv_event_t *event) {
+  if (lv_event_get_code(event) != LV_EVENT_CLICKED) return;
+  closeWidgetFullScreen();
+}
+
+/*
+  Grows a widget from where it sits on the page to the whole screen.
+
+  The expanded contents are built once, at their final size, and only the
+  container's geometry is animated - LVGL clips children to their parent, so
+  the page is revealed as the box grows without a single relayout per frame.
+*/
+void openWidgetFullScreen(lv_obj_t *sourceTile, uint8_t kind) {
+  if (widgetExpandedOverlay) {
+    closeWidgetFullScreen();
+    return;
+  }
+  if (!uiRoot || !sourceTile || !lv_obj_is_valid(sourceTile)) return;
+
+  lv_area_t source;
+  lv_obj_get_coords(sourceTile, &source);
+  widgetExpandFrom = source;
+
+  const int top = 42;
+  const int bottom = 10;
+  widgetExpandTo.x1 = 6;
+  widgetExpandTo.y1 = top;
+  widgetExpandTo.x2 = LCD_W - 6 - 1;
+  widgetExpandTo.y2 = LCD_H - bottom - 1;
+
+  int finalWidth = lv_area_get_width(&widgetExpandTo);
+  int finalHeight = lv_area_get_height(&widgetExpandTo);
+
+  widgetExpandedOverlay = lv_obj_create(uiRoot);
+  lv_obj_remove_style_all(widgetExpandedOverlay);
+  lv_obj_set_pos(widgetExpandedOverlay, source.x1, source.y1);
+  lv_obj_set_size(widgetExpandedOverlay, lv_area_get_width(&source),
+                  lv_area_get_height(&source));
+  lv_obj_set_style_radius(widgetExpandedOverlay, 14, 0);
+  lv_obj_set_style_bg_color(widgetExpandedOverlay, lvRgb(10, 18, 30), 0);
+  lv_obj_set_style_bg_opa(widgetExpandedOverlay, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_color(widgetExpandedOverlay, lv_color_white(), 0);
+  lv_obj_set_style_border_opa(widgetExpandedOverlay, LV_OPA_20, 0);
+  lv_obj_set_style_border_width(widgetExpandedOverlay, 1, 0);
+  lv_obj_set_style_pad_all(widgetExpandedOverlay, 0, 0);
+  lv_obj_set_style_clip_corner(widgetExpandedOverlay, true, 0);
+  lv_obj_clear_flag(widgetExpandedOverlay, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(widgetExpandedOverlay, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(widgetExpandedOverlay, widgetOverlayEvent, LV_EVENT_CLICKED, nullptr);
+
+  widgetExpandedKind = kind;
+  buildWidgetFace(widgetExpandedInstance, widgetExpandedOverlay, kind,
+                  finalWidth, finalHeight, true);
+
+  makeWidgetLabel(widgetExpandedOverlay, "Tap to close", 0, finalHeight - 24,
+                  &lv_font_montserrat_10, widgetMutedColour(), finalWidth,
+                  LV_TEXT_ALIGN_CENTER);
+
+  lv_anim_t animation;
+  lv_anim_init(&animation);
+  lv_anim_set_var(&animation, widgetExpandedOverlay);
+  lv_anim_set_exec_cb(&animation, widgetExpandAnimExec);
+  lv_anim_set_values(&animation, 0, 256);
+  lv_anim_set_time(&animation, 240);
+  lv_anim_set_path_cb(&animation, lv_anim_path_ease_out);
+  lv_anim_start(&animation);
+}
+
+void widgetTileEvent(lv_event_t *event) {
+  if (lv_event_get_code(event) != LV_EVENT_CLICKED) return;
+  lv_obj_t *tile = lv_event_get_target(event);
+  uint8_t kind = (uint8_t)(uintptr_t)lv_event_get_user_data(event);
+  lastWakeMs = millis();
+  openWidgetFullScreen(tile, kind);
+}
+
+/*
+  Places one widget on the current page. slot is the widget's top-left grid
+  slot; it always starts a row, so only slot/3 matters for the y position.
+*/
+void makeWidgetTile(uint8_t slot, uint8_t kind) {
+  if (widgetInstanceCount >= MAX_LIVE_WIDGETS) return;
+  uint8_t row = slot / 3;
+  notePopulatedRemoteRow(row);
+  notePopulatedRemoteRow(row + 1);
+
+  lv_obj_t *card = lv_obj_create(content);
+  lv_obj_remove_style_all(card);
+  lv_obj_set_pos(card, 8, themeGridStartY() + row * 52);
+  lv_obj_set_size(card, WIDGET_TILE_WIDTH, WIDGET_TILE_HEIGHT);
+  registerSplitDiagnosticAnchor(card);
+  lv_obj_set_style_radius(card, 12, 0);
+  lv_color_t cardColour = activeRuntimeThemeStyle
+    ? lv_color_hex(activeRuntimeThemeStyle->glassColour) : lvRgb(30, 42, 58);
+  lv_opa_t cardOpacity = activeRuntimeThemeStyle
+    ? (lv_opa_t)activeRuntimeThemeStyle->glassOpacity : (lv_opa_t)58;
+  lv_obj_set_style_bg_color(card, cardColour, 0);
+  lv_obj_set_style_bg_opa(card, cardOpacity, 0);
+  lv_obj_set_style_border_color(card, lv_color_white(), 0);
+  lv_obj_set_style_border_opa(card, LV_OPA_20, 0);
+  lv_obj_set_style_border_width(card, 1, 0);
+  lv_obj_set_style_pad_all(card, 0, 0);
+  lv_obj_set_style_clip_corner(card, true, 0);
+  lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_flag(card, LV_OBJ_FLAG_GESTURE_BUBBLE);
+  lv_obj_add_event_cb(card, widgetTileEvent, LV_EVENT_CLICKED,
+                      (void *)(uintptr_t)kind);
+
+  WidgetInstance &instance = widgetInstances[widgetInstanceCount++];
+  buildWidgetFace(instance, card, kind, WIDGET_TILE_WIDTH, WIDGET_TILE_HEIGHT, false);
+  refreshWidgetInstance(instance);
+}
+
+/*
+  WMO weather interpretation codes, which is what Open-Meteo reports. Grouped
+  rather than listed one by one - the distinction between "slight" and
+  "moderate" drizzle is not worth a line on a 224px tile.
+*/
+const char *weatherConditionText(int code) {
+  if (code == 0) return "Clear";
+  if (code == 1) return "Mainly clear";
+  if (code == 2) return "Partly cloudy";
+  if (code == 3) return "Overcast";
+  if (code == 45 || code == 48) return "Fog";
+  if (code >= 51 && code <= 57) return "Drizzle";
+  if (code >= 61 && code <= 67) return "Rain";
+  if (code >= 71 && code <= 77) return "Snow";
+  if (code >= 80 && code <= 82) return "Showers";
+  if (code == 85 || code == 86) return "Snow showers";
+  if (code == 95) return "Thunderstorm";
+  if (code == 96 || code == 99) return "Thunderstorm, hail";
+  return "Unknown";
+}
+
+/*
+  Open-Meteo needs no API key and takes plain coordinates, which is why
+  WebConfig resolves the town name to a latitude and longitude at setup time
+  and stores those - geocoding from the remote would mean a second request
+  and a second thing to fail with the radio only briefly up.
+
+  Fetched at most every fifteen minutes, and only while the screen is awake:
+  a forecast nobody is looking at is not worth the Wi-Fi.
+*/
+void serviceWeatherWidget(uint32_t now) {
+  static const uint32_t WEATHER_REFRESH_MS = 15UL * 60UL * 1000UL;
+  static const uint32_t WEATHER_RETRY_MS = 2UL * 60UL * 1000UL;
+
+  if (!weatherWidgetPlaced || !widgetSettings.weatherValidLocation) return;
+  if (displaySleeping) return;
+  if (!wifiOn || WiFi.status() != WL_CONNECTED) return;
+  if (weatherNextAttemptMs && (int32_t)(now - weatherNextAttemptMs) < 0) return;
+  if (weatherReading.valid && (now - weatherReading.fetchedAtMs) < WEATHER_REFRESH_MS) return;
+
+  char url[220];
+  snprintf(url, sizeof(url),
+           "https://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f"
+           "&current=temperature_2m,weather_code"
+           "&daily=temperature_2m_max,temperature_2m_min"
+           "&timezone=auto&forecast_days=1",
+           widgetSettings.weatherLatitude, widgetSettings.weatherLongitude);
+
+  NetworkClientSecure secure;
+  // Open-Meteo is a public read-only endpoint and the remote carries no root
+  // store; a failed handshake here would only ever mean no temperature.
+  secure.setInsecure();
+
+  HTTPClient http;
+  http.setConnectTimeout(4000);
+  http.setTimeout(8000);
+  if (!http.begin(secure, url)) {
+    weatherNextAttemptMs = now + WEATHER_RETRY_MS;
+    Serial.println("Weather: could not open the forecast connection");
+    return;
+  }
+  http.addHeader("Accept", "application/json");
+  int status = http.GET();
+  if (status < 200 || status >= 300) {
+    http.end();
+    weatherNextAttemptMs = now + WEATHER_RETRY_MS;
+    Serial.printf("Weather: forecast request failed (HTTP %d)\n", status);
+    return;
+  }
+
+  JsonDocument filter(&psramJsonAllocator);
+  JsonObject current = filter["current"].to<JsonObject>();
+  current["temperature_2m"] = true;
+  current["weather_code"] = true;
+  JsonObject daily = filter["daily"].to<JsonObject>();
+  daily["temperature_2m_max"] = true;
+  daily["temperature_2m_min"] = true;
+
+  JsonDocument doc(&psramJsonAllocator);
+  DeserializationError parse = deserializeJson(doc, http.getStream(),
+                                               DeserializationOption::Filter(filter));
+  http.end();
+  if (parse) {
+    weatherNextAttemptMs = now + WEATHER_RETRY_MS;
+    Serial.printf("Weather: unreadable forecast (%s)\n", parse.c_str());
+    return;
+  }
+
+  JsonObjectConst readings = doc["current"].as<JsonObjectConst>();
+  if (readings.isNull() || !readings["temperature_2m"].is<float>()) {
+    weatherNextAttemptMs = now + WEATHER_RETRY_MS;
+    Serial.println("Weather: the forecast carried no current temperature");
+    return;
+  }
+
+  weatherReading.temperatureC = readings["temperature_2m"] | 0.0f;
+  strlcpy(weatherReading.condition,
+          weatherConditionText(readings["weather_code"] | -1),
+          sizeof(weatherReading.condition));
+
+  JsonArrayConst highs = doc["daily"]["temperature_2m_max"].as<JsonArrayConst>();
+  JsonArrayConst lows = doc["daily"]["temperature_2m_min"].as<JsonArrayConst>();
+  weatherReading.rangeValid = highs.size() > 0 && lows.size() > 0;
+  if (weatherReading.rangeValid) {
+    weatherReading.highC = highs[0] | 0.0f;
+    weatherReading.lowC = lows[0] | 0.0f;
+  }
+
+  weatherReading.valid = true;
+  weatherReading.fetchedAtMs = now;
+  weatherNextAttemptMs = 0;
+  Serial.printf("Weather: %s %.1fC (%.1f/%.1f) for %s\n",
+                weatherReading.condition, weatherReading.temperatureC,
+                weatherReading.highC, weatherReading.lowC,
+                widgetSettings.weatherLocation);
+
+  for (uint8_t i = 0; i < widgetInstanceCount; i++) refreshWidgetInstance(widgetInstances[i]);
+  if (widgetExpandedOverlay && !widgetExpandedClosing) {
+    refreshWidgetInstance(widgetExpandedInstance);
+  }
+}
+
+void serviceWidgets(uint32_t now) {
+  if (now - widgetLastServiceMs < 1000UL) return;
+  widgetLastServiceMs = now;
+  for (uint8_t i = 0; i < widgetInstanceCount; i++) refreshWidgetInstance(widgetInstances[i]);
+  if (widgetExpandedOverlay && !widgetExpandedClosing) {
+    refreshWidgetInstance(widgetExpandedInstance);
+  }
+}
+
 void renderActivityPage() {
   applyRuntimeTheme(activeActivity >= 0 ? activities[activeActivity].themePath : "");
   remotePageRowCount = 0;
@@ -25334,6 +26326,10 @@ void renderActivityPage() {
   uint8_t count = 0;
   const Tile *tiles = currentActivityTiles(count);
   for (uint8_t i = 0; i < count && i < MAX_ACTIVITY_TILES; i++) {
+    if (tiles[i].kind == Tile::WIDGET) {
+      makeWidgetTile(tiles[i].slot, tiles[i].widgetKind);
+      continue;
+    }
     if (tiles[i].kind == Tile::ACTIVITY) {
       int8_t targetActivityIndex = findRuntimeActivityIndex(tiles[i].targetActivityId);
       if (targetActivityIndex >= 0) {
@@ -25371,6 +26367,11 @@ void renderDevicePage() {
   lv_obj_set_style_pad_bottom(content, 12, 0);
   if (activeDevice < 0) activeDevice = 0;
   renderTopBar(devices[activeDevice].name, true);
+
+  for (uint8_t i = 0; i < devices[activeDevice].widgetCount; i++) {
+    makeWidgetTile(devices[activeDevice].widgets[i].slot,
+                   devices[activeDevice].widgets[i].kind);
+  }
 
   uint8_t count = devices[activeDevice].commandCount;
   for (uint8_t i = 0; i < count; i++) {
@@ -25604,6 +26605,12 @@ void renderCurrentPage() {
 
   lv_obj_clean(topBar);
   lv_obj_clean(content);
+  // Every widget instance points into the objects just destroyed, and an
+  // expanded widget hangs off uiRoot rather than content, so it would
+  // otherwise survive the page it belongs to.
+  dismissWidgetFullScreen();
+  widgetInstanceCount = 0;
+  memset(widgetInstances, 0, sizeof(widgetInstances));
   memset(batteryMetricNameLabels, 0, sizeof(batteryMetricNameLabels));
   memset(batteryMetricValueLabels, 0, sizeof(batteryMetricValueLabels));
   memset(displayValueLabels, 0, sizeof(displayValueLabels));
@@ -27200,6 +28207,10 @@ void loop() {
   serviceInternetTime(now);
   serviceNetworkPower(now);
   serviceBatteryHistory(now);
+  if (!displaySleeping) {
+    serviceWidgets(now);
+    serviceWeatherWidget(now);
+  }
   if (pendingRuntimeReload && (int32_t)(now - runtimeReloadAfterMs) >= 0) {
     pendingRuntimeReload = false;
     bool wasSleeping = displaySleeping;
