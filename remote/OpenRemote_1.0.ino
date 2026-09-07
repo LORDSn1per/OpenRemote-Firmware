@@ -1,6 +1,27 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.20 - 2026-09-07
+    - Home Assistant tiles show live state without a dock too. 4.19 only ever
+      populated them through the dock's WebSocket, so a remote with the relay
+      switched off - or with no dock at all - showed "--" forever while the
+      MQTT tiles beside them updated perfectly. That was an inconsistency,
+      not a decision: MQTT already had a direct path and Home Assistant
+      simply did not.
+    - Direct state is polled over REST while the screen is awake, one entity
+      every two and a half seconds, round-robin. A tile the user is looking
+      at is right within a few seconds, and nothing polls at all once the
+      screen sleeps.
+    - After a direct call the entity it acted on is polled immediately, so
+      pressing On updates that tile at once rather than at the next slot in
+      the rotation.
+    - The two paths are genuinely different and the settings page now says
+      which is which rather than implying the dock is required. Through the
+      dock, state arrives the instant Home Assistant reports it and keeps
+      arriving while the remote sleeps. Direct, it is only current while the
+      screen is on and costs Wi-Fi to keep there - which is the same trade
+      the MQTT switch makes.
+
   4.19 - 2026-09-07
     - Home Assistant tiles now show live state. A light's tile reads "on" or
       "off" from the server rather than assuming the last press worked, the
@@ -5040,7 +5061,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.19"
+#define OPENREMOTE_VERSION_STRING "4.20"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -5939,6 +5960,13 @@ uint32_t weatherNextAttemptMs = 0;
 bool weatherWidgetPlaced = false;
 bool weatherFetchWanted = false;
 bool weatherOwnsRadio = false;
+/* Home Assistant's direct polling holds the radio the same way, and is
+   declared here for the same reason: scheduleNetworkShutdown() and
+   serviceNetworkPower() sit far above where the rest of the HA code lives. */
+bool haDirectOwnsRadio = false;
+uint32_t haPollNextMs = 0;
+uint8_t haPollCursor = 0;
+const char *haRefreshNow = nullptr;   // Entity to re-read at the next chance.
 uint32_t weatherRadioStartedMs = 0;
 time_t weatherLastSlotEpoch = 0;
 
@@ -9525,7 +9553,7 @@ void scheduleNetworkShutdown(uint32_t delayMs = NETWORK_IDLE_SHUTDOWN_MS) {
     (settingsView == SETTINGS_WIFI || settingsView == SETTINGS_WIFI_PASSWORD ||
      settingsView == SETTINGS_WIFI_QR);
   if (wifiUiActive || ntpSyncPending || wifiScanPending || wifiConnectPending) return;
-  if (weatherOwnsRadio) return;
+  if (weatherOwnsRadio || haDirectOwnsRadio) return;
   networkShutdownAtMs = millis() + delayMs;
 }
 
@@ -9662,7 +9690,7 @@ void serviceNetworkPower(unsigned long now) {
     (settingsView == SETTINGS_WIFI || settingsView == SETTINGS_WIFI_PASSWORD ||
      settingsView == SETTINGS_WIFI_QR);
   if (!wifiUiActive && !ntpSyncPending && !wifiScanPending && !wifiConnectPending &&
-      !weatherOwnsRadio) {
+      !weatherOwnsRadio && !haDirectOwnsRadio) {
     if (bluetoothActivitySessionRequired()) parkNetworkStackForBle();
     else stopNetworkStack();
   }
@@ -13490,6 +13518,7 @@ char haDockErrorText[64] = "";
 volatile bool haConfigPushWanted = false;
 bool haWatchListPushed = false;
 
+
 String normaliseHomeAssistantUrl(const String &raw) {
   String url = raw;
   url.trim();
@@ -13578,7 +13607,12 @@ bool callHomeAssistantDirect(const DeviceCommand &command) {
   String response, error;
   int status = homeAssistantRequest("POST", "/api/services/" + domain + "/" + action,
                                     homeAssistantCallBody(command), response, error);
-  scheduleNetworkShutdown();
+  if (status >= 200 && status < 300 && command.haShowState) {
+    // Confirm from the server at the next service tick rather than assuming.
+    haRefreshNow = command.haEntityId;
+  } else {
+    scheduleNetworkShutdown();
+  }
   if (status < 200 || status >= 300) {
     Serial.printf("Home Assistant: %s on %s failed - %s\n", command.haService,
                   command.haEntityId, error.c_str());
@@ -13720,6 +13754,98 @@ void sendHomeAssistantWatchListToDock() {
   haWatchListPushed = true;
   Serial.printf("Dock: pushed %u Home Assistant entit%s to watch\n",
                 (unsigned)count, count == 1 ? "y" : "ies");
+}
+
+void releaseHomeAssistantRadio() {
+  if (!haDirectOwnsRadio) return;
+  haDirectOwnsRadio = false;
+  scheduleNetworkShutdown();
+}
+
+/*
+  Reads one entity's current state over REST.
+
+  Filtered to the single field that matters: a light with a colour wheel
+  reports a long attribute block, and none of it belongs on a 68px tile.
+*/
+bool pollHomeAssistantEntity(const char *entityId) {
+  if (!entityId || !entityId[0]) return false;
+  String response, error;
+  int status = homeAssistantRequest("GET", String("/api/states/") + entityId, "",
+                                    response, error);
+  if (status < 200 || status >= 300) {
+    Serial.printf("Home Assistant: could not read %s - %s\n", entityId, error.c_str());
+    return false;
+  }
+  JsonDocument filter;
+  filter["state"] = true;
+  JsonDocument doc(&psramJsonAllocator);
+  if (deserializeJson(doc, response, DeserializationOption::Filter(filter))) return false;
+  const char *state = doc["state"] | "";
+  if (!state[0]) return false;
+  setLiveState(entityId, state);
+  return true;
+}
+
+/*
+  Keeps Home Assistant tiles current.
+
+  Two quite different paths. With a dock, it holds the WebSocket and pushes
+  changes the moment they happen, including while this remote is asleep -
+  the remote only has to tell it what to watch. Without one, the remote
+  polls, but only while the screen is awake: a tile nobody is looking at is
+  not worth the radio, and the remote cannot hold a socket open the way a
+  mains powered dock can.
+*/
+void serviceHomeAssistantLive(uint32_t now) {
+  if (!homeAssistantConfigured()) {
+    releaseHomeAssistantRadio();
+    return;
+  }
+
+  if (homeAssistantShouldUseDock()) {
+    if (!haWatchListPushed && dockConnected()) sendHomeAssistantWatchListToDock();
+    releaseHomeAssistantRadio();
+    return;
+  }
+
+  const char *entities[MAX_LIVE_STATES];
+  uint8_t count = collectHomeAssistantEntities(entities, MAX_LIVE_STATES);
+  if (!count || displaySleeping) {
+    releaseHomeAssistantRadio();
+    return;
+  }
+
+  /* A tile the user just pressed jumps the queue - waiting out the rotation
+     to confirm a light came on reads as the button not having worked. */
+  if (haRefreshNow) {
+    const char *entityId = haRefreshNow;
+    haRefreshNow = nullptr;
+    if (WiFi.status() == WL_CONNECTED) {
+      pollHomeAssistantEntity(entityId);
+      return;
+    }
+  }
+
+  if (haPollNextMs && (int32_t)(now - haPollNextMs) < 0) return;
+  haPollNextMs = now + 2500UL;
+
+  if (WiFi.status() != WL_CONNECTED) {
+    if (!hasAnyWifiProfile()) return;
+    wifiOn = true;
+    ensureSelectedWifiProfile();
+    haDirectOwnsRadio = true;
+    networkShutdownAtMs = 0;
+    if (!ensureStationConnected(12000UL)) {
+      releaseHomeAssistantRadio();
+      haPollNextMs = now + 30000UL;
+      return;
+    }
+  }
+  haDirectOwnsRadio = true;
+  if (haPollCursor >= count) haPollCursor = 0;
+  pollHomeAssistantEntity(entities[haPollCursor]);
+  haPollCursor++;
 }
 
 bool transmitHomeAssistantCommand(const DeviceCommand &command) {
@@ -30128,12 +30254,7 @@ void loop() {
   if (!displaySleeping) serviceWidgets(now);
   serviceWeatherWidget(now);
   serviceMqtt(now);
-  /* Live Home Assistant state needs the dock: it is the only side that can
-     hold a WebSocket open, because the remote's radio is off. */
-  if (homeAssistantConfigured() && homeAssistantShouldUseDock() &&
-      !haWatchListPushed && dockConnected()) {
-    sendHomeAssistantWatchListToDock();
-  }
+  serviceHomeAssistantLive(now);
   if (liveStateDirty && !displaySleeping) {
     liveStateDirty = false;
     refreshLiveTiles();
