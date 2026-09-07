@@ -1,6 +1,29 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.17 - 2026-09-07
+    - Added MQTT, as a device transport beside IR, Bluetooth, Homebridge and
+      ESP-NOW rather than as a mode of its own. A command carries a topic and
+      a payload and publishes them; that is all the original OMOTE firmware
+      ever did with MQTT, and it is the piece that reaches hardware Homebridge
+      cannot see - a bare ESP32, a Tasmota plug, an MQTT-native doorbell.
+    - Unlike OMOTE the broker is configured in WebConfig rather than compiled
+      into secrets.h, so it can be changed without a rebuild and travels in
+      backups like everything else.
+    - A command can also name a state topic. The dock subscribes to it and
+      pushes changes to the remote, so a tile can read "Garage / OPEN" from
+      the broker instead of assuming what it last sent worked.
+    - Publishing goes through the dock by default, and this matters more than
+      it did for Homebridge. OMOTE holds Wi-Fi up permanently, which a mains
+      powered board can afford; this remote keeps its radio off, so a direct
+      publish has to associate first and a button would sit for seconds doing
+      nothing. Through the dock a press is an ESP-NOW burst and the dock,
+      which is already holding a broker session open, publishes immediately.
+      Direct publishing still works when no dock is paired.
+    - Topic and payload are heap strings rather than fixed arrays in
+      DeviceCommand, because 12 devices times 200 commands would have spent
+      about 300KB of PSRAM on fields that are empty for every IR button.
+
   4.16 - 2026-09-07
     - The weather widget draws a coloured icon. WebConfig had shown one all
       along, from an inline SVG in the designer, but the firmware drew no
@@ -4970,7 +4993,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.16"
+#define OPENREMOTE_VERSION_STRING "4.17"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -5007,6 +5030,7 @@ static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
 #include <esp_rom_crc.h>
 #include <HTTPClient.h>
 #include <NetworkClientSecure.h>
+#include <PubSubClient.h>
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <ESPmDNS.h>
@@ -5632,7 +5656,21 @@ struct DeviceCommand {
   bool repeatDefault;
   uint8_t espNowDeviceIndex;
   uint8_t espNowTransport;
-  enum Kind : uint8_t { NONE, PARSED, RAW, BLE_HID, HOMEBRIDGE, ESPNOW } kind;
+  /*
+    Heap strings rather than fixed arrays. MAX_RUNTIME_DEVICES *
+    MAX_DEVICE_COMMANDS is 2400 commands, so a 96-byte topic and a 48-byte
+    payload inline would cost roughly 300KB of PSRAM to hold nothing at all
+    for every IR button. duplicateRuntimeString() returns nullptr for an
+    empty value, so only real MQTT commands allocate; clearRuntimeCommands()
+    frees them beside iconPath and rawTimings.
+  */
+  char *mqttTopic;
+  char *mqttPayload;
+  char *mqttStateTopic;
+  char *mqttStateOnValue;
+  uint8_t mqttQos;
+  bool mqttRetain;
+  enum Kind : uint8_t { NONE, PARSED, RAW, BLE_HID, HOMEBRIDGE, ESPNOW, MQTT } kind;
 };
 
 // ESP-NOW transport values for DeviceCommand::espNowTransport - what the
@@ -5676,6 +5714,12 @@ static const uint32_t ESPNOW_DOCK_WIFI_MAGIC   = 0x4F525743UL;  // "ORWC"
 static const uint32_t ESPNOW_DOCK_HBCFG_MAGIC  = 0x4F524843UL;  // "ORHC"
 static const uint32_t ESPNOW_HOMEBRIDGE_MAGIC  = 0x4F524842UL;  // "ORHB"
 static const uint32_t ESPNOW_HOMEBRIDGE_RESULT_MAGIC = 0x4F524852UL;  // "ORHR"
+// --- MQTT over the dock ---
+static const uint32_t ESPNOW_DOCK_MQTTCFG_MAGIC   = 0x4F524D43UL;  // "ORMC"
+static const uint32_t ESPNOW_MQTT_PUBLISH_MAGIC   = 0x4F524D50UL;  // "ORMP"
+static const uint32_t ESPNOW_MQTT_RESULT_MAGIC    = 0x4F524D52UL;  // "ORMR"
+static const uint32_t ESPNOW_MQTT_SUBSCRIBE_MAGIC = 0x4F524D53UL;  // "ORMS"
+static const uint32_t ESPNOW_MQTT_STATE_MAGIC     = 0x4F524D54UL;  // "ORMT"
 
 struct __attribute__((packed)) EspNowDockInfoPacket {
   uint32_t magic;
@@ -6084,8 +6128,25 @@ bool dockLedOnTransmit = true;
 // default: it only works once the dock has the Wi-Fi and Homebridge details,
 // and quietly changing where commands originate would be a poor surprise.
 bool homebridgeViaDock = false;
+
+/*
+  MQTT broker.
+
+  Configured from WebConfig rather than compiled in the way OMOTE's
+  secrets.h was, so it can be changed without a rebuild and is covered by
+  backup and restore. The credentials live in NVS beside the Homebridge
+  ones and never travel in runtime.json.
+*/
+bool mqttEnabled = false;
+String mqttHost;
+uint16_t mqttPort = 1883;
+String mqttUsername;
+String mqttPassword;
+String mqttClientId;
+bool mqttViaDock = true;
 volatile bool homebridgeDockPending = false;
 volatile bool homebridgeConfigPushWanted = false;
+volatile bool mqttConfigPushWanted = false;
 volatile bool homebridgeDockOk = false;
 volatile int homebridgeDockStatus = 0;
 char homebridgeDockErrorText[64] = {0};
@@ -6815,6 +6876,58 @@ struct __attribute__((packed)) EspNowHomebridgeResultPacket {
   char error[64];
 };
 static_assert(sizeof(EspNowHomebridgeResultPacket) == 71, "Homebridge result layout drifted from the dock");
+
+/* --- MQTT over the dock ---------------------------------------------------
+   The dock is the natural home for MQTT. It is mains powered and already
+   holds Wi-Fi up permanently for the Homebridge relay, so it can keep a
+   broker session and its subscriptions alive; the remote cannot, because its
+   radio is off whenever nothing needs it.
+
+   Every layout below is pinned with a static_assert and must match the dock
+   firmware byte for byte. */
+struct __attribute__((packed)) EspNowDockMqttPacket {
+  uint32_t magic;
+  uint16_t port;
+  uint8_t enabled;
+  char host[65];
+  char username[33];
+  char password[65];
+  char clientId[33];
+};
+static_assert(sizeof(EspNowDockMqttPacket) == 203, "dock MQTT config layout drifted from the dock");
+
+struct __attribute__((packed)) EspNowMqttPublishPacket {
+  uint32_t magic;
+  uint8_t qos;
+  uint8_t retain;
+  char topic[96];
+  char payload[96];
+};
+static_assert(sizeof(EspNowMqttPublishPacket) == 198, "MQTT publish layout drifted from the dock");
+
+struct __attribute__((packed)) EspNowMqttResultPacket {
+  uint32_t magic;
+  uint8_t ok;
+  char error[64];
+};
+static_assert(sizeof(EspNowMqttResultPacket) == 69, "MQTT result layout drifted from the dock");
+
+/* One topic per frame. total is how many frames make up this list, so the
+   dock knows when it has the whole thing; total 0 clears every subscription. */
+struct __attribute__((packed)) EspNowMqttSubscribePacket {
+  uint32_t magic;
+  uint8_t index;
+  uint8_t total;
+  char topic[96];
+};
+static_assert(sizeof(EspNowMqttSubscribePacket) == 102, "MQTT subscribe layout drifted from the dock");
+
+struct __attribute__((packed)) EspNowMqttStatePacket {
+  uint32_t magic;
+  char topic[96];
+  char value[64];
+};
+static_assert(sizeof(EspNowMqttStatePacket) == 164, "MQTT state layout drifted from the dock");
 
 struct __attribute__((packed)) EspNowRfLearnStartPacket {
   uint32_t magic;
@@ -9021,6 +9134,8 @@ void loadSettings() {
   dockRfEnabled = preferences.getBool("dockRf", true);
   dockLedOnTransmit = preferences.getBool("dockLed", true);
   homebridgeViaDock = preferences.getBool("hbViaDock", false);
+  mqttEnabled = preferences.getBool("mqEn", false);
+  mqttViaDock = preferences.getBool("mqViaDock", true);
   espNowTxPower = preferences.getUChar("enTxPwr", 2);
   if (espNowTxPower > 2) espNowTxPower = 2;
   clockEnabled = preferences.getBool("clock", true);
@@ -9090,6 +9205,11 @@ void loadSettings() {
   homebridgeAddress = preferences.getString("hbAddr", "");
   homebridgeUsername = preferences.getString("hbUser", "");
   homebridgePassword = preferences.getString("hbPass", "");
+  mqttHost = preferences.getString("mqHost", "");
+  mqttUsername = preferences.getString("mqUser", "");
+  mqttPassword = preferences.getString("mqPass", "");
+  mqttClientId = preferences.getString("mqCid", "");
+  mqttPort = (uint16_t)preferences.getUShort("mqPort", 1883);
   remoteName = preferences.getString("remoteName", "OpenRemote");
   preferences.end();
 
@@ -9141,6 +9261,22 @@ void loadSettings() {
   }
   if (migratedWifiProfile) saveWifiProfiles();
   raiseToWake = true;
+}
+
+void saveMqttCredentials(const String &host, uint16_t port, const String &username,
+                         const String &password, const String &clientId) {
+  mqttHost = host;
+  mqttPort = port ? port : 1883;
+  mqttUsername = username;
+  mqttPassword = password;
+  mqttClientId = clientId;
+  preferences.begin(PREFERENCES_NAMESPACE, false);
+  preferences.putString("mqHost", mqttHost);
+  preferences.putUShort("mqPort", mqttPort);
+  preferences.putString("mqUser", mqttUsername);
+  preferences.putString("mqPass", mqttPassword);
+  preferences.putString("mqCid", mqttClientId);
+  preferences.end();
 }
 
 void saveHomebridgeCredentials(const String &address, const String &username,
@@ -11800,6 +11936,20 @@ void applySettingsJson(JsonVariantConst settings) {
   dockRfEnabled = settings["dockRfEnabled"] | dockRfEnabled;
   dockLedOnTransmit = settings["dockLedOnTransmit"] | dockLedOnTransmit;
   homebridgeViaDock = settings["homebridgeViaDock"] | homebridgeViaDock;
+  /* Host and port are not secret and ride in runtime.json so a restore puts
+     them back; the username and password stay in NVS. */
+  mqttEnabled = settings["mqttEnabled"] | mqttEnabled;
+  mqttViaDock = settings["mqttViaDock"] | mqttViaDock;
+  if (settings["mqttHost"].is<const char *>()) {
+    mqttHost = String((const char *)(settings["mqttHost"] | ""));
+  }
+  if (settings["mqttPort"].is<int>()) {
+    int port = settings["mqttPort"] | 1883;
+    mqttPort = (uint16_t)constrain(port, 1, 65535);
+  }
+  if (settings["mqttClientId"].is<const char *>()) {
+    mqttClientId = String((const char *)(settings["mqttClientId"] | ""));
+  }
   // Push straight to the dock when either changed, so WebConfig's switches
   // take effect immediately rather than at the next reboot.
   if (previousRf != dockRfEnabled || previousLed != dockLedOnTransmit) sendDockSettings();
@@ -11860,6 +12010,18 @@ void clearRuntimeCommands() {
       if (devices[deviceIndex].commands[commandIndex].iconPath) {
         free(devices[deviceIndex].commands[commandIndex].iconPath);
         devices[deviceIndex].commands[commandIndex].iconPath = nullptr;
+      }
+      char **mqttStrings[4] = {
+        &devices[deviceIndex].commands[commandIndex].mqttTopic,
+        &devices[deviceIndex].commands[commandIndex].mqttPayload,
+        &devices[deviceIndex].commands[commandIndex].mqttStateTopic,
+        &devices[deviceIndex].commands[commandIndex].mqttStateOnValue
+      };
+      for (uint8_t s = 0; s < 4; s++) {
+        if (*mqttStrings[s]) {
+          free(*mqttStrings[s]);
+          *mqttStrings[s] = nullptr;
+        }
       }
     }
   }
@@ -12798,6 +12960,357 @@ bool homebridgeLogin(const String &address, const String &username,
   return true;
 }
 
+/* ====================================================================== *
+   MQTT
+
+   OMOTE published a topic and a payload from a button and that was the whole
+   feature; this keeps that shape but configures the broker from WebConfig
+   rather than compiling it into secrets.h.
+
+   The important difference is where the connection lives. OMOTE calls
+   WiFi.begin() at boot and never lets go, which a mains powered board can
+   afford. This remote turns its radio off whenever nothing needs it, so a
+   direct publish has to associate first - seconds, on a button press. The
+   dock is already holding Wi-Fi up for the Homebridge relay, so by default
+   a press is an ESP-NOW burst and the dock, which keeps a broker session
+   and its subscriptions alive, publishes at once. Direct publishing remains
+   for a remote with no dock paired.
+ * ====================================================================== */
+WiFiClient mqttNetClient;
+PubSubClient mqttClient(mqttNetClient);
+
+bool mqttOwnsRadio = false;
+uint32_t mqttRadioStartedMs = 0;
+uint32_t mqttIdleReleaseAtMs = 0;
+uint32_t mqttNextConnectMs = 0;
+bool mqttSubscriptionsPushed = false;
+
+// A dock publish is answered, so the UI can report a failure rather than
+// flashing success at a command that went nowhere.
+volatile bool mqttDockPending = false;
+volatile bool mqttDockOk = false;
+char mqttDockErrorText[64] = "";
+
+/*
+  Last known value of every subscribed topic. Small and fixed: a page can
+  only show so many live tiles, and an unbounded cache on a device with no
+  way to evict it is a slow leak.
+*/
+struct MqttStateEntry {
+  char topic[96];
+  char value[48];
+  bool valid;
+};
+static const uint8_t MAX_MQTT_STATES = 16;
+MqttStateEntry mqttStates[MAX_MQTT_STATES];
+uint8_t mqttStateCount = 0;
+bool mqttStateDirty = false;
+
+String mqttEffectiveClientId() {
+  if (mqttClientId.length()) return mqttClientId;
+  String mac = WiFi.macAddress();
+  mac.replace(":", "");
+  return String("OpenRemote-") + mac;
+}
+
+bool mqttConfigured() {
+  return mqttEnabled && mqttHost.length();
+}
+
+bool mqttShouldUseDock() {
+  return mqttViaDock && espNowEnabled && espNowDeviceCount > 0;
+}
+
+const char *mqttStateFor(const char *topic) {
+  if (!topic || !topic[0]) return nullptr;
+  for (uint8_t i = 0; i < mqttStateCount; i++) {
+    if (mqttStates[i].valid && strcmp(mqttStates[i].topic, topic) == 0) {
+      return mqttStates[i].value;
+    }
+  }
+  return nullptr;
+}
+
+void setMqttState(const char *topic, const char *value) {
+  if (!topic || !topic[0]) return;
+  for (uint8_t i = 0; i < mqttStateCount; i++) {
+    if (strcmp(mqttStates[i].topic, topic) != 0) continue;
+    if (strcmp(mqttStates[i].value, value ? value : "") == 0) return;
+    strlcpy(mqttStates[i].value, value ? value : "", sizeof(mqttStates[i].value));
+    mqttStates[i].valid = true;
+    mqttStateDirty = true;
+    return;
+  }
+  if (mqttStateCount >= MAX_MQTT_STATES) return;
+  MqttStateEntry &entry = mqttStates[mqttStateCount++];
+  strlcpy(entry.topic, topic, sizeof(entry.topic));
+  strlcpy(entry.value, value ? value : "", sizeof(entry.value));
+  entry.valid = true;
+  mqttStateDirty = true;
+}
+
+/* Walks the model for every state topic a command asks to watch. */
+uint8_t collectMqttStateTopics(const char *topics[], uint8_t maximum) {
+  uint8_t count = 0;
+  for (uint8_t d = 0; d < DEVICE_COUNT && count < maximum; d++) {
+    for (uint16_t c = 0; c < devices[d].commandCount && count < maximum; c++) {
+      const DeviceCommand &command = devices[d].commands[c];
+      if (command.kind != DeviceCommand::MQTT) continue;
+      if (!command.mqttStateTopic || !command.mqttStateTopic[0]) continue;
+      bool seen = false;
+      for (uint8_t i = 0; i < count; i++) {
+        if (strcmp(topics[i], command.mqttStateTopic) == 0) { seen = true; break; }
+      }
+      if (!seen) topics[count++] = command.mqttStateTopic;
+    }
+  }
+  return count;
+}
+
+void mqttMessageArrived(char *topic, byte *payload, unsigned int length) {
+  char value[48];
+  unsigned int copy = length < sizeof(value) - 1 ? length : sizeof(value) - 1;
+  memcpy(value, payload, copy);
+  value[copy] = '\0';
+  setMqttState(topic, value);
+  Serial.printf("MQTT: %s = %s\n", topic, value);
+}
+
+void releaseMqttRadio() {
+  if (!mqttOwnsRadio) return;
+  mqttOwnsRadio = false;
+  scheduleNetworkShutdown();
+}
+
+/*
+  Brings the station up and logs in to the broker. Only used when no dock is
+  carrying MQTT - see the note at the top of this section about why that is
+  the slower path.
+*/
+bool mqttConnectDirect(String &error) {
+  if (!mqttConfigured()) {
+    error = "MQTT is not configured";
+    return false;
+  }
+  if (mqttClient.connected()) return true;
+
+  if (WiFi.status() != WL_CONNECTED) {
+    if (!hasAnyWifiProfile()) {
+      error = "No saved Wi-Fi network";
+      return false;
+    }
+    wifiOn = true;
+    ensureSelectedWifiProfile();
+    mqttOwnsRadio = true;
+    mqttRadioStartedMs = millis();
+    networkShutdownAtMs = 0;
+    if (!ensureStationConnected(12000UL)) {
+      error = "Could not connect OpenRemote to its saved Wi-Fi network";
+      releaseMqttRadio();
+      return false;
+    }
+  }
+
+  mqttClient.setBufferSize(512);
+  mqttClient.setServer(mqttHost.c_str(), mqttPort);
+  mqttClient.setCallback(mqttMessageArrived);
+  String clientId = mqttEffectiveClientId();
+  bool connected = mqttUsername.length()
+    ? mqttClient.connect(clientId.c_str(), mqttUsername.c_str(), mqttPassword.c_str())
+    : mqttClient.connect(clientId.c_str());
+  if (!connected) {
+    error = String("Broker refused the connection (state ") + mqttClient.state() + ")";
+    return false;
+  }
+  Serial.printf("MQTT: connected to %s:%u as %s\n", mqttHost.c_str(),
+                (unsigned)mqttPort, clientId.c_str());
+
+  const char *topics[MAX_MQTT_STATES];
+  uint8_t count = collectMqttStateTopics(topics, MAX_MQTT_STATES);
+  for (uint8_t i = 0; i < count; i++) mqttClient.subscribe(topics[i]);
+  if (count) Serial.printf("MQTT: subscribed to %u state topic(s)\n", count);
+  return true;
+}
+
+/* Hands the dock the broker details, as sendHomebridgeConfigToDock() does
+   for Homebridge - on every change and whenever the link comes up, never
+   only once, so a dock that was reflashed or out of range is not left with
+   nothing and no way to say so. */
+void sendMqttConfigToDock() {
+  if (!espNowEnabled || espNowDeviceCount == 0) return;
+  if (!ensureEspNowLink()) return;
+
+  EspNowDockMqttPacket packet = {};
+  packet.magic = ESPNOW_DOCK_MQTTCFG_MAGIC;
+  packet.port = mqttPort;
+  packet.enabled = mqttConfigured() ? 1 : 0;
+  strlcpy(packet.host, mqttHost.c_str(), sizeof(packet.host));
+  strlcpy(packet.username, mqttUsername.c_str(), sizeof(packet.username));
+  strlcpy(packet.password, mqttPassword.c_str(), sizeof(packet.password));
+  String clientId = mqttEffectiveClientId();
+  strlcpy(packet.clientId, clientId.c_str(), sizeof(packet.clientId));
+  sendEspNowWithRetry(espNowDevices[0].mac, (const uint8_t *)&packet, sizeof(packet));
+  Serial.printf("Dock: pushed MQTT broker %s:%u (%s)\n",
+                packet.host[0] ? packet.host : "(not configured)",
+                (unsigned)packet.port, packet.enabled ? "enabled" : "disabled");
+  mqttSubscriptionsPushed = false;
+}
+
+/* One frame per topic, numbered so the dock knows when it has the set.
+   total 0 tells it to drop everything it was watching. */
+void sendMqttSubscriptionsToDock() {
+  if (!espNowEnabled || espNowDeviceCount == 0) return;
+  if (!ensureEspNowLink()) return;
+
+  const char *topics[MAX_MQTT_STATES];
+  uint8_t count = collectMqttStateTopics(topics, MAX_MQTT_STATES);
+
+  EspNowMqttSubscribePacket packet = {};
+  packet.magic = ESPNOW_MQTT_SUBSCRIBE_MAGIC;
+  packet.total = count;
+  if (!count) {
+    packet.index = 0;
+    sendEspNowWithRetry(espNowDevices[0].mac, (const uint8_t *)&packet, sizeof(packet));
+  }
+  for (uint8_t i = 0; i < count; i++) {
+    packet.index = i;
+    strlcpy(packet.topic, topics[i], sizeof(packet.topic));
+    sendEspNowWithRetry(espNowDevices[0].mac, (const uint8_t *)&packet, sizeof(packet));
+    delay(12);   // Give the dock time to subscribe before the next arrives.
+  }
+  mqttSubscriptionsPushed = true;
+  Serial.printf("Dock: pushed %u MQTT subscription(s)\n", count);
+}
+
+bool publishMqttViaDock(const DeviceCommand &command) {
+  EspNowMqttPublishPacket packet = {};
+  packet.magic = ESPNOW_MQTT_PUBLISH_MAGIC;
+  packet.qos = command.mqttQos;
+  packet.retain = command.mqttRetain ? 1 : 0;
+  strlcpy(packet.topic, command.mqttTopic ? command.mqttTopic : "", sizeof(packet.topic));
+  strlcpy(packet.payload, command.mqttPayload ? command.mqttPayload : "", sizeof(packet.payload));
+
+  if (!ensureEspNowLink()) {
+    Serial.println("MQTT via dock: could not bring the link up");
+    return false;
+  }
+  mqttDockPending = true;
+  mqttDockOk = false;
+  mqttDockErrorText[0] = '\0';
+  if (!sendEspNowWithRetry(espNowDevices[0].mac, (const uint8_t *)&packet, sizeof(packet))) {
+    mqttDockPending = false;
+    Serial.println("MQTT via dock: the publish did not reach the dock");
+    return false;
+  }
+  unsigned long started = millis();
+  while (mqttDockPending && (millis() - started) < 4000UL) delay(5);
+  if (mqttDockPending) {
+    mqttDockPending = false;
+    Serial.println("MQTT via dock: the dock did not answer in time");
+    return false;
+  }
+  if (!mqttDockOk) {
+    Serial.printf("MQTT via dock: %s\n",
+                  mqttDockErrorText[0] ? mqttDockErrorText : "failed");
+    /* Same second chance the Homebridge relay gives: a dock saying it has no
+       broker was reflashed, asleep or out of range when the details were
+       pushed, and pushing only on that transition left no way to recover. */
+    if (strstr(mqttDockErrorText, "no broker") || strstr(mqttDockErrorText, "not on Wi-Fi")) {
+      Serial.println("MQTT via dock: re-sending broker details and retrying");
+      sendMqttConfigToDock();
+      delay(1200);
+      mqttDockPending = true;
+      mqttDockOk = false;
+      mqttDockErrorText[0] = '\0';
+      if (sendEspNowWithRetry(espNowDevices[0].mac, (const uint8_t *)&packet, sizeof(packet))) {
+        unsigned long retry = millis();
+        while (mqttDockPending && (millis() - retry) < 6000UL) delay(5);
+        if (!mqttDockPending && mqttDockOk) return true;
+      }
+      mqttDockPending = false;
+    }
+    return false;
+  }
+  Serial.printf("MQTT via dock: %s = %s\n", packet.topic, packet.payload);
+  return true;
+}
+
+bool publishMqttDirect(const DeviceCommand &command) {
+  String error;
+  if (!mqttConnectDirect(error)) {
+    Serial.printf("MQTT: %s\n", error.c_str());
+    return false;
+  }
+  bool ok = mqttClient.publish(command.mqttTopic,
+                               command.mqttPayload ? command.mqttPayload : "",
+                               command.mqttRetain);
+  Serial.printf("MQTT: publish %s = %s %s\n", command.mqttTopic,
+                command.mqttPayload ? command.mqttPayload : "",
+                ok ? "ok" : "FAILED");
+  // Hold the session briefly: a user pressing several buttons should not pay
+  // for a reconnect each time.
+  mqttIdleReleaseAtMs = millis() + 20000UL;
+  return ok;
+}
+
+bool transmitMqttCommand(const DeviceCommand &command) {
+  if (!mqttConfigured()) {
+    Serial.println("MQTT: no broker configured");
+    return false;
+  }
+  if (!command.mqttTopic || !command.mqttTopic[0]) {
+    // A state-only tile is an indicator, not a button; nothing to send.
+    return false;
+  }
+  bool sent = mqttShouldUseDock() ? publishMqttViaDock(command)
+                                  : publishMqttDirect(command);
+  if (sent && mqttShouldUseDock()) flashEspNowCommandFeedback();
+  return sent;
+}
+
+void serviceMqtt(uint32_t now) {
+  if (!mqttConfigured()) return;
+
+  if (mqttShouldUseDock()) {
+    // The dock owns the session; the remote only has to make sure the dock
+    // knows what to watch.
+    if (!mqttSubscriptionsPushed && dockConnected()) sendMqttSubscriptionsToDock();
+    return;
+  }
+
+  if (mqttClient.connected()) {
+    mqttClient.loop();
+    if (mqttIdleReleaseAtMs && (int32_t)(now - mqttIdleReleaseAtMs) >= 0) {
+      mqttIdleReleaseAtMs = 0;
+      mqttClient.disconnect();
+      releaseMqttRadio();
+      Serial.println("MQTT: session idle, radio released");
+    }
+    return;
+  }
+
+  /* Without a dock the subscriptions can only live while the screen is awake
+     and the radio is up. Reconnect on that basis rather than holding the
+     radio permanently, which is the whole reason the dock path exists. */
+  bool wantSubscriptions = false;
+  const char *topics[MAX_MQTT_STATES];
+  if (!displaySleeping && collectMqttStateTopics(topics, MAX_MQTT_STATES)) {
+    wantSubscriptions = true;
+  }
+  if (!wantSubscriptions) {
+    releaseMqttRadio();
+    return;
+  }
+  if (mqttNextConnectMs && (int32_t)(now - mqttNextConnectMs) < 0) return;
+  String error;
+  if (!mqttConnectDirect(error)) {
+    mqttNextConnectMs = now + 30000UL;
+    return;
+  }
+  mqttNextConnectMs = 0;
+  mqttIdleReleaseAtMs = 0;
+}
+
 bool homebridgeAuthorizedRequest(const char *method, const String &path,
                                  const String &payload, String &response,
                                  int &status, String &error) {
@@ -13129,6 +13642,9 @@ void endVoiceSearchHold(const DeviceCommand *command) {
 bool transmitIrCommand(const DeviceCommand &command) {
   if (command.kind == DeviceCommand::HOMEBRIDGE) {
     return transmitHomebridgeCommand(command);
+  }
+  if (command.kind == DeviceCommand::MQTT) {
+    return transmitMqttCommand(command);
   }
   if (command.kind == DeviceCommand::BLE_HID) {
     if (!bleReady) applyBluetoothState();
@@ -13635,7 +14151,31 @@ void loadRuntimeModel(JsonDocument &doc) {
             runtimeCommand.homebridgeCharacteristic[0]) {
           runtimeCommand.kind = DeviceCommand::HOMEBRIDGE;
         }
-      } else if (runtimeCommand.kind == DeviceCommand::NONE) {
+      }
+
+      /*
+        An MQTT command is a topic and a payload, which is all OMOTE's ever
+        was. stateTopic is this build's addition: name a topic to subscribe
+        to and the tile reports what the broker says rather than assuming
+        the last publish worked.
+      */
+      JsonObjectConst mqtt = command["mqtt"].as<JsonObjectConst>();
+      if (!mqtt.isNull()) {
+        runtimeCommand.mqttTopic = duplicateRuntimeString(String(mqtt["topic"] | ""));
+        runtimeCommand.mqttPayload = duplicateRuntimeString(String(mqtt["payload"] | ""));
+        runtimeCommand.mqttStateTopic = duplicateRuntimeString(String(mqtt["stateTopic"] | ""));
+        runtimeCommand.mqttStateOnValue = duplicateRuntimeString(String(mqtt["onValue"] | ""));
+        runtimeCommand.mqttQos = (uint8_t)constrain((int)(mqtt["qos"] | 0), 0, 1);
+        runtimeCommand.mqttRetain = mqtt["retain"] | false;
+        // A command with only a state topic is a read-only indicator, which
+        // is a legitimate thing to put on a page, so either one qualifies.
+        if (runtimeCommand.mqttTopic || runtimeCommand.mqttStateTopic) {
+          runtimeCommand.kind = DeviceCommand::MQTT;
+        }
+      }
+
+      if (mqtt.isNull() && homebridge.isNull() &&
+          runtimeCommand.kind == DeviceCommand::NONE) {
         String deviceTransport = device.transport;
         deviceTransport.toLowerCase();
         if (deviceTransport.indexOf("ble") >= 0 ||
@@ -18266,6 +18806,121 @@ void handleHomebridgeDiscover() {
   sendJson(200, body);
 }
 
+/*
+  Broker details. The username and password go to NVS and never travel in
+  runtime.json, exactly as the Homebridge credentials do - a backup carries
+  the host and port so a restore puts the setup back, but not the secret.
+*/
+void handleMqttConfigApi() {
+  if (!requestAuthorized()) {
+    sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
+    return;
+  }
+  JsonDocument request(&psramJsonAllocator);
+  if (deserializeJson(request, webServer.arg("plain"))) {
+    sendJson(400, "{\"ok\":false,\"error\":\"Invalid MQTT request\"}");
+    return;
+  }
+  String host = String((const char *)(request["host"] | mqttHost.c_str()));
+  int port = request["port"] | (int)mqttPort;
+  String username = String((const char *)(request["username"] | mqttUsername.c_str()));
+  // An absent password means "keep the stored one", so WebConfig does not
+  // have to ask for it again every time something else on the card changes.
+  String password = request["password"].is<const char *>()
+    ? String((const char *)(request["password"] | "")) : mqttPassword;
+  String clientId = String((const char *)(request["clientId"] | mqttClientId.c_str()));
+
+  saveMqttCredentials(host, (uint16_t)constrain(port, 1, 65535), username,
+                      password, clientId);
+  mqttEnabled = request["enabled"] | mqttEnabled;
+  mqttViaDock = request["viaDock"] | mqttViaDock;
+  preferences.begin(PREFERENCES_NAMESPACE, false);
+  preferences.putBool("mqEn", mqttEnabled);
+  preferences.putBool("mqViaDock", mqttViaDock);
+  preferences.end();
+
+  if (mqttClient.connected()) mqttClient.disconnect();
+  mqttNextConnectMs = 0;
+  mqttSubscriptionsPushed = false;
+  if (mqttViaDock) mqttConfigPushWanted = true;
+
+  JsonDocument response;
+  response["ok"] = true;
+  response["configured"] = mqttConfigured();
+  String body;
+  serializeJson(response, body);
+  sendJson(200, body);
+  Serial.printf("MQTT: settings saved (%s:%u, %s, %s)\n",
+                mqttHost.length() ? mqttHost.c_str() : "(none)", (unsigned)mqttPort,
+                mqttEnabled ? "enabled" : "disabled",
+                mqttViaDock ? "via dock" : "direct");
+}
+
+void handleMqttStatusApi() {
+  if (!requestAuthorized()) {
+    sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
+    return;
+  }
+  JsonDocument response;
+  response["ok"] = true;
+  response["enabled"] = mqttEnabled;
+  response["host"] = mqttHost;
+  response["port"] = mqttPort;
+  response["username"] = mqttUsername;
+  response["clientId"] = mqttClientId;
+  response["passwordSaved"] = mqttPassword.length() > 0;
+  response["viaDock"] = mqttViaDock;
+  response["configured"] = mqttConfigured();
+  response["usingDock"] = mqttShouldUseDock();
+  response["connected"] = mqttClient.connected();
+  JsonArray states = response["states"].to<JsonArray>();
+  for (uint8_t i = 0; i < mqttStateCount; i++) {
+    if (!mqttStates[i].valid) continue;
+    JsonObject entry = states.add<JsonObject>();
+    entry["topic"] = mqttStates[i].topic;
+    entry["value"] = mqttStates[i].value;
+  }
+  String body;
+  serializeJson(response, body);
+  sendJson(200, body);
+}
+
+/* Publishes a one-off topic/payload so the broker settings can be proved
+   from WebConfig without first building a device and putting it on a page. */
+void handleMqttTestApi() {
+  if (!requestAuthorized()) {
+    sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
+    return;
+  }
+  JsonDocument request(&psramJsonAllocator);
+  if (deserializeJson(request, webServer.arg("plain"))) {
+    sendJson(400, "{\"ok\":false,\"error\":\"Invalid MQTT test request\"}");
+    return;
+  }
+  DeviceCommand probe = {};
+  probe.kind = DeviceCommand::MQTT;
+  String topic = String((const char *)(request["topic"] | "openremote/test"));
+  String payload = String((const char *)(request["payload"] | "hello"));
+  probe.mqttTopic = const_cast<char *>(topic.c_str());
+  probe.mqttPayload = const_cast<char *>(payload.c_str());
+  bool ok = transmitMqttCommand(probe);
+  // The probe never owned these; clear before anything can try to free them.
+  probe.mqttTopic = nullptr;
+  probe.mqttPayload = nullptr;
+
+  JsonDocument response;
+  response["ok"] = ok;
+  response["usedDock"] = mqttShouldUseDock();
+  if (!ok) {
+    response["error"] = mqttShouldUseDock() && mqttDockErrorText[0]
+      ? mqttDockErrorText
+      : "Could not publish - check the broker address, port and credentials";
+  }
+  String body;
+  serializeJson(response, body);
+  sendJson(ok ? 200 : 502, body);
+}
+
 void handleHomebridgeStatus() {
   if (!requestAuthorized()) {
     sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
@@ -18434,6 +19089,9 @@ void configureWebServer() {
   webServer.on("/api/config", HTTP_POST, handleRuntimeConfigUpload,
                handleRuntimeConfigUploadData);
   webServer.on("/api/command/test", HTTP_POST, handleCommandTest);
+  webServer.on("/api/mqtt/config", HTTP_POST, handleMqttConfigApi);
+  webServer.on("/api/mqtt/status", HTTP_GET, handleMqttStatusApi);
+  webServer.on("/api/mqtt/test", HTTP_POST, handleMqttTestApi);
   webServer.on("/api/homebridge/discover", HTTP_POST, handleHomebridgeDiscover);
   webServer.on("/api/homebridge/status", HTTP_GET, handleHomebridgeStatus);
   webServer.on("/api/homebridge/control", HTTP_POST, handleHomebridgeControl);
@@ -18922,6 +19580,7 @@ void onEspNowDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int 
         // reflashed, so its credentials cannot be assumed. Flagged here and
         // pushed from loop(), never from this callback.
         if (homebridgeViaDock) homebridgeConfigPushWanted = true;
+        if (mqttViaDock) mqttConfigPushWanted = true;
       }
       return;
     }
@@ -18937,6 +19596,34 @@ void onEspNowDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int 
       homebridgeDockStatus = result.httpStatus;
       strlcpy(homebridgeDockErrorText, result.error, sizeof(homebridgeDockErrorText));
       homebridgeDockPending = false;   // Releases the waiting sender.
+      return;
+    }
+  }
+
+  if (mqttDockPending && (size_t)len >= sizeof(EspNowMqttResultPacket) &&
+      espNowDeviceCount > 0 && memcmp(espNowDevices[0].mac, info->src_addr, 6) == 0) {
+    EspNowMqttResultPacket result;
+    memcpy(&result, data, sizeof(result));
+    if (result.magic == ESPNOW_MQTT_RESULT_MAGIC) {
+      result.error[sizeof(result.error) - 1] = '\0';
+      mqttDockOk = result.ok != 0;
+      strlcpy(mqttDockErrorText, result.error, sizeof(mqttDockErrorText));
+      mqttDockPending = false;   // Releases the waiting sender.
+      return;
+    }
+  }
+
+  /* A retained value arrives the moment the dock subscribes, so a tile shows
+     the real state as soon as the link is up rather than after the next
+     change. Unsolicited - the dock sends these whenever the broker does. */
+  if ((size_t)len >= sizeof(EspNowMqttStatePacket) &&
+      espNowDeviceCount > 0 && memcmp(espNowDevices[0].mac, info->src_addr, 6) == 0) {
+    EspNowMqttStatePacket state;
+    memcpy(&state, data, sizeof(state));
+    if (state.magic == ESPNOW_MQTT_STATE_MAGIC) {
+      state.topic[sizeof(state.topic) - 1] = '\0';
+      state.value[sizeof(state.value) - 1] = '\0';
+      setMqttState(state.topic, state.value);
       return;
     }
   }
@@ -25621,10 +26308,42 @@ void tileEvent(lv_event_t *e) {
   }
 }
 
+/*
+  A tile watching an MQTT topic. The pointers are into the runtime model's own
+  strings, which live exactly as long as the tiles do - both are torn down
+  together when a page is rebuilt.
+*/
+struct MqttTileBinding {
+  lv_obj_t *valueLabel;
+  const char *topic;
+  const char *onValue;
+};
+static const uint8_t MAX_MQTT_TILES = 12;
+MqttTileBinding mqttTileBindings[MAX_MQTT_TILES];
+uint8_t mqttTileBindingCount = 0;
+
+void applyMqttTileState(const MqttTileBinding &binding) {
+  if (!binding.valueLabel || !lv_obj_is_valid(binding.valueLabel)) return;
+  const char *value = mqttStateFor(binding.topic);
+  // "--" rather than blank: nothing heard yet is a different thing from a
+  // topic whose value really is empty, and the user can tell them apart.
+  lv_label_set_text(binding.valueLabel, value && value[0] ? value : "--");
+  bool on = value && binding.onValue && binding.onValue[0] &&
+            strcasecmp(value, binding.onValue) == 0;
+  lv_obj_set_style_text_color(binding.valueLabel,
+                              on ? lvRgb(48, 209, 88) : lvRgb(150, 165, 182), 0);
+}
+
+void refreshMqttStateTiles() {
+  for (uint8_t i = 0; i < mqttTileBindingCount; i++) applyMqttTileState(mqttTileBindings[i]);
+}
+
 void makeTile(uint8_t slot, const char *label, const char *iconPath, bool showText,
               uint8_t boxMode, bool repeat, DeviceCommand *command, Macro *macro) {
   uint8_t col = slot % 3;
   uint8_t row = slot / 3;
+  bool showsMqttState = command && command->kind == DeviceCommand::MQTT &&
+                        command->mqttStateTopic && command->mqttStateTopic[0];
   notePopulatedRemoteRow(row);
   int x = 8 + col * 76;
   int iconPixels = constrain((int)map(buttonIconSize, 20, 64, 16, 40), 16, 40);
@@ -25673,6 +26392,25 @@ void makeTile(uint8_t slot, const char *label, const char *iconPath, bool showTe
     lv_obj_clear_flag(l, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_clear_flag(l, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_center(l);
+    if (showsMqttState) lv_obj_align(l, LV_ALIGN_CENTER, 0, -7);
+  }
+
+  if (showsMqttState && mqttTileBindingCount < MAX_MQTT_TILES) {
+    lv_obj_t *value = lv_label_create(tile);
+    lv_label_set_text(value, "--");
+    lv_label_set_long_mode(value, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(value, 60);
+    lv_obj_set_style_text_font(value, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_align(value, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(value, LV_ALIGN_BOTTOM_MID, 0, 1);
+    lv_obj_clear_flag(value, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(value, LV_OBJ_FLAG_SCROLLABLE);
+
+    MqttTileBinding &binding = mqttTileBindings[mqttTileBindingCount++];
+    binding.valueLabel = value;
+    binding.topic = command->mqttStateTopic;
+    binding.onValue = command->mqttStateOnValue;
+    applyMqttTileState(binding);
   }
 }
 
@@ -27093,6 +27831,8 @@ void renderCurrentPage() {
   dismissWidgetFullScreen();
   widgetInstanceCount = 0;
   memset(widgetInstances, 0, sizeof(widgetInstances));
+  mqttTileBindingCount = 0;
+  memset(mqttTileBindings, 0, sizeof(mqttTileBindings));
   memset(batteryMetricNameLabels, 0, sizeof(batteryMetricNameLabels));
   memset(batteryMetricValueLabels, 0, sizeof(batteryMetricValueLabels));
   memset(displayValueLabels, 0, sizeof(displayValueLabels));
@@ -28667,6 +29407,13 @@ void loop() {
     homebridgeConfigPushWanted = false;
     if (homebridgeViaDock) sendHomebridgeConfigToDock();
   }
+  if (mqttConfigPushWanted) {
+    mqttConfigPushWanted = false;
+    if (mqttViaDock) {
+      sendMqttConfigToDock();
+      sendMqttSubscriptionsToDock();
+    }
+  }
   if (dockLinkIndicatorDirty) { dockLinkIndicatorDirty = false; refreshDockLinkIndicator(); }
   serviceEspNowDevicesModal(now);
   serviceEspNowSearchOverlay(now);
@@ -28691,6 +29438,11 @@ void loop() {
   serviceBatteryHistory(now);
   if (!displaySleeping) serviceWidgets(now);
   serviceWeatherWidget(now);
+  serviceMqtt(now);
+  if (mqttStateDirty && !displaySleeping) {
+    mqttStateDirty = false;
+    refreshMqttStateTiles();
+  }
   if (pendingRuntimeReload && (int32_t)(now - runtimeReloadAfterMs) >= 0) {
     pendingRuntimeReload = false;
     bool wasSleeping = displaySleeping;

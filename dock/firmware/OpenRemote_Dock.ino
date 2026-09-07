@@ -667,6 +667,7 @@
 #include <esp_ota_ops.h>
 #include <esp_rom_crc.h>
 #include <HTTPClient.h>
+#include <PubSubClient.h>
 #if DOCK_RF_CS_PIN >= 0
 // Asynchronous serial mode, not the packet engine: a gate or garage remote is
 // a raw OOK edge train with no framing the CC1101 could parse for us. GDO0
@@ -691,7 +692,7 @@ static inline bool serialHostAttached() {
 }
 
 
-#define OPENREMOTE_DOCK_VERSION_STRING "1.33"
+#define OPENREMOTE_DOCK_VERSION_STRING "1.34"
 
 // A literal in the built image, so a tool holding the .bin can tell what it is
 // without running it. The remote firmware carries the same idea under
@@ -874,6 +875,12 @@ static const uint32_t ESPNOW_DOCK_INFO_MAGIC = 0x4F524449UL;  // "ORDI"
 static const uint32_t ESPNOW_DOCK_WIFI_MAGIC   = 0x4F525743UL;  // "ORWC"
 static const uint32_t ESPNOW_DOCK_HBCFG_MAGIC  = 0x4F524843UL;  // "ORHC"
 static const uint32_t ESPNOW_HOMEBRIDGE_MAGIC  = 0x4F524842UL;  // "ORHB"
+// --- MQTT ---
+static const uint32_t ESPNOW_DOCK_MQTTCFG_MAGIC   = 0x4F524D43UL;  // "ORMC"
+static const uint32_t ESPNOW_MQTT_PUBLISH_MAGIC   = 0x4F524D50UL;  // "ORMP"
+static const uint32_t ESPNOW_MQTT_RESULT_MAGIC    = 0x4F524D52UL;  // "ORMR"
+static const uint32_t ESPNOW_MQTT_SUBSCRIBE_MAGIC = 0x4F524D53UL;  // "ORMS"
+static const uint32_t ESPNOW_MQTT_STATE_MAGIC     = 0x4F524D54UL;  // "ORMT"
 static const uint32_t ESPNOW_HOMEBRIDGE_RESULT_MAGIC = 0x4F524852UL;  // "ORHR"
 
 struct __attribute__((packed)) EspNowDockInfoPacket {
@@ -941,6 +948,51 @@ struct __attribute__((packed)) EspNowHomebridgeResultPacket {
   int16_t httpStatus;
   char error[64];
 };
+
+/* --- MQTT ------------------------------------------------------------------
+   Every layout here is pinned with a static_assert and must match the
+   remote's copy byte for byte. */
+struct __attribute__((packed)) EspNowDockMqttPacket {
+  uint32_t magic;
+  uint16_t port;
+  uint8_t enabled;
+  char host[65];
+  char username[33];
+  char password[65];
+  char clientId[33];
+};
+static_assert(sizeof(EspNowDockMqttPacket) == 203, "dock MQTT config layout drifted from the remote");
+
+struct __attribute__((packed)) EspNowMqttPublishPacket {
+  uint32_t magic;
+  uint8_t qos;
+  uint8_t retain;
+  char topic[96];
+  char payload[96];
+};
+static_assert(sizeof(EspNowMqttPublishPacket) == 198, "MQTT publish layout drifted from the remote");
+
+struct __attribute__((packed)) EspNowMqttResultPacket {
+  uint32_t magic;
+  uint8_t ok;
+  char error[64];
+};
+static_assert(sizeof(EspNowMqttResultPacket) == 69, "MQTT result layout drifted from the remote");
+
+struct __attribute__((packed)) EspNowMqttSubscribePacket {
+  uint32_t magic;
+  uint8_t index;
+  uint8_t total;
+  char topic[96];
+};
+static_assert(sizeof(EspNowMqttSubscribePacket) == 102, "MQTT subscribe layout drifted from the remote");
+
+struct __attribute__((packed)) EspNowMqttStatePacket {
+  uint32_t magic;
+  char topic[96];
+  char value[64];
+};
+static_assert(sizeof(EspNowMqttStatePacket) == 164, "MQTT state layout drifted from the remote");
 
 struct __attribute__((packed)) EspNowRfLearnStartPacket {
   uint32_t magic;
@@ -1023,6 +1075,35 @@ bool dockRfEnabled = true;
 // there is no shared expiry to keep in step.
 String hbSsid, hbPassword, hbAddress, hbUser, hbPass, hbToken;
 bool wifiConfigured = false;
+
+/*
+  MQTT.
+
+  The dock is the right place for this: it is mains powered and already keeps
+  the station associated and awake for the Homebridge relay, so a broker
+  session and its subscriptions can simply stay open. The remote cannot do
+  that - its radio is off whenever nothing needs it - which is why a publish
+  from a button arrives here as an ESP-NOW frame instead.
+*/
+WiFiClient mqttNet;
+PubSubClient mqttClient(mqttNet);
+String mqttHost, mqttUser, mqttPass, mqttClientId;
+uint16_t mqttPort = 1883;
+bool mqttEnabled = false;
+unsigned long mqttNextConnectMs = 0;
+bool mqttSubscribed = false;
+
+static const uint8_t MAX_MQTT_TOPICS = 16;
+char mqttTopics[MAX_MQTT_TOPICS][96];
+uint8_t mqttTopicCount = 0;
+
+volatile bool pendingMqttConfigReady = false;
+EspNowDockMqttPacket pendingMqttConfig;
+volatile bool pendingMqttPublish = false;
+EspNowMqttPublishPacket pendingMqttPublishPacket;
+uint8_t pendingMqttMac[6];
+volatile bool pendingMqttSubscribeReady = false;
+EspNowMqttSubscribePacket pendingMqttSubscribe;
 bool wifiJoined = false;
 unsigned long wifiNextAttemptMs = 0;
 unsigned long wifiPsAssertMs = 0;
@@ -1729,6 +1810,12 @@ void loadRemote() {
   hbSsid = prefs.getString("wifiSsid", "");
   hbPassword = prefs.getString("wifiPass", "");
   hbAddress = prefs.getString("hbAddr", "");
+  mqttHost = prefs.getString("mqHost", "");
+  mqttUser = prefs.getString("mqUser", "");
+  mqttPass = prefs.getString("mqPass", "");
+  mqttClientId = prefs.getString("mqCid", "");
+  mqttPort = prefs.getUShort("mqPort", 1883);
+  mqttEnabled = prefs.getBool("mqEn", false);
   hbUser = prefs.getString("hbUser", "");
   hbPass = prefs.getString("hbPass", "");
   wifiConfigured = hbSsid.length() > 0;
@@ -1884,6 +1971,37 @@ void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len)
     memcpy(pendingHomebridgeMac, info->src_addr, 6);
     // Handled from loop(): an HTTP round trip cannot run on the Wi-Fi task.
     pendingHomebridge = true;
+    return;
+  }
+
+  if (magic == ESPNOW_DOCK_MQTTCFG_MAGIC && len >= (int)sizeof(EspNowDockMqttPacket)) {
+    if (!remoteKnown || memcmp(info->src_addr, remoteMac, 6) != 0) return;
+    memcpy(&pendingMqttConfig, data, sizeof(pendingMqttConfig));
+    pendingMqttConfig.host[sizeof(pendingMqttConfig.host) - 1] = '\0';
+    pendingMqttConfig.username[sizeof(pendingMqttConfig.username) - 1] = '\0';
+    pendingMqttConfig.password[sizeof(pendingMqttConfig.password) - 1] = '\0';
+    pendingMqttConfig.clientId[sizeof(pendingMqttConfig.clientId) - 1] = '\0';
+    pendingMqttConfigReady = true;   // Applied from loop(): this writes NVS.
+    return;
+  }
+
+  if (magic == ESPNOW_MQTT_PUBLISH_MAGIC && len >= (int)sizeof(EspNowMqttPublishPacket)) {
+    if (!remoteKnown || memcmp(info->src_addr, remoteMac, 6) != 0) return;
+    if (pendingMqttPublish) return;   // loop() has not taken the last one yet.
+    memcpy(&pendingMqttPublishPacket, data, sizeof(pendingMqttPublishPacket));
+    pendingMqttPublishPacket.topic[sizeof(pendingMqttPublishPacket.topic) - 1] = '\0';
+    pendingMqttPublishPacket.payload[sizeof(pendingMqttPublishPacket.payload) - 1] = '\0';
+    memcpy(pendingMqttMac, info->src_addr, 6);
+    // Handled from loop(): a broker round trip cannot run on the Wi-Fi task.
+    pendingMqttPublish = true;
+    return;
+  }
+
+  if (magic == ESPNOW_MQTT_SUBSCRIBE_MAGIC && len >= (int)sizeof(EspNowMqttSubscribePacket)) {
+    if (!remoteKnown || memcmp(info->src_addr, remoteMac, 6) != 0) return;
+    memcpy(&pendingMqttSubscribe, data, sizeof(pendingMqttSubscribe));
+    pendingMqttSubscribe.topic[sizeof(pendingMqttSubscribe.topic) - 1] = '\0';
+    pendingMqttSubscribeReady = true;
     return;
   }
 
@@ -2502,6 +2620,165 @@ void sendHomebridgeResult(const uint8_t *mac, bool ok, int status, const char *e
   }
 }
 
+void sendMqttResult(const uint8_t *mac, bool ok, const char *error) {
+  EspNowMqttResultPacket result = {};
+  result.magic = ESPNOW_MQTT_RESULT_MAGIC;
+  result.ok = ok ? 1 : 0;
+  if (error) strlcpy(result.error, error, sizeof(result.error));
+  for (uint8_t attempt = 0; attempt < 3; attempt++) {
+    if (esp_now_send(mac, (const uint8_t *)&result, sizeof(result)) == ESP_OK) return;
+    delay(2);
+  }
+}
+
+/* Pushed unsolicited whenever the broker reports a value, so a tile on the
+   remote reflects what is actually true rather than what it last sent. */
+void sendMqttState(const char *topic, const char *value) {
+  if (!remoteKnown) return;
+  EspNowMqttStatePacket packet = {};
+  packet.magic = ESPNOW_MQTT_STATE_MAGIC;
+  strlcpy(packet.topic, topic, sizeof(packet.topic));
+  strlcpy(packet.value, value, sizeof(packet.value));
+  for (uint8_t attempt = 0; attempt < 3; attempt++) {
+    if (esp_now_send(remoteMac, (const uint8_t *)&packet, sizeof(packet)) == ESP_OK) return;
+    delay(2);
+  }
+}
+
+void mqttMessageArrived(char *topic, byte *payload, unsigned int length) {
+  char value[64];
+  unsigned int copy = length < sizeof(value) - 1 ? length : sizeof(value) - 1;
+  memcpy(value, payload, copy);
+  value[copy] = '\0';
+  Serial.printf("Dock: MQTT %s = %s\n", topic, value);
+  sendMqttState(topic, value);
+}
+
+void mqttSubscribeAll() {
+  for (uint8_t i = 0; i < mqttTopicCount; i++) {
+    if (mqttClient.subscribe(mqttTopics[i])) {
+      Serial.printf("Dock: subscribed to %s\n", mqttTopics[i]);
+    }
+  }
+  mqttSubscribed = true;
+}
+
+/*
+  Keeps the broker session up. Unlike the remote there is no radio to
+  release afterwards - staying connected is the entire reason MQTT lives
+  here, because a subscription that only exists while someone is holding the
+  remote cannot report a state change that happened an hour ago.
+*/
+void serviceMqtt(unsigned long now) {
+  if (pendingMqttConfigReady) {
+    pendingMqttConfigReady = false;
+    String host = pendingMqttConfig.host;
+    String user = pendingMqttConfig.username;
+    String pass = pendingMqttConfig.password;
+    String cid = pendingMqttConfig.clientId;
+    uint16_t port = pendingMqttConfig.port ? pendingMqttConfig.port : 1883;
+    bool enabled = pendingMqttConfig.enabled != 0;
+    if (host != mqttHost || user != mqttUser || pass != mqttPass ||
+        cid != mqttClientId || port != mqttPort || enabled != mqttEnabled) {
+      mqttHost = host; mqttUser = user; mqttPass = pass; mqttClientId = cid;
+      mqttPort = port; mqttEnabled = enabled;
+      prefs.begin("dock", false);
+      prefs.putString("mqHost", mqttHost);
+      prefs.putString("mqUser", mqttUser);
+      prefs.putString("mqPass", mqttPass);
+      prefs.putString("mqCid", mqttClientId);
+      prefs.putUShort("mqPort", mqttPort);
+      prefs.putBool("mqEn", mqttEnabled);
+      prefs.end();
+      if (mqttClient.connected()) mqttClient.disconnect();
+      mqttSubscribed = false;
+      mqttNextConnectMs = 0;
+      Serial.printf("Dock: MQTT broker %s:%u (%s)\n",
+                    mqttHost.length() ? mqttHost.c_str() : "(none)",
+                    (unsigned)mqttPort, mqttEnabled ? "enabled" : "disabled");
+    }
+  }
+
+  if (pendingMqttSubscribeReady) {
+    pendingMqttSubscribeReady = false;
+    // index 0 restarts the list, so a shrinking set replaces the old one
+    // rather than accumulating topics nobody watches any more.
+    if (pendingMqttSubscribe.index == 0) {
+      if (mqttClient.connected()) {
+        for (uint8_t i = 0; i < mqttTopicCount; i++) mqttClient.unsubscribe(mqttTopics[i]);
+      }
+      mqttTopicCount = 0;
+      mqttSubscribed = false;
+    }
+    if (pendingMqttSubscribe.total && mqttTopicCount < MAX_MQTT_TOPICS &&
+        pendingMqttSubscribe.topic[0]) {
+      strlcpy(mqttTopics[mqttTopicCount], pendingMqttSubscribe.topic,
+              sizeof(mqttTopics[0]));
+      mqttTopicCount++;
+      if (mqttClient.connected()) {
+        mqttClient.subscribe(mqttTopics[mqttTopicCount - 1]);
+        Serial.printf("Dock: subscribed to %s\n", mqttTopics[mqttTopicCount - 1]);
+      }
+    }
+  }
+
+  if (!mqttEnabled || !mqttHost.length() || otaActive) return;
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  if (!mqttClient.connected()) {
+    if (mqttNextConnectMs && (long)(now - mqttNextConnectMs) < 0) return;
+    mqttClient.setBufferSize(512);
+    mqttClient.setServer(mqttHost.c_str(), mqttPort);
+    mqttClient.setCallback(mqttMessageArrived);
+    String clientId = mqttClientId.length() ? mqttClientId : String("OpenRemoteDock");
+    bool ok = mqttUser.length()
+      ? mqttClient.connect(clientId.c_str(), mqttUser.c_str(), mqttPass.c_str())
+      : mqttClient.connect(clientId.c_str());
+    if (!ok) {
+      mqttNextConnectMs = now + 10000UL;
+      Serial.printf("Dock: MQTT connect failed (state %d), retrying\n", mqttClient.state());
+      return;
+    }
+    Serial.printf("Dock: MQTT connected to %s:%u\n", mqttHost.c_str(), (unsigned)mqttPort);
+    mqttSubscribed = false;
+    mqttNextConnectMs = 0;
+  }
+
+  if (!mqttSubscribed) mqttSubscribeAll();
+  mqttClient.loop();
+
+  if (!pendingMqttPublish) return;
+  pendingMqttPublish = false;
+  EspNowMqttPublishPacket packet = pendingMqttPublishPacket;
+  uint8_t mac[6];
+  memcpy(mac, pendingMqttMac, 6);
+  bool ok = mqttClient.publish(packet.topic, packet.payload, packet.retain != 0);
+  Serial.printf("Dock: MQTT publish %s = %s %s\n", packet.topic, packet.payload,
+                ok ? "ok" : "FAILED");
+  sendMqttResult(mac, ok, ok ? "" : "Broker rejected the publish");
+}
+
+/* Answers a publish that arrived with nothing able to carry it, so the remote
+   reports a failure instead of waiting out its timeout. Kept separate from
+   serviceMqtt() because that returns early in exactly these cases. */
+void serviceMqttUnavailable() {
+  if (!pendingMqttPublish) return;
+  if (mqttEnabled && mqttHost.length() && WiFi.status() == WL_CONNECTED &&
+      mqttClient.connected()) {
+    return;   // serviceMqtt() will deal with it.
+  }
+  pendingMqttPublish = false;
+  uint8_t mac[6];
+  memcpy(mac, pendingMqttMac, 6);
+  if (!mqttEnabled || !mqttHost.length()) {
+    sendMqttResult(mac, false, "Dock has no broker configured");
+  } else if (WiFi.status() != WL_CONNECTED) {
+    sendMqttResult(mac, false, "Dock is not on Wi-Fi");
+  } else {
+    sendMqttResult(mac, false, "Dock is not connected to the broker");
+  }
+}
+
 // Stores config pushed by the remote. Called from loop() because the receive
 // callback runs on the Wi-Fi task and these write NVS.
 void serviceHomebridgeConfig() {
@@ -2805,6 +3082,8 @@ void loop() {
   serviceHomebridgeConfig();
   serviceHomebridgeWifi(now);
   serviceHomebridge(now);
+  serviceMqtt(now);
+  serviceMqttUnavailable();
   serviceOta(now);
   serviceRfLearn(now);
   serviceSettings();
