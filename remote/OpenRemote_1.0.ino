@@ -1,6 +1,59 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.15 - 2026-09-07
+    - Actually stopped the duplicate forecast fetch on boot. 4.14 aimed at
+      the wrong thing: it assumed the clock was unset until NTP landed, so
+      the boot fetch could not record which slot it belonged to. It is not
+      unset - seedSystemClock() puts the last manual time (or a fixed
+      default) in place during startup precisely so nothing has to cope with
+      an epoch of zero. The boot fetch therefore did record a slot, computed
+      from that seeded and quite wrong time, and NTP then moved the clock to
+      a different slot and the fetch ran again exactly as before.
+    - Now decided on the monotonic millisecond clock instead: if a valid
+      reading was taken within the last ten minutes, whatever slot we find
+      ourselves in is treated as already served. Ten minutes settles a clock
+      correction arriving seconds after a fetch, and is far short of the one
+      hour minimum refresh interval, so it cannot swallow a scheduled slot.
+    - Both 4.14 and this were found the same way: flash it, reset it, read
+      the serial log, count the "Weather:" lines. 4.14 changed the log not at
+      all, which is what said the reasoning behind it was wrong rather than
+      merely incomplete.
+
+  4.14 - 2026-09-07
+    - The weather widget no longer fetches the same forecast twice on every
+      boot. The boot fetch runs before NTP has finished, so there is no clock
+      to record which refresh slot it belonged to; when the time then arrived
+      a moment later the slot looked unvisited and the whole request ran
+      again. A reading taken seconds ago is still the current one, so if a
+      valid reading younger than the refresh interval already exists when the
+      clock first becomes usable, the slot is simply adopted instead.
+    - Found by reading the serial log after 4.13 rather than from a report:
+      two identical "Weather:" lines a second apart, either side of "NTP:
+      time updated".
+
+  4.13 - 2026-09-07
+    - The weather widget now gets its forecast. 4.12 fixed the radio and the
+      schedule and the request genuinely succeeded - TLS, HTTP 200, and a
+      JSON parse that returned Ok - yet every attempt still logged "the
+      forecast carried no current temperature".
+    - Open-Meteo replies with Transfer-Encoding: chunked and no
+      Content-Length, and HTTPClient::getStream() hands back the raw socket
+      without removing the chunk framing. ArduinoJson was therefore reading
+      "231\r\n{\"latitude\"..." - it parsed the chunk length 231 as a
+      complete JSON number, stopped, and reported success. The filter then
+      discarded that number because it expected an object, leaving a null
+      document that had no "current" in it. Nothing on the failure path was
+      lying; every layer did exactly what it was asked.
+    - The body is read with getString(), which de-chunks, and parsed from
+      there. Note this is the opposite of the 4.10 change to Homebridge
+      discovery, and deliberately so: that response is hundreds of kilobytes
+      against ~135KB of free heap and must be streamed, while a forecast is
+      about 560 bytes and buffering it costs nothing. The deciding factor is
+      the size of the reply, not a rule about which call to prefer.
+    - The response length is logged, so a truncated or empty reply is
+      distinguishable from a well-formed one that lacks the field.
+
   4.12 - 2026-09-07
     - Fixed a widget drawing on top of the tile beside it. A widget is three
       columns wide, so it can only begin a row, but the slot number WebConfig
@@ -4900,7 +4953,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.12"
+#define OPENREMOTE_VERSION_STRING "4.15"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -26331,7 +26384,26 @@ void serviceWeatherWidget(uint32_t now) {
   bool clockUsable = epoch > 1700000000;
   time_t slot = clockUsable
     ? weatherSlotStart(epoch, widgetSettings.weatherIntervalHours) : 0;
-  if (clockUsable && slot != weatherLastSlotEpoch) weatherFetchWanted = true;
+  if (clockUsable && slot != weatherLastSlotEpoch) {
+    /*
+      The boot fetch runs against a seeded clock - seedSystemClock() installs
+      the last manual time during startup so nothing has to handle an epoch
+      of zero - so it records a slot derived from a time that is usually
+      wrong. NTP then corrects the clock, the slot changes, and without this
+      the identical forecast is fetched a second time on every boot.
+
+      Judged on millis() rather than on the wall clock, because millis() is
+      monotonic and is the one thing a clock correction cannot disturb. Ten
+      minutes is long enough to absorb an NTP fix arriving seconds after a
+      fetch and far shorter than the one hour minimum refresh interval, so it
+      can never swallow a scheduled slot.
+    */
+    static const uint32_t SLOT_ADOPT_GRACE_MS = 10UL * 60UL * 1000UL;
+    bool readingJustTaken = weatherReading.valid &&
+      (now - weatherReading.fetchedAtMs) < SLOT_ADOPT_GRACE_MS;
+    if (readingJustTaken) weatherLastSlotEpoch = slot;
+    else weatherFetchWanted = true;
+  }
 
   if (!weatherFetchWanted) {
     releaseWeatherRadio();
@@ -26389,6 +26461,24 @@ void serviceWeatherWidget(uint32_t now) {
     return;
   }
 
+  /*
+    getString(), not getStream().
+
+    Open-Meteo answers with Transfer-Encoding: chunked and no Content-Length,
+    and HTTPClient::getStream() returns the raw socket with the chunk framing
+    still in it. ArduinoJson then read "231\r\n{...", parsed the chunk length
+    231 as a complete JSON number and returned Ok, so every check downstream
+    saw a valid-but-empty document and reported a missing temperature.
+    getString() removes the framing.
+
+    This is the reverse of what 4.10 did to Homebridge discovery, on purpose:
+    that reply runs to hundreds of kilobytes against roughly 135KB of free
+    heap and has to be streamed. A forecast is about 560 bytes. Size decides
+    which call is right, not a preference for one over the other.
+  */
+  String body = http.getString();
+  http.end();
+
   JsonDocument filter(&psramJsonAllocator);
   JsonObject current = filter["current"].to<JsonObject>();
   current["temperature_2m"] = true;
@@ -26398,13 +26488,13 @@ void serviceWeatherWidget(uint32_t now) {
   daily["temperature_2m_min"] = true;
 
   JsonDocument doc(&psramJsonAllocator);
-  DeserializationError parse = deserializeJson(doc, http.getStream(),
+  DeserializationError parse = deserializeJson(doc, body,
                                                DeserializationOption::Filter(filter));
-  http.end();
   if (parse) {
     weatherNextAttemptMs = now + WEATHER_RETRY_MS;
     releaseWeatherRadio();
-    Serial.printf("Weather: unreadable forecast (%s)\n", parse.c_str());
+    Serial.printf("Weather: unreadable forecast (%s), %u bytes\n",
+                  parse.c_str(), (unsigned)body.length());
     return;
   }
 
@@ -26412,7 +26502,10 @@ void serviceWeatherWidget(uint32_t now) {
   if (readings.isNull() || !readings["temperature_2m"].is<float>()) {
     weatherNextAttemptMs = now + WEATHER_RETRY_MS;
     releaseWeatherRadio();
-    Serial.println("Weather: the forecast carried no current temperature");
+    // The length distinguishes a truncated or empty reply from a well-formed
+    // one that simply does not carry the field.
+    Serial.printf("Weather: no current temperature in a %u byte reply\n",
+                  (unsigned)body.length());
     return;
   }
 
