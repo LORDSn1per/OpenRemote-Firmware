@@ -81,15 +81,17 @@ work. Nothing to install, and it works on any device with a browser.
 
 ### Remote firmware — on-device control
 
-<img src="docs/images/openremote-firmware.jpg" alt="OpenRemote firmware" width="100%">
+<img src="docs/images/openremote-rev6.jpg" alt="OpenRemote Rev 6 remote firmware" width="100%">
 
 Runs on the remote: a colour touchscreen, physical buttons, infrared, Bluetooth
 for Android TV and Chromecast — including voice search through the built-in
-microphone — plus Wi-Fi for Home Assistant and Homebridge.
+microphone — plus Wi-Fi for Home Assistant, MQTT and Homebridge.
 
 [Read more →](remote/README.md)
 
 ### Dock firmware — reach the rooms the remote cannot
+
+<img src="docs/images/openremote-dock-rev6.jpg" alt="OpenRemote Rev 6 Dock" width="100%">
 
 Mains powered, sits with your equipment, and relays commands from the remote
 over its own radio link. It fires infrared into a closed cabinet or a second
