@@ -16,5 +16,5 @@
   "dockFlashSize": "4MB",
   "dockBootstrapImage": "OpenRemote_Dock_bootstrap.bin",
   "dockBootstrapBytes": 65536,
-  "dockBootstrapSha256": "a81e941d2398c39af1353564d0a22b83930b65cb92c7ad31eac2ec200a3ba405"
+  "dockBootstrapSha256": "04d368cbe219e8eaabfcacf14db30f6b50f121f340f438ca8f66c0e78f4fdffc"
 }

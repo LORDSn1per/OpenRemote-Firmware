@@ -4,7 +4,7 @@ import contextlib, datetime as dt, glob, hashlib, io, json, os, re, select, shut
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-APP_VERSION="2.78"
+APP_VERSION="2.79"
 SERIAL_BAUD=460800
 # 2.68 adds Linux as a third supported platform. Until now every non-Windows
 # branch in this file assumed macOS outright - AppleScript dialogs, diskutil,
@@ -96,7 +96,7 @@ DEVICE_SPECS={
               "chip_id":CHIP_ID_S3,"app_partition":0x330000,
               "marker":"OPENREMOTE_FIRMWARE_VERSION"},
     "dock":  {"label":"OpenRemote dock","chip":"ESP32-C3","esptool_chip":"esp32c3",
-              "chip_id":CHIP_ID_C3,"app_partition":0x140000,
+              "chip_id":CHIP_ID_C3,"app_partition":0x1E0000,
               "marker":"OPENREMOTE_DOCK_VERSION"},
 }
 

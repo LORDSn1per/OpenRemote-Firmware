@@ -1,6 +1,30 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.21 - 2026-09-08
+    - Widgets can go on the Activities landing page. Requested by
+      NightHawk_FPV, who wanted the weather and battery without first opening
+      an activity - which is the screen the remote actually sits on.
+    - That page is not a designed layout like the others: it draws one slider
+      per activity, in order, and only ever read its item list to pick up each
+      activity's boundary-box setting. It now reads widget placements from the
+      same list, and the sliders flow around them - a widget covering rows two
+      and three pushes the activities that follow down to row four, which is
+      what the designer shows.
+    - Typing a Wi-Fi password with both cases no longer loses what you typed.
+      Shift and the symbols key rebuild the whole settings page to redraw the
+      keyboard, which destroyed the text area and created an empty one, so
+      every character entered before the first shift vanished. Reported by
+      KlausMu, who could not enter a mixed-case password at all - which is
+      most passwords.
+    - The text now lives in a draft the page owns rather than only inside the
+      LVGL widget, and is restored whenever the field is rebuilt. The dock
+      rename field already worked this way, which is why it never showed the
+      bug; the Wi-Fi field was the one that did not.
+    - The draft is cleared on Join, on Cancel and on leaving the Wi-Fi pages,
+      so a password is never carried into a later attempt at a different
+      network.
+
   4.20 - 2026-09-07
     - Home Assistant tiles show live state without a dock too. 4.19 only ever
       populated them through the dock's WebSocket, so a remote with the relay
@@ -5061,7 +5085,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.20"
+#define OPENREMOTE_VERSION_STRING "4.21"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -6067,6 +6091,21 @@ uint8_t activityTextSize = 20;
 bool buttonBoxesEnabled = true;
 bool activityBoxesEnabled = true;
 char activitiesThemePath[72] = "";
+
+/*
+  Widgets placed on the Activities landing page.
+
+  That page has no Tile array - it draws itself from the activity list - so a
+  widget on it needs somewhere of its own to live, the same way a device page
+  needed DeviceWidget.
+*/
+struct ActivitiesWidget {
+  uint8_t kind;
+  uint8_t row;      // top row it occupies; it covers this row and the next
+};
+static const uint8_t MAX_ACTIVITIES_WIDGETS = 3;
+ActivitiesWidget activitiesWidgets[MAX_ACTIVITIES_WIDGETS];
+uint8_t activitiesWidgetCount = 0;
 RuntimeThemeStyle runtimeThemes[MAX_RUNTIME_THEMES] = {};
 uint8_t runtimeThemeCount = 0;
 RuntimeThemeStyle *activeRuntimeThemeStyle = nullptr;
@@ -7369,6 +7408,15 @@ lv_obj_t *statusBattery = nullptr;
 lv_obj_t *statusBatteryTerminal = nullptr;
 lv_obj_t *brightnessBatteryLabel = nullptr;
 lv_obj_t *wifiPasswordArea = nullptr;
+/*
+  What has been typed into the Wi-Fi password field.
+
+  Shift and the symbols key rebuild the settings page to redraw the keyboard
+  with the other character set, which destroys the text area and builds a new
+  one. Keeping the text only inside the widget meant it died with it - so a
+  mixed-case password lost everything entered before the first shift.
+*/
+String wifiPasswordDraft;
 lv_obj_t *wifiKeyboard = nullptr;
 lv_obj_t *setupApStatusLabel = nullptr;
 lv_obj_t *buttonTestPanel = nullptr;
@@ -7647,6 +7695,8 @@ uint16_t countSavedIrDeviceFiles();
 uint8_t *readSdFileToPsramBuffer(File &file, size_t &outSize);
 bool i2cDevicePresent(uint8_t address);
 bool transmitIrCommand(const DeviceCommand &command);
+// Defined with the rest of the widget drawing, far below renderActivitiesPage.
+void makeWidgetTile(uint8_t slot, uint8_t kind, int originY);
 bool isVoiceSearchCommand(const DeviceCommand *command);
 bool beginVoiceSearchHold(const DeviceCommand *command, bool fromTouch = false);
 void endVoiceSearchHold(const DeviceCommand *command = nullptr);
@@ -14529,6 +14579,7 @@ void loadRuntimeModel(JsonDocument &doc) {
   clearRuntimeCommands();
   DEVICE_COUNT = 0;
   weatherWidgetPlaced = false;
+  activitiesWidgetCount = 0;
   ACTIVITY_COUNT = 0;
   MACRO_COUNT = 0;
   memset(devices, 0, sizeof(Device) * MAX_RUNTIME_DEVICES);
@@ -14885,7 +14936,22 @@ void loadRuntimeModel(JsonDocument &doc) {
   for (JsonObjectConst page : doc["pages"].as<JsonArrayConst>()) {
     if (strcmp(page["pageType"] | "", "activities") == 0) {
       strlcpy(activitiesThemePath, page["themePath"] | "", sizeof(activitiesThemePath));
+      uint8_t activitiesSlotCursor = 0;
       for (JsonObjectConst item : page["items"].as<JsonArrayConst>()) {
+        if (strcmp(item["type"] | "", "widget") == 0) {
+          uint8_t widgetSlot = alignSlotToRow(
+            constrain((int)(item["slot"] | activitiesSlotCursor), 0, 254));
+          activitiesSlotCursor = (uint8_t)constrain((int)widgetSlot + 6, 0, 254);
+          if (activitiesWidgetCount >= MAX_ACTIVITIES_WIDGETS) continue;
+          ActivitiesWidget &placement = activitiesWidgets[activitiesWidgetCount++];
+          placement.kind = widgetKindFromName(item["widget"] | "media");
+          placement.row = (uint8_t)(widgetSlot / 3);
+          if (placement.kind == WIDGET_WEATHER) weatherWidgetPlaced = true;
+          continue;
+        }
+        if (strcmp(item["type"] | "", "activity") == 0 && activitiesSlotCursor < 252) {
+          activitiesSlotCursor += 3;
+        }
         if (strcmp(item["type"] | "", "activity") != 0) continue;
         const char *activityId = item["refId"] | "";
         if (!activityId[0]) continue;
@@ -23974,6 +24040,9 @@ void serviceWifiScan(unsigned long now) {
 void chooseWifiNetwork(lv_event_t *e) {
   int index = (int)(intptr_t)lv_event_get_user_data(e);
   if (index < 0 || index >= wifiScanResultCount) return;
+  // Picking a network starts a fresh entry: a draft left from a previous
+  // attempt must not appear pre-filled under a different SSID.
+  if (selectedWifiSsid != wifiScanResults[index].ssid) wifiPasswordDraft = "";
   selectedWifiSsid = wifiScanResults[index].ssid;
   if (wifiScanResults[index].encryption == WIFI_AUTH_OPEN) {
     // An already-saved open network used to just silently reconnect here,
@@ -24279,6 +24348,7 @@ void wifiKeyboardEvent(lv_event_t *e) {
       return;
     }
     String password = lv_textarea_get_text(wifiPasswordArea);
+    wifiPasswordDraft = "";
     connectSelectedWifi(password, true);
   } else if (strcmp(key, "<CANCEL>") == 0) {
     if (settingsView == SETTINGS_DOCK_RENAME) {
@@ -24286,17 +24356,24 @@ void wifiKeyboardEvent(lv_event_t *e) {
       openSettingsView(SETTINGS_DOCK);
       return;
     }
+    wifiPasswordDraft = "";
     openSettingsView(SETTINGS_WIFI);
   } else if (strcmp(key, "<DEL>") == 0) {
     lv_textarea_del_char(wifiPasswordArea);
+    wifiPasswordDraft = lv_textarea_get_text(wifiPasswordArea);
   } else if (strcmp(key, "<SPACE>") == 0) {
     lv_textarea_add_text(wifiPasswordArea, " ");
+    wifiPasswordDraft = lv_textarea_get_text(wifiPasswordArea);
   } else if (strcmp(key, "<CAPS>") == 0 || strcmp(key, "<SYM>") == 0) {
+    // Both rebuild the page to redraw the keyboard, which destroys the text
+    // area - so the draft must be current before that happens.
+    wifiPasswordDraft = lv_textarea_get_text(wifiPasswordArea);
     if (strcmp(key, "<CAPS>") == 0) customKeyboardCaps = !customKeyboardCaps;
     else customKeyboardSymbols = !customKeyboardSymbols;
     pendingUiRefresh = true;
   } else {
     lv_textarea_add_text(wifiPasswordArea, key);
+    wifiPasswordDraft = lv_textarea_get_text(wifiPasswordArea);
   }
   lastWakeMs = millis();
 }
@@ -24500,6 +24577,8 @@ void renderWifiPasswordPageOmote() {
   lv_textarea_set_one_line(wifiPasswordArea, true);
   lv_textarea_set_password_mode(wifiPasswordArea, true);
   lv_textarea_set_placeholder_text(wifiPasswordArea, "Wi-Fi password");
+  // Survives the rebuild that shift and the symbols key cause.
+  lv_textarea_set_text(wifiPasswordArea, wifiPasswordDraft.c_str());
   lv_obj_set_style_bg_color(wifiPasswordArea, lvRgb(0x30, 0x30, 0x30), 0);
   lv_obj_set_style_bg_opa(wifiPasswordArea, LV_OPA_COVER, 0);
   lv_obj_set_style_border_width(wifiPasswordArea, 1, 0);
@@ -24554,6 +24633,8 @@ void renderWifiPasswordPage() {
   lv_textarea_set_one_line(wifiPasswordArea, true);
   lv_textarea_set_password_mode(wifiPasswordArea, true);
   lv_textarea_set_placeholder_text(wifiPasswordArea, "Wi-Fi password");
+  // Survives the rebuild that shift and the symbols key cause.
+  lv_textarea_set_text(wifiPasswordArea, wifiPasswordDraft.c_str());
 
   lv_obj_t *eyeIcon = makeButton(content, LV_SYMBOL_EYE_OPEN, 196, 41, 36, 36, lvRgb(30, 38, 50));
   lv_obj_t *eyeLabel = lv_obj_get_child(eyeIcon, 0);
@@ -26839,13 +26920,34 @@ void renderActivitiesPage() {
     return;
   }
 
+  int activitiesOrigin = activeRuntimeThemeStyle ? activeRuntimeThemeStyle->split + 4 : 104;
+
+  /*
+    Widgets first, then the sliders flow into whatever rows are left. A
+    widget covers two rows, so an activity never lands underneath one -
+    which is what the designer draws.
+  */
+  bool rowTaken[24] = {};
+  for (uint8_t w = 0; w < activitiesWidgetCount; w++) {
+    uint8_t row = activitiesWidgets[w].row;
+    if (row + 1 >= (uint8_t)(sizeof(rowTaken) / sizeof(rowTaken[0]))) continue;
+    rowTaken[row] = true;
+    rowTaken[row + 1] = true;
+    makeWidgetTile((uint8_t)(row * 3), activitiesWidgets[w].kind, activitiesOrigin);
+  }
+
+  uint8_t activityRow = 0;
   for (uint8_t i = 0; i < ACTIVITY_COUNT; i++) {
+    while (activityRow < sizeof(rowTaken) / sizeof(rowTaken[0]) && rowTaken[activityRow]) {
+      activityRow++;
+    }
     uint8_t thumbSize = activitySliderThumbPixels();
     int cardHeight = activitySliderCardPixels(thumbSize);
     int rowPitch = 52;
     lv_obj_t *card = lv_obj_create(content);
-    int cardStart = activeRuntimeThemeStyle ? activeRuntimeThemeStyle->split + 4 : 104;
-    lv_obj_set_pos(card, 8, cardStart + i * rowPitch);
+    int cardStart = activitiesOrigin;
+    lv_obj_set_pos(card, 8, cardStart + activityRow * rowPitch);
+    activityRow++;
     registerSplitDiagnosticAnchor(card);
     lv_obj_set_size(card, 224, cardHeight);
     lv_color_t cardColour = activeRuntimeThemeStyle
@@ -28044,7 +28146,13 @@ void widgetTileEvent(lv_event_t *event) {
   Places one widget on the current page. slot is the widget's top-left grid
   slot; it always starts a row, so only slot/3 matters for the y position.
 */
-void makeWidgetTile(uint8_t slot, uint8_t kind) {
+/*
+  originY of -1 means "the usual grid origin". The Activities page passes its
+  own, because its rows start from the theme's split line rather than from
+  themeGridStartY() - the two differ, and a widget placed at the wrong origin
+  lands on top of the first activity.
+*/
+void makeWidgetTile(uint8_t slot, uint8_t kind, int originY) {
   if (widgetInstanceCount >= MAX_LIVE_WIDGETS) return;
   uint8_t row = slot / 3;
   notePopulatedRemoteRow(row);
@@ -28052,7 +28160,7 @@ void makeWidgetTile(uint8_t slot, uint8_t kind) {
 
   lv_obj_t *card = lv_obj_create(content);
   lv_obj_remove_style_all(card);
-  lv_obj_set_pos(card, 8, themeGridStartY() + row * 52);
+  lv_obj_set_pos(card, 8, (originY >= 0 ? originY : themeGridStartY()) + row * 52);
   lv_obj_set_size(card, WIDGET_TILE_WIDTH, WIDGET_TILE_HEIGHT);
   registerSplitDiagnosticAnchor(card);
   lv_obj_set_style_radius(card, 12, 0);
@@ -28355,7 +28463,7 @@ void renderActivityPage() {
   const Tile *tiles = currentActivityTiles(count);
   for (uint8_t i = 0; i < count && i < MAX_ACTIVITY_TILES; i++) {
     if (tiles[i].kind == Tile::WIDGET) {
-      makeWidgetTile(tiles[i].slot, tiles[i].widgetKind);
+      makeWidgetTile(tiles[i].slot, tiles[i].widgetKind, -1);
       continue;
     }
     if (tiles[i].kind == Tile::ACTIVITY) {
@@ -28398,7 +28506,7 @@ void renderDevicePage() {
 
   for (uint8_t i = 0; i < devices[activeDevice].widgetCount; i++) {
     makeWidgetTile(devices[activeDevice].widgets[i].slot,
-                   devices[activeDevice].widgets[i].kind);
+                   devices[activeDevice].widgets[i].kind, -1);
   }
 
   uint8_t count = devices[activeDevice].commandCount;
