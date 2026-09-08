@@ -1,6 +1,24 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.31 - 2026-09-09
+    - Reports firmware and reachability for every paired dock, not just the
+      first. A second dock could never say anything about itself: its info
+      reply was discarded because the handler compared the sender against
+      espNowDevices[0], and the ping that prompts a reply was only ever sent to
+      espNowDevices[0] either. It appeared on the list as a name and nothing
+      more.
+    - "In range" now means the dock actually answered. Each paired device
+      carries its own version and last-seen time, set from that dock's own
+      reply, so a dock that is unplugged or out of range is distinguishable
+      from one that is merely paired - which the WebConfig status panel needs
+      to colour them differently.
+    - /api/espnow/devices takes a probe argument. The ESP-NOW radio is off
+      almost all the time, so a last-seen time would otherwise be minutes stale
+      whenever WebConfig asked and a working dock would be reported as out of
+      range. With probe set, the remote brings the link up, pings every dock
+      and waits for the replies, so the answer describes now.
+
   4.30 - 2026-09-09
     - Adds Kaseikyo, NEC42, Pioneer and RCA. These are the four protocols in
       the Flipper IR database that IRremote has no sender for, so neither the
@@ -5254,7 +5272,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.30"
+#define OPENREMOTE_VERSION_STRING "4.31"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -5992,6 +6010,9 @@ static const uint16_t DOCK_MIN_REPEAT_INTERVAL_MS = 210;
 // same however it is woken.
 static const uint32_t ESPNOW_DOCK_SETTINGS_MAGIC = 0x4F524453UL;  // "ORDS"
 static const uint32_t ESPNOW_DOCK_PING_MAGIC     = 0x4F525047UL;  // "ORPG"
+// How long a dock stays "in range" after its last reply. Comfortably longer
+// than the ping cadence, short enough that a dock switched off is noticed.
+static const unsigned long DOCK_PRESENCE_GRACE_MS = 30000UL;
 // Sent as the radio is released, so the dock can put its LED out at the same
 // moment the remote's pill outline goes white instead of waiting to notice
 // the silence.
@@ -7157,6 +7178,12 @@ struct EspNowPairedDevice {
   // refused on a guess.
   bool rfKnown;
   bool rfPresent;
+  // Per dock rather than one global pair, so a second dock is not described
+  // using the first one's firmware and reachability. Both come from that
+  // dock's own reply to a ping, so "in range" means it actually answered
+  // rather than that it is merely on the paired list.
+  char version[9];
+  unsigned long lastSeenMs;
 };
 
 struct EspNowCandidate {
@@ -18919,6 +18946,45 @@ void appendEspNowDeviceListJson(JsonArray target) {
     JsonObject entry = target.add<JsonObject>();
     entry["mac"] = formatMacAddress(espNowDevices[i].mac);
     entry["name"] = espNowDevices[i].name;
+    // "online" is only ever true because this dock answered, never because it
+    // is on the list. A paired dock that is unplugged or out of range reports
+    // false, which is what lets WebConfig colour it differently.
+    entry["online"] = espNowDevices[i].lastSeenMs &&
+      (millis() - espNowDevices[i].lastSeenMs) < DOCK_PRESENCE_GRACE_MS;
+    entry["firmware"] = espNowDevices[i].version;
+    entry["rfKnown"] = espNowDevices[i].rfKnown;
+    entry["rfPresent"] = espNowDevices[i].rfPresent;
+  }
+}
+
+/*
+  Ping every paired dock and give them a moment to answer.
+
+  The ESP-NOW radio is off almost all of the time, so lastSeenMs would
+  otherwise be minutes stale whenever WebConfig asked - and a dock that is
+  sitting there working would be reported as out of range. This brings the
+  link up, pings each dock, and waits long enough for the info replies to
+  land, so the answer describes now rather than the last time something
+  happened to be sent.
+*/
+void probeEspNowDocks() {
+  if (!espNowEnabled || espNowDeviceCount == 0) return;
+  if (!ensureEspNowLink()) return;
+  uint8_t ping[5];
+  uint32_t pingMagic = ESPNOW_DOCK_PING_MAGIC;
+  memcpy(ping, &pingMagic, sizeof(pingMagic));
+  uint8_t primary = 0;
+  wifi_second_chan_t second;
+  ping[4] = (esp_wifi_get_channel(&primary, &second) == ESP_OK && primary) ? primary : 0;
+  for (uint8_t i = 0; i < espNowDeviceCount; i++) {
+    sendEspNowWithRetry(espNowDevices[i].mac, ping, sizeof(ping));
+  }
+  // The reply is queued on the dock's loop and sent from there, so this is a
+  // round trip through two schedulers rather than a MAC-layer ack.
+  unsigned long until = millis() + 600;
+  while ((long)(millis() - until) < 0) {
+    delay(10);
+    serviceUiDuringLongHttpTransfer();
   }
 }
 
@@ -19085,6 +19151,9 @@ void handleEspNowDevicesList() {
     sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
     return;
   }
+  // WebConfig asks for a live answer when it is showing dock status; the
+  // plain list is still cheap for everything else.
+  if (webServer.hasArg("probe")) probeEspNowDocks();
   JsonDocument doc;
   doc["ok"] = true;
   appendEspNowDeviceListJson(doc["devices"].to<JsonArray>());
@@ -20676,8 +20745,11 @@ void onEspNowDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int 
   // A firmware ack from the dock we are currently updating. Checked before the
   // scan and learn windows because a transfer can be running while neither is
   // open, and only ever accepted from the dock this transfer is addressed to.
-  if ((size_t)len >= sizeof(EspNowDockInfoPacket) && espNowDeviceCount > 0 &&
-      memcmp(espNowDevices[0].mac, info->src_addr, 6) == 0) {
+  // From any paired dock, not just the first. A second dock's reply used to be
+  // discarded here, so it could never report its firmware or prove it was in
+  // range - it simply looked like a name on a list.
+  if ((size_t)len >= sizeof(EspNowDockInfoPacket) &&
+      findEspNowDeviceIndexByMac(info->src_addr) >= 0) {
     EspNowDockInfoPacket dockInfo;
     memcpy(&dockInfo, data, sizeof(dockInfo));
     if (dockInfo.magic == ESPNOW_DOCK_INFO_MAGIC) {
@@ -20685,13 +20757,18 @@ void onEspNowDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int 
       // Only meaningful from a dock new enough to send it; an older one
       // leaves the packet short and the field zero, so rfKnown stays false
       // and learning is attempted rather than refused.
-      if ((size_t)len >= sizeof(EspNowDockInfoPacket)) {
-        for (uint8_t i = 0; i < espNowDeviceCount; i++) {
-          if (memcmp(espNowDevices[i].mac, info->src_addr, 6) != 0) continue;
+      for (uint8_t i = 0; i < espNowDeviceCount; i++) {
+        if (memcmp(espNowDevices[i].mac, info->src_addr, 6) != 0) continue;
+        // Answering at all is the proof of presence - recorded for every dock
+        // that replies, not just the first paired one.
+        espNowDevices[i].lastSeenMs = millis();
+        strlcpy(espNowDevices[i].version, dockInfo.version,
+                sizeof(espNowDevices[i].version));
+        if ((size_t)len >= sizeof(EspNowDockInfoPacket)) {
           espNowDevices[i].rfKnown = true;
           espNowDevices[i].rfPresent = dockInfo.rfPresent != 0;
-          break;
         }
+        break;
       }
       if (strcmp(dockReportedVersion, dockInfo.version) != 0) {
         strlcpy(dockReportedVersion, dockInfo.version, sizeof(dockReportedVersion));
@@ -21145,7 +21222,11 @@ void serviceDockLink(unsigned long now) {
   uint8_t primary = 0;
   wifi_second_chan_t second;
   ping[4] = (esp_wifi_get_channel(&primary, &second) == ESP_OK && primary) ? primary : 0;
-  sendEspNowWithRetry(espNowDevices[0].mac, ping, sizeof(ping));
+  // Every paired dock. Pinging only the first meant a second dock never
+  // answered, so it never reported a version and never looked reachable.
+  for (uint8_t i = 0; i < espNowDeviceCount; i++) {
+    sendEspNowWithRetry(espNowDevices[i].mac, ping, sizeof(ping));
+  }
   // Only meaningful while the radio is actually up and pinging.
   if (dockLinkOnline && (now - dockLastAckMs) > 20000UL) {
     dockLinkOnline = false;
