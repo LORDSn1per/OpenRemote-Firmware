@@ -1,6 +1,52 @@
 /*
   OpenRemote Dock firmware change log (newest first)
 
+  1.47 - 2026-09-08
+    - Raw IR now goes out through the RMT peripheral, and IR commands from the
+      dock finally reach the device. The emitter had been proven firing and the
+      code proven correct, but the timing was not: the 't' probe measured 178us
+      of overhead on every single edge with the carrier in LEDC hardware, and
+      88us with it bit-banged in software. IRremote drives the pin from the CPU
+      with a library call per edge, and on a single-core C3 that is nowhere
+      near fast enough - a learned code's 600us marks were going out 15-30%
+      long, cumulatively, which no receiver will accept.
+      RMT generates both the carrier and the mark/space envelope in hardware
+      from a symbol list, so the CPU hands over the whole burst and the timing
+      is exact regardless of what Wi-Fi, MQTT or ESP-NOW are doing. One tick is
+      1us. Each symbol carries two pulses, which is what a raw IR code already
+      is, so the timings pair up as mark-then-space with no translation.
+      IRremote remains as a fallback if an RMT channel cannot be claimed.
+
+  1.46 - 2026-09-08
+    - Adds 't' to the serial console: transmits a known IR probe pattern so the
+      remote's own IR receiver can capture what this dock actually emits.
+      There is no oscilloscope on the bench but there is something better - a
+      receiver only produces output at all if the carrier is close enough to
+      38kHz to demodulate, so learning the probe on the remote settles both
+      open questions at once: whether a valid carrier exists, and whether the
+      mark/space envelope survives intact. The pattern is round numbers on
+      purpose (9000/4500 header, then 600us marks with 600/1600us spaces) so
+      any stretching is obvious and measurable from the capture alone.
+
+  1.45 - 2026-09-08
+    - IR commands from the dock now actually reach the device. The emitter had
+      been confirmed firing - the orange test LED blinked, the IR LED showed
+      the usual faint purple on a phone camera - and the timings were correct,
+      yet a heater that responded to the identical command from the remote's
+      own emitter ignored every one of them from the dock.
+      The carrier was the difference. IRremote bit-bangs the 38kHz carrier in
+      software unless SEND_PWM_BY_TIMER is defined, and a 38kHz half-period is
+      13us. The remote gets away with that on a dual-core S3 at 240MHz. The
+      dock cannot: a single-core C3 at 160MHz running Wi-Fi, MQTT, a Home
+      Assistant WebSocket and ESP-NOW takes an interrupt straight through the
+      middle of carrier pulses. The mark/space envelope survived - those are
+      hundreds of microseconds - which is exactly why the LED looked perfect
+      while the receiver's 38kHz bandpass filter discarded the lot.
+      SEND_PWM_BY_TIMER moves the carrier onto the LEDC peripheral, where it is
+      exact no matter what the CPU is doing, and leaves software responsible
+      only for the envelope. The dock has no IrReceiver anywhere, so nothing
+      else wanted that timer.
+
   1.44 - 2026-09-08
     - Adds a serial console with a bench test for the IR emitter, because "the
       IR LED never blinks" cannot be diagnosed from a 38kHz carrier that is
@@ -774,7 +820,7 @@ static inline bool serialHostAttached() {
 }
 
 
-#define OPENREMOTE_DOCK_VERSION_STRING "1.44"
+#define OPENREMOTE_DOCK_VERSION_STRING "1.47"
 
 // A literal in the built image, so a tool holding the .bin can tell what it is
 // without running it. The remote firmware carries the same idea under
@@ -1554,6 +1600,84 @@ void ledBlink(unsigned long now, uint32_t periodMs) {
 // signal's total duration but not its internal structure, with a floor so a
 // short code is still visible.
 
+/*
+  Raw IR transmission through the RMT peripheral rather than IRremote.
+
+  IRremote drives the pin from the CPU, one library call per edge, and on this
+  part that is nowhere near fast enough. Measured with the 't' probe: 178us of
+  overhead on every single edge with the carrier in LEDC hardware, and 88us
+  with it bit-banged in software. A learned code's marks are around 600us, so
+  each one was going out 15-30% long, cumulatively, and no receiver would
+  accept that - which is exactly what was happening. The emitter was firing
+  perfectly and the timing was wrong.
+
+  RMT is the peripheral built for this. Both the carrier and the mark/space
+  envelope are generated in hardware from a symbol list, so the CPU hands over
+  the whole burst and the timing is exact no matter what Wi-Fi, MQTT or
+  ESP-NOW are doing at the time. One tick is 1us, finer than any IR code needs.
+
+  Each rmt_data_t carries two pulses, so the timings pair up naturally into
+  mark-then-space symbols - which is what a raw IR code already is.
+*/
+#if DOCK_IR_LED_PIN >= 0
+bool irRmtReady = false;
+uint16_t irRmtKhz = 0;
+
+bool irRmtBegin(uint16_t khz) {
+  if (irRmtReady && irRmtKhz == khz) return true;
+  if (irRmtReady) rmtDeinit(DOCK_IR_LED_PIN);
+  irRmtReady = false;
+  if (!rmtInit(DOCK_IR_LED_PIN, RMT_TX_MODE, RMT_MEM_NUM_BLOCKS_2, 1000000)) {
+    Serial.println("Dock: RMT init failed for the IR emitter");
+    return false;
+  }
+  // Carrier on the marks only (level 1), one third duty, which is what an IR
+  // receiver's AGC is designed around.
+  if (!rmtSetCarrier(DOCK_IR_LED_PIN, true, true, (uint32_t)khz * 1000UL, 33.0f)) {
+    Serial.println("Dock: RMT carrier setup failed for the IR emitter");
+    rmtDeinit(DOCK_IR_LED_PIN);
+    return false;
+  }
+  rmtSetEOT(DOCK_IR_LED_PIN, 0);   // Rest low between bursts, emitter dark.
+  irRmtKhz = khz;
+  irRmtReady = true;
+  Serial.printf("Dock: IR emitter on RMT, %u kHz carrier at 1us resolution\n",
+                (unsigned)khz);
+  return true;
+}
+
+bool irRmtSendRaw(const uint16_t *timings, uint16_t count, uint16_t khz) {
+  if (!timings || !count) return false;
+  if (!irRmtBegin(khz)) return false;
+  // One frame can hold at most 120 timings (the ESP-NOW payload limit), so 60
+  // symbols covers anything that can arrive.
+  static rmt_data_t symbols[64];
+  const uint16_t maxSymbols = sizeof(symbols) / sizeof(symbols[0]);
+  uint16_t used = 0;
+  for (uint16_t i = 0; i < count && used < maxSymbols; i += 2) {
+    // duration is 15 bits, so 32767us is the longest single pulse RMT can
+    // express. No IR code comes close - the longest header here is 9ms - but
+    // clamping beats emitting a wrapped, meaningless duration.
+    uint32_t mark = timings[i] > 32767U ? 32767U : timings[i];
+    symbols[used].level0 = 1;
+    symbols[used].duration0 = mark ? mark : 1;
+    if (i + 1 < count) {
+      uint32_t space = timings[i + 1] > 32767U ? 32767U : timings[i + 1];
+      symbols[used].level1 = 0;
+      symbols[used].duration1 = space ? space : 1;
+    } else {
+      // Odd count: the code ends on a mark. One tick of low closes the symbol
+      // so the burst ends cleanly rather than on a zero duration, which RMT
+      // reads as an end marker in the middle of the data.
+      symbols[used].level1 = 0;
+      symbols[used].duration1 = 1;
+    }
+    used++;
+  }
+  return rmtWrite(DOCK_IR_LED_PIN, symbols, used, RMT_WAIT_FOR_EVER);
+}
+#endif
+
 // Sends the command on the IR emitter for real, with the indicator LED lit for
 // exactly as long as the transmission lasts.
 //
@@ -1650,6 +1774,10 @@ bool transmitIrInner(const EspNowCommandHeader &header, const uint16_t *timings,
 
   if (header.encoding == 1) {
     if (!timings || !count) return false;
+    if (irRmtSendRaw(timings, count, khz)) return true;
+    // Falls back rather than failing outright: a dock that cannot claim an RMT
+    // channel should still transmit, badly-timed though it will be.
+    Serial.println("Dock: RMT unavailable, falling back to IRremote timing");
     IrSender.sendRaw(timings, count, khz);
     return true;
   }
@@ -3901,6 +4029,45 @@ void runIrEmitterTest(bool modulated, uint8_t cycles) {
 }
 #endif
 
+/*
+  Transmits a known IR pattern so the remote's own receiver can capture it.
+
+  There is no oscilloscope on this bench, but there is something better: the
+  remote has a real IR receiver, and a receiver only produces output at all if
+  the carrier is close enough to 38kHz for its bandpass filter to demodulate.
+  So pointing this dock at the remote and learning what actually arrives
+  settles both open questions in one measurement - whether a valid carrier is
+  being produced, and whether the mark/space envelope survives the trip
+  intact. Comparing the captured timings against the pattern below says which.
+
+  The pattern is deliberately simple and self-describing: a 9000us lead-in mark
+  and 4500us space (NEC's header, which every receiver handles), then eight
+  600us marks separated by alternating 600us and 1600us spaces. Any stretching
+  shows up immediately as those round numbers coming back wrong, and by how
+  much on marks versus spaces.
+*/
+#if DOCK_IR_LED_PIN >= 0
+void sendIrProbePattern() {
+  static const uint16_t probe[] = {
+    9000, 4500,
+    600, 600, 600, 1600, 600, 600, 600, 1600,
+    600, 600, 600, 1600, 600, 600, 600, 1600,
+    600
+  };
+  const uint16_t count = sizeof(probe) / sizeof(probe[0]);
+  uint32_t expected = 0;
+  for (uint16_t i = 0; i < count; i++) expected += probe[i];
+  Serial.printf("Dock: IR probe - %u timing(s), %lu us expected, 38 kHz\n",
+                (unsigned)count, (unsigned long)expected);
+  uint32_t began = micros();
+  if (!irRmtSendRaw(probe, count, 38)) IrSender.sendRaw(probe, count, 38);
+  uint32_t took = micros() - began;
+  Serial.printf("Dock: IR probe sent in %lu us (overhead %ld us, %ld us per "
+                "edge)\n", (unsigned long)took, (long)took - (long)expected,
+                ((long)took - (long)expected) / (long)count);
+}
+#endif
+
 void serviceSerialConsole() {
   while (Serial.available()) {
     int key = Serial.read();
@@ -3908,11 +4075,13 @@ void serviceSerialConsole() {
 #if DOCK_IR_LED_PIN >= 0
     if (key == 'i' || key == 'I') { runIrEmitterTest(false, 5); continue; }
     if (key == 'm' || key == 'M') { runIrEmitterTest(true, 5); continue; }
+    if (key == 't' || key == 'T') { sendIrProbePattern(); continue; }
 #endif
     Serial.println("Dock serial console:");
 #if DOCK_IR_LED_PIN >= 0
     Serial.println("  i - IR emitter test: 1s solid on, 200ms off, 5 times");
     Serial.println("  m - the same at 38kHz, the real carrier");
+    Serial.println("  t - transmit a known IR probe pattern for the remote to learn");
 #else
     Serial.println("  (the IR emitter is disabled in this build)");
 #endif
