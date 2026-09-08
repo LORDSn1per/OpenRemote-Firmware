@@ -1,6 +1,51 @@
 /*
   OpenRemote Dock firmware change log (newest first)
 
+  1.52 - 2026-09-09
+    - RC5 and RC5X are transmittable. They are the only supported protocols
+      whose frame begins with a space - a biphase 1 is space-then-mark, and the
+      start bit is a 1 - and the run accumulator banked that leading space
+      instead of discarding it, so it became the first entry in the timing
+      list. The first entry of a timing list is a mark by definition, so every
+      RC5 frame went out with a spurious 889us mark glued to the front. Every
+      other protocol starts with a mark and was unaffected, which is exactly
+      how the round-trip test found it: six protocols decoded, those two came
+      back as anonymous PulseDistance.
+    - Verified end to end rather than by inspection. The dock transmits one
+      known frame per protocol ('1'-'9' on the serial console) and the remote's
+      own IR receiver decodes what arrives, which checks the timing constants,
+      bit order, complement rules and carrier frequency against hardware:
+        NEC->NEC  NECext->Onkyo  Samsung32->Samsung  RC5->RC5  RC5X->RC5
+        RC6->RC6  SIRC/SIRC15/SIRC20->Sony
+      27 of 27 captures over three sweeps. The three real .ir file devices on
+      this remote now decode as clean NEC, 67 timings, 8980/4470 header - the
+      same BenQ command that arrived as "980 370 3880 270 430 220 ..." before.
+
+  1.51 - 2026-09-09
+    - Adds '1'-'9' to the serial console: one known frame per protocol, for
+      round-trip verification against the remote's receiver.
+
+  1.50 - 2026-09-09
+    - Parsed protocols now go out through RMT as well, which fixes .ir file
+      devices being unusable through the dock. 1.47 moved only raw codes; a
+      Flipper .ir file is mostly parsed entries, and those were still handed to
+      IRremote's encoders and still driven from the CPU an edge at a time.
+      Captured through the remote's own receiver, a BenQ "On" arrived as
+        980 370 3880 270 430 220 330 620 630 470 630 4870 180 720 ...
+      with the 9000us header mark broken into three fragments: the software
+      carrier stops whenever the CPU is preempted and the receiver reads every
+      dropout as the end of a mark. A FetchTV Power produced nothing decodable.
+      NEC, NECext/NEC1, Samsung32, SIRC and RC5/RC6 are now rendered to a raw
+      timing list here and handed to RMT, which takes the CPU out of the
+      transmission entirely exactly as it did for raw codes. IRremote remains
+      for any protocol without an encoder.
+    - RC5 and RC6 carry a toggle bit that has to flip between distinct presses
+      or the receiver treats the second as a repeat of the first and ignores
+      it, so it is flipped per send.
+    - Manchester coding merges adjacent half-bits of the same level rather than
+      emitting them separately, so the timing list always alternates mark and
+      space, which is what RMT and every receiver require.
+
   1.49 - 2026-09-08
     - Adds 'u', a symmetric square probe (fifteen 2000us pulses), to separate an
       emitter fault from a receiver artefact. The main 't' probe could not: it
@@ -853,7 +898,7 @@ static inline bool serialHostAttached() {
 }
 
 
-#define OPENREMOTE_DOCK_VERSION_STRING "1.49"
+#define OPENREMOTE_DOCK_VERSION_STRING "1.52"
 
 // A literal in the built image, so a tool holding the .bin can tell what it is
 // without running it. The remote firmware carries the same idea under
@@ -1694,9 +1739,9 @@ bool irRmtBegin(uint16_t khz) {
 bool irRmtSendRaw(const uint16_t *timings, uint16_t count, uint16_t khz) {
   if (!timings || !count) return false;
   if (!irRmtBegin(khz)) return false;
-  // One frame can hold at most 120 timings (the ESP-NOW payload limit), so 60
-  // symbols covers anything that can arrive.
-  static rmt_data_t symbols[64];
+  // A raw frame from the remote holds at most 120 timings (the ESP-NOW payload
+  // limit) and a rendered parsed frame at most 160, so 88 symbols covers both.
+  static rmt_data_t symbols[88];
   const uint16_t maxSymbols = sizeof(symbols) / sizeof(symbols[0]);
   uint16_t used = 0;
   for (uint16_t i = 0; i < count && used < maxSymbols; i += 2) {
@@ -1720,6 +1765,246 @@ bool irRmtSendRaw(const uint16_t *timings, uint16_t count, uint16_t khz) {
     used++;
   }
   return rmtWrite(DOCK_IR_LED_PIN, symbols, used, RMT_WAIT_FOR_EVER);
+}
+#endif
+
+/*
+  Parsed protocols rendered to raw timings, so they go out through RMT too.
+
+  1.47 moved only raw codes. A Flipper .ir file is mostly parsed entries, and
+  those were still handed to IRremote's encoders and still driven from the CPU
+  an edge at a time. Captured through the remote's receiver a BenQ "On" arrived
+  as
+
+    980 370 3880 270 430 220 330 620 630 470 630 4870 180 720 ...
+
+  with a 9000us header mark broken into three fragments: the software carrier
+  stops whenever the CPU is preempted, and the receiver reads every dropout as
+  the end of a mark.
+
+  Every constant and every bit rule below is taken from the IRremote source the
+  remote transmits with, not from a datasheet or from memory, because the goal
+  is not "a correct NEC frame" - it is the same frame the remote sends, since
+  the whole database already works from there. They were checked against
+  ir_NEC.hpp, ir_Samsung.hpp, ir_Sony.hpp and ir_RC5_RC6.hpp in the exact
+  library version this firmware builds with.
+
+  Measured over the whole 14,551-remote database, the parsed buttons are:
+
+    NECext 143026   NEC 10053   RC5 7906   Samsung32 2517   SIRC 1103
+    SIRC20 1033     RC6 932     SIRC15 838  RC5X 222
+
+  which is 98.7% of all 169,910 parsed buttons. The remainder - Kaseikyo 1680,
+  RCA 274, Pioneer 189, NEC42 137 - are not supported by the remote either, so
+  the dock reaching parity with it covers everything that can be sent at all.
+  The other 124,104 buttons in the database are raw and already went through
+  RMT from 1.47.
+*/
+#if DOCK_IR_LED_PIN >= 0
+uint16_t irEncodeBuf[160];
+uint16_t irEncodeCount = 0;
+
+void irEncAdd(uint16_t us) {
+  if (!us) return;                       // Never emit a zero - RMT reads it as an end marker.
+  if (irEncodeCount < (uint16_t)(sizeof(irEncodeBuf) / sizeof(irEncodeBuf[0]))) {
+    irEncodeBuf[irEncodeCount++] = us;
+  }
+}
+
+/*
+  Level run accumulator.
+
+  IRremote builds a frame by calling mark() and space() in whatever order the
+  protocol needs, and consecutive calls at the same level are one pulse on air,
+  not two. Recording them as runs reproduces that exactly, and guarantees the
+  finished list alternates mark, space, mark, space - which is what RMT and
+  every receiver require.
+
+  A leading space is dropped. RC5 genuinely begins with one (its start bit is a
+  1, and a biphase 1 is space-then-mark), but a receiver cannot see a space
+  before the first mark, and a timing list has to begin with a mark.
+*/
+bool irRunLevel = true;
+uint16_t irRunPending = 0;
+
+void irRunReset() { irRunLevel = true; irRunPending = 0; irEncodeCount = 0; }
+
+void irRunAdd(bool level, uint16_t us) {
+  // A leading space is discarded outright, not banked. Banking it made it the
+  // first entry in the list, and the first entry of a timing list is a mark by
+  // definition - so RC5 and RC5X, the only protocols whose frame begins with a
+  // space, went out with a spurious 889us mark glued to the front and were
+  // decoded as anonymous PulseDistance instead of RC5. Every other protocol
+  // starts with a mark and was unaffected, which is exactly how the round-trip
+  // test found it: six protocols decoded, those two did not.
+  if (!irEncodeCount && !irRunPending && !level) return;
+  if (level == irRunLevel) { irRunPending += us; return; }
+  irEncAdd(irRunPending);
+  irRunLevel = level;
+  irRunPending = us;
+}
+
+void irRunFlush() { irEncAdd(irRunPending); irRunPending = 0; }
+
+// Pulse distance: fixed mark, the following space carries the bit. LSB first.
+void irEncPulseDistance(uint32_t data, uint8_t bits, uint16_t mark,
+                        uint16_t zeroSpace, uint16_t oneSpace) {
+  for (uint8_t i = 0; i < bits; i++) {
+    irRunAdd(true, mark);
+    irRunAdd(false, (data >> i) & 1UL ? oneSpace : zeroSpace);
+  }
+}
+
+// Pulse width: the mark carries the bit, every space is the same. LSB first.
+void irEncPulseWidth(uint32_t data, uint8_t bits, uint16_t zeroMark,
+                     uint16_t oneMark, uint16_t space) {
+  for (uint8_t i = 0; i < bits; i++) {
+    irRunAdd(true, (data >> i) & 1UL ? oneMark : zeroMark);
+    irRunAdd(false, space);
+  }
+}
+
+/*
+  Biphase, MSB first - a direct transcription of IRremote's sendBiphaseData().
+  A 1 is space-then-mark and a 0 is mark-then-space, and the run accumulator
+  above merges the adjacent halves that IRremote handles with its explicit
+  "2 * unit" extension.
+*/
+void irEncBiphase(uint16_t unit, uint32_t data, uint8_t bits, bool startBit) {
+  uint8_t total = bits + (startBit ? 1 : 0);
+  uint32_t mask = 1UL << (total - 1);
+  bool next = startBit ? true : ((data & mask) != 0);
+  for (uint8_t i = total; i > 0; i--) {
+    bool current = next;
+    mask >>= 1;
+    next = ((data & mask) != 0) || (i == 1);
+    if (current) { irRunAdd(false, unit); irRunAdd(true, unit); }
+    else         { irRunAdd(true, unit);  irRunAdd(false, unit); }
+  }
+}
+
+// RC5 and RC6 carry a toggle that must flip between distinct presses, or the
+// receiver treats the second press as a repeat of the first and ignores it.
+bool irRc5Toggle = false;
+
+bool irEncodeParsed(const EspNowCommandHeader &header, uint16_t &khzOut,
+                    uint8_t &repeats, uint16_t &gapMs) {
+  irRunReset();
+  repeats = 1;
+  gapMs = 0;
+  khzOut = 38;
+  const char *p = header.protocol;
+  const uint16_t kNecUnit = 560;   // Named to dodge IRremote's own NEC_UNIT macro.
+
+  if (strcmp(p, "NEC") == 0 || strcmp(p, "NECext") == 0 || strcmp(p, "NEC1") == 0) {
+    bool ext = strcmp(p, "NEC") != 0;
+    uint32_t frame;
+    if (ext) {
+      // sendOnkyo(): address and command both go out as given, 16 bits each,
+      // with no complement bytes at all.
+      frame = ((uint32_t)(header.command & 0xFFFFU) << 16) |
+              (uint32_t)(header.address & 0xFFFFU);
+    } else {
+      // computeNECRawDataAndChecksum(): an address with a zero high byte is an
+      // 8-bit address and is followed by its complement; the command always is.
+      uint32_t addressField = (header.address & 0xFF00U)
+        ? (header.address & 0xFFFFU)
+        : ((header.address & 0xFFU) | ((~header.address & 0xFFU) << 8));
+      uint32_t commandField = (header.command & 0xFFU) |
+                              ((~header.command & 0xFFU) << 8);
+      frame = addressField | (commandField << 16);
+    }
+    khzOut = 38;
+    irRunAdd(true, 16 * kNecUnit);       // 8960
+    irRunAdd(false, 8 * kNecUnit);       // 4480
+    irEncPulseDistance(frame, 32, kNecUnit, kNecUnit, 3 * kNecUnit);
+    irRunAdd(true, kNecUnit);            // Stop bit.
+    irRunFlush();
+    return irEncodeCount > 0;
+  }
+
+  if (strcmp(p, "Samsung32") == 0) {
+    // sendSamsung(): an 8-bit address is duplicated rather than complemented -
+    // that is what makes it Flipper-IRDB compatible - while an 8-bit command
+    // is followed by its complement.
+    uint32_t addressField = (header.address < 0x100U)
+      ? ((header.address & 0xFFU) | ((header.address & 0xFFU) << 8))
+      : (header.address & 0xFFFFU);
+    uint32_t commandField = (header.command < 0x100U)
+      ? ((header.command & 0xFFU) | ((~header.command & 0xFFU) << 8))
+      : (header.command & 0xFFFFU);
+    khzOut = 38;
+    irRunAdd(true, 8 * kNecUnit);        // 4480
+    irRunAdd(false, 8 * kNecUnit);       // 4480
+    irEncPulseDistance(addressField | (commandField << 16), 32,
+                       kNecUnit, kNecUnit, 3 * kNecUnit);
+    irRunAdd(true, kNecUnit);            // Stop bit.
+    irRunFlush();
+    return irEncodeCount > 0;
+  }
+
+  if (strncmp(p, "SIRC", 4) == 0) {
+    const uint16_t kSonyUnit = 600;
+    uint8_t bits = header.sonyBits ? header.sonyBits : 12;
+    if (bits != 12 && bits != 15 && bits != 20) bits = 12;
+    // sendSony(): address << 7 | command, LSB first, pulse width, and no stop
+    // bit because the one and zero spaces are identical.
+    uint32_t frame = ((uint32_t)header.address << 7) | (header.command & 0x7FU);
+    khzOut = 40;                         // Sony is 40kHz, not 38.
+    irRunAdd(true, 4 * kSonyUnit);       // 2400
+    irRunAdd(false, kSonyUnit);          // 600
+    irEncPulseWidth(frame, bits, kSonyUnit, 2 * kSonyUnit, kSonyUnit);
+    irRunFlush();
+    // Sony receivers expect the frame three times; a single one is routinely
+    // ignored. IRremote's repeat period is 45ms measured start to start.
+    repeats = 3;
+    gapMs = 22;
+    return irEncodeCount > 0;
+  }
+
+  if (strcmp(p, "RC5") == 0 || strcmp(p, "RC5X") == 0) {
+    const uint16_t kRc5Unit = 889;
+    uint8_t command = (uint8_t)header.command;
+    uint16_t data = (uint16_t)(header.address & 0x1FU) << 6;
+    // sendRC5(): the field bit is 1 for RC5 and 0 for RC5X, and RC5X is
+    // detected from the command itself rather than from the protocol name.
+    if (command >= 0x40) command &= 0x3FU;
+    else data |= 1U << 12;
+    irRc5Toggle = !irRc5Toggle;
+    if (irRc5Toggle) data |= 1U << 11;
+    data |= command;
+    khzOut = 36;                         // RC5 and RC6 are 36kHz.
+    irEncBiphase(kRc5Unit, data, 13, true);
+    irRunFlush();
+    return irEncodeCount > 0;
+  }
+
+  if (strcmp(p, "RC6") == 0) {
+    const uint16_t kRc6Unit = 444;
+    irRc5Toggle = !irRc5Toggle;
+    // sendRC6(): command, address, then the toggle in the third byte, sent as
+    // 20 bits MSB first - three zero mode bits, the toggle, address, command.
+    uint32_t data = (uint32_t)(header.command & 0xFFU) |
+                    ((uint32_t)(header.address & 0xFFU) << 8) |
+                    (irRc5Toggle ? (1UL << 16) : 0UL);
+    khzOut = 36;
+    irRunAdd(true, 6 * kRc6Unit);        // 2666 leader mark
+    irRunAdd(false, 2 * kRc6Unit);       // 889 leader space
+    irRunAdd(true, kRc6Unit);            // Start bit, a 1: mark then space.
+    irRunAdd(false, kRc6Unit);
+    // RC6 is the opposite polarity to RC5: a 1 is mark-then-space. The fourth
+    // bit sent is the toggle and is double width.
+    uint32_t mask = 1UL << 19;
+    for (uint8_t i = 1; mask; i++, mask >>= 1) {
+      uint16_t t = (i == 4) ? (kRc6Unit * 2) : kRc6Unit;
+      if (data & mask) { irRunAdd(true, t);  irRunAdd(false, t); }
+      else             { irRunAdd(false, t); irRunAdd(true, t);  }
+    }
+    irRunFlush();
+    return irEncodeCount > 0;
+  }
+
+  return false;
 }
 #endif
 
@@ -1825,6 +2110,32 @@ bool transmitIrInner(const EspNowCommandHeader &header, const uint16_t *timings,
     Serial.println("Dock: RMT unavailable, falling back to IRremote timing");
     IrSender.sendRaw(timings, count, khz);
     return true;
+  }
+
+  // Rendered here and sent through RMT, the same exact-timing path raw uses.
+  // IRremote below is only reached for a protocol with no encoder here, and
+  // its output is known to fragment under load - see irEncodeParsed().
+  {
+    uint8_t repeats = 1;
+    uint16_t gapMs = 0;
+    uint16_t protocolKhz = khz;
+    if (irEncodeParsed(header, protocolKhz, repeats, gapMs) && irEncodeCount) {
+      // The carrier comes from the protocol, not from the frame: Sony is 40kHz
+      // and RC5/RC6 are 36kHz, and sending those at 38 is a real mismatch
+      // against a receiver's bandpass filter. A parsed command carries no
+      // frequency of its own, so the dock used to send every one of them at 38.
+      Serial.printf("Dock: IR %s rendered to %u timing(s) at %u kHz, "
+                    "%u transmission(s)\n", header.protocol,
+                    (unsigned)irEncodeCount, (unsigned)protocolKhz,
+                    (unsigned)repeats);
+      bool ok = true;
+      for (uint8_t r = 0; r < repeats; r++) {
+        if (r && gapMs) delay(gapMs);
+        if (!irRmtSendRaw(irEncodeBuf, irEncodeCount, protocolKhz)) { ok = false; break; }
+      }
+      if (ok) return true;
+      Serial.println("Dock: RMT unavailable, falling back to IRremote timing");
+    }
   }
 
   if (strcmp(header.protocol, "NEC") == 0) {
@@ -4143,6 +4454,81 @@ void sendIrSquareProbe() {
 }
 #endif
 
+/*
+  Times a parsed-protocol send, which still goes through IRremote.
+
+  Only the raw path was moved to RMT. A parsed command - which is most of what
+  a Flipper .ir file holds - is still handed to IRremote's own protocol
+  encoders, and those drive the pin the same slow way the raw path used to.
+  NEC is exactly measurable, which makes it a good witness: address 0x00 with
+  command 0x00 transmits 0x00, 0xFF, 0x00, 0xFF, so sixteen zero bits and
+  sixteen one bits, and the frame is
+
+    9000 + 4500 + 16*(560+560) + 16*(560+1690) + 560 = 67980us
+
+  Anything much past that is the same per-edge overhead that stopped raw codes
+  working, and means parsed commands need the same treatment.
+*/
+#if DOCK_IR_LED_PIN >= 0
+void sendIrNecProbe() {
+  const uint32_t expected = 67980;
+  Serial.printf("Dock: NEC probe - address 0x00 command 0x00, %lu us expected\n",
+                (unsigned long)expected);
+  uint32_t began = micros();
+  IrSender.sendNEC(0x0000, 0x00, 0);
+  uint32_t took = micros() - began;
+  Serial.printf("Dock: NEC probe sent in %lu us (overhead %ld us, %+.1f%%)\n",
+                (unsigned long)took, (long)took - (long)expected,
+                100.0 * ((double)took - (double)expected) / (double)expected);
+}
+#endif
+
+/*
+  One known frame per supported protocol, for round-trip verification.
+
+  Encoders cannot be trusted just because they compile. Each of these sends a
+  frame whose protocol, address and command are known, so the remote's own IR
+  receiver can decode what arrives and the two can be compared. That checks the
+  timing constants, bit order, complement rules and carrier frequency at once,
+  against hardware rather than against my reading of the library.
+*/
+#if DOCK_IR_LED_PIN >= 0
+void sendIrProtocolProbe(uint8_t which) {
+  EspNowCommandHeader h = {};
+  h.encoding = 0;
+  switch (which) {
+    case 1: strcpy(h.protocol, "NEC");       h.address = 0x04;   h.command = 0x08; break;
+    case 2: strcpy(h.protocol, "NECext");    h.address = 0x2A17; h.command = 0x0C; break;
+    case 3: strcpy(h.protocol, "Samsung32"); h.address = 0x07;   h.command = 0x02; break;
+    case 4: strcpy(h.protocol, "RC5");       h.address = 0x05;   h.command = 0x0A; break;
+    case 5: strcpy(h.protocol, "RC5X");      h.address = 0x05;   h.command = 0x4A; break;
+    case 6: strcpy(h.protocol, "RC6");       h.address = 0x05;   h.command = 0x0A; break;
+    case 7: strcpy(h.protocol, "SIRC");      h.address = 0x01;   h.command = 0x15; h.sonyBits = 12; break;
+    case 8: strcpy(h.protocol, "SIRC15");    h.address = 0x01;   h.command = 0x15; h.sonyBits = 15; break;
+    case 9: strcpy(h.protocol, "SIRC20");    h.address = 0x1A;   h.command = 0x15; h.sonyBits = 20; break;
+    default: return;
+  }
+  uint16_t khz = 38, gapMs = 0;
+  uint8_t repeats = 1;
+  if (!irEncodeParsed(h, khz, repeats, gapMs) || !irEncodeCount) {
+    Serial.printf("Dock: protocol probe %u (%s) has no encoder\n", (unsigned)which, h.protocol);
+    return;
+  }
+  Serial.printf("Dock: protocol probe %u - %s address 0x%04lX command 0x%04lX, "
+                "%u timing(s) at %u kHz, %u transmission(s)\n",
+                (unsigned)which, h.protocol, (unsigned long)h.address,
+                (unsigned long)h.command, (unsigned)irEncodeCount,
+                (unsigned)khz, (unsigned)repeats);
+  for (uint8_t r = 0; r < repeats; r++) {
+    if (r && gapMs) delay(gapMs);
+    if (!irRmtSendRaw(irEncodeBuf, irEncodeCount, khz)) {
+      Serial.println("Dock: protocol probe could not reach RMT");
+      return;
+    }
+  }
+}
+#endif
+
 void serviceSerialConsole() {
   while (Serial.available()) {
     int key = Serial.read();
@@ -4152,6 +4538,8 @@ void serviceSerialConsole() {
     if (key == 'm' || key == 'M') { runIrEmitterTest(true, 5); continue; }
     if (key == 't' || key == 'T') { sendIrProbePattern(); continue; }
     if (key == 'u' || key == 'U') { sendIrSquareProbe(); continue; }
+    if (key >= '1' && key <= '9') { sendIrProtocolProbe((uint8_t)(key - '0')); continue; }
+    if (key == 'n' || key == 'N') { sendIrNecProbe(); continue; }
 #endif
     Serial.println("Dock serial console:");
 #if DOCK_IR_LED_PIN >= 0
@@ -4159,6 +4547,8 @@ void serviceSerialConsole() {
     Serial.println("  m - the same at 38kHz, the real carrier");
     Serial.println("  t - transmit a known IR probe pattern for the remote to learn");
     Serial.println("  u - transmit a symmetric 2000us square probe");
+    Serial.println("  1-9 - one known frame per protocol, for round-trip checks");
+    Serial.println("  n - time a parsed NEC send (still via IRremote)");
 #else
     Serial.println("  (the IR emitter is disabled in this build)");
 #endif
