@@ -693,7 +693,7 @@ static inline bool serialHostAttached() {
 }
 
 
-#define OPENREMOTE_DOCK_VERSION_STRING "1.38"
+#define OPENREMOTE_DOCK_VERSION_STRING "1.39"
 
 // A literal in the built image, so a tool holding the .bin can tell what it is
 // without running it. The remote firmware carries the same idea under
@@ -1237,6 +1237,10 @@ EspNowHomebridgePacket pendingHomebridgeCommand;
 uint8_t pendingHomebridgeMac[6] = {0};
 
 bool rfPresent = false;
+// Raw PARTNUM/VERSION from the last probe, reported on the boot banner so a
+// wiring fault and a dead module can be told apart without a scope.
+uint8_t rfLastPartnum = 0xFF;
+uint8_t rfLastVersion = 0xFF;
 // 250 bytes is the ESP-NOW ceiling and the result header eats 7, so at two
 // bytes a timing only 121 can ever be sent back. Capturing more than that
 // still helps: it lets a too-long burst be recognised as too long rather than
@@ -1810,13 +1814,34 @@ bool rfInit() {
 #else
   ELECHOUSE_cc1101.setGDO0(DOCK_RF_GDO0_PIN);
 #endif
-  // Asked before anything is configured: getCC1101() reads the part and
-  // version registers back over SPI, so it answers "is a CC1101 actually
-  // wired to these pins" rather than "did we write some registers into
-  // nothing". Without it a missing or miswired module looks identical to a
-  // working one until a capture silently returns nothing.
-  if (!ELECHOUSE_cc1101.getCC1101()) return false;
+
+  /*
+    Init() BEFORE the probe, and it has to be this way round.
+
+    The probe used to run first, on the reasoning that reading the version
+    register back proves a chip is really there rather than that we wrote
+    registers into nothing. The reasoning was right; the ordering made it
+    impossible. SPI.begin() lives inside Init() and nowhere else in the
+    driver, so getCC1101() was transferring on a bus that had never been
+    started - it read 0 every time and reported "no CC1101" against
+    perfectly wired hardware, including two known-good modules.
+
+    Init() only starts the bus, resets and loads defaults. Against an empty
+    socket that writes into nothing and the probe below still fails, so the
+    original intent survives intact.
+  */
   ELECHOUSE_cc1101.Init();
+
+  // Read directly rather than trusting the bool: the raw values separate
+  // "nothing answered" (0x00) from "the bus is stuck high" (0xFF) from a
+  // real part, which is the difference between a wiring fault and a dead
+  // module and was previously invisible.
+  uint8_t partnum = ELECHOUSE_cc1101.SpiReadStatus(CC1101_PARTNUM);
+  uint8_t version = ELECHOUSE_cc1101.SpiReadStatus(CC1101_VERSION);
+  rfLastPartnum = partnum;
+  rfLastVersion = version;
+  if (!ELECHOUSE_cc1101.getCC1101()) return false;
+
   ELECHOUSE_cc1101.setMHZ(DOCK_RF_FREQ_MHZ);
   ELECHOUSE_cc1101.setModulation(2);   // 2 = ASK/OOK, what these remotes use.
   ELECHOUSE_cc1101.setCCMode(0);       // Raw, not the packet engine.
@@ -3552,13 +3577,27 @@ void setup() {
 #if DOCK_RF_CS_PIN >= 0
   rfPresent = rfInit();
   if (rfPresent) {
-    Serial.printf("RF433: CC1101 found - SCK %d, MISO %d, MOSI %d, CSN %d, GDO0 %d "
-                  "at %.2f MHz\n", (int)DOCK_RF_SCK_PIN, (int)DOCK_RF_MISO_PIN,
+    Serial.printf("RF433: CC1101 found (partnum 0x%02X, version 0x%02X) - SCK %d, "
+                  "MISO %d, MOSI %d, CSN %d, GDO0 %d at %.2f MHz\n",
+                  rfLastPartnum, rfLastVersion,
+                  (int)DOCK_RF_SCK_PIN, (int)DOCK_RF_MISO_PIN,
                   (int)DOCK_RF_MOSI_PIN, (int)DOCK_RF_CS_PIN, (int)DOCK_RF_GDO0_PIN,
                   (double)DOCK_RF_FREQ_MHZ);
   } else {
-    Serial.println("RF433: no CC1101 answered on the SPI pins - check wiring and "
-                   "that VCC is 3V3, not 5V");
+    Serial.printf("RF433: no CC1101 answered - partnum 0x%02X, version 0x%02X on "
+                  "SCK %d, MISO %d, MOSI %d, CSN %d\n",
+                  rfLastPartnum, rfLastVersion,
+                  (int)DOCK_RF_SCK_PIN, (int)DOCK_RF_MISO_PIN,
+                  (int)DOCK_RF_MOSI_PIN, (int)DOCK_RF_CS_PIN);
+    // 0x00 and 0xFF are the two ways "nothing is talking" shows up, and they
+    // point at different faults.
+    if (rfLastVersion == 0x00) {
+      Serial.println("RF433: 0x00 means MISO never went high - check MISO, CSN "
+                     "and that the module has 3V3 power");
+    } else if (rfLastVersion == 0xFF) {
+      Serial.println("RF433: 0xFF means MISO is stuck high - check MISO is not "
+                     "open circuit and that SCK reaches the module");
+    }
   }
 #else
   Serial.println("RF433: disabled in this build");
