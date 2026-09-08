@@ -1,6 +1,19 @@
 /*
   OpenRemote Dock firmware change log (newest first)
 
+  1.53 - 2026-09-09
+    - IRremote and RMT cannot both own the emitter pin, and nothing was
+      arbitrating. IRremote drives it through LEDC, and enableIROut() - which
+      every IrSender call runs - rebinds the GPIO matrix to that peripheral.
+      RMT keeps its own channel and carries on reporting successful
+      transmissions afterwards, but the pin no longer listens to it. So a
+      single fallback to IRremote, for one unsupported protocol or one failed
+      RMT claim, would silently kill dock IR until the next reboot while every
+      log line still said the burst went out - the worst kind of failure, and
+      the same shape as the bugs this whole sequence has been about.
+      Every path that calls into IrSender now drops the RMT-ready flag, so the
+      next send re-runs rmtInit() and takes the pin back.
+
   1.52 - 2026-09-09
     - RC5 and RC5X are transmittable. They are the only supported protocols
       whose frame begins with a space - a biphase 1 is space-then-mark, and the
@@ -898,7 +911,7 @@ static inline bool serialHostAttached() {
 }
 
 
-#define OPENREMOTE_DOCK_VERSION_STRING "1.52"
+#define OPENREMOTE_DOCK_VERSION_STRING "1.53"
 
 // A literal in the built image, so a tool holding the .bin can tell what it is
 // without running it. The remote firmware carries the same idea under
@@ -1701,6 +1714,21 @@ void ledBlink(unsigned long now, uint32_t periodMs) {
 bool irRmtReady = false;
 uint16_t irRmtKhz = 0;
 
+/*
+  IRremote and RMT cannot both own the emitter pin.
+
+  IRremote drives it through LEDC, and enableIROut() - which every IrSender
+  call runs - rebinds the GPIO matrix to that peripheral. RMT keeps its own
+  channel and carries on reporting successful transmissions afterwards, but
+  the pin no longer listens to it, so the dock goes quiet while every log line
+  still says the burst went out. One fallback to IRremote, for one unsupported
+  protocol, would silently disable dock IR until the next reboot.
+
+  Any code path that calls into IrSender therefore drops this flag, and the
+  next RMT send re-runs rmtInit() and takes the pin back.
+*/
+void irReleaseToIrRemote() { irRmtReady = false; }
+
 bool irRmtBegin(uint16_t khz) {
   if (irRmtReady && irRmtKhz == khz) return true;
   if (irRmtReady) rmtDeinit(DOCK_IR_LED_PIN);
@@ -2109,6 +2137,7 @@ bool transmitIrInner(const EspNowCommandHeader &header, const uint16_t *timings,
     // channel should still transmit, badly-timed though it will be.
     Serial.println("Dock: RMT unavailable, falling back to IRremote timing");
     IrSender.sendRaw(timings, count, khz);
+    irReleaseToIrRemote();
     return true;
   }
 
@@ -2140,19 +2169,25 @@ bool transmitIrInner(const EspNowCommandHeader &header, const uint16_t *timings,
 
   if (strcmp(header.protocol, "NEC") == 0) {
     IrSender.sendNEC((uint16_t)header.address, (uint16_t)header.command, 0);
+    irReleaseToIrRemote();
   } else if (strcmp(header.protocol, "NECext") == 0 ||
              strcmp(header.protocol, "NEC1") == 0) {
     IrSender.sendOnkyo((uint16_t)header.address, (uint16_t)header.command, 0);
+    irReleaseToIrRemote();
   } else if (strcmp(header.protocol, "Samsung32") == 0) {
     IrSender.sendSamsung((uint16_t)header.address, (uint16_t)header.command, 0);
+    irReleaseToIrRemote();
   } else if (strcmp(header.protocol, "RC5") == 0 ||
              strcmp(header.protocol, "RC5X") == 0) {
     IrSender.sendRC5((uint8_t)header.address, (uint8_t)header.command, 0);
+    irReleaseToIrRemote();
   } else if (strcmp(header.protocol, "RC6") == 0) {
     IrSender.sendRC6((uint8_t)header.address, (uint8_t)header.command, 0);
+    irReleaseToIrRemote();
   } else if (strncmp(header.protocol, "SIRC", 4) == 0) {
     IrSender.sendSony((uint16_t)header.address, (uint8_t)header.command, 2,
                       header.sonyBits ? header.sonyBits : 12);
+    irReleaseToIrRemote();
   } else {
     Serial.printf("Dock: IR protocol not supported: %s\n", header.protocol);
     return false;
@@ -4381,7 +4416,8 @@ void runIrEmitterTest(bool modulated, uint8_t cycles) {
   // again, or every IR command after a test would silently do nothing.
   IrSender.begin(DOCK_IR_LED_PIN);
   disableLEDFeedback();
-  Serial.println("Dock: IR emitter test finished, emitter handed back to IRremote");
+  irReleaseToIrRemote();
+  Serial.println("Dock: IR emitter test finished, emitter reclaimed on next send");
 }
 #endif
 
@@ -4416,7 +4452,10 @@ void sendIrProbePattern() {
   Serial.printf("Dock: IR probe - %u timing(s), %lu us expected, 38 kHz\n",
                 (unsigned)count, (unsigned long)expected);
   uint32_t began = micros();
-  if (!irRmtSendRaw(probe, count, 38)) IrSender.sendRaw(probe, count, 38);
+  if (!irRmtSendRaw(probe, count, 38)) {
+    IrSender.sendRaw(probe, count, 38);
+    irReleaseToIrRemote();
+  }
   uint32_t took = micros() - began;
   Serial.printf("Dock: IR probe sent in %lu us (overhead %ld us, %ld us per "
                 "edge)\n", (unsigned long)took, (long)took - (long)expected,
@@ -4450,7 +4489,10 @@ void sendIrSquareProbe() {
   for (uint16_t i = 0; i < count; i++) expected += probe[i];
   Serial.printf("Dock: IR square probe - %u timing(s) of 2000us, %lu us total\n",
                 (unsigned)count, (unsigned long)expected);
-  if (!irRmtSendRaw(probe, count, 38)) IrSender.sendRaw(probe, count, 38);
+  if (!irRmtSendRaw(probe, count, 38)) {
+    IrSender.sendRaw(probe, count, 38);
+    irReleaseToIrRemote();
+  }
 }
 #endif
 

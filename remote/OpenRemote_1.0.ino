@@ -1,6 +1,20 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.29 - 2026-09-09
+    - An IR learn started from WebConfig now powers the receiver first. Display
+      sleep cuts PIN_IR_VCC and calls IrReceiver.stop(), but leaves Wi-Fi up,
+      so a learn against a remote whose screen had gone dark answered
+      "listening" and then timed out every time with "No IR signal received
+      within 12 seconds". The receiver had been unpowered throughout. Nothing
+      in the reply or the log hinted at it, and the natural conclusion is that
+      the transmitter is broken - which cost a real detour here, chasing a dock
+      that was transmitting perfectly into a receiver that could not hear.
+      The learn window also defers the idle timer now, so the remote cannot
+      drop into deep sleep - and drop Wi-Fi - midway through it. The display is
+      deliberately left asleep: learning from WebConfig has no reason to light
+      the screen.
+
   4.28 - 2026-09-08
     - ESP-NOW now finds a dock that is on a different Wi-Fi channel instead of
       failing silently. espNowChannel is adopted from whatever channel this
@@ -5218,7 +5232,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.28"
+#define OPENREMOTE_VERSION_STRING "4.29"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -18801,8 +18815,27 @@ void handleIrLearnStart() {
   }
   irLearningResult = "";
   irLearningError = "";
+  /*
+    Power the receiver before listening to it.
+
+    Display sleep cuts PIN_IR_VCC and calls IrReceiver.stop(), but it leaves
+    Wi-Fi up - so a learn started from WebConfig against a remote whose screen
+    had gone dark answered "listening" quite happily and then always timed out
+    with "No IR signal received within 12 seconds". The receiver had no power
+    the whole time. Nothing in the reply or the log said so, and the natural
+    reading is that the transmitter is at fault, which is exactly the wrong
+    place to look.
+
+    The display is deliberately left asleep: learning from WebConfig has no
+    reason to light the screen, and it comes back on its own on the next touch.
+  */
+  digitalWrite(PIN_IR_VCC, HIGH);
+  delay(60);                    // A TSOP needs a few ms after power-up.
   irLearningStartedMs = millis();
   irLearningActive = true;
+  // Keeps the idle timer from taking the remote into deep sleep - which does
+  // drop Wi-Fi - in the middle of the twelve second window.
+  lastWakeMs = millis();
   IrReceiver.start();
   sendJson(202, "{\"ok\":true,\"state\":\"listening\",\"timeoutMs\":12000}");
 }
