@@ -1,6 +1,22 @@
 /*
   OpenRemote Dock firmware change log (newest first)
 
+  1.44 - 2026-09-08
+    - Adds a serial console with a bench test for the IR emitter, because "the
+      IR LED never blinks" cannot be diagnosed from a 38kHz carrier that is
+      invisible by design - a real command keys it for about 136ms at roughly
+      half duty, which even on a visible LED standing in for the emitter is a
+      flicker that is easy to miss entirely.
+      Send 'i' for five 1s-solid / 200ms-off blinks, or 'm' for the same at
+      38kHz. Both bypass IRremote and drive the pin directly, which is the
+      point: they separate "the emitter hardware cannot light" from "IRremote
+      is not driving the pin". Solid working while 38kHz does not puts the
+      fault in carrier generation; neither working puts it in the pin, the gate
+      network, the FET or the LED bank.
+    - The test takes the pin back from IRremote's LEDC peripheral and hands it
+      back afterwards, so running one does not leave the emitter dead until the
+      next reboot.
+
   1.43 - 2026-09-08
     - Keeps the sync gap that frames a captured code, and stops inventing one.
       1.42 captured clean data but discarded the long silence at the end of
@@ -758,7 +774,7 @@ static inline bool serialHostAttached() {
 }
 
 
-#define OPENREMOTE_DOCK_VERSION_STRING "1.43"
+#define OPENREMOTE_DOCK_VERSION_STRING "1.44"
 
 // A literal in the built image, so a tool holding the .bin can tell what it is
 // without running it. The remote firmware carries the same idea under
@@ -3783,6 +3799,7 @@ void setup() {
   disableLEDFeedback();
   Serial.printf("IR emitter: GPIO%d (IRremote LED feedback disabled - it would "
                 "claim GPIO%d)\n", (int)DOCK_IR_LED_PIN, (int)LED_BUILTIN);
+  Serial.println("IR emitter test: send 'i' for 1s solid blinks, 'm' for 38kHz");
 #else
   Serial.println("IR emitter: disabled");
 #endif
@@ -3824,8 +3841,87 @@ void setup() {
   ledWrite(false);
 }
 
+/*
+  Bench test for the IR emitter chain, driven from the serial console.
+
+  The emitter is not a LED on a GPIO. IR_PWM drives the gate of Q1 (FS8205A)
+  through R3, and Q1 sinks the cathodes of the four-LED bank that hangs off
+  +5V through R5-R8. A 38kHz carrier is also invisible by design: a real
+  command keys the carrier for about 136ms at roughly half duty, which even on
+  a visible LED substituted for the emitter is a faint flicker that is easy to
+  miss entirely.
+
+  So the two modes below are a deliberate pair, and the difference between them
+  is the measurement:
+    solid  - a full second of DC on the gate. This depends on nothing but the
+             pin, the gate network, the FET and the LED bank. If it does not
+             light, the fault is in that chain and no firmware change can help.
+    38kHz  - the same drive, hand-rolled at the real carrier frequency. If
+             solid works and this does not, the pin and the hardware are fine
+             and the problem is in how the carrier is being generated.
+
+  Both bypass IRremote completely, which is the point: they separate "the
+  emitter hardware cannot light" from "IRremote is not driving the pin".
+*/
+#if DOCK_IR_LED_PIN >= 0
+void runIrEmitterTest(bool modulated, uint8_t cycles) {
+  Serial.printf("Dock: IR emitter test on GPIO%d - %u cycle(s), 1000ms %s then "
+                "200ms off\n", (int)DOCK_IR_LED_PIN, (unsigned)cycles,
+                modulated ? "of 38kHz carrier" : "solid on");
+  pinMode(DOCK_IR_LED_PIN, OUTPUT);
+  for (uint8_t cycle = 0; cycle < cycles; cycle++) {
+    if (modulated) {
+      // 13us high, 13us low is 38.5kHz at roughly half duty. Broken into
+      // ~10ms blocks with a yield between: a solid second of
+      // delayMicroseconds() with no break would trip the task watchdog.
+      for (uint16_t block = 0; block < 100; block++) {
+        for (uint16_t pulse = 0; pulse < 380; pulse++) {
+          digitalWrite(DOCK_IR_LED_PIN, HIGH);
+          delayMicroseconds(13);
+          digitalWrite(DOCK_IR_LED_PIN, LOW);
+          delayMicroseconds(13);
+        }
+        yield();
+      }
+    } else {
+      digitalWrite(DOCK_IR_LED_PIN, HIGH);
+      delay(1000);
+    }
+    digitalWrite(DOCK_IR_LED_PIN, LOW);
+    Serial.printf("  cycle %u of %u done\n", (unsigned)(cycle + 1),
+                  (unsigned)cycles);
+    delay(200);
+  }
+  // IRremote owns this pin through the LEDC peripheral in normal operation,
+  // and the plain pinMode()/digitalWrite() above took it back. Hand it over
+  // again, or every IR command after a test would silently do nothing.
+  IrSender.begin(DOCK_IR_LED_PIN);
+  disableLEDFeedback();
+  Serial.println("Dock: IR emitter test finished, emitter handed back to IRremote");
+}
+#endif
+
+void serviceSerialConsole() {
+  while (Serial.available()) {
+    int key = Serial.read();
+    if (key < 33) continue;   // Whitespace, newlines and stray control bytes.
+#if DOCK_IR_LED_PIN >= 0
+    if (key == 'i' || key == 'I') { runIrEmitterTest(false, 5); continue; }
+    if (key == 'm' || key == 'M') { runIrEmitterTest(true, 5); continue; }
+#endif
+    Serial.println("Dock serial console:");
+#if DOCK_IR_LED_PIN >= 0
+    Serial.println("  i - IR emitter test: 1s solid on, 200ms off, 5 times");
+    Serial.println("  m - the same at 38kHz, the real carrier");
+#else
+    Serial.println("  (the IR emitter is disabled in this build)");
+#endif
+  }
+}
+
 void loop() {
   unsigned long now = millis();
+  serviceSerialConsole();
   serviceButton(now);
   servicePairing(now);
   serviceChannelMove();
