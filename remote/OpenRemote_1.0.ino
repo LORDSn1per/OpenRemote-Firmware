@@ -1,6 +1,26 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.25 - 2026-09-08
+    - Fixes a learned RF433 command being impossible to send: pressing it did
+      nothing and testing it from WebConfig came back "This command cannot be
+      transmitted by the installed firmware". The dock's serial showed no RF
+      activity at all because no frame ever left the remote.
+      The cause was two different header sizes on the same 250-byte ESP-NOW
+      budget. The dock's learn reply carries a 7-byte header, so it could
+      capture and return up to (250-7)/2 = 121 timings. The command frame going
+      the other way carried a 35-byte header, so it could only hold
+      (250-35)/2 = 107. Any capture landing in the 108..121 band - which is
+      where an ordinary 433MHz remote's burst falls - was learned, stored,
+      synced and displayed perfectly, and then refused by buildEspNowPayload()
+      as too large every single time it was pressed.
+      Twenty-five of those 35 bytes (address, command, sonyBits, protocol) are
+      PARSED-only fields that mean nothing to a raw timing list. They have been
+      moved to the end of EspNowCommandHeader and are no longer transmitted for
+      a RAW frame, which lifts the command ceiling to (250-10)/2 = 120. The
+      dock's RF_SEND_MAX is pinned to that same number, so anything that can be
+      learned can always be sent. Requires dock firmware 1.40.
+
   4.24 - 2026-09-08
     - RF433 learning no longer refuses with "ESP-NOW is disabled, or Wi-Fi
       station isn't available right now" on a perfectly healthy dock.
@@ -5135,7 +5155,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.24"
+#define OPENREMOTE_VERSION_STRING "4.25"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -6082,6 +6102,13 @@ struct ActivitySliderUi {
   lv_obj_t *card;
   lv_obj_t *thumb;
   uint8_t activityIndex;
+  // Axis lock, so a drag that starts on the slide zone but is really a scroll
+  // moves the page instead of the thumb. Same shape as ScrollSafeSliderState.
+  lv_point_t startPoint;
+  lv_point_t lastPoint;
+  bool tracking;
+  bool horizontal;
+  bool vertical;
 };
 
 // OpenRemote ships with no demonstration devices or activities. WebConfig
@@ -7638,6 +7665,7 @@ void renderCurrentPage();
 void rebuildPages();
 void changePage(int delta);
 void renderAllPageSlots();
+void finaliseActivitiesPageScrolling();
 void configurePageStripDirections();
 void bindPageUi(uint8_t index);
 void requestPageStripRebuild();
@@ -21222,18 +21250,40 @@ bool removeEspNowDevice(const uint8_t mac[6]) {
 // fixed in 3.06's Global Cache bug), this refuses to send and logs the
 // timing count and byte size so the failure is visible instead of a command
 // that quietly does nothing at the far end.
+// Field order is load-bearing, not cosmetic. Everything a RAW command needs
+// sits in the first ten bytes; the twenty-five bytes after it (address,
+// command, sonyBits, protocol) mean nothing to a RAW frame and are simply not
+// transmitted for one. That matters because ESP-NOW gives us 250 bytes total
+// and a learned RF433 code is a list of timings that wants every one of them:
+// sending the full 35-byte header left room for (250-35)/2 = 107 timings,
+// while the dock's learn reply - which has its own, smaller 7-byte header -
+// would happily capture and return up to 121. Anything the user learned in
+// that 108..121 band was stored, synced and displayed perfectly and then
+// refused at send time by buildEspNowPayload() as "too large", which is
+// exactly what a 433MHz remote's capture usually lands on. Trimming the tail
+// raises the send ceiling to (250-10)/2 = 120 and RF_SEND_MAX on the dock is
+// pinned to the same number, so a code that can be learned can always be sent.
 struct __attribute__((packed)) EspNowCommandHeader {
   uint32_t magic;
   uint8_t transport;
   uint8_t encoding;  // 0 = PARSED (protocol/address/command), 1 = RAW (timings)
   uint16_t frequencyKhz;
+  uint16_t rawCount;
+  // --- PARSED-only tail: omitted entirely from a RAW frame ---
   uint32_t address;
   uint32_t command;
   uint8_t sonyBits;
   char protocol[16];
-  uint16_t rawCount;
 };
 static const uint32_t ESPNOW_COMMAND_MAGIC = 0x4F52434DUL;  // "ORCM"
+
+// How many header bytes actually go on air for a RAW frame. Derived from the
+// struct rather than written as 10 so it cannot drift if a field is ever added
+// to the front.
+static const size_t ESPNOW_COMMAND_RAW_HEADER_BYTES =
+  offsetof(EspNowCommandHeader, address);
+static_assert(ESPNOW_COMMAND_RAW_HEADER_BYTES == 10,
+              "RAW command header must stay 10 bytes - the dock reads exactly this many");
 
 bool buildEspNowPayload(const DeviceCommand &command, uint8_t *buf, size_t bufCap,
                         size_t &outLen) {
@@ -21254,7 +21304,10 @@ bool buildEspNowPayload(const DeviceCommand &command, uint8_t *buf, size_t bufCa
     Serial.println("ESP-NOW: command has no IR data to send");
     return false;
   }
-  size_t payloadLen = sizeof(EspNowCommandHeader) +
+  // A RAW frame stops the header after rawCount - see the note on the struct.
+  size_t headerBytes = header.encoding == 1 ? ESPNOW_COMMAND_RAW_HEADER_BYTES
+                                            : sizeof(EspNowCommandHeader);
+  size_t payloadLen = headerBytes +
                       (header.encoding == 1 ? (size_t)header.rawCount * sizeof(uint16_t) : 0);
   if (payloadLen > bufCap) {
     Serial.printf("ESP-NOW: command too large to send (%u raw timing(s), "
@@ -21262,9 +21315,9 @@ bool buildEspNowPayload(const DeviceCommand &command, uint8_t *buf, size_t bufCa
                   (unsigned)header.rawCount, (unsigned)payloadLen, (unsigned)bufCap);
     return false;
   }
-  memcpy(buf, &header, sizeof(header));
+  memcpy(buf, &header, headerBytes);
   if (header.encoding == 1) {
-    memcpy(buf + sizeof(header), command.rawTimings,
+    memcpy(buf + headerBytes, command.rawTimings,
            (size_t)header.rawCount * sizeof(uint16_t));
   }
   outLen = payloadLen;
@@ -26813,6 +26866,12 @@ void activitySliderEvent(lv_event_t *e) {
   if (code == LV_EVENT_PRESSED) {
     activityDragActive = true;
     lastWakeMs = millis();
+    ui->tracking = true;
+    ui->horizontal = false;
+    ui->vertical = false;
+    lv_indev_t *pressIndev = lv_indev_get_act();
+    if (pressIndev) lv_indev_get_point(pressIndev, &ui->startPoint);
+    ui->lastPoint = ui->startPoint;
   } else if (code == LV_EVENT_PRESSING) {
     lastWakeMs = millis();
   }
@@ -26826,6 +26885,41 @@ void activitySliderEvent(lv_event_t *e) {
     lv_indev_get_point(indev, &point);
     lv_obj_get_coords(ui->card, &cardArea);
 
+    // The grab zone carries PRESS_LOCK so a fast horizontal swipe cannot slip
+    // off the thumb mid-drag - but that also means LVGL hands this handler
+    // every subsequent touch sample no matter which way the finger went, and
+    // never offers the page a scroll of its own. Without an axis lock a list
+    // of activities taller than the screen could not be scrolled at all: any
+    // drag beginning on a card just dragged that card's thumb up and down.
+    // Six pixels of travel decides which gesture this is, once, and the
+    // loser is ignored for the rest of the press.
+    int dx = abs((int)point.x - (int)ui->startPoint.x);
+    int dy = abs((int)point.y - (int)ui->startPoint.y);
+    if (ui->tracking && !ui->horizontal && !ui->vertical && max(dx, dy) >= 6) {
+      ui->horizontal = dx > dy;
+      ui->vertical = !ui->horizontal;
+      // A vertical drag is the page's, not the slider's: let go of the thumb
+      // and stop suppressing whatever else watches activityDragActive.
+      if (ui->vertical) {
+        activityDragActive = false;
+        resetActivityThumb(ui);
+      }
+    }
+
+    if (ui->vertical) {
+      // LVGL still considers the grab zone the owner of this touch and will
+      // not scroll the page by itself, so drive the page directly - the same
+      // thing scrollSafeSliderEvent() has to do for a slider.
+      lv_coord_t deltaY = point.y - ui->lastPoint.y;
+      if (deltaY != 0) {
+        lv_obj_t *scrollTarget = findScrollableAncestor(ui->card);
+        if (scrollTarget) lv_obj_scroll_by(scrollTarget, 0, deltaY, LV_ANIM_OFF);
+      }
+      ui->lastPoint = point;
+      return;
+    }
+    ui->lastPoint = point;
+
     int minX = 4;
     int maxX = max(minX, (int)lv_obj_get_width(ui->card) -
                              (int)lv_obj_get_width(ui->thumb) - 4);
@@ -26835,6 +26929,12 @@ void activitySliderEvent(lv_event_t *e) {
 
   if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
     activityDragActive = false;
+    bool wasVertical = ui->vertical;
+    ui->tracking = false;
+    ui->horizontal = false;
+    ui->vertical = false;
+    // A scroll never activates an activity however far the list travelled.
+    if (wasVertical) return;
     int maxX = max(4, (int)lv_obj_get_width(ui->card) -
                        (int)lv_obj_get_width(ui->thumb) - 4);
     if (lv_obj_get_x(ui->thumb) >= maxX - 8) {
@@ -27059,6 +27159,18 @@ void renderUsbConnectedScreen() {
 void renderActivitiesPage() {
   applyRuntimeTheme(activitiesThemePath);
   configureContent(0, LCD_H, true);
+  // configureContent() clears LV_OBJ_FLAG_SCROLLABLE, and unlike
+  // renderActivityPage()/renderDevicePage() this function never put it back -
+  // so the Activities list simply could not scroll, at any length. Add enough
+  // activities (or a widget, which eats two rows before the first card) and
+  // everything past the bottom of the screen was unreachable. Scrolling is
+  // switched back off at the end by finaliseActivitiesPageScrolling() when the
+  // page fits, so a short list still behaves as a fixed screen.
+  lv_obj_add_flag(content, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(content, LV_OBJ_FLAG_SCROLL_MOMENTUM);
+  lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLL_ELASTIC);
+  lv_obj_set_scroll_dir(content, LV_DIR_VER);
+  lv_obj_set_scrollbar_mode(content, LV_SCROLLBAR_MODE_ACTIVE);
   renderTopBar("Activities", true);
 
   if (usbStudioLinkActive()) {
@@ -27139,7 +27251,12 @@ void renderActivitiesPage() {
     lv_obj_add_flag(card, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_scroll_dir(card, LV_DIR_HOR);
     lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLL_CHAIN_HOR);
-    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLL_CHAIN_VER);
+    // Vertical chaining stays ON. The card only scrolls horizontally, so a
+    // vertical drag has nothing to do here and must be handed up to the page;
+    // clearing this flag as well was the second reason a long Activities list
+    // would not move - the cards are 224px of a 240px-wide screen, so nearly
+    // every drag starts on one and was being swallowed.
+    lv_obj_add_flag(card, LV_OBJ_FLAG_SCROLL_CHAIN_VER);
     lv_obj_set_scrollbar_mode(card, LV_SCROLLBAR_MODE_OFF);
 
     lv_obj_t *thumb = lv_obj_create(card);
@@ -27213,6 +27330,24 @@ void renderActivitiesPage() {
     lv_obj_set_style_text_opa(chevrons, LV_OPA_40, 0);
     lv_obj_clear_flag(chevrons, LV_OBJ_FLAG_CLICKABLE);
   }
+
+  finaliseActivitiesPageScrolling();
+}
+
+// The Activities list is a plain stack of cards, not the calibrated tile grid
+// finaliseRemotePageScrolling() exists to reposition, so it gets the simple
+// half: a little breathing room at the end of a real scroll, and no scrolling
+// at all when everything already fits.
+void finaliseActivitiesPageScrolling() {
+  lv_obj_set_style_pad_bottom(content, 0, 0);
+  lv_obj_update_layout(content);
+  if (lv_obj_get_scroll_bottom(content) <= 0) {
+    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(content, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_scroll_to_y(content, 0, LV_ANIM_OFF);
+    return;
+  }
+  lv_obj_set_style_pad_bottom(content, 10, 0);
 }
 
 const Tile *currentActivityTiles(uint8_t &count) {

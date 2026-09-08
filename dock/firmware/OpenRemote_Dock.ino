@@ -1,6 +1,23 @@
 /*
   OpenRemote Dock firmware change log (newest first)
 
+  1.40 - 2026-09-08
+    - Fixes a learned RF433 code that could never be transmitted. This dock's
+      learn reply has a 7-byte header and so could return up to 121 timings,
+      but the command frame coming back the other way carried a 35-byte header
+      and could only hold 107 - so a capture between those two numbers, which
+      is where a typical 433MHz remote lands, was learned successfully and then
+      silently refused at send time. The 25 PARSED-only bytes have moved to the
+      end of EspNowCommandHeader and are no longer sent for a RAW frame, and
+      RF_SEND_MAX is now pinned to the resulting 120-timing ceiling so a code
+      that can be learned can always be sent. Requires remote firmware 4.25.
+    - (Changelog note: entries for 1.34 through 1.39 were never written up here
+      even though the version string moved. The work in that range was the
+      MQTT client, the Home Assistant WebSocket, the partition table that
+      reclaimed the unused SPIFFS region, the DOCK_IDENTIFY ping state, the
+      rfPresent report back to the remote, and the CC1101 detection fix that
+      calls Init() before getCC1101() so SPI.begin() has actually run.)
+
   1.33 - 2026-09-06
     - Fixes the Homebridge relay failing with "login failed (HTTP -1)". The
       dock hardcoded "http://" in front of the configured address, so an
@@ -693,7 +710,7 @@ static inline bool serialHostAttached() {
 }
 
 
-#define OPENREMOTE_DOCK_VERSION_STRING "1.39"
+#define OPENREMOTE_DOCK_VERSION_STRING "1.40"
 
 // A literal in the built image, so a tool holding the .bin can tell what it is
 // without running it. The remote firmware carries the same idea under
@@ -921,17 +938,34 @@ struct __attribute__((packed)) EspNowAnnouncePacket {
   char name[24];
 };
 
+// Field order is load-bearing and must match the remote exactly. Everything a
+// RAW command needs sits in the first ten bytes; the twenty-five after it are
+// PARSED-only and are not transmitted for a RAW frame at all. ESP-NOW gives
+// both ends 250 bytes, and a learned RF433 code is a list of timings that
+// wants all of them - sending the full 35-byte header capped a command at
+// (250-35)/2 = 107 timings while this dock's learn reply could return 121, so
+// a capture landing in between was learned and stored perfectly and then
+// rejected at send time. Trimming the tail lifts the ceiling to 120, which is
+// what RF_SEND_MAX below is now pinned to.
 struct __attribute__((packed)) EspNowCommandHeader {
   uint32_t magic;
   uint8_t transport;
   uint8_t encoding;  // 0 = PARSED (protocol/address/command), 1 = RAW (timings)
   uint16_t frequencyKhz;
+  uint16_t rawCount;
+  // --- PARSED-only tail: absent from a RAW frame ---
   uint32_t address;
   uint32_t command;
   uint8_t sonyBits;
   char protocol[16];
-  uint16_t rawCount;
 };
+
+// How many header bytes a RAW frame actually carries. Derived from the struct
+// so it cannot drift if a field is ever added to the front.
+static const size_t ESPNOW_COMMAND_RAW_HEADER_BYTES =
+  offsetof(EspNowCommandHeader, address);
+static_assert(ESPNOW_COMMAND_RAW_HEADER_BYTES == 10,
+              "RAW command header must stay 10 bytes - the remote writes exactly this many");
 
 
 struct __attribute__((packed)) EspNowDockWifiPacket {
@@ -1246,7 +1280,16 @@ uint8_t rfLastVersion = 0xFF;
 // still helps: it lets a too-long burst be recognised as too long rather than
 // silently truncated into something that would never replay.
 static const uint16_t RF_CAPTURE_MAX = 300;
-static const uint16_t RF_SEND_MAX = (250 - sizeof(EspNowRfLearnResultHeader)) / 2;
+// Capped by what a command frame can carry back out, not by what the learn
+// reply can carry in. The learn reply has a 7-byte header and could return 121
+// timings, but a command frame has a 10-byte header and tops out at 120 - and
+// a code that can be learned but never sent is worse than one truncated by a
+// single edge, because it looks like it worked right up until the button does
+// nothing.
+static const uint16_t RF_SEND_MAX =
+  (250 - ESPNOW_COMMAND_RAW_HEADER_BYTES) / 2;
+static_assert(RF_SEND_MAX <= (250 - sizeof(EspNowRfLearnResultHeader)) / 2,
+              "a capture must still fit the learn reply frame");
 static const uint16_t RF_MIN_EDGES = 16;      // Fewer than this is noise, not a remote.
 static const uint32_t RF_END_GAP_US = 20000;  // Silence that means the burst ended.
 static const uint32_t RF_MAX_EDGE_US = 60000; // Clamp: uint16_t cannot hold more.
@@ -2033,17 +2076,25 @@ void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len)
   wifi_second_chan_t second;
   esp_wifi_get_channel(&primary, &second);
 
-  if (magic == ESPNOW_COMMAND_MAGIC && len >= (int)sizeof(EspNowCommandHeader)) {
-    memcpy(&pendingHeader, data, sizeof(pendingHeader));
+  // encoding lives at a fixed offset inside the first ten bytes, so it can be
+  // read before deciding how long the header is - a RAW frame stops after
+  // rawCount, a PARSED one carries the whole struct.
+  if (magic == ESPNOW_COMMAND_MAGIC && len >= (int)ESPNOW_COMMAND_RAW_HEADER_BYTES) {
+    uint8_t encoding = data[offsetof(EspNowCommandHeader, encoding)];
+    size_t headerBytes = encoding == 1 ? ESPNOW_COMMAND_RAW_HEADER_BYTES
+                                       : sizeof(EspNowCommandHeader);
+    if ((size_t)len < headerBytes) return;
+    pendingHeader = EspNowCommandHeader();
+    memcpy(&pendingHeader, data, headerBytes);
     pendingTimingCount = 0;
     if (pendingHeader.encoding == 1 && pendingHeader.rawCount) {
       uint16_t count = pendingHeader.rawCount;
       if (count > (uint16_t)(sizeof(pendingTimings) / sizeof(pendingTimings[0]))) {
         count = sizeof(pendingTimings) / sizeof(pendingTimings[0]);
       }
-      size_t need = sizeof(EspNowCommandHeader) + (size_t)count * sizeof(uint16_t);
+      size_t need = headerBytes + (size_t)count * sizeof(uint16_t);
       if ((size_t)len >= need) {
-        memcpy(pendingTimings, data + sizeof(EspNowCommandHeader),
+        memcpy(pendingTimings, data + headerBytes,
                (size_t)count * sizeof(uint16_t));
         pendingTimingCount = count;
       }
