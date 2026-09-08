@@ -1,6 +1,22 @@
 /*
   OpenRemote Dock firmware change log (newest first)
 
+  1.49 - 2026-09-08
+    - Adds 'u', a symmetric square probe (fifteen 2000us pulses), to separate an
+      emitter fault from a receiver artefact. The main 't' probe could not: it
+      showed every space arriving 120-170us long while marks were accurate,
+      which reads like the emitter stretching pulses.
+      It is not. Captured through the remote's receiver, the square probe came
+      back at 29980us against 30000us sent - 0.07% - with marks averaging 2005
+      and spaces 1991. The RMT emitter's timing is exact. What looks like error
+      at 600us is receiver AGC latency, which is a large fraction of a short
+      pulse and a negligible one of a long pulse.
+      That matters because it rules the firmware out and points at signal
+      strength instead: a learned code already carries the learning receiver's
+      bias (marks short, spaces long), replaying it emits a signal that is
+      already 14% short on marks, and how much further the destination's own
+      AGC erodes them depends on how strong the emitter is.
+
   1.48 - 2026-09-08
     - Fixes the carrier being applied to the spaces instead of the marks, which
       is why 1.47 still did nothing. Two mistakes in one call to
@@ -837,7 +853,7 @@ static inline bool serialHostAttached() {
 }
 
 
-#define OPENREMOTE_DOCK_VERSION_STRING "1.48"
+#define OPENREMOTE_DOCK_VERSION_STRING "1.49"
 
 // A literal in the built image, so a tool holding the .bin can tell what it is
 // without running it. The remote firmware carries the same idea under
@@ -4097,6 +4113,36 @@ void sendIrProbePattern() {
 }
 #endif
 
+/*
+  A perfectly symmetric probe: eight 2000us marks separated by 2000us spaces.
+
+  It exists to tell an emitter fault from a receiver artefact, which the main
+  probe cannot. Every mark and every space is the same length, so:
+    - if the capture comes back symmetric but the whole thing is longer than
+      32ms, the emitter is genuinely stretching pulses.
+    - if it comes back asymmetric - marks and spaces differing - while the
+      total holds at 32ms, nothing is being stretched at all and what looks
+      like error is the receiver's AGC moving the mark/space boundary, which
+      it does on every receiver and which the original learned code already
+      carries too.
+  2000us is long enough that a receiver's AGC latency is a small fraction of
+  it, which the 600us pulses of a real code are not.
+*/
+#if DOCK_IR_LED_PIN >= 0
+void sendIrSquareProbe() {
+  static const uint16_t probe[] = {
+    2000, 2000, 2000, 2000, 2000, 2000, 2000, 2000,
+    2000, 2000, 2000, 2000, 2000, 2000, 2000
+  };
+  const uint16_t count = sizeof(probe) / sizeof(probe[0]);
+  uint32_t expected = 0;
+  for (uint16_t i = 0; i < count; i++) expected += probe[i];
+  Serial.printf("Dock: IR square probe - %u timing(s) of 2000us, %lu us total\n",
+                (unsigned)count, (unsigned long)expected);
+  if (!irRmtSendRaw(probe, count, 38)) IrSender.sendRaw(probe, count, 38);
+}
+#endif
+
 void serviceSerialConsole() {
   while (Serial.available()) {
     int key = Serial.read();
@@ -4105,12 +4151,14 @@ void serviceSerialConsole() {
     if (key == 'i' || key == 'I') { runIrEmitterTest(false, 5); continue; }
     if (key == 'm' || key == 'M') { runIrEmitterTest(true, 5); continue; }
     if (key == 't' || key == 'T') { sendIrProbePattern(); continue; }
+    if (key == 'u' || key == 'U') { sendIrSquareProbe(); continue; }
 #endif
     Serial.println("Dock serial console:");
 #if DOCK_IR_LED_PIN >= 0
     Serial.println("  i - IR emitter test: 1s solid on, 200ms off, 5 times");
     Serial.println("  m - the same at 38kHz, the real carrier");
     Serial.println("  t - transmit a known IR probe pattern for the remote to learn");
+    Serial.println("  u - transmit a symmetric 2000us square probe");
 #else
     Serial.println("  (the IR emitter is disabled in this build)");
 #endif
