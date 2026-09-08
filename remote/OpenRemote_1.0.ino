@@ -1,6 +1,49 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.28 - 2026-09-08
+    - ESP-NOW now finds a dock that is on a different Wi-Fi channel instead of
+      failing silently. espNowChannel is adopted from whatever channel this
+      remote's own station is using, which is only correct while the remote and
+      the dock are associated to the same access point. On a mesh they need not
+      be: the dock reported channel 8 while the same SSID had roamed this
+      remote onto channel 1, and from that moment every frame went out where
+      nothing was listening. The symptom was indistinguishable from a dock that
+      was out of range or switched off -
+        ESP-NOW: send failed after 3 attempts
+      - with nothing anywhere pointing at the channel.
+      After a failed send the remote now sweeps channels 1-13, keeps the one
+      the dock acknowledges on and persists it. Only when standalone: while
+      riding the station the channel belongs to the Wi-Fi association and
+      cannot be retuned without dropping the connection.
+
+  4.27 - 2026-09-08
+    - An RF433 button was coming out of the dock's infrared LED. With both
+      boards captured on one clock the dock said exactly that:
+        Dock: IR command from A4:CB:8F:E8:8A:D4 - RAW, 120 timing(s), 38 kHz
+        Dock: IR sent in 147.19 ms (signal is 136.62 ms, 38 kHz)
+      The frame arrived intact - all 120 timings, 4.26's fix working - but with
+      transport IR, so the CC1101 was never involved.
+      The command had never become kind ESPNOW in the first place. The parser
+      resolved the target dock's MAC to an index in the paired-device list at
+      *parse* time, and if that lookup failed the command was deliberately left
+      as ordinary RAW IR. It then fell through to relayIrToDock(), which forces
+      the transport to IR. Re-pairing a dock after the config was parsed was
+      enough to trigger it, and nothing in any log said so - every line
+      reported a completely successful send.
+    - The command now carries the dock's MAC and resolves it to an index at
+      send time, so re-pairing a dock no longer requires a re-sync to make its
+      buttons work.
+    - An RF433 command is now always dock-routed regardless of whether that
+      dock is paired at that instant. The old "fall back to local IR rather
+      than leave a dead button" rule is right for a dock-routed *infrared*
+      command, which the remote's own emitter can stand in for. There is
+      nothing to stand in for with RF433: 433MHz edge timings cannot come out
+      of an infrared LED, and doing it silently hid the real problem. An
+      unpaired target now says so:
+        ESP-NOW: command targets 40:4C:CA:F9:EF:54, which is not currently
+        paired (0 dock(s) paired)
+
   4.26 - 2026-09-08
     - Fixes the real reason a learned RF433 command could never be sent, which
       4.25 got close to but missed. The remote's own serial said it outright
@@ -5175,7 +5218,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.26"
+#define OPENREMOTE_VERSION_STRING "4.28"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -5836,7 +5879,17 @@ struct DeviceCommand {
   uint8_t boxMode;
   bool showText;
   bool repeatDefault;
-  uint8_t espNowDeviceIndex;
+  /*
+    The dock this command is addressed to, kept as a MAC and resolved to an
+    index at send time rather than at parse time. Resolving during the config
+    parse meant the answer depended on whether the paired-device list happened
+    to be loaded yet, and went stale the moment a dock was re-paired: the
+    lookup failed, kind stayed RAW instead of becoming ESPNOW, and the command
+    quietly fell through to relayIrToDock() - which forces the transport to IR.
+    An RF433 button therefore came out of the dock's infrared LED, silently,
+    with every log line reporting a perfectly successful send.
+  */
+  uint8_t espNowMac[6];
   uint8_t espNowTransport;
   /*
     Which encoding the payload actually is, kept because `kind` cannot say.
@@ -6466,6 +6519,11 @@ static const uint32_t ESPNOW_ONDEMAND_HOLD_MS = 2000;
 bool espNowStandalone = false;
 unsigned long lastEspNowPsAssertMs = 0;      // We brought the radio up ourselves.
 uint8_t espNowChannel = 0;          // 0 = not yet known.
+// Sweep bounds for espNowRecoverChannel(). 1-13 is the 2.4GHz set every
+// region shares; 14 is Japan-only and no ESP32 defaults to it.
+static const uint8_t ESPNOW_CHANNEL_MIN = 1;
+static const uint8_t ESPNOW_CHANNEL_MAX = 13;
+bool espNowRecoverChannel(const uint8_t mac[6], const uint8_t *payload, size_t len);
 unsigned long espNowHoldUntilMs = 0;
 uint32_t espNowLastBringUpMs = 0;   // Measured, so the cost is known not guessed.
 char sdStatusText[64] = "Not checked";
@@ -14835,18 +14893,27 @@ void loadRuntimeModel(JsonDocument &doc) {
           (runtimeCommand.kind == DeviceCommand::RAW ||
            runtimeCommand.kind == DeviceCommand::PARSED)) {
         uint8_t targetMac[6];
-        int targetIndex = parseMacAddress(espNow["mac"] | "", targetMac)
-          ? findEspNowDeviceIndexByMac(targetMac) : -1;
-        if (targetIndex >= 0) {
+        if (parseMacAddress(espNow["mac"] | "", targetMac)) {
           const char *transportText = espNow["transport"] | "ir";
-          runtimeCommand.espNowDeviceIndex = (uint8_t)targetIndex;
-          runtimeCommand.espNowTransport = strcmp(transportText, "rf433") == 0
+          bool rf433 = strcmp(transportText, "rf433") == 0;
+          memcpy(runtimeCommand.espNowMac, targetMac, 6);
+          runtimeCommand.espNowTransport = rf433
             ? ESPNOW_TRANSPORT_RF433 : ESPNOW_TRANSPORT_IR;
           // Captured before kind is overwritten - this is the line whose
           // absence made every ESP-NOW command unsendable.
           runtimeCommand.espNowEncoding =
             runtimeCommand.kind == DeviceCommand::RAW ? 1 : 0;
-          runtimeCommand.kind = DeviceCommand::ESPNOW;
+          // An RF433 code is always dock-routed, whether or not that dock is
+          // paired at this instant. The old rule - "leave it as local IR if
+          // the MAC is not currently paired, so it is not a dead button" -
+          // makes sense for a dock-routed *infrared* command, which the
+          // remote's own emitter can genuinely stand in for. For RF433 there
+          // is nothing to stand in for: firing 433MHz edge timings out of an
+          // infrared LED cannot work, and doing it silently hides the real
+          // problem, which is that the dock needs pairing.
+          if (rf433 || findEspNowDeviceIndexByMac(targetMac) >= 0) {
+            runtimeCommand.kind = DeviceCommand::ESPNOW;
+          }
         }
       }
       JsonObjectConst hid = command["hid"].as<JsonObjectConst>();
@@ -21659,6 +21726,62 @@ bool sendEspNowWithRetry(const uint8_t mac[6], const uint8_t *payload, size_t le
     espNowSendWaiting = false;  // Timed out - stop waiting, next attempt rearms it.
   }
   Serial.printf("ESP-NOW: send failed after %u attempts\n", (unsigned)ESPNOW_SEND_MAX_ATTEMPTS);
+  return espNowRecoverChannel(mac, payload, len);
+}
+
+/*
+  Last resort after a send has failed on the channel we believed the dock was
+  on: try the others, and keep the one that answers.
+
+  espNowChannel is adopted from whatever channel this remote's own station
+  happens to be using, which is correct only while the remote and the dock are
+  associated to the same access point. On a mesh they need not be - the dock
+  reported channel 8 while this remote had been roamed onto channel 1 by the
+  same SSID - and from then on every frame went out on a channel with nothing
+  listening. Nothing said so: the failure looked exactly like a dock that was
+  out of range or powered off.
+
+  Only meaningful standalone, where this code owns the radio and may retune it.
+  While riding the station the channel belongs to the Wi-Fi association and
+  cannot be changed without dropping the connection, so the sweep is skipped
+  and the caller's failure stands.
+*/
+bool espNowRecoverChannel(const uint8_t mac[6], const uint8_t *payload, size_t len) {
+  if (!espNowStandalone || !espNowRadioActive) return false;
+  uint8_t original = espNowChannel;
+  for (uint8_t channel = ESPNOW_CHANNEL_MIN; channel <= ESPNOW_CHANNEL_MAX; channel++) {
+    if (channel == original) continue;
+    if (esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE) != ESP_OK) continue;
+    delay(2);   // One tick for the radio to settle on the new channel.
+    espNowSendWaiting = true;
+    espNowSendSucceeded = false;
+    if (esp_now_send(mac, payload, len) != ESP_OK) {
+      espNowSendWaiting = false;
+      continue;
+    }
+    unsigned long waitStart = millis();
+    while (espNowSendWaiting && (millis() - waitStart) < ESPNOW_SEND_ATTEMPT_TIMEOUT_MS) {
+      delay(1);
+    }
+    bool acked = !espNowSendWaiting && espNowSendSucceeded;
+    espNowSendWaiting = false;
+    if (acked) {
+      espNowChannel = channel;
+      preferences.begin("openremote", false);
+      preferences.putUChar("enChan", espNowChannel);
+      preferences.end();
+      Serial.printf("ESP-NOW: dock answered on channel %u, not %u - remembered "
+                    "(the remote and the dock are on different access points)\n",
+                    (unsigned)channel, (unsigned)original);
+      return true;
+    }
+  }
+  // Nothing answered anywhere: put the radio back where it was rather than
+  // leaving it parked on channel 13 for the next attempt.
+  esp_wifi_set_channel(original, WIFI_SECOND_CHAN_NONE);
+  Serial.printf("ESP-NOW: no dock answered on any channel (swept %u-%u), "
+                "staying on %u\n", (unsigned)ESPNOW_CHANNEL_MIN,
+                (unsigned)ESPNOW_CHANNEL_MAX, (unsigned)original);
   return false;
 }
 
@@ -21693,8 +21816,14 @@ bool relayIrToDock(const DeviceCommand &command) {
 }
 
 bool sendEspNowCommand(const DeviceCommand &command) {
-  if (command.espNowDeviceIndex >= espNowDeviceCount) {
-    Serial.println("ESP-NOW: command has no valid paired device");
+  // Resolved here, not at parse time, so re-pairing a dock does not require a
+  // re-sync to make its buttons work again.
+  int deviceIndex = findEspNowDeviceIndexByMac(command.espNowMac);
+  if (deviceIndex < 0) {
+    Serial.printf("ESP-NOW: command targets %s, which is not currently paired "
+                  "(%u dock(s) paired)\n",
+                  formatMacAddress(command.espNowMac).c_str(),
+                  (unsigned)espNowDeviceCount);
     return false;
   }
   // Brings the radio up rather than refusing when it is down. Under on-demand
@@ -21710,7 +21839,7 @@ bool sendEspNowCommand(const DeviceCommand &command) {
   uint8_t payload[ESPNOW_MAX_PAYLOAD_BYTES];
   size_t payloadLen = 0;
   if (!buildEspNowPayload(command, payload, sizeof(payload), payloadLen)) return false;
-  const uint8_t *mac = espNowDevices[command.espNowDeviceIndex].mac;
+  const uint8_t *mac = espNowDevices[deviceIndex].mac;
   // Retried like every other send: interference costs a repeat, not the press.
   if (!sendEspNowWithRetry(mac, payload, payloadLen)) {
     Serial.printf("ESP-NOW: send failed to %s\n", formatMacAddress(mac).c_str());

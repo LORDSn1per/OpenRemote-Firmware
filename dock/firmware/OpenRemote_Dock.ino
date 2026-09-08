@@ -1,6 +1,45 @@
 /*
   OpenRemote Dock firmware change log (newest first)
 
+  1.43 - 2026-09-08
+    - Keeps the sync gap that frames a captured code, and stops inventing one.
+      1.42 captured clean data but discarded the long silence at the end of
+      each burst - and that silence is the sync these receivers use to know
+      where a code begins. The replay then substituted an arbitrary 15ms of its
+      own between repeats, which is not what the original remote sends. A
+      captured burst now ends with its own measured trailing gap, so the array
+      is a complete self-contained frame and repeating it back to back
+      reproduces the original transmission with no invented timings anywhere.
+      Codes learned on 1.42 or earlier must be learned again.
+
+  1.42 - 2026-09-08
+    - Fixes RF433 captures being corrupt, which is why a learned code replayed
+      correctly and still did nothing. Two faults, both visible the moment
+      1.41's payload dump printed a real capture:
+        [  0] +983   -269   +60000 -353   +894   -911   ...
+        [ 84] ... +5174 ...
+      * The 60000us third "pulse" was a 60ms silence stored as an edge. The
+        guard that was meant to drop it only applied while the buffer was
+        completely empty, so two edges of noise arriving first were enough to
+        let it through, and the fabricated pulse then sat in the middle of
+        every replay.
+      * RF_END_GAP_US is 20ms, but this remote repeats its burst every 5.2ms,
+        so the capture never saw a boundary. It ran through repeat after repeat
+        until the button was released, filled the 300-edge buffer, and was then
+        truncated to 120 to fit one ESP-NOW frame - cutting the code in half,
+        mid-burst.
+      A gap longer than RF_BURST_GAP_US (3ms - well above the ~1ms longest real
+      pulse, well below the 5.2ms shortest gap) is now never stored as an edge.
+      Before the code it means the buffer holds noise, which is discarded so
+      the capture restarts cleanly; after it, it means one whole repeat is in
+      hand and the capture finishes there. The same code now captures as ~81
+      clean edges instead of 120 mangled ones.
+      Codes learned before this must be learned again - the stored timings are
+      the corrupt ones.
+    - Silences "gpio_isr_handler_remove: GPIO isr service is not installed",
+      logged on every RF send because rfIdle() detached an edge interrupt that
+      a transmit had never attached.
+
   1.41 - 2026-09-08
     - Prints what actually reaches the RF module. Every RF433 command now logs
       its encoding, timing count, carrier and the live RF-enabled/chip-present
@@ -719,7 +758,7 @@ static inline bool serialHostAttached() {
 }
 
 
-#define OPENREMOTE_DOCK_VERSION_STRING "1.41"
+#define OPENREMOTE_DOCK_VERSION_STRING "1.43"
 
 // A literal in the built image, so a tool holding the .bin can tell what it is
 // without running it. The remote firmware carries the same idea under
@@ -1302,6 +1341,25 @@ static_assert(RF_SEND_MAX <= (250 - sizeof(EspNowRfLearnResultHeader)) / 2,
 static const uint16_t RF_MIN_EDGES = 16;      // Fewer than this is noise, not a remote.
 static const uint32_t RF_END_GAP_US = 20000;  // Silence that means the burst ended.
 static const uint32_t RF_MAX_EDGE_US = 60000; // Clamp: uint16_t cannot hold more.
+/*
+  Silence that separates one repeat of a code from the next.
+
+  A 433MHz remote sends the same burst several times in a row with a short gap
+  between, and RF_END_GAP_US (20ms) is far too long to see that gap: a real
+  capture measured here ran 900us/300us pulses with only 5.2ms between repeats,
+  so the capture ran straight through every repeat until the user let go of the
+  button, filled the 300-edge buffer and was then truncated to 120 to fit one
+  ESP-NOW frame - cutting the code in half, mid-burst.
+
+  Anything longer than this is a gap between bursts and never part of one.
+  Comfortably above the longest real pulse (about 1ms) and well below the
+  shortest gap seen (5.2ms).
+*/
+static const uint32_t RF_BURST_GAP_US = 3000;
+// Stand-in sync gap, used only when a burst ended by falling silent so no real
+// gap was ever measured. Typical of the OOK remotes this replays.
+static const uint16_t RF_DEFAULT_SYNC_GAP_US = 10000;
+volatile bool rfBurstComplete = false;
 
 volatile uint16_t rfEdges[RF_CAPTURE_MAX];
 volatile uint16_t rfEdgeCount = 0;
@@ -1860,17 +1918,59 @@ void IRAM_ATTR rfEdgeIsr() {
   uint32_t now = micros();
   uint32_t delta = now - rfLastEdgeUs;
   rfLastEdgeUs = now;
-  if (!rfCapturing) return;
-  // The first edge's delta is the time since some unrelated earlier edge, so
-  // it is noise by definition and is used only to start the clock.
-  if (rfEdgeCount == 0 && delta > RF_END_GAP_US) return;
+  if (!rfCapturing || rfBurstComplete) return;
+  if (delta > RF_BURST_GAP_US) {
+    /*
+      A gap, never a pulse. It used to be clamped to RF_MAX_EDGE_US and stored
+      like any other edge, which is where the fabricated 60000us "pulse" in the
+      middle of captured codes came from - the old guard above only skipped it
+      while the buffer was still completely empty, so a couple of noise edges
+      arriving first were enough to let a 60ms silence straight in.
+
+      Before the code proper there is only noise or the tail of an earlier
+      burst, so anything held so far is discarded and the capture restarts
+      here. Once a burst's worth of edges is in hand the same gap means the
+      opposite: one clean repeat has been captured, which is exactly what
+      should be replayed.
+    */
+    if (rfEdgeCount < RF_MIN_EDGES) {
+      rfEdgeCount = 0;
+      return;
+    }
+    /*
+      The gap is stored, not thrown away, and it is what completes the frame.
+
+      These remotes end a burst with a short pulse followed by a long silence -
+      the sync the receiver uses to know where the code begins - and dropping
+      it left a captured code that was all data and no framing. The transmitter
+      then substituted an arbitrary 15ms of its own, which is not what the
+      original remote sends and is not what the receiver is looking for.
+      Keeping the real measurement makes the array a complete, self-contained
+      frame: replaying it back to back reproduces the original transmission
+      exactly, with no invented timings anywhere in the chain.
+    */
+    uint32_t gap = delta > 65535UL ? 65535UL : delta;
+    if (rfEdgeCount < RF_CAPTURE_MAX) rfEdges[rfEdgeCount++] = (uint16_t)gap;
+    rfBurstComplete = true;
+    return;
+  }
   if (delta > RF_MAX_EDGE_US) delta = RF_MAX_EDGE_US;
   if (rfEdgeCount < RF_CAPTURE_MAX) rfEdges[rfEdgeCount++] = (uint16_t)delta;
 }
 
+// Tracks whether the edge interrupt is actually attached. rfIdle() is called
+// from paths that never started a capture (a transmit, for one), and
+// detachInterrupt() on a pin with no handler makes the IDF log
+//   gpio_isr_handler_remove(576): GPIO isr service is not installed
+// on every RF send - alarming, and pure noise in a log that now matters.
+bool rfEdgeIsrAttached = false;
+
 void rfIdle() {
   rfCapturing = false;
-  detachInterrupt(digitalPinToInterrupt(DOCK_RF_GDO0_PIN));
+  if (rfEdgeIsrAttached) {
+    detachInterrupt(digitalPinToInterrupt(DOCK_RF_GDO0_PIN));
+    rfEdgeIsrAttached = false;
+  }
   ELECHOUSE_cc1101.setSidle();
 }
 
@@ -1922,11 +2022,13 @@ bool rfInit() {
 
 void rfStartCapture(uint32_t timeoutMs) {
   rfEdgeCount = 0;
+  rfBurstComplete = false;
   rfLastEdgeUs = micros();
   pinMode(DOCK_RF_GDO0_PIN, INPUT);
   ELECHOUSE_cc1101.SetRx();
   rfCapturing = true;
   attachInterrupt(digitalPinToInterrupt(DOCK_RF_GDO0_PIN), rfEdgeIsr, CHANGE);
+  rfEdgeIsrAttached = true;
   rfLearnActive = true;
   rfLearnEndsMs = millis() + timeoutMs;
   Serial.printf("Dock: RF433 listening for %lu ms\n", (unsigned long)timeoutMs);
@@ -1980,7 +2082,10 @@ bool rfTransmitRaw(const uint16_t *timings, uint16_t count) {
       level = !level;
     }
     digitalWrite(DOCK_RF_GDO0_PIN, LOW);
-    if (repeat < 2) rfWaitUs(15000);
+    // No invented gap between repeats any more. The capture now ends with the
+    // burst's own trailing silence, so the frame already carries the sync the
+    // receiver frames on; adding 15ms on top of it produced a gap the original
+    // remote never sends.
   }
   uint32_t tookUs = micros() - began;
   ELECHOUSE_cc1101.setSidle();
@@ -2723,9 +2828,18 @@ void serviceRfLearn(unsigned long now) {
   // of the transmission, and waiting for the full window after it would just
   // make the user hold the button wondering whether it worked.
   uint16_t captured = rfEdgeCount;
-  if (captured >= RF_MIN_EDGES && (micros() - rfLastEdgeUs) > RF_END_GAP_US) {
+  if (captured >= RF_MIN_EDGES &&
+      (rfBurstComplete || (micros() - rfLastEdgeUs) > RF_END_GAP_US)) {
     rfIdle();
     rfLearnActive = false;
+    // Reached by the plain silence timeout too, where no trailing gap was ever
+    // measured because no further edge arrived. An odd count means the frame
+    // ends on a pulse with no sync behind it, so one is added - the frame has
+    // to be complete for a repeat to mean anything.
+    if ((captured & 1) && captured < RF_CAPTURE_MAX) {
+      rfEdges[captured++] = RF_DEFAULT_SYNC_GAP_US;
+      rfEdgeCount = captured;
+    }
     uint16_t send = captured > RF_SEND_MAX ? RF_SEND_MAX : captured;
     // Copied out of the volatile ISR buffer before sending: the radio is
     // stopped by now, but the buffer is still shared state.
