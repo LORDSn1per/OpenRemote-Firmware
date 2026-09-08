@@ -1,6 +1,28 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.30 - 2026-09-09
+    - Adds Kaseikyo, NEC42, Pioneer and RCA. These are the four protocols in
+      the Flipper IR database that IRremote has no sender for, so neither the
+      remote nor the dock could transmit any of them - 2,280 of the 169,910
+      parsed buttons across the 14,551-remote database (Kaseikyo 1680, RCA 274,
+      Pioneer 189, NEC42 137). With them the two firmwares cover every parsed
+      protocol the database contains.
+    - They live in shared/openremote_ir_extra_protocols.h, compiled into both
+      firmwares from one file rather than written twice. The remote hands the
+      rendered timings to IrSender.sendRaw() and the dock hands them to RMT, so
+      the two emitters cannot drift - which is exactly the failure that made an
+      RF433 button come out of an infrared LED earlier in this sequence.
+    - Field packing was derived from the database, not assumed. Kaseikyo is the
+      one worth recording: across all 1,680 of its buttons the command never
+      exceeds 0x3FF (exactly the 10-bit data field), address bits 8..23 are
+      always a vendor id (0x2002 Panasonic, 0x3254 Denon) and bits 24..25 only
+      ever hold 0..3, the 2-bit id. The on-air layout and checksum then follow
+      IRremote's ir_Kaseikyo.hpp so the frame matches what that library builds.
+      Timings came from the database's own raw captures of each family - 400
+      samples each, medians 3459/1729/432/1297 for Kaseikyo and
+      8446/4207/526/1578 for Pioneer - rather than from memory.
+
   4.29 - 2026-09-09
     - An IR learn started from WebConfig now powers the receiver first. Display
       sleep cuts PIN_IR_VCC and calls IrReceiver.stop(), but leaves Wi-Fi up,
@@ -5232,7 +5254,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.29"
+#define OPENREMOTE_VERSION_STRING "4.30"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -5274,6 +5296,7 @@ static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
 #include <DNSServer.h>
 #include <ESPmDNS.h>
 #include <Preferences.h>
+#include "openremote_ir_extra_protocols.h"
 #include <Update.h>
 #include <BLEDevice.h>
 #include <BLEServer.h>
@@ -14522,8 +14545,23 @@ bool transmitIrCommand(const DeviceCommand &command) {
     IrSender.sendSony((uint16_t)command.address, (uint8_t)command.command, 2,
                       command.sonyBits ? command.sonyBits : 12);
   } else {
-    Serial.printf("IR protocol not yet supported: %s\n", command.protocol);
-    return false;
+    /*
+      Kaseikyo, NEC42, Pioneer and RCA - the four protocols in the Flipper
+      database that IRremote has no sender for. They are rendered to raw
+      timings by the shared header and handed to sendRaw(), which is the same
+      code the dock compiles, so both emitters build identical frames.
+    */
+    static uint16_t extraTimings[110];
+    uint16_t extraKhz = 38;
+    uint16_t extraCount = orIrEncodeExtraProtocol(
+      command.protocol, command.address, command.command, extraTimings,
+      (uint16_t)(sizeof(extraTimings) / sizeof(extraTimings[0])), extraKhz);
+    if (!extraCount) {
+      Serial.printf("IR protocol not yet supported: %s\n", command.protocol);
+      return false;
+    }
+    flashCommandFeedback();
+    IrSender.sendRaw(extraTimings, extraCount, extraKhz);
   }
   return true;
 }

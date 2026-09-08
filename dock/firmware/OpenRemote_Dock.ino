@@ -1,6 +1,14 @@
 /*
   OpenRemote Dock firmware change log (newest first)
 
+  1.54 - 2026-09-09
+    - Adds Kaseikyo, NEC42, Pioneer and RCA, from the shared encoder header the
+      remote compiles too, so both build identical frames. These are the four
+      protocols the Flipper database carries that IRremote cannot send - 2,280
+      buttons - and with them the dock covers every parsed protocol in the
+      database. Probes 'a' to 'd' on the serial console transmit one known
+      frame of each for round-trip checking.
+
   1.53 - 2026-09-09
     - IRremote and RMT cannot both own the emitter pin, and nothing was
       arbitrating. IRremote drives it through LEDC, and enableIROut() - which
@@ -881,6 +889,7 @@
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <Preferences.h>
+#include "openremote_ir_extra_protocols.h"
 #include <IRremote.hpp>
 #include <esp_ota_ops.h>
 #include <esp_rom_crc.h>
@@ -911,7 +920,7 @@ static inline bool serialHostAttached() {
 }
 
 
-#define OPENREMOTE_DOCK_VERSION_STRING "1.53"
+#define OPENREMOTE_DOCK_VERSION_STRING "1.54"
 
 // A literal in the built image, so a tool holding the .bin can tell what it is
 // without running it. The remote firmware carries the same idea under
@@ -2005,6 +2014,18 @@ bool irEncodeParsed(const EspNowCommandHeader &header, uint16_t &khzOut,
     irEncBiphase(kRc5Unit, data, 13, true);
     irRunFlush();
     return irEncodeCount > 0;
+  }
+
+  // Kaseikyo, NEC42, Pioneer and RCA come from the shared header, so the dock
+  // and the remote build byte-identical frames for them.
+  {
+    uint16_t extraKhz = 38;
+    uint16_t n = orIrEncodeExtraProtocol(p, header.address, header.command,
+                                         irEncodeBuf,
+                                         (uint16_t)(sizeof(irEncodeBuf) /
+                                                    sizeof(irEncodeBuf[0])),
+                                         extraKhz);
+    if (n) { irEncodeCount = n; khzOut = extraKhz; return true; }
   }
 
   if (strcmp(p, "RC6") == 0) {
@@ -4548,6 +4569,13 @@ void sendIrProtocolProbe(uint8_t which) {
     case 7: strcpy(h.protocol, "SIRC");      h.address = 0x01;   h.command = 0x15; h.sonyBits = 12; break;
     case 8: strcpy(h.protocol, "SIRC15");    h.address = 0x01;   h.command = 0x15; h.sonyBits = 15; break;
     case 9: strcpy(h.protocol, "SIRC20");    h.address = 0x1A;   h.command = 0x15; h.sonyBits = 20; break;
+    // The four from the shared header. Kaseikyo's fields are a real Panasonic
+    // entry out of the database (vendor 0x2002), so a receiver that knows the
+    // protocol should decode it as Panasonic rather than as anonymous timings.
+    case 10: strcpy(h.protocol, "Kaseikyo"); h.address = 0x002002AC; h.command = 0x3D1; break;
+    case 11: strcpy(h.protocol, "NEC42");    h.address = 0x51;       h.command = 0x1F;  break;
+    case 12: strcpy(h.protocol, "Pioneer");  h.address = 0xA5;       h.command = 0x1C;  break;
+    case 13: strcpy(h.protocol, "RCA");      h.address = 0x0F;       h.command = 0x54;  break;
     default: return;
   }
   uint16_t khz = 38, gapMs = 0;
@@ -4561,6 +4589,11 @@ void sendIrProtocolProbe(uint8_t which) {
                 (unsigned)which, h.protocol, (unsigned long)h.address,
                 (unsigned long)h.command, (unsigned)irEncodeCount,
                 (unsigned)khz, (unsigned)repeats);
+  // The whole rendered frame, so it can be decoded off the serial log and
+  // checked against the protocol's field layout without needing a receiver.
+  Serial.print("Dock: probe timings");
+  for (uint16_t i = 0; i < irEncodeCount; i++) Serial.printf(" %u", (unsigned)irEncodeBuf[i]);
+  Serial.println();
   for (uint8_t r = 0; r < repeats; r++) {
     if (r && gapMs) delay(gapMs);
     if (!irRmtSendRaw(irEncodeBuf, irEncodeCount, khz)) {
@@ -4581,6 +4614,7 @@ void serviceSerialConsole() {
     if (key == 't' || key == 'T') { sendIrProbePattern(); continue; }
     if (key == 'u' || key == 'U') { sendIrSquareProbe(); continue; }
     if (key >= '1' && key <= '9') { sendIrProtocolProbe((uint8_t)(key - '0')); continue; }
+    if (key >= 'a' && key <= 'd') { sendIrProtocolProbe((uint8_t)(key - 'a' + 10)); continue; }
     if (key == 'n' || key == 'N') { sendIrNecProbe(); continue; }
 #endif
     Serial.println("Dock serial console:");
@@ -4590,6 +4624,7 @@ void serviceSerialConsole() {
     Serial.println("  t - transmit a known IR probe pattern for the remote to learn");
     Serial.println("  u - transmit a symmetric 2000us square probe");
     Serial.println("  1-9 - one known frame per protocol, for round-trip checks");
+    Serial.println("  a-d - Kaseikyo, NEC42, Pioneer, RCA");
     Serial.println("  n - time a parsed NEC send (still via IRremote)");
 #else
     Serial.println("  (the IR emitter is disabled in this build)");
