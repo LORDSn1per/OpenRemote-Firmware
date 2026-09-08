@@ -1,6 +1,23 @@
 /*
   OpenRemote Dock firmware change log (newest first)
 
+  1.48 - 2026-09-08
+    - Fixes the carrier being applied to the spaces instead of the marks, which
+      is why 1.47 still did nothing. Two mistakes in one call to
+      rmtSetCarrier(), both mine:
+      * Its third argument is named carrier_level but the core assigns it
+        directly to rmt_carrier_config_t::flags::polarity_active_low. Passing
+        true, intending "carrier on the high level", actually asked for active
+        low - so the 38kHz went out during the gaps and the marks carried
+        nothing. It must be false.
+      * The duty argument is a fraction from 0 to 1, not a percentage. 33.0f
+        trips the core's own range check and is silently replaced with 0.5.
+      The behaviour this produced was distinctive and worth recording: the
+      emitter radiated hard enough to jam a real remote sending the same code
+      from beside it - covering the dock's emitter with a hand let the heater
+      hear the remote again - while conveying nothing itself. Plenty of energy
+      at the right frequency, inverted content.
+
   1.47 - 2026-09-08
     - Raw IR now goes out through the RMT peripheral, and IR commands from the
       dock finally reach the device. The emitter had been proven firing and the
@@ -820,7 +837,7 @@ static inline bool serialHostAttached() {
 }
 
 
-#define OPENREMOTE_DOCK_VERSION_STRING "1.47"
+#define OPENREMOTE_DOCK_VERSION_STRING "1.48"
 
 // A literal in the built image, so a tool holding the .bin can tell what it is
 // without running it. The remote firmware carries the same idea under
@@ -1631,9 +1648,21 @@ bool irRmtBegin(uint16_t khz) {
     Serial.println("Dock: RMT init failed for the IR emitter");
     return false;
   }
-  // Carrier on the marks only (level 1), one third duty, which is what an IR
-  // receiver's AGC is designed around.
-  if (!rmtSetCarrier(DOCK_IR_LED_PIN, true, true, (uint32_t)khz * 1000UL, 33.0f)) {
+  /*
+    Carrier on the marks, at one third duty.
+
+    Both of these arguments are easy to get wrong and were, in 1.47. The third
+    is named carrier_level but the core assigns it straight to
+    polarity_active_low, so passing true - meaning "carrier on the high level"
+    - actually asked for active low and put the carrier on the spaces instead
+    of the marks. The emitter then radiated hard enough to jam a real remote
+    transmitting the same code beside it while conveying nothing itself, which
+    is precisely how it behaved. It must be false.
+
+    The last is a fraction from 0 to 1, not a percentage: 33.0f trips the
+    core's own range check and is silently replaced with 0.5.
+  */
+  if (!rmtSetCarrier(DOCK_IR_LED_PIN, true, false, (uint32_t)khz * 1000UL, 0.33f)) {
     Serial.println("Dock: RMT carrier setup failed for the IR emitter");
     rmtDeinit(DOCK_IR_LED_PIN);
     return false;
