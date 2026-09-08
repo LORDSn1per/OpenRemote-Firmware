@@ -1,6 +1,25 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.24 - 2026-09-08
+    - RF433 learning no longer refuses with "ESP-NOW is disabled, or Wi-Fi
+      station isn't available right now" on a perfectly healthy dock.
+      startRfLearn() tested espNowRadioActive and gave up if it was false, but
+      the radio is off almost all of the time by design - it drops a couple of
+      seconds after each use - so the check failed on nearly every attempt.
+      It now calls ensureEspNowLink() and brings the radio up, which is what
+      every other path already did. The identical mistake was fixed in
+      sendEspNowCommand() a while back and its comment says so; this function
+      was simply never brought along.
+    - The dock now tells the remote whether a CC1101 actually answered on its
+      SPI pins, and learning refuses immediately and says so when one has not.
+      Before, a dock with no radio fitted accepted the request and the window
+      timed out with "No usable RF433 signal was captured. Try again." - which
+      blames the user's remote control for missing hardware.
+    - The dock's ten-second status line reported rf=on from the RF *setting*
+      while no chip was present. It now distinguishes them: on+chip,
+      on/NO-CHIP, off(setting) or not-built.
+
   4.23 - 2026-09-08
     - A second dock now receives commands too. relayIrToDock() addressed
       espNowDevices[0] and nothing else, so pairing a second dock got you a
@@ -5116,7 +5135,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.23"
+#define OPENREMOTE_VERSION_STRING "4.24"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -5865,8 +5884,12 @@ struct __attribute__((packed)) EspNowDockInfoPacket {
   uint32_t magic;
   char version[8];
   char name[24];
+  // Whether a CC1101 answered on the dock's SPI pins. Without it, a dock with
+  // no radio fitted and a dock nobody pointed a remote control at both arrive
+  // as the same learn timeout.
+  uint8_t rfPresent;
 };
-static_assert(sizeof(EspNowDockInfoPacket) == 36, "dock info layout drifted from the dock");
+static_assert(sizeof(EspNowDockInfoPacket) == 37, "dock info layout drifted from the dock");
 
 struct __attribute__((packed)) EspNowDockSettingsPacket {
   uint32_t magic;
@@ -6975,6 +6998,11 @@ static const size_t ESPNOW_MAX_PAYLOAD_BYTES = 250;
 struct EspNowPairedDevice {
   uint8_t mac[6];
   char name[24];
+  // Learned from the dock's info reply, not stored: a dock that has never
+  // introduced itself since boot leaves rfKnown false, and nothing is
+  // refused on a guess.
+  bool rfKnown;
+  bool rfPresent;
 };
 
 struct EspNowCandidate {
@@ -20452,6 +20480,17 @@ void onEspNowDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int 
     memcpy(&dockInfo, data, sizeof(dockInfo));
     if (dockInfo.magic == ESPNOW_DOCK_INFO_MAGIC) {
       dockInfo.version[sizeof(dockInfo.version) - 1] = '\0';
+      // Only meaningful from a dock new enough to send it; an older one
+      // leaves the packet short and the field zero, so rfKnown stays false
+      // and learning is attempted rather than refused.
+      if ((size_t)len >= sizeof(EspNowDockInfoPacket)) {
+        for (uint8_t i = 0; i < espNowDeviceCount; i++) {
+          if (memcmp(espNowDevices[i].mac, info->src_addr, 6) != 0) continue;
+          espNowDevices[i].rfKnown = true;
+          espNowDevices[i].rfPresent = dockInfo.rfPresent != 0;
+          break;
+        }
+      }
       if (strcmp(dockReportedVersion, dockInfo.version) != 0) {
         strlcpy(dockReportedVersion, dockInfo.version, sizeof(dockReportedVersion));
         Serial.printf("Dock: reports firmware %s\n", dockReportedVersion);
@@ -21053,16 +21092,35 @@ bool startRfLearn(uint8_t deviceIndex) {
     rfLearnError = "That device isn't paired";
     return false;
   }
-  if (!espNowRadioActive) {
-    rfLearnError = "ESP-NOW is disabled, or Wi-Fi station isn't available right now";
+  /*
+    A dock that has told us it has no CC1101 cannot learn anything, and saying
+    so now is far better than opening a window and blaming the user's remote
+    control when it times out.
+  */
+  if (espNowDevices[deviceIndex].rfKnown && !espNowDevices[deviceIndex].rfPresent) {
+    rfLearnError = "This dock has no RF433 module fitted - check the CC1101 wiring, "
+                   "and that its VCC is on 3V3 rather than 5V";
+    return false;
+  }
+  /*
+    Bring the radio up rather than refusing when it is down.
+
+    This tested espNowRadioActive and gave up, but under on-demand ESP-NOW the
+    radio is off almost all of the time - it drops a couple of seconds after
+    the last use - so learning failed on nearly every attempt with a message
+    about Wi-Fi that had nothing to do with it. sendEspNowCommand() had the
+    same fault and the same fix; this one was never brought along.
+  */
+  if (!ensureEspNowLink()) {
+    rfLearnError = "Could not bring the ESP-NOW link up. Check ESP-NOW is enabled "
+                   "in Settings and that the dock is powered.";
     return false;
   }
   EspNowRfLearnStartPacket packet = {};
   packet.magic = ESPNOW_RF_LEARN_START_MAGIC;
   packet.timeoutMs = ESPNOW_RF_LEARN_TIMEOUT_MS;
-  esp_err_t result = esp_now_send(espNowDevices[deviceIndex].mac,
-                                  (const uint8_t *)&packet, sizeof(packet));
-  if (result != ESP_OK) {
+  if (!sendEspNowWithRetry(espNowDevices[deviceIndex].mac,
+                           (const uint8_t *)&packet, sizeof(packet))) {
     rfLearnError = "Could not reach the paired dock";
     return false;
   }

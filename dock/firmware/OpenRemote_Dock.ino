@@ -693,7 +693,7 @@ static inline bool serialHostAttached() {
 }
 
 
-#define OPENREMOTE_DOCK_VERSION_STRING "1.37"
+#define OPENREMOTE_DOCK_VERSION_STRING "1.38"
 
 // A literal in the built image, so a tool holding the .bin can tell what it is
 // without running it. The remote firmware carries the same idea under
@@ -901,8 +901,12 @@ struct __attribute__((packed)) EspNowDockInfoPacket {
   uint32_t magic;
   char version[8];
   char name[24];
+  // Whether a CC1101 actually answered on the SPI pins. The remote needs this
+  // to tell "the dock has no radio fitted" from "nothing was transmitted at
+  // it", which otherwise both arrive as a learn window timing out.
+  uint8_t rfPresent;
 };
-static_assert(sizeof(EspNowDockInfoPacket) == 36, "dock info layout drifted from the remote");
+static_assert(sizeof(EspNowDockInfoPacket) == 37, "dock info layout drifted from the remote");
 
 struct __attribute__((packed)) EspNowDockSettingsPacket {
   uint32_t magic;
@@ -2475,12 +2479,22 @@ void serviceStateLog(unsigned long now) {
     primed = true;
     lastLit = lit;
     nextMs = now + 10000UL;
+    // rf reports the setting AND whether a CC1101 actually answered. "on"
+    // alone used to be printed on a dock with no radio fitted, which reads as
+    // working hardware.
+    const char *rfState;
+#if DOCK_RF_CS_PIN >= 0
+    if (!dockRfEnabled) rfState = "off(setting)";
+    else rfState = rfPresent ? "on+chip" : "on/NO-CHIP";
+#else
+    rfState = "not-built";
+#endif
     Serial.printf("Dock: paired=%s linkUp=%s ledLit=%s ledOnTx=%s rf=%s channel=%u\n",
                   remoteKnown ? "yes" : "NO",
                   remoteLinkUp() ? "yes" : "no",
                   lit ? "yes" : "no",
                   dockLedOnTransmit ? "on" : "OFF",
-                  dockRfEnabled ? "on" : "off",
+                  rfState,
                   (unsigned)lockedChannel);
   }
 }
@@ -2521,6 +2535,11 @@ void serviceInfoReply() {
   // have renamed its copy since, and the remote's name is the one a person
   // sees, so this is only a fallback for a dock the remote has no name for.
   strlcpy(info.name, dockName, sizeof(info.name));
+#if DOCK_RF_CS_PIN >= 0
+  info.rfPresent = rfPresent ? 1 : 0;
+#else
+  info.rfPresent = 0;
+#endif
   esp_now_send(remoteMac, (const uint8_t *)&info, sizeof(info));
 }
 
