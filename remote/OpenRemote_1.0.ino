@@ -1,6 +1,25 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.23 - 2026-09-08
+    - A second dock now receives commands too. relayIrToDock() addressed
+      espNowDevices[0] and nothing else, so pairing a second dock got you a
+      device that pinged, updated and renamed perfectly and never transmitted
+      anything - which looks like a broken dock rather than a remote sending
+      to one address. Every paired dock is sent the command, and the send
+      counts as successful if any of them took it.
+    - Added Ping to the paired dock list. It blinks that dock's LED rapidly
+      for five seconds, which is how you tell two identical docks apart when
+      one is behind a cabinet door. The dock does it from its state machine
+      rather than with delay(), so ESP-NOW, MQTT and the Home Assistant
+      socket keep running while it blinks.
+    - "Tap anywhere else to close" now does. The dock list is a child object
+      covering most of the overlay and, like every LVGL object, it was
+      clickable by default and swallowed the press - so only the strip of
+      overlay left visible around it responded, which happened to be the
+      band the hint text sits in. The list and its cards no longer take
+      clicks; the buttons on them still do.
+
   4.22 - 2026-09-08
     - The show/hide eye on the Wi-Fi password field now survives shift and the
       symbols key as well. 4.21 kept the typed text across the rebuild those
@@ -5097,7 +5116,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.22"
+#define OPENREMOTE_VERSION_STRING "4.23"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -5840,6 +5859,7 @@ static const uint32_t ESPNOW_HA_CALL_MAGIC     = 0x4F524148UL;  // "ORAH"
 static const uint32_t ESPNOW_HA_RESULT_MAGIC   = 0x4F524152UL;  // "ORAR"
 static const uint32_t ESPNOW_HA_WATCH_MAGIC    = 0x4F524157UL;  // "ORAW"
 static const uint32_t ESPNOW_HA_STATE_MAGIC    = 0x4F524153UL;  // "ORAS"
+static const uint32_t ESPNOW_DOCK_IDENTIFY_MAGIC = 0x4F524944UL;  // "ORID"
 
 struct __attribute__((packed)) EspNowDockInfoPacket {
   uint32_t magic;
@@ -21500,7 +21520,24 @@ bool relayIrToDock(const DeviceCommand &command) {
   DeviceCommand routed = command;
   routed.espNowTransport = ESPNOW_TRANSPORT_IR;
   if (!buildEspNowPayload(routed, payload, sizeof(payload), payloadLen)) return false;
-  return sendEspNowWithRetry(espNowDevices[0].mac, payload, payloadLen);
+  /*
+    Every paired dock, not just the first.
+    
+    A second dock exists to cover a room the first cannot reach, so an IR
+    command has to leave from both - addressing espNowDevices[0] alone meant
+    the second dock never transmitted anything while still pairing, pinging
+    and updating normally, which reads as a faulty dock.
+
+    Counted as sent if any dock took it: one out of range should not fail a
+    press the other dock has already acted on.
+  */
+  bool anySent = false;
+  for (uint8_t i = 0; i < espNowDeviceCount; i++) {
+    if (sendEspNowWithRetry(espNowDevices[i].mac, payload, payloadLen)) anySent = true;
+    else Serial.printf("ESP-NOW: IR relay failed to %s\n",
+                       formatMacAddress(espNowDevices[i].mac).c_str());
+  }
+  return anySent;
 }
 
 bool sendEspNowCommand(const DeviceCommand &command) {
@@ -22761,6 +22798,25 @@ void espNowForgetClicked(lv_event_t *e) {
   pendingUiRefresh = settingsView == SETTINGS_DOCK;
 }
 
+/* Ping: asks one dock to blink so it can be told apart from another. */
+void espNowPingClicked(lv_event_t *e) {
+  uint8_t index = (uint8_t)(intptr_t)lv_event_get_user_data(e);
+  if (index >= espNowDeviceCount) return;
+  lastWakeMs = millis();
+  if (!ensureEspNowLink()) {
+    Serial.println("ESP-NOW: ping dropped, could not bring the link up");
+    return;
+  }
+  uint32_t magic = ESPNOW_DOCK_IDENTIFY_MAGIC;
+  if (sendEspNowWithRetry(espNowDevices[index].mac, (const uint8_t *)&magic, sizeof(magic))) {
+    Serial.printf("ESP-NOW: ping sent to %s\n",
+                  formatMacAddress(espNowDevices[index].mac).c_str());
+  } else {
+    Serial.printf("ESP-NOW: ping did not reach %s\n",
+                  formatMacAddress(espNowDevices[index].mac).c_str());
+  }
+}
+
 void espNowPairedOverlayClicked(lv_event_t *e) {
   (void)e;
   hideEspNowPairedOverlay();
@@ -22792,6 +22848,9 @@ void rebuildEspNowPairedList() {
     lv_obj_set_width(card, LV_PCT(100));
     lv_obj_set_height(card, 96);
     lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    // Not clickable, so a tap on the card background reaches the overlay
+    // behind it and closes the sheet. The three buttons stay clickable.
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_set_style_bg_color(card, lvRgb(24, 42, 68), 0);
     lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(card, 10, 0);
@@ -22808,9 +22867,23 @@ void rebuildEspNowPairedList() {
     lv_obj_set_width(mac, 192);
     lv_label_set_long_mode(mac, LV_LABEL_LONG_DOT);
 
+    lv_obj_t *ping = lv_btn_create(card);
+    lv_obj_set_pos(ping, 12, 54);
+    lv_obj_set_size(ping, 58, 32);
+    lv_obj_set_style_bg_color(ping, lvRgb(28, 96, 76), 0);
+    lv_obj_set_style_radius(ping, 8, 0);
+    lv_obj_set_style_shadow_width(ping, 0, 0);
+    lv_obj_add_event_cb(ping, espNowPingClicked, LV_EVENT_CLICKED,
+                        (void *)(intptr_t)i);
+    lv_obj_t *pingLabel = lv_label_create(ping);
+    lv_label_set_text(pingLabel, "Ping");
+    lv_obj_set_style_text_font(pingLabel, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(pingLabel, textPrimary(), 0);
+    lv_obj_center(pingLabel);
+
     lv_obj_t *rename = lv_btn_create(card);
-    lv_obj_set_pos(rename, 12, 54);
-    lv_obj_set_size(rename, 90, 32);
+    lv_obj_set_pos(rename, 79, 54);
+    lv_obj_set_size(rename, 58, 32);
     lv_obj_set_style_bg_color(rename, lvRgb(34, 84, 140), 0);
     lv_obj_set_style_radius(rename, 8, 0);
     lv_obj_set_style_shadow_width(rename, 0, 0);
@@ -22823,8 +22896,8 @@ void rebuildEspNowPairedList() {
     lv_obj_center(renameLabel);
 
     lv_obj_t *forget = lv_btn_create(card);
-    lv_obj_set_pos(forget, 114, 54);
-    lv_obj_set_size(forget, 90, 32);
+    lv_obj_set_pos(forget, 146, 54);
+    lv_obj_set_size(forget, 58, 32);
     lv_obj_set_style_bg_color(forget, lvRgb(120, 32, 32), 0);
     lv_obj_set_style_radius(forget, 8, 0);
     lv_obj_set_style_shadow_width(forget, 0, 0);
@@ -22869,6 +22942,15 @@ void showEspNowPairedOverlay(lv_event_t *e) {
     lv_obj_set_style_pad_all(espNowPairedList, 0, 0);
     lv_obj_set_style_pad_row(espNowPairedList, 8, 0);
     lv_obj_set_flex_flow(espNowPairedList, LV_FLEX_FLOW_COLUMN);
+    /*
+      The list covers almost the whole overlay and, like every LVGL object,
+      was clickable by default - so it swallowed the press and only the thin
+      strip of overlay around it closed the sheet. That strip happens to
+      contain the hint text, which is why tapping the words worked and
+      tapping anything else did not. Scrolling is unaffected: that comes
+      from the scrollable flag, not this one.
+    */
+    lv_obj_clear_flag(espNowPairedList, LV_OBJ_FLAG_CLICKABLE);
   }
   rebuildEspNowPairedList();
   lv_obj_clear_flag(espNowPairedOverlay, LV_OBJ_FLAG_HIDDEN);

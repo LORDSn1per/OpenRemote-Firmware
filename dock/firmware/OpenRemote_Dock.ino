@@ -693,7 +693,7 @@ static inline bool serialHostAttached() {
 }
 
 
-#define OPENREMOTE_DOCK_VERSION_STRING "1.36"
+#define OPENREMOTE_DOCK_VERSION_STRING "1.37"
 
 // A literal in the built image, so a tool holding the .bin can tell what it is
 // without running it. The remote firmware carries the same idea under
@@ -781,6 +781,10 @@ static const uint32_t OTA_SUCCESS_HOLD_MS    = 1500;   // Solid, then reboot.
 static const uint32_t OTA_FAIL_DURATION_MS   = 3000;   // Fast blink, then idle.
 static const uint32_t OTA_STALL_TIMEOUT_MS   = 15000;  // No chunk for this long.
 static const uint32_t IDENTIFY_BLINKS        = 3;      // Short press feedback.
+// Ping from the remote. Long enough to find the dock by eye in a cabinet,
+// short enough that nobody waits for it to finish.
+static const uint32_t IDENTIFY_DURATION_MS   = 5000;
+static const uint32_t IDENTIFY_BLINK_MS      = 90;
 static const uint32_t FORGET_HOLD_MS         = 10000;  // Hold to unpair.
 static const uint32_t CHANNEL_DWELL_MS        = 450;    // Per channel while walking.
 static const uint8_t  CHANNEL_MIN             = 1;
@@ -889,6 +893,8 @@ static const uint32_t ESPNOW_HA_CALL_MAGIC      = 0x4F524148UL;  // "ORAH"
 static const uint32_t ESPNOW_HA_RESULT_MAGIC    = 0x4F524152UL;  // "ORAR"
 static const uint32_t ESPNOW_HA_WATCH_MAGIC    = 0x4F524157UL;  // "ORAW"
 static const uint32_t ESPNOW_HA_STATE_MAGIC    = 0x4F524153UL;  // "ORAS"
+// Sent by the remote's Ping button. Answered by blinking, nothing else.
+static const uint32_t ESPNOW_DOCK_IDENTIFY_MAGIC = 0x4F524944UL;  // "ORID"
 static const uint32_t ESPNOW_HOMEBRIDGE_RESULT_MAGIC = 0x4F524852UL;  // "ORHR"
 
 struct __attribute__((packed)) EspNowDockInfoPacket {
@@ -1113,10 +1119,12 @@ enum DockState : uint8_t {
   DOCK_OTA,           // Receiving firmware. LED blinking at 500ms.
   DOCK_OTA_SUCCESS,   // LED solid, then reboot into the new image.
   DOCK_OTA_FAILED,    // LED blinking at 45ms, then back to idle on the old image.
+  DOCK_IDENTIFY,      // Answering Ping: fast blink for IDENTIFY_DURATION_MS.
 };
 
 DockState dockState = DOCK_IDLE;
 unsigned long dockStateSinceMs = 0;
+volatile bool pendingIdentify = false;
 
 char dockName[24] = "OpenRemote Dock";
 
@@ -2113,6 +2121,12 @@ void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len)
     return;
   }
 
+  if (magic == ESPNOW_DOCK_IDENTIFY_MAGIC) {
+    if (!remoteKnown || memcmp(info->src_addr, remoteMac, 6) != 0) return;
+    pendingIdentify = true;
+    return;
+  }
+
   if (magic == ESPNOW_HA_WATCH_MAGIC && len >= (int)sizeof(EspNowHaWatchPacket)) {
     if (!remoteKnown || memcmp(info->src_addr, remoteMac, 6) != 0) return;
     memcpy(&pendingHaWatch, data, sizeof(pendingHaWatch));
@@ -2435,6 +2449,10 @@ void serviceLedStates(unsigned long now) {
       // distance is that something failed. Serial says which.
       ledBlink(now, PAIR_FAIL_BLINK_MS);
       if (now - dockStateSinceMs >= OTA_FAIL_DURATION_MS) enterState(DOCK_IDLE);
+      break;
+    case DOCK_IDENTIFY:
+      ledBlink(now, IDENTIFY_BLINK_MS);
+      if (now - dockStateSinceMs >= IDENTIFY_DURATION_MS) enterState(DOCK_IDLE);
       break;
     default:
       break;
@@ -3548,6 +3566,15 @@ void loop() {
   serviceMqttUnavailable();
   serviceHomeAssistant(now);
   serviceHaWebSocket(now);
+  if (pendingIdentify) {
+    pendingIdentify = false;
+    // Never interrupts pairing or a firmware transfer - a dock mid-OTA
+    // blinking "here I am" would be actively misleading.
+    if (dockState == DOCK_IDLE || dockState == DOCK_IDENTIFY) {
+      Serial.println("Dock: ping from the remote - blinking to identify");
+      enterState(DOCK_IDENTIFY);
+    }
+  }
   serviceOta(now);
   serviceRfLearn(now);
   serviceSettings();
