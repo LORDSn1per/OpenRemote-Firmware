@@ -1,6 +1,26 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.26 - 2026-09-08
+    - Fixes the real reason a learned RF433 command could never be sent, which
+      4.25 got close to but missed. The remote's own serial said it outright
+      once the request was made with the log open:
+        ESP-NOW: command has no IR data to send
+      ESP-NOW is a routing overlay: a learned code is decoded into RAW timings
+      exactly like a local command, and then kind is overwritten with ESPNOW so
+      transmitIrCommand() routes it to the dock. That overwrite threw away the
+      only record of which decode had happened - and buildEspNowPayload() tests
+      kind against RAW and PARSED, so by then it matched neither and refused
+      every ESP-NOW command outright. No RF433 command has ever been
+      transmittable; the code path was broken from the day it was written. (IR
+      through a dock was unaffected because irRoute uses relayIrToDock(), a
+      different function entirely.)
+      DeviceCommand now carries espNowEncoding, recorded at parse time before
+      kind is overwritten, and buildEspNowPayload() reads that instead.
+    - 4.25's header-size fix is still required, not superseded: the captured
+      code in question is exactly 120 timings, which the old 35-byte header
+      would have rejected as too large the moment this bug stopped hiding it.
+
   4.25 - 2026-09-08
     - Fixes a learned RF433 command being impossible to send: pressing it did
       nothing and testing it from WebConfig came back "This command cannot be
@@ -5155,7 +5175,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.25"
+#define OPENREMOTE_VERSION_STRING "4.26"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -5818,6 +5838,18 @@ struct DeviceCommand {
   bool repeatDefault;
   uint8_t espNowDeviceIndex;
   uint8_t espNowTransport;
+  /*
+    Which encoding the payload actually is, kept because `kind` cannot say.
+    ESP-NOW is a routing overlay: a learned code is decoded into RAW timings
+    or PARSED protocol fields exactly as a local command is, and then `kind`
+    is overwritten with ESPNOW so transmitIrCommand() routes it to the dock.
+    That overwrite threw away the only record of which decode had happened,
+    so buildEspNowPayload() - which tests `kind` against RAW and PARSED -
+    matched neither and rejected every single ESP-NOW command with "command
+    has no IR data to send". Values match the wire header's encoding field:
+    0 = PARSED, 1 = RAW.
+  */
+  uint8_t espNowEncoding;
   /*
     Heap strings rather than fixed arrays. MAX_RUNTIME_DEVICES *
     MAX_DEVICE_COMMANDS is 2400 commands, so a 96-byte topic and a 48-byte
@@ -14810,6 +14842,10 @@ void loadRuntimeModel(JsonDocument &doc) {
           runtimeCommand.espNowDeviceIndex = (uint8_t)targetIndex;
           runtimeCommand.espNowTransport = strcmp(transportText, "rf433") == 0
             ? ESPNOW_TRANSPORT_RF433 : ESPNOW_TRANSPORT_IR;
+          // Captured before kind is overwritten - this is the line whose
+          // absence made every ESP-NOW command unsendable.
+          runtimeCommand.espNowEncoding =
+            runtimeCommand.kind == DeviceCommand::RAW ? 1 : 0;
           runtimeCommand.kind = DeviceCommand::ESPNOW;
         }
       }
@@ -21290,11 +21326,16 @@ bool buildEspNowPayload(const DeviceCommand &command, uint8_t *buf, size_t bufCa
   EspNowCommandHeader header = {};
   header.magic = ESPNOW_COMMAND_MAGIC;
   header.transport = command.espNowTransport;
-  if (command.kind == DeviceCommand::RAW && command.rawTimings && command.rawCount) {
+  // Tested against espNowEncoding rather than kind. By the time a command
+  // reaches here kind is always ESPNOW - the routing overlay replaced whatever
+  // the decode produced - so comparing kind to RAW or PARSED matched neither
+  // and dropped straight through to the "no IR data" refusal below.
+  bool rawPayload = command.espNowEncoding == 1 || command.kind == DeviceCommand::RAW;
+  if (rawPayload && command.rawTimings && command.rawCount) {
     header.encoding = 1;
     header.frequencyKhz = command.frequencyKhz ? command.frequencyKhz : 38;
     header.rawCount = command.rawCount;
-  } else if (command.kind == DeviceCommand::PARSED) {
+  } else if (!rawPayload && command.protocol[0]) {
     header.encoding = 0;
     header.address = command.address;
     header.command = command.command;

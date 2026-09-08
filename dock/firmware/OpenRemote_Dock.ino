@@ -1,6 +1,15 @@
 /*
   OpenRemote Dock firmware change log (newest first)
 
+  1.41 - 2026-09-08
+    - Prints what actually reaches the RF module. Every RF433 command now logs
+      its encoding, timing count, carrier and the live RF-enabled/chip-present
+      state before any of the refusals can discard it, followed by the entire
+      edge train eight to a line with a per-burst duration. "The dock never got
+      it" and "the dock got it and turned it down" were previously
+      indistinguishable from the dock's serial, which is most of why this took
+      as long as it did to find.
+
   1.40 - 2026-09-08
     - Fixes a learned RF433 code that could never be transmitted. This dock's
       learn reply has a 7-byte header and so could return up to 121 timings,
@@ -710,7 +719,7 @@ static inline bool serialHostAttached() {
 }
 
 
-#define OPENREMOTE_DOCK_VERSION_STRING "1.40"
+#define OPENREMOTE_DOCK_VERSION_STRING "1.41"
 
 // A literal in the built image, so a tool holding the .bin can tell what it is
 // without running it. The remote firmware carries the same idea under
@@ -1309,6 +1318,7 @@ bool rfInit();
 void rfIdle();
 void rfStartCapture(uint32_t timeoutMs);
 bool rfTransmitRaw(const uint16_t *timings, uint16_t count);
+void rfDumpTimings(const char *label, const uint16_t *timings, uint16_t count);
 #endif
 bool dockLedOnTransmit = true;
 
@@ -1526,6 +1536,21 @@ bool transmitIrInner(const EspNowCommandHeader &header, const uint16_t *timings,
   uint16_t khz = header.frequencyKhz ? header.frequencyKhz : 38;
 
   if (header.transport == 1) {
+    // Everything the RF module is about to be asked to do, printed before any
+    // of the refusals below, so "the dock never got it" and "the dock got it
+    // and turned it down" can be told apart from the serial log alone.
+#if DOCK_RF_CS_PIN >= 0
+    const char *chipText = rfPresent ? "found" : "missing";
+#else
+    const char *chipText = "pins disabled in this build";
+#endif
+    Serial.printf("Dock: RF433 command in - encoding %u, %u timing(s), "
+                  "%u kHz, RF %s, chip %s\n",
+                  (unsigned)header.encoding, (unsigned)count, (unsigned)khz,
+                  dockRfEnabled ? "on" : "off", chipText);
+#if DOCK_RF_CS_PIN >= 0
+    rfDumpTimings("Dock: RF433 payload", timings, count);
+#endif
     if (!dockRfEnabled) {
       Serial.println("Dock: RF433 command ignored - RF is switched off");
       return false;
@@ -1905,6 +1930,28 @@ void rfStartCapture(uint32_t timeoutMs) {
   rfLearnActive = true;
   rfLearnEndsMs = millis() + timeoutMs;
   Serial.printf("Dock: RF433 listening for %lu ms\n", (unsigned long)timeoutMs);
+}
+
+// Prints the whole edge train, eight to a line, with a total duration. A
+// 433MHz code is only ever a list of on/off microsecond runs, so this is
+// literally everything that reaches the module - if the numbers here look
+// nothing like the original remote's timing, the capture is the problem
+// rather than the transmit.
+void rfDumpTimings(const char *label, const uint16_t *timings, uint16_t count) {
+  if (!serialHostAttached() || !timings || !count) return;
+  uint32_t totalUs = 0;
+  for (uint16_t i = 0; i < count; i++) totalUs += timings[i];
+  Serial.printf("%s: %u edge(s), %lu.%02lu ms per burst\n", label,
+                (unsigned)count, (unsigned long)(totalUs / 1000UL),
+                (unsigned long)((totalUs % 1000UL) / 10UL));
+  for (uint16_t i = 0; i < count; i += 8) {
+    Serial.printf("  [%3u]", (unsigned)i);
+    for (uint16_t j = i; j < count && j < (uint16_t)(i + 8); j++) {
+      // on/off alternates from the first edge, which is always carrier-on.
+      Serial.printf(" %c%-5u", (j & 1) ? '-' : '+', (unsigned)timings[j]);
+    }
+    Serial.println();
+  }
 }
 
 // delayMicroseconds is only reliable for short waits, and a gap between OOK
