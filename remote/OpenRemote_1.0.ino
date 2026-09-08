@@ -1,6 +1,18 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.22 - 2026-09-08
+    - The show/hide eye on the Wi-Fi password field now survives shift and the
+      symbols key as well. 4.21 kept the typed text across the rebuild those
+      keys cause but not the reveal state, so the moment you reached for a
+      capital the password went back to dots - which is exactly when you most
+      want to see what you have typed.
+    - Same cause as the text: the page is rebuilt to redraw the keyboard, and
+      the field and its eye are built fresh from defaults. The reveal state is
+      now held beside the draft and applied to both the field and the glyph.
+      Cleared with the draft on Join, Cancel and a change of network, so a
+      password is never left showing on a later attempt.
+
   4.21 - 2026-09-08
     - Widgets can go on the Activities landing page. Requested by
       NightHawk_FPV, who wanted the weather and battery without first opening
@@ -5085,7 +5097,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.21"
+#define OPENREMOTE_VERSION_STRING "4.22"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -7417,6 +7429,12 @@ lv_obj_t *wifiPasswordArea = nullptr;
   mixed-case password lost everything entered before the first shift.
 */
 String wifiPasswordDraft;
+/*
+  Whether the password is being shown. Kept beside the draft and for the same
+  reason: shift and the symbols key rebuild the page, and the field and its
+  eye would otherwise come back masked every time.
+*/
+bool wifiPasswordVisible = false;
 lv_obj_t *wifiKeyboard = nullptr;
 lv_obj_t *setupApStatusLabel = nullptr;
 lv_obj_t *buttonTestPanel = nullptr;
@@ -24042,7 +24060,10 @@ void chooseWifiNetwork(lv_event_t *e) {
   if (index < 0 || index >= wifiScanResultCount) return;
   // Picking a network starts a fresh entry: a draft left from a previous
   // attempt must not appear pre-filled under a different SSID.
-  if (selectedWifiSsid != wifiScanResults[index].ssid) wifiPasswordDraft = "";
+  if (selectedWifiSsid != wifiScanResults[index].ssid) {
+    wifiPasswordDraft = "";
+    wifiPasswordVisible = false;
+  }
   selectedWifiSsid = wifiScanResults[index].ssid;
   if (wifiScanResults[index].encryption == WIFI_AUTH_OPEN) {
     // An already-saved open network used to just silently reconnect here,
@@ -24349,6 +24370,7 @@ void wifiKeyboardEvent(lv_event_t *e) {
     }
     String password = lv_textarea_get_text(wifiPasswordArea);
     wifiPasswordDraft = "";
+    wifiPasswordVisible = false;
     connectSelectedWifi(password, true);
   } else if (strcmp(key, "<CANCEL>") == 0) {
     if (settingsView == SETTINGS_DOCK_RENAME) {
@@ -24357,6 +24379,7 @@ void wifiKeyboardEvent(lv_event_t *e) {
       return;
     }
     wifiPasswordDraft = "";
+    wifiPasswordVisible = false;
     openSettingsView(SETTINGS_WIFI);
   } else if (strcmp(key, "<DEL>") == 0) {
     lv_textarea_del_char(wifiPasswordArea);
@@ -24503,6 +24526,7 @@ void renderCompactWifiKeyboardOmote() {
 void wifiPasswordVisibilityEvent(lv_event_t *e) {
   if (!wifiPasswordArea) return;
   bool wasHidden = lv_textarea_get_password_mode(wifiPasswordArea);
+  wifiPasswordVisible = wasHidden;      // Remembered across the next rebuild.
   lv_textarea_set_password_mode(wifiPasswordArea, !wasHidden);
   lv_obj_t *icon = (lv_obj_t *)lv_event_get_user_data(e);
   if (icon) lv_label_set_text(icon, wasHidden ? LV_SYMBOL_EYE_CLOSE : LV_SYMBOL_EYE_OPEN);
@@ -24575,9 +24599,9 @@ void renderWifiPasswordPageOmote() {
   lv_obj_set_pos(wifiPasswordArea, 8, 44);
   lv_obj_set_size(wifiPasswordArea, 184, 30);
   lv_textarea_set_one_line(wifiPasswordArea, true);
-  lv_textarea_set_password_mode(wifiPasswordArea, true);
+  lv_textarea_set_password_mode(wifiPasswordArea, !wifiPasswordVisible);
   lv_textarea_set_placeholder_text(wifiPasswordArea, "Wi-Fi password");
-  // Survives the rebuild that shift and the symbols key cause.
+  // Both survive the rebuild that shift and the symbols key cause.
   lv_textarea_set_text(wifiPasswordArea, wifiPasswordDraft.c_str());
   lv_obj_set_style_bg_color(wifiPasswordArea, lvRgb(0x30, 0x30, 0x30), 0);
   lv_obj_set_style_bg_opa(wifiPasswordArea, LV_OPA_COVER, 0);
@@ -24586,7 +24610,9 @@ void renderWifiPasswordPageOmote() {
   lv_obj_set_style_radius(wifiPasswordArea, 8, 0);
   lv_obj_set_style_text_color(wifiPasswordArea, textPrimary(), 0);
 
-  lv_obj_t *eyeIcon = makeOmoteButton(content, LV_SYMBOL_EYE_OPEN, 196, 44, 36, 30, lvRgb(0x30, 0x30, 0x30));
+  lv_obj_t *eyeIcon = makeOmoteButton(content,
+    wifiPasswordVisible ? LV_SYMBOL_EYE_CLOSE : LV_SYMBOL_EYE_OPEN,
+    196, 44, 36, 30, lvRgb(0x30, 0x30, 0x30));
   lv_obj_t *eyeLabel = lv_obj_get_child(eyeIcon, 0);
   lv_obj_add_event_cb(eyeIcon, wifiPasswordVisibilityEvent, LV_EVENT_CLICKED, eyeLabel);
 
@@ -24631,12 +24657,14 @@ void renderWifiPasswordPage() {
   // (this page never had one; only the Omote version did).
   lv_obj_set_size(wifiPasswordArea, 184, 36);
   lv_textarea_set_one_line(wifiPasswordArea, true);
-  lv_textarea_set_password_mode(wifiPasswordArea, true);
+  lv_textarea_set_password_mode(wifiPasswordArea, !wifiPasswordVisible);
   lv_textarea_set_placeholder_text(wifiPasswordArea, "Wi-Fi password");
-  // Survives the rebuild that shift and the symbols key cause.
+  // Both survive the rebuild that shift and the symbols key cause.
   lv_textarea_set_text(wifiPasswordArea, wifiPasswordDraft.c_str());
 
-  lv_obj_t *eyeIcon = makeButton(content, LV_SYMBOL_EYE_OPEN, 196, 41, 36, 36, lvRgb(30, 38, 50));
+  lv_obj_t *eyeIcon = makeButton(content,
+    wifiPasswordVisible ? LV_SYMBOL_EYE_CLOSE : LV_SYMBOL_EYE_OPEN,
+    196, 41, 36, 36, lvRgb(30, 38, 50));
   lv_obj_t *eyeLabel = lv_obj_get_child(eyeIcon, 0);
   lv_obj_add_event_cb(eyeIcon, wifiPasswordVisibilityEvent, LV_EVENT_CLICKED, eyeLabel);
 
