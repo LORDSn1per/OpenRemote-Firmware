@@ -1699,8 +1699,16 @@
 
 /* The widget button is allowed here now - the Activities page is the screen
    the remote actually sits on, and it is where a weather or battery tile is
-   most wanted. Everything else on the rail stays hidden. */
-.lcdActivitiesPage .designerAddRail .designerToolBtn:not(#designerAddActivityBtn):not(#designerAddWidgetBtn),
+   most wanted. Everything else on the rail stays hidden.
+
+   Theme is excluded too, and had to be: this selector carries two ids inside
+   its :not() clauses, which makes it (2,3,0), so it beat every
+   "#designerThemeBtn{display:flex!important}" rule further down the sheet at
+   (1,2,0). Three separate rules were trying to show that button and all three
+   silently lost, so the Activities page had no way to choose a theme at all.
+   Exclusions belong here rather than in yet another override, because adding
+   a fourth loser would not have helped either. */
+.lcdActivitiesPage .designerAddRail .designerToolBtn:not(#designerAddActivityBtn):not(#designerAddWidgetBtn):not(#designerThemeBtn),
 .lcdSettingsPage .designerAddRail,
 .lcdDevicePage #designerAddActivityBtn,
 .lcdDevicePage #designerAddMacroBtn{

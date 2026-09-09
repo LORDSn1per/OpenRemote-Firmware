@@ -1,6 +1,68 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.41 - 2026-09-09
+    - Fixes Bluetooth pairing failing for every host once the bond store filled
+      up. Captured on hardware, pairing negotiated completely and then died at
+      the final step:
+        BLE HID: MTU negotiated to 247
+        E NimBLE: ble_store_config_write_rpa_rec rc=27
+        BLE HID: pairing complete
+        BLE HID/ATVV: host disconnected
+      rc=27 is BLE_HS_ESTORE_CAP - the store is full, so the peer's RPA record
+      cannot be written and the bond is left incomplete. Nothing could pair: a
+      Chromecast could not, and neither could a Mac, while the remote
+      advertised perfectly and reported itself healthy throughout.
+    - The guard against this already existed and had simply never run.
+      startBluetoothPairing() checked capacity before applyBluetoothState(),
+      but the store can only be read while the NimBLE host is up, and the stack
+      is down when Pair is pressed from idle - so the count came back -1, the
+      "bonds >= 0" guard skipped the whole block, and no room was ever made.
+      The check now happens after the stack is up and before anything can
+      connect.
+    - Worth recording for the next time this looks like a peer problem: the
+      remote advertised correctly the entire time and was plainly visible as
+      "OpenRemote HID" in another machine's Bluetooth list. Everything on this
+      side looked right, and every symptom pointed at the television.
+
+  4.40 - 2026-09-09
+    - The Activities list no longer scrolls under the clock pill. That page
+      spanned the whole screen height, which was harmless while it could not
+      scroll because nothing was ever drawn up there - but once 4.24 made it
+      scrollable the cards and widgets slid straight behind the title bar,
+      since LVGL clips a child to its parent and the parent covered the bar.
+      It now starts where every other page starts, so the bar is an edge the
+      list disappears behind. Row positions are converted from the theme's
+      absolute split, so the layout is unchanged on screen.
+    - The dock is told which Chromecast to watch rather than deciding for
+      itself. The remote knows which device the user is on - the one the media
+      widget is pinned to, or the device page currently open - so it says so,
+      and the dock watches that one alone. It previously rotated through every
+      Chromecast in the house, which was slower to notice playback (the poll
+      interval times the device count) and could report whichever happened to
+      be playing rather than the one in front of the user.
+
+  4.39 - 2026-09-09
+    - The media widget shows what a Chromecast is playing. It had never been
+      connected to anything: nowPlaying was written exactly once, by its own
+      initialiser with valid=false, and every other reference to it was a read,
+      so "Nothing playing" was the only state it could ever reach.
+    - The dock now polls Chromecasts over Cast V2 and sends the result here.
+      The dock does it because it is mains powered and always on; polling from
+      the remote would mean waking the radio every few seconds, which is the
+      opposite of what the widget is for.
+    - Frames arrive only when something meaningful changes. The position clock
+      is advanced here from the moment a frame landed, so a track simply
+      playing costs no radio traffic at all.
+    - What is available depends on the app rather than the device, which is
+      worth recording because it is the opposite of what one would guess. Both
+      an oval Chromecast and a Google TV Streamer report a session for apps
+      running natively on them. SmartTube publishes title, subtitle, artist and
+      duration; the Apple TV app publishes only play state and position, even
+      on a fresh connection with an explicit GET_STATUS. The widget shows the
+      app name when there is no title, which is the honest fallback rather than
+      an empty card.
+
   4.38 - 2026-09-09
     - Completes 4.37: a restored forecast is no longer followed by a fetch
       anyway. The slot check asked whether the current slot differed from the
@@ -5395,7 +5457,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.38"
+#define OPENREMOTE_VERSION_STRING "4.41"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -6143,6 +6205,46 @@ static const uint32_t ESPNOW_DOCK_LINK_DOWN_MAGIC = 0x4F524C44UL;  // "ORLD"
 // Dock -> remote, in reply to a ping. Without it the remote knows a dock is
 // there but nothing about what it is running.
 static const uint32_t ESPNOW_DOCK_INFO_MAGIC = 0x4F524449UL;  // "ORDI"
+static const uint32_t ESPNOW_NOWPLAYING_MAGIC = 0x4F524E50UL;  // "ORNP"
+static const uint32_t ESPNOW_MEDIA_TARGET_MAGIC = 0x4F524D54UL;  // "ORMT"
+
+/*
+  Remote -> dock: the one Chromecast the media widget is about.
+
+  The remote decides, because it is the end that knows which device the user
+  is actually on - either the device the widget is pinned to, or the device
+  page currently open. The dock then watches that one and nothing else, rather
+  than rotating through every Chromecast in the house and reporting whichever
+  happened to be playing.
+*/
+struct __attribute__((packed)) EspNowMediaTargetPacket {
+  uint32_t magic;
+  char name[32];
+};
+static_assert(sizeof(EspNowMediaTargetPacket) == 36,
+              "media target layout drifted from the dock");
+
+/*
+  Dock -> remote, for the media widget.
+
+  The dock does the Chromecast polling because it is mains powered and always
+  on; doing it from here would mean waking the radio every few seconds, which
+  is the opposite of what a battery remote should do. The dock only sends when
+  something meaningful changes - the position clock is advanced here between
+  updates, so a ticking timer costs no frames at all.
+*/
+struct __attribute__((packed)) EspNowNowPlayingPacket {
+  uint32_t magic;
+  uint8_t valid;
+  uint8_t playing;
+  uint32_t position;
+  uint32_t duration;
+  char title[64];
+  char subtitle[48];
+  char source[24];
+};
+static_assert(sizeof(EspNowNowPlayingPacket) == 150,
+              "now playing layout drifted from the dock");
 // Homebridge relayed through the dock. The dock is mains powered and holds its
 // Wi-Fi association open, so it can issue the HTTP call immediately, where the
 // remote would have to bring a radio up and associate first - seconds, every
@@ -8009,6 +8111,13 @@ bool relayIrToDock(const DeviceCommand &command);
 bool dockConnected();
 // Set by whichever task sends a command - including the HTTP task - and acted
 // on by the Arduino loop, which is the only task allowed to touch LVGL.
+// Set by the ESP-NOW receive callback, acted on by loop(). The widget redraw
+// touches LVGL, and that belongs to the loop task alone - the same rule whose
+// breach corrupted the heap in 4.32.
+volatile bool nowPlayingDirty = false;
+// Printed from loop() rather than the callback: Serial from the Wi-Fi task
+// competes with the same UART the loop uses and has garbled output before.
+volatile bool nowPlayingLogWanted = false;
 volatile bool commandFeedbackWanted = false;
 volatile bool espNowCommandFeedbackWanted = false;
 void sendDockSettings();
@@ -11756,22 +11865,21 @@ void startBluetoothPairing() {
     stale NVS records became unreachable - exactly the state reported as
     "I deleted it and now I cannot re-pair".
   */
-  int bonds = bluetoothStoredBondCount();
-  if (bonds >= 0) {
-    Serial.printf("BLE HID: %d bond(s) stored before pairing (max %d)\n",
-                  bonds, 3);
-#if defined(CONFIG_NIMBLE_ENABLED)
-    // Deliberately not "bonds >= 3" alone. The RPA records fill independently
-    // of PEER_SEC, and it is the RPA array overflowing that actually blocks a
-    // new bond - the failure looked like "0 bond(s) stored" followed by
-    // ble_store_config_write_rpa_rec rc=27.
-    if (bluetoothStoreAtCapacity()) {
-      clearBluetoothStoreRecords("full -");
-      bleBonded = false;
-      bleBondStateSavePending = true;
-    }
-#endif
-  }
+  /*
+    The store can only be inspected once the host is running, so the check
+    that used to live here has moved below applyBluetoothState().
+
+    It never ran. bluetoothStoredBondCount() needs the NimBLE host, and with
+    Bluetooth idle the stack is down when Pair is pressed - the count came back
+    -1, the "bonds >= 0" guard skipped the whole block, and no room was ever
+    made. The result on hardware was a pairing that negotiated fully and then
+    died at the last step:
+      E NimBLE: ble_store_config_write_rpa_rec rc=27
+      BLE HID: pairing complete
+      BLE HID/ATVV: host disconnected
+    rc=27 is BLE_HS_ESTORE_CAP. No device could pair - not a Chromecast, not a
+    Mac - while the remote advertised perfectly and looked entirely healthy.
+  */
   bluetoothOn = true;
   blePairingMode = true;
   bleKeepAliveUntilMs = millis() + BLE_PAIRING_WINDOW_MS;
@@ -11787,6 +11895,32 @@ void startBluetoothPairing() {
     pendingUiRefresh = settingsView == SETTINGS_BLUETOOTH;
     return;
   }
+#if defined(CONFIG_NIMBLE_ENABLED)
+  /*
+    Make room now that the host is up, before anything is allowed to connect.
+
+    Deliberately not "bond count >= 3" alone: the RPA records fill
+    independently of PEER_SEC, and it is the RPA array overflowing that
+    actually blocks a new bond. The failure reads as "0 bond(s) stored"
+    followed immediately by rc=27, which is why counting bonds alone was never
+    going to catch it.
+
+    Asking to pair is an unambiguous statement that the user wants this remote
+    on a new host, so clearing a full store here needs no further permission -
+    and leaving it full guarantees the pairing they just asked for cannot
+    complete.
+  */
+  int bonds = bluetoothStoredBondCount();
+  if (bonds >= 0) {
+    Serial.printf("BLE HID: %d bond(s) stored before pairing (max %d)\n", bonds, 3);
+  }
+  if (bluetoothStoreAtCapacity()) {
+    Serial.println("BLE HID: bond store is full - clearing it so this pairing can complete");
+    clearBluetoothStoreRecords("full at pairing -");
+    bleBonded = false;
+    bleBondStateSavePending = true;
+  }
+#endif
   advertiseBluetoothHid();
   pendingUiRefresh = settingsView == SETTINGS_BLUETOOTH;
 }
@@ -20928,6 +21062,38 @@ void onEspNowDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int 
   // A firmware ack from the dock we are currently updating. Checked before the
   // scan and learn windows because a transfer can be running while neither is
   // open, and only ever accepted from the dock this transfer is addressed to.
+  /*
+    Now playing, from the dock's Chromecast poller.
+
+    Accepted from any paired dock and applied straight to the widget's model.
+    positionAtMs is stamped here rather than sent, so the widget's clock ticks
+    on from the moment the frame landed - which is what lets the dock stay
+    quiet while a track simply plays.
+  */
+  if ((size_t)len >= sizeof(EspNowNowPlayingPacket) &&
+      findEspNowDeviceIndexByMac(info->src_addr) >= 0) {
+    uint32_t magic = 0;
+    memcpy(&magic, data, sizeof(magic));
+    if (magic == ESPNOW_NOWPLAYING_MAGIC) {
+      EspNowNowPlayingPacket packet;
+      memcpy(&packet, data, sizeof(packet));
+      packet.title[sizeof(packet.title) - 1] = '\0';
+      packet.subtitle[sizeof(packet.subtitle) - 1] = '\0';
+      packet.source[sizeof(packet.source) - 1] = '\0';
+      nowPlaying.valid = packet.valid != 0;
+      nowPlaying.playing = packet.playing != 0;
+      nowPlaying.position = packet.position;
+      nowPlaying.duration = packet.duration;
+      nowPlaying.positionAtMs = millis();
+      strlcpy(nowPlaying.title, packet.title, sizeof(nowPlaying.title));
+      strlcpy(nowPlaying.subtitle, packet.subtitle, sizeof(nowPlaying.subtitle));
+      strlcpy(nowPlaying.source, packet.source, sizeof(nowPlaying.source));
+      nowPlayingDirty = true;   // Repainted from loop(): LVGL is not this task's.
+      nowPlayingLogWanted = true;
+      return;
+    }
+  }
+
   // From any paired dock, not just the first. A second dock's reply used to be
   // discarded here, so it could never report its firmware or prove it was in
   // range - it simply looked like a name on a list.
@@ -27730,9 +27896,23 @@ void renderUsbConnectedScreen() {
   }
 }
 
+// Where the Activities list starts, matching the tile pages' own content top
+// so the clock pill sits above every page's scrollable area alike.
+static const int ACTIVITIES_CONTENT_TOP = 42;
+
 void renderActivitiesPage() {
   applyRuntimeTheme(activitiesThemePath);
-  configureContent(0, LCD_H, true);
+  /*
+    Below the title bar, not behind it.
+
+    This page used to span the whole screen, which was harmless while it could
+    not scroll - nothing was ever drawn up there. Once it could scroll, the
+    cards and widgets slid straight under the clock pill, because LVGL clips a
+    child to its parent and the parent covered the bar. Starting the content
+    where every other page starts it makes the bar an edge the list disappears
+    behind, which is what it looks like everywhere else.
+  */
+  configureContent(ACTIVITIES_CONTENT_TOP, LCD_H - ACTIVITIES_CONTENT_TOP, true);
   // configureContent() clears LV_OBJ_FLAG_SCROLLABLE, and unlike
   // renderActivityPage()/renderDevicePage() this function never put it back -
   // so the Activities list simply could not scroll, at any length. Add enough
@@ -27774,7 +27954,17 @@ void renderActivitiesPage() {
     return;
   }
 
-  int activitiesOrigin = activeRuntimeThemeStyle ? activeRuntimeThemeStyle->split + 4 : 104;
+  /*
+    Measured from the top of the content area now that it begins below the
+    title bar, so the first row lands in exactly the same place on screen as
+    it did before - the theme's split is still an absolute position, and this
+    converts it. The floor of zero matters for a theme whose split sits above
+    the bar: without it the first row would be pushed off the top of its own
+    parent and clipped away entirely.
+  */
+  int activitiesOrigin = activeRuntimeThemeStyle
+    ? max(0, (int)activeRuntimeThemeStyle->split + 4 - ACTIVITIES_CONTENT_TOP)
+    : (104 - ACTIVITIES_CONTENT_TOP);
 
   /*
     Widgets first, then the sliders flow into whatever rows are left. A
@@ -29399,7 +29589,73 @@ void serviceWeatherWidget(uint32_t now) {
   }
 }
 
+/*
+  Which Chromecast the media widget is about, and telling the dock about it.
+
+  Two sources, matching the widget's own setting. Pinned to a device, it is
+  that device's name. Set to follow the page - the default - it is whichever
+  device page is open, which is the one the user is looking at and driving.
+  With no device page open there is nothing to report, and the dock is told
+  so rather than being left watching the last one.
+
+  Only sent when it changes. The dock keeps the name until told otherwise, so
+  repeating it on a timer would spend radio on saying nothing new.
+*/
+void serviceMediaTarget(uint32_t now) {
+  static char lastSent[32] = "";
+  static uint32_t nextRetryMs = 0;
+
+  char wanted[32] = "";
+  if (widgetSettings.mediaUseNamedDevice && widgetSettings.mediaDeviceId[0]) {
+    Device *pinned = findRuntimeDevice(widgetSettings.mediaDeviceId);
+    if (pinned) strlcpy(wanted, pinned->name, sizeof(wanted));
+  } else if (currentPage < pageCount && pages[currentPage].kind == PAGE_DEVICE &&
+             activeDevice >= 0 && activeDevice < DEVICE_COUNT) {
+    strlcpy(wanted, devices[activeDevice].name, sizeof(wanted));
+  }
+
+  if (strcmp(wanted, lastSent) == 0) return;
+  if (nextRetryMs && (int32_t)(now - nextRetryMs) < 0) return;
+  if (espNowDeviceCount == 0 || !espNowEnabled) return;
+  if (!ensureEspNowLink()) { nextRetryMs = now + 5000; return; }
+
+  EspNowMediaTargetPacket packet = {};
+  packet.magic = ESPNOW_MEDIA_TARGET_MAGIC;
+  strlcpy(packet.name, wanted, sizeof(packet.name));
+  bool sent = false;
+  for (uint8_t i = 0; i < espNowDeviceCount; i++) {
+    if (sendEspNowWithRetry(espNowDevices[i].mac, (const uint8_t *)&packet,
+                            sizeof(packet))) sent = true;
+  }
+  if (!sent) { nextRetryMs = now + 5000; return; }
+  strlcpy(lastSent, wanted, sizeof(lastSent));
+  nextRetryMs = 0;
+  Serial.printf("Media: watching '%s'\n", wanted[0] ? wanted : "(nothing)");
+}
+
 void serviceWidgets(uint32_t now) {
+  // A fresh now-playing frame repaints immediately rather than waiting for the
+  // one second tick, so a play, pause or track change appears at once.
+  if (nowPlayingLogWanted) {
+    nowPlayingLogWanted = false;
+    if (nowPlaying.valid) {
+      Serial.printf("Media: %s - %s%s (%lu/%lus)\n",
+                    nowPlaying.source[0] ? nowPlaying.source : "player",
+                    nowPlaying.playing ? "playing " : "paused ",
+                    nowPlaying.title[0] ? nowPlaying.title : "(no title published)",
+                    (unsigned long)nowPlaying.position,
+                    (unsigned long)nowPlaying.duration);
+    } else {
+      Serial.println("Media: nothing playing");
+    }
+  }
+  if (nowPlayingDirty) {
+    nowPlayingDirty = false;
+    for (uint8_t i = 0; i < widgetInstanceCount; i++) refreshWidgetInstance(widgetInstances[i]);
+    if (widgetExpandedOverlay && !widgetExpandedClosing) {
+      refreshWidgetInstance(widgetExpandedInstance);
+    }
+  }
   if (now - widgetLastServiceMs < 1000UL) return;
   widgetLastServiceMs = now;
   for (uint8_t i = 0; i < widgetInstanceCount; i++) refreshWidgetInstance(widgetInstances[i]);
@@ -31323,6 +31579,7 @@ void loop() {
   serviceNetworkPower(now);
   serviceBatteryHistory(now);
   if (!displaySleeping) serviceWidgets(now);
+  serviceMediaTarget(now);
   serviceWeatherWidget(now);
   serviceMqtt(now);
   serviceHomeAssistantLive(now);

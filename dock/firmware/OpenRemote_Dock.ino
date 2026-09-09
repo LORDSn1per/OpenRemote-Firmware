@@ -1,6 +1,37 @@
 /*
   OpenRemote Dock firmware change log (newest first)
 
+  1.57 - 2026-09-09
+    - Watches the one Chromecast the remote names, instead of rotating through
+      all of them. The remote is the end that knows which device the user is
+      on, so it sends the name and this watches that and nothing else - faster
+      to notice playback, and it can no longer report a different room's TV.
+    - Names are matched case-insensitively and as a substring either way,
+      because the name in the user's configuration and the fn= record a
+      Chromecast advertises are rarely typed identically. When nothing
+      matches, the names actually on the network are logged, since a mismatch
+      is otherwise invisible and looks like polling being broken.
+
+  1.56 - 2026-09-09
+    - Reads what a Chromecast is playing and sends it to the remote's media
+      widget. Cast V2 is TLS on port 8009 carrying length-prefixed protobuf
+      with JSON inside; the protobuf is six fields of varint and length
+      delimited string, so it is written by hand here rather than pulling in a
+      library for it.
+    - Chromecasts are found by mDNS rather than configured by address, because
+      a household has several and their addresses move. One TLS session at a
+      time, deliberately: mbedTLS needs tens of kilobytes per session against
+      327KB of RAM in total, so holding one open per Chromecast is not
+      affordable. The device that is actually playing is polled every three
+      seconds and the rest are visited slowly in rotation.
+    - Established by prototyping against five real devices before any firmware
+      was written: what is available depends on the app, not the device type.
+      Both an oval Chromecast and a Google TV Streamer report a session for
+      apps running natively on them. SmartTube publishes title, subtitle,
+      artist and duration; the Apple TV app publishes only playerState and
+      currentTime, with no metadata at all even on a fresh connection with an
+      explicit GET_STATUS.
+
   1.55 - 2026-09-09
     - Writes flash once a channel change has settled instead of on every hop.
       Following the remote has to be immediate - it is the only thing keeping
@@ -907,6 +938,9 @@
 #include <HTTPClient.h>
 #include <PubSubClient.h>
 #include <WebSocketsClient.h>
+#include <NetworkClientSecure.h>
+#include <ESPmDNS.h>
+#include <ArduinoJson.h>
 #if DOCK_RF_CS_PIN >= 0
 // Asynchronous serial mode, not the packet engine: a gate or garage remote is
 // a raw OOK edge train with no framing the CC1101 could parse for us. GDO0
@@ -931,7 +965,7 @@ static inline bool serialHostAttached() {
 }
 
 
-#define OPENREMOTE_DOCK_VERSION_STRING "1.55"
+#define OPENREMOTE_DOCK_VERSION_STRING "1.57"
 
 // A literal in the built image, so a tool holding the .bin can tell what it is
 // without running it. The remote firmware carries the same idea under
@@ -1112,6 +1146,48 @@ static const uint32_t ESPNOW_DOCK_LINK_DOWN_MAGIC = 0x4F524C44UL;  // "ORLD"
 // is already happening every 5 seconds while the link is up - so the answer
 // costs nothing extra and is always current.
 static const uint32_t ESPNOW_DOCK_INFO_MAGIC = 0x4F524449UL;  // "ORDI"
+static const uint32_t ESPNOW_NOWPLAYING_MAGIC = 0x4F524E50UL;  // "ORNP"
+static const uint32_t ESPNOW_MEDIA_TARGET_MAGIC = 0x4F524D54UL;  // "ORMT"
+
+// Remote -> dock: the one Chromecast the media widget is about. The remote
+// decides - it is the end that knows which device the user is on - and the
+// dock watches that and nothing else.
+struct __attribute__((packed)) EspNowMediaTargetPacket {
+  uint32_t magic;
+  char name[32];
+};
+static_assert(sizeof(EspNowMediaTargetPacket) == 36,
+              "media target layout drifted from the remote");
+
+/*
+  The single Chromecast the remote has asked about, by friendly name. Declared
+  here, beside the packet that sets it, because the ESP-NOW receive callback
+  runs long before the Cast module is defined further down.
+
+  Watching only this one replaced rotating through every Chromecast in the
+  house. Rotation was both slower - the worst case for noticing playback was
+  the poll interval times the device count - and wrong: with several devices
+  it could report whichever happened to be playing rather than the one the
+  user is sitting in front of.
+*/
+char castTargetName[32] = "";
+volatile bool castTargetChanged = false;
+
+// Dock -> remote, for the media widget. Sent only when something meaningful
+// changes: the remote advances the position itself between updates, so a
+// ticking clock costs no frames.
+struct __attribute__((packed)) EspNowNowPlayingPacket {
+  uint32_t magic;
+  uint8_t valid;
+  uint8_t playing;
+  uint32_t position;
+  uint32_t duration;
+  char title[64];
+  char subtitle[48];
+  char source[24];
+};
+static_assert(sizeof(EspNowNowPlayingPacket) == 150,
+              "now playing layout drifted from the remote");
 // Homebridge relayed through this dock instead of the remote. Byte-identical
 // to the remote's definitions - the static_asserts below fail the build if
 // either side drifts.
@@ -3016,6 +3092,20 @@ void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len)
     }
     return;
   }
+  if (magic == ESPNOW_MEDIA_TARGET_MAGIC &&
+      len >= (int)sizeof(EspNowMediaTargetPacket)) {
+    if (remoteKnown && memcmp(info->src_addr, remoteMac, 6) == 0) {
+      EspNowMediaTargetPacket target;
+      memcpy(&target, data, sizeof(target));
+      target.name[sizeof(target.name) - 1] = '\0';
+      if (strcmp(castTargetName, target.name) != 0) {
+        strlcpy(castTargetName, target.name, sizeof(castTargetName));
+        castTargetChanged = true;   // Acted on from loop(); this is the Wi-Fi task.
+      }
+    }
+    return;
+  }
+
   if (magic == ESPNOW_DOCK_PING_MAGIC) {
     // The MAC-layer ack was the ping's own purpose; the reply is how the remote
     // learns what is on the other end. Queued rather than sent from here - this
@@ -3481,6 +3571,462 @@ void serviceChannelMove() {
   rememberRemote(remoteMac, target);
 }
 
+// ---------------------------------------------------------------------------
+// Chromecast "now playing" (Cast V2)
+// ---------------------------------------------------------------------------
+/*
+  Reads what a Chromecast is playing and hands it to the remote for the media
+  widget. Lives on the dock because the dock is mains powered and always on:
+  polling this from the remote would mean waking its radio every few seconds,
+  which is the opposite of what the widget is for.
+
+  Cast V2 is TLS on port 8009 carrying length-prefixed protobuf. The protobuf
+  is small enough to write by hand - six fields, all varints or length
+  delimited strings - so no library is needed for it. The payload inside is
+  JSON, which ArduinoJson parses through a filter to keep it cheap.
+
+  The conversation, established by prototyping against five real devices:
+    CONNECT   to receiver-0 on the connection namespace
+    GET_STATUS on the receiver namespace -> the running app, and its
+              transportId, if it offers the media namespace
+    CONNECT   to that transportId
+    GET_STATUS on the media namespace -> playerState, currentTime, and a
+              media block with title, subtitle, artist and duration
+
+  What is actually available depends on the app, not on the device, which is
+  worth recording because it is counter-intuitive. Both an oval Chromecast and
+  a Google TV Streamer report a session for apps running natively on them. A
+  well behaved app publishes everything - SmartTube gives title, subtitle,
+  artist and duration. A poorly behaved one publishes only transport state:
+  the Apple TV app reports playerState and currentTime and no metadata at all,
+  even on a fresh connection with an explicit GET_STATUS. So the widget shows
+  the app name in that case rather than nothing, which is the honest fallback.
+*/
+#define CAST_PORT 8009
+#define CAST_NS_CONNECTION "urn:x-cast:com.google.cast.tp.connection"
+#define CAST_NS_HEARTBEAT  "urn:x-cast:com.google.cast.tp.heartbeat"
+#define CAST_NS_RECEIVER   "urn:x-cast:com.google.cast.receiver"
+#define CAST_NS_MEDIA      "urn:x-cast:com.google.cast.media"
+
+static const uint8_t CAST_MAX_DEVICES = 6;
+static const uint32_t CAST_POLL_ACTIVE_MS = 3000;    // While something plays.
+/*
+  Six seconds between idle devices, not twelve.
+
+  The rotation only reaches one device per interval, so with six Chromecasts
+  in the house the worst case for noticing that something has started playing
+  is the interval times the device count. At twelve seconds that is over a
+  minute of the widget showing nothing while a video plays, which reads as
+  broken. At six it is half that, and since a poll is a single short-lived TLS
+  session on a mains-powered dock, the extra work costs nothing that matters.
+*/
+static const uint32_t CAST_POLL_IDLE_MS = 6000;
+static const uint32_t CAST_DISCOVER_MS = 300000;     // Re-scan for devices.
+
+struct CastDevice {
+  IPAddress ip;
+  char name[32];
+};
+
+CastDevice castDevices[CAST_MAX_DEVICES];
+uint8_t castDeviceCount = 0;
+/*
+  The single Chromecast the remote has asked about, by friendly name.
+
+  Watching only this one replaced rotating through every Chromecast in the
+  house. Rotation was both slower - the worst case for noticing playback was
+  the poll interval times the device count - and wrong: with several devices
+  it could report whichever happened to be playing rather than the one the
+  user is actually sitting in front of. The remote knows which device it is
+  driving, so it says so and the dock does as it is told.
+*/
+
+unsigned long castNextPollMs = 0;
+unsigned long castNextDiscoverMs = 0;
+bool castEnabled = true;
+bool castMdnsStarted = false;
+
+// Mirrors the remote's NowPlaying. Kept here so a state change can be told
+// from a repeat and only real changes cost an ESP-NOW frame.
+struct CastNowPlaying {
+  bool valid;
+  bool playing;
+  uint32_t position;
+  uint32_t duration;
+  char title[64];
+  char subtitle[48];
+  char source[24];
+};
+CastNowPlaying castState = {};
+
+// --- protobuf, just enough of it ------------------------------------------
+
+void castPutVarint(String &out, uint32_t value) {
+  do {
+    uint8_t byte = value & 0x7F;
+    value >>= 7;
+    if (value) byte |= 0x80;
+    out += (char)byte;
+  } while (value);
+}
+
+void castPutString(String &out, uint8_t field, const char *value) {
+  castPutVarint(out, (uint32_t)(field << 3) | 2);
+  size_t len = strlen(value);
+  castPutVarint(out, (uint32_t)len);
+  out += value;
+}
+
+void castPutVarintField(String &out, uint8_t field, uint32_t value) {
+  castPutVarint(out, (uint32_t)(field << 3) | 0);
+  castPutVarint(out, value);
+}
+
+bool castSend(NetworkClientSecure &client, const char *source, const char *dest,
+              const char *ns, const String &payload) {
+  String msg;
+  msg.reserve(payload.length() + 96);
+  castPutVarintField(msg, 1, 0);            // protocol_version = CASTV2_1_0
+  castPutString(msg, 2, source);
+  castPutString(msg, 3, dest);
+  castPutString(msg, 4, ns);
+  castPutVarintField(msg, 5, 0);            // payload_type = STRING
+  castPutVarint(msg, (uint32_t)(6 << 3) | 2);
+  castPutVarint(msg, (uint32_t)payload.length());
+  msg += payload;
+
+  uint8_t header[4];
+  uint32_t len = (uint32_t)msg.length();
+  header[0] = (uint8_t)(len >> 24); header[1] = (uint8_t)(len >> 16);
+  header[2] = (uint8_t)(len >> 8);  header[3] = (uint8_t)len;
+  if (client.write(header, 4) != 4) return false;
+  return client.write((const uint8_t *)msg.c_str(), msg.length()) == msg.length();
+}
+
+uint32_t castReadVarint(const uint8_t *buf, size_t len, size_t &offset) {
+  uint32_t result = 0; uint8_t shift = 0;
+  while (offset < len && shift < 32) {
+    uint8_t byte = buf[offset++];
+    result |= (uint32_t)(byte & 0x7F) << shift;
+    if (!(byte & 0x80)) break;
+    shift += 7;
+  }
+  return result;
+}
+
+// Pulls just the namespace (field 4) and payload (field 6) back out.
+bool castDecode(const uint8_t *buf, size_t len, String &ns, String &payload) {
+  size_t offset = 0;
+  ns = ""; payload = "";
+  while (offset < len) {
+    uint32_t key = castReadVarint(buf, len, offset);
+    uint8_t field = (uint8_t)(key >> 3), wire = (uint8_t)(key & 7);
+    if (wire == 0) { castReadVarint(buf, len, offset); continue; }
+    if (wire != 2) return false;
+    uint32_t size = castReadVarint(buf, len, offset);
+    if (offset + size > len) return false;
+    if (field == 4) ns = String((const char *)(buf + offset), size);
+    else if (field == 6) payload = String((const char *)(buf + offset), size);
+    offset += size;
+  }
+  return true;
+}
+
+// Blocking read of one framed message, bounded by a deadline.
+bool castReadMessage(NetworkClientSecure &client, String &ns, String &payload,
+                     unsigned long deadlineMs) {
+  uint8_t header[4];
+  size_t got = 0;
+  while (got < 4) {
+    if ((long)(millis() - deadlineMs) >= 0) return false;
+    if (!client.connected()) return false;
+    int n = client.read(header + got, 4 - got);
+    if (n > 0) got += (size_t)n; else delay(5);
+  }
+  uint32_t len = ((uint32_t)header[0] << 24) | ((uint32_t)header[1] << 16) |
+                 ((uint32_t)header[2] << 8) | header[3];
+  // A status carrying a queue can run to several kilobytes; anything past this
+  // is not something this dock needs and reading it would only cost heap.
+  if (len == 0 || len > 6144) return false;
+  uint8_t *buf = (uint8_t *)malloc(len);
+  if (!buf) return false;
+  got = 0;
+  while (got < len) {
+    if ((long)(millis() - deadlineMs) >= 0) { free(buf); return false; }
+    if (!client.connected()) { free(buf); return false; }
+    int n = client.read(buf + got, len - got);
+    if (n > 0) got += (size_t)n; else delay(5);
+  }
+  bool ok = castDecode(buf, len, ns, payload);
+  free(buf);
+  return ok;
+}
+
+// --- discovery -------------------------------------------------------------
+
+/*
+  Finds Chromecasts by mDNS rather than by configured address, because a
+  household has several and their addresses move. The friendly name comes back
+  in the TXT record as fn=, which is what a person recognises and what the
+  remote shows when an app publishes no title of its own.
+*/
+void castDiscover() {
+  int found = MDNS.queryService("googlecast", "tcp");
+  if (found <= 0) {
+    Serial.println("Cast: no Chromecasts answered the mDNS query");
+    return;
+  }
+  castDeviceCount = 0;
+  for (int i = 0; i < found && castDeviceCount < CAST_MAX_DEVICES; i++) {
+    IPAddress address = MDNS.address(i);
+    /*
+      Skip entries with no address. The query returns a service record for
+      every Chromecast that answers, but the A record does not always come
+      back with it - several arrive as 0.0.0.0 - and connecting to that just
+      burns a TLS attempt and four seconds of timeout on every rotation.
+      The next scan usually resolves them, so dropping them is enough.
+    */
+    if (address == IPAddress((uint32_t)0)) continue;
+    castDevices[castDeviceCount].ip = address;
+    String friendly = MDNS.txt(i, "fn");
+    if (!friendly.length()) friendly = MDNS.hostname(i);
+    strlcpy(castDevices[castDeviceCount].name, friendly.c_str(),
+            sizeof(castDevices[castDeviceCount].name));
+    castDeviceCount++;
+  }
+  Serial.printf("Cast: found %u device(s) of %d answering\n",
+                (unsigned)castDeviceCount, found);
+  // Come back sooner when the addresses have not resolved yet, rather than
+  // waiting out the full five minute scan interval with nothing to poll.
+  if (!castDeviceCount) castNextDiscoverMs = millis() + 20000UL;
+  for (uint8_t i = 0; i < castDeviceCount; i++) {
+    Serial.printf("  %s at %s\n", castDevices[i].name,
+                  castDevices[i].ip.toString().c_str());
+  }
+}
+
+// --- polling one device ----------------------------------------------------
+
+/*
+  Connects, asks what is playing, and disconnects.
+
+  One TLS session at a time, deliberately. mbedTLS needs tens of kilobytes per
+  session and this part has 327KB of RAM in total, so holding five open - one
+  per Chromecast in a normal house - is not affordable. Connecting each time
+  costs about a second, which is why only the device that is actually playing
+  is polled quickly and the rest are visited slowly in rotation.
+*/
+bool castPollDevice(uint8_t index, CastNowPlaying &out) {
+  if (index >= castDeviceCount) return false;
+  NetworkClientSecure client;
+  client.setInsecure();               // Chromecasts present a self-signed cert.
+  client.setTimeout(4);
+  if (!client.connect(castDevices[index].ip, CAST_PORT)) return false;
+
+  unsigned long deadline = millis() + 6000;
+  castSend(client, "sender-or", "receiver-0", CAST_NS_CONNECTION, "{\"type\":\"CONNECT\"}");
+  castSend(client, "sender-or", "receiver-0", CAST_NS_RECEIVER,
+           "{\"type\":\"GET_STATUS\",\"requestId\":1}");
+
+  String transportId;
+  String appName;
+  bool askedMedia = false;
+  bool gotAnswer = false;
+
+  while ((long)(millis() - deadline) < 0) {
+    String ns, payload;
+    if (!castReadMessage(client, ns, payload, deadline)) break;
+    if (ns == CAST_NS_HEARTBEAT) {
+      castSend(client, "sender-or", "receiver-0", CAST_NS_HEARTBEAT, "{\"type\":\"PONG\"}");
+      continue;
+    }
+    if (ns == CAST_NS_RECEIVER && !askedMedia) {
+      JsonDocument filter;
+      JsonObject app = filter["status"]["applications"][0].to<JsonObject>();
+      app["displayName"] = true;
+      app["transportId"] = true;
+      app["namespaces"][0]["name"] = true;
+      JsonDocument doc;
+      if (deserializeJson(doc, payload, DeserializationOption::Filter(filter))) continue;
+      JsonArrayConst apps = doc["status"]["applications"].as<JsonArrayConst>();
+      for (JsonObjectConst entry : apps) {
+        bool hasMedia = false;
+        for (JsonObjectConst space : entry["namespaces"].as<JsonArrayConst>()) {
+          const char *name = space["name"] | "";
+          if (strstr(name, "cast.media")) { hasMedia = true; break; }
+        }
+        if (!hasMedia) continue;
+        transportId = String(entry["transportId"] | "");
+        appName = String(entry["displayName"] | "");
+        break;
+      }
+      if (!transportId.length()) { gotAnswer = true; break; }   // Nothing running.
+      askedMedia = true;
+      castSend(client, "sender-or", transportId.c_str(), CAST_NS_CONNECTION,
+               "{\"type\":\"CONNECT\"}");
+      castSend(client, "sender-or", transportId.c_str(), CAST_NS_MEDIA,
+               "{\"type\":\"GET_STATUS\",\"requestId\":2}");
+      continue;
+    }
+    if (ns == CAST_NS_MEDIA) {
+      JsonDocument filter;
+      JsonObject entry = filter["status"][0].to<JsonObject>();
+      entry["playerState"] = true;
+      entry["currentTime"] = true;
+      JsonObject media = entry["media"].to<JsonObject>();
+      media["duration"] = true;
+      JsonObject meta = media["metadata"].to<JsonObject>();
+      meta["title"] = true;
+      meta["subtitle"] = true;
+      meta["artist"] = true;
+      JsonDocument doc;
+      if (deserializeJson(doc, payload, DeserializationOption::Filter(filter))) continue;
+      JsonObjectConst status = doc["status"][0].as<JsonObjectConst>();
+      if (status.isNull()) continue;
+      out.valid = true;
+      const char *state = status["playerState"] | "";
+      out.playing = strcmp(state, "PLAYING") == 0;
+      out.position = (uint32_t)(status["currentTime"] | 0.0f);
+      out.duration = (uint32_t)(status["media"]["duration"] | 0.0f);
+      /*
+        Only overwrite the text when this status actually carries it. Cast
+        sends the media block when it changes and omits it from the frequent
+        position-only updates, so keeping the previous title is what makes a
+        title survive between them rather than flickering away.
+      */
+      JsonObjectConst metadata = status["media"]["metadata"].as<JsonObjectConst>();
+      if (!metadata.isNull()) {
+        strlcpy(out.title, metadata["title"] | "", sizeof(out.title));
+        const char *sub = metadata["subtitle"] | "";
+        if (!sub[0]) sub = metadata["artist"] | "";
+        strlcpy(out.subtitle, sub, sizeof(out.subtitle));
+      }
+      strlcpy(out.source, appName.c_str(), sizeof(out.source));
+      gotAnswer = true;
+      break;
+    }
+  }
+  client.stop();
+  return gotAnswer;
+}
+
+// --- the service loop and the relay ---------------------------------------
+
+bool castStateDiffers(const CastNowPlaying &a, const CastNowPlaying &b) {
+  if (a.valid != b.valid || a.playing != b.playing) return true;
+  if (strcmp(a.title, b.title) || strcmp(a.subtitle, b.subtitle) ||
+      strcmp(a.source, b.source)) return true;
+  if (a.duration != b.duration) return true;
+  // Position moves constantly, so it alone is not a reason to spend a frame -
+  // the remote advances its own clock between updates. Only a jump that a
+  // seek or a track change would produce is worth reporting.
+  int32_t drift = (int32_t)a.position - (int32_t)b.position;
+  return drift > 10 || drift < -10;
+}
+
+void castSendToRemote() {
+  if (!remoteKnown) return;
+  EspNowNowPlayingPacket packet = {};
+  packet.magic = ESPNOW_NOWPLAYING_MAGIC;
+  packet.valid = castState.valid ? 1 : 0;
+  packet.playing = castState.playing ? 1 : 0;
+  packet.position = castState.position;
+  packet.duration = castState.duration;
+  strlcpy(packet.title, castState.title, sizeof(packet.title));
+  strlcpy(packet.subtitle, castState.subtitle, sizeof(packet.subtitle));
+  strlcpy(packet.source, castState.source, sizeof(packet.source));
+  esp_now_send(remoteMac, (const uint8_t *)&packet, sizeof(packet));
+}
+
+/*
+  Case-insensitive, and a substring either way.
+
+  The name the remote sends is whatever the device is called in the user's own
+  configuration, and the name the Chromecast advertises is its fn= record.
+  Those are rarely typed identically - "Lounge" against "Lounge Room TV" - so
+  an exact comparison would fail almost every time while looking like a bug in
+  the polling.
+*/
+bool castNameMatches(const char *deviceName, const char *target) {
+  if (!deviceName || !target || !target[0] || !deviceName[0]) return false;
+  String a(deviceName), b(target);
+  a.toLowerCase(); b.toLowerCase();
+  return a.indexOf(b) >= 0 || b.indexOf(a) >= 0;
+}
+
+int8_t castFindTarget() {
+  for (uint8_t i = 0; i < castDeviceCount; i++) {
+    if (castNameMatches(castDevices[i].name, castTargetName)) return (int8_t)i;
+  }
+  return -1;
+}
+
+void serviceCast(unsigned long now) {
+  if (!castEnabled || otaActive || rfLearnActive) return;
+  if (WiFi.status() != WL_CONNECTED) return;
+  // Nothing can be queried before mDNS is up, and asking anyway just logs an
+  // ESPmDNS "Query Failed" on every pass until the station associates.
+  if (!castMdnsStarted) return;
+  // Nothing to do until the remote says which Chromecast it cares about.
+  if (!castTargetName[0]) return;
+
+  if (castTargetChanged) {
+    castTargetChanged = false;
+    castNextDiscoverMs = now;      // Re-scan at once for the new name.
+    castState = CastNowPlaying{};
+    castSendToRemote();            // Clear the widget while the new one is found.
+  }
+
+  if ((long)(now - castNextDiscoverMs) >= 0) {
+    castNextDiscoverMs = now + CAST_DISCOVER_MS;
+    castDiscover();
+  }
+  if (!castDeviceCount) return;
+  if ((long)(now - castNextPollMs) < 0) return;
+
+  int8_t index = castFindTarget();
+  if (index < 0) {
+    // Say what was looked for and what is actually on the network, because the
+    // usual cause is a device named differently in the configuration than the
+    // Chromecast advertises, and that is invisible otherwise.
+    Serial.printf("Cast: no Chromecast matching '%s'. Seen:\n", castTargetName);
+    for (uint8_t i = 0; i < castDeviceCount; i++) {
+      Serial.printf("  %s\n", castDevices[i].name);
+    }
+    castNextPollMs = now + CAST_DISCOVER_MS;
+    if (castState.valid) { castState = CastNowPlaying{}; castSendToRemote(); }
+    return;
+  }
+
+  CastNowPlaying fresh = castState;
+  fresh.valid = false;
+  bool answered = castPollDevice((uint8_t)index, fresh);
+  if (!answered || !fresh.valid) fresh = CastNowPlaying{};
+  // One device, so the only question is how closely to watch it: quickly while
+  // something is playing, and more gently when it is idle.
+  castNextPollMs = now + (fresh.valid ? CAST_POLL_ACTIVE_MS : CAST_POLL_IDLE_MS);
+
+  if (castStateDiffers(fresh, castState)) {
+    castState = fresh;
+    castSendToRemote();
+    if (serialHostAttached()) {
+      if (castState.valid) {
+        Serial.printf("Cast: %s on %s - %s%s (%lu/%lus)\n",
+                      castState.source[0] ? castState.source : "player",
+                      castDevices[index].name,
+                      castState.playing ? "playing " : "paused ",
+                      castState.title[0] ? castState.title : "(no title published)",
+                      (unsigned long)castState.position,
+                      (unsigned long)castState.duration);
+      } else {
+        Serial.printf("Cast: nothing playing on %s\n", castDevices[index].name);
+      }
+    }
+  } else {
+    castState.position = fresh.position;
+  }
+}
+
 // Joins the configured Wi-Fi and keeps it joined.
 //
 // ESP-NOW and the station share one radio and therefore one channel. Joining an
@@ -3507,6 +4053,15 @@ void serviceHomebridgeWifi(unsigned long now) {
       Serial.printf("Dock: Wi-Fi joined '%s' as %s on channel %u, staying awake\n",
                     hbSsid.c_str(), WiFi.localIP().toString().c_str(),
                     (unsigned)WiFi.channel());
+      // mDNS has to be running before Chromecasts can be found, and it can
+      // only start once there is an address to answer on. Discovery itself is
+      // scheduled from serviceCast() rather than done here, so a slow query
+      // never sits in the middle of the association path.
+      if (!castMdnsStarted) {
+        castMdnsStarted = MDNS.begin("openremote-dock");
+        Serial.printf("Cast: mDNS %s\n", castMdnsStarted ? "ready" : "failed to start");
+        castNextDiscoverMs = millis();
+      }
       // The association may have moved the radio. Whatever channel it landed
       // on is now the one ESP-NOW must use as well.
       uint8_t primary = WiFi.channel();
@@ -4685,6 +5240,7 @@ void loop() {
   servicePairing(now);
   serviceChannelMove();
   serviceChannelSave(now);
+  serviceCast(now);
   serviceHomebridgeConfig();
   serviceHomebridgeWifi(now);
   serviceHomebridge(now);
