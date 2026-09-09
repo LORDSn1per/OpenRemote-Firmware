@@ -1,6 +1,45 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.48 - 2026-09-09
+    - Fixed renaming the remote through WebConfig reverting to OpenRemote.
+      ArduinoJson's `value | nullptr` selects a nullptr_t fallback and returns
+      null even for a valid string, so the uploaded name was ignored and the
+      old live name was written back to runtime.json after sync. Read the name
+      explicitly as const char*, retaining the existing missing/empty guard.
+      Corrected the same string-read mistake for clockCity.
+
+  4.48 - 2026-09-09
+    - Poster artwork on the media widget, fetched once and then kept.
+      The dock reports only the address; the remote downloads it, scales it to
+      96x96 with LovyanGFX - which decodes both JPEG and PNG - and writes raw
+      RGB565 to /media/art keyed by a hash of that address. Watch a series
+      night after night and it is downloaded the first evening and read off the
+      card every evening after, which is the point: a poster does not change,
+      so re-fetching it daily is pure waste of radio and battery.
+    - Waking stays as quick as it is now. A cache hit is one file read and
+      happens immediately; a miss needs Wi-Fi and a decode, so it waits until
+      the display is properly awake and the widget is actually on screen. The
+      wake path never fetches.
+    - Keyed by address rather than title, because two shows can share a name
+      and one show can change its poster - the address is what identifies the
+      image. Stored decoded rather than as the original JPEG, so display is a
+      file read rather than a decode on every wake.
+    - Written to a temporary name and renamed, so a fetch cut short by a flat
+      battery cannot leave a half-written file that loads as a corrupt poster
+      from then on. Three failures and it stops retrying that address.
+
+  4.47 - 2026-09-09
+    - The media widget refreshes every five seconds while it is on screen
+      rather than every thirty. Thirty was chosen to be frugal and was simply
+      too slow to be believed: stop something and the widget went on showing it
+      for up to half a minute, which reads as broken rather than thrifty. A
+      request is one short link bring-up of about twelve milliseconds, so this
+      is roughly a quarter of one percent of radio-on time, and only while
+      someone is actually looking at the widget. The position still advances
+      locally between requests - this interval only decides how quickly a
+      change made somewhere else shows up.
+
   4.46 - 2026-09-09
     - The media widget asks the dock for a status instead of holding the radio
       open waiting to be told. 4.45 kept the ESP-NOW radio up for as long as a
@@ -5521,7 +5560,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.46"
+#define OPENREMOTE_VERSION_STRING "4.48"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -6272,6 +6311,16 @@ static const uint32_t ESPNOW_DOCK_INFO_MAGIC = 0x4F524449UL;  // "ORDI"
 static const uint32_t ESPNOW_NOWPLAYING_MAGIC = 0x4F524E50UL;  // "ORNP"
 static const uint32_t ESPNOW_MEDIA_TARGET_MAGIC = 0x4F524D54UL;  // "ORMT"
 static const uint32_t ESPNOW_NOWPLAYING_REQ_MAGIC = 0x4F524E52UL;  // "ORNR"
+static const uint32_t ESPNOW_ARTWORK_MAGIC = 0x4F524157UL;        // "ORAW"
+
+// Dock -> remote: where the poster for the current title lives. Only the
+// address travels; see serviceMediaArtwork() for what happens to it.
+struct __attribute__((packed)) EspNowArtworkPacket {
+  uint32_t magic;
+  char url[200];
+};
+static_assert(sizeof(EspNowArtworkPacket) == 204,
+              "artwork layout drifted from the dock");
 static const uint32_t ESPNOW_CAST_SCAN_MAGIC = 0x4F524353UL;   // "ORCS"
 
 // Remote -> dock: send what is playing, now. See serviceMediaRadio().
@@ -8213,11 +8262,30 @@ bool dockOtaPrepare(uint8_t deviceIndex, String &error);
 bool relayIrToDock(const DeviceCommand &command);
 bool dockConnected();
 extern bool nowPlayingRefreshWanted;
+// Both are defined down with the media widget, and both are used above it.
+const void *mediaArtSource();
+bool mediaWidgetOnScreen();
 // Set by whichever task sends a command - including the HTTP task - and acted
 // on by the Arduino loop, which is the only task allowed to touch LVGL.
 // Set by the ESP-NOW receive callback, acted on by loop(). The widget redraw
 // touches LVGL, and that belongs to the loop task alone - the same rule whose
 // breach corrupted the heap in 4.32.
+/*
+  The poster for whatever is playing, and where it is kept.
+
+  Cached on the SD card and keyed by the address it came from, so a series
+  watched night after night is fetched once and then read locally forever. The
+  fetch itself never happens on the wake path - see serviceMediaArtwork() - so
+  waking stays as quick as it is now.
+*/
+char mediaArtUrl[200] = "";
+char mediaArtFile[48] = "";
+volatile bool mediaArtUrlChanged = false;
+bool mediaArtFetchWanted = false;
+uint32_t mediaArtNextTryMs = 0;
+uint8_t mediaArtFailures = 0;
+lv_img_dsc_t mediaArtDescriptor = {};
+uint8_t *mediaArtPixels = nullptr;
 volatile bool nowPlayingDirty = false;
 // Printed from loop() rather than the callback: Serial from the Wi-Fi task
 // competes with the same UART the loop uses and has garbled output before.
@@ -12741,13 +12809,13 @@ void handleWifiForgetApi() {
 void applySettingsJson(JsonVariantConst settings) {
   if (settings.isNull()) return;
   bool previousWifiOn = wifiOn;
-  const char *configuredName = settings["remoteName"] | nullptr;
+  const char *configuredName = settings["remoteName"].as<const char *>();
   if (configuredName && configuredName[0]) remoteName = configuredName;
   wifiOn = settings["wifiEnabled"] | wifiOn;
   bluetoothOn = settings["bluetoothEnabled"] | bluetoothOn;
   clockEnabled = settings["clockEnabled"] | clockEnabled;
   clockUseInternetTime = settings["clockUseInternetTime"] | clockUseInternetTime;
-  const char *city = settings["clockCity"] | nullptr;
+  const char *city = settings["clockCity"].as<const char *>();
   if (city && city[0]) clockCityName = city;
   clockUtcOffsetMinutes = constrain(
     (int)(settings["clockUtcOffsetMinutes"] | clockUtcOffsetMinutes),
@@ -21227,6 +21295,22 @@ void onEspNowDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int 
   // A firmware ack from the dock we are currently updating. Checked before the
   // scan and learn windows because a transfer can be running while neither is
   // open, and only ever accepted from the dock this transfer is addressed to.
+  if ((size_t)len >= sizeof(EspNowArtworkPacket) &&
+      findEspNowDeviceIndexByMac(info->src_addr) >= 0) {
+    uint32_t magic = 0;
+    memcpy(&magic, data, sizeof(magic));
+    if (magic == ESPNOW_ARTWORK_MAGIC) {
+      EspNowArtworkPacket packet;
+      memcpy(&packet, data, sizeof(packet));
+      packet.url[sizeof(packet.url) - 1] = '\0';
+      if (strcmp(mediaArtUrl, packet.url) != 0) {
+        strlcpy(mediaArtUrl, packet.url, sizeof(mediaArtUrl));
+        mediaArtUrlChanged = true;   // Resolved from loop(); SD and Wi-Fi are not this task's.
+      }
+      return;
+    }
+  }
+
   if ((size_t)len >= sizeof(EspNowCastListPacket) &&
       findEspNowDeviceIndexByMac(info->src_addr) >= 0) {
     uint32_t magic = 0;
@@ -28738,9 +28822,10 @@ void buildWidgetMediaFace(WidgetInstance &instance, lv_obj_t *parent,
   lv_obj_clear_flag(art, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_clear_flag(art, LV_OBJ_FLAG_SCROLLABLE);
 
-  if (widgetSettings.mediaArtwork && haveMedia && nowPlaying.artworkPath[0]) {
+  const void *artSource = mediaArtSource();
+  if (widgetSettings.mediaArtwork && haveMedia && artSource) {
     lv_obj_t *poster = lv_img_create(art);
-    lv_img_set_src(poster, nowPlaying.artworkPath);
+    lv_img_set_src(poster, artSource);
     lv_obj_center(poster);
     lv_obj_clear_flag(poster, LV_OBJ_FLAG_CLICKABLE);
   } else {
@@ -29804,6 +29889,193 @@ void serviceWeatherWidget(uint32_t now) {
   all. Each request costs one short link bring-up - about twelve milliseconds -
   and the reply arrives inside the on-demand hold that request already armed.
 */
+/* ---------------------------------------------------------------------- *
+   Media artwork
+
+   Fetched once per poster and kept on the SD card, keyed by a hash of its
+   address. Watch a series night after night and the image is downloaded the
+   first time and read locally every time after - which is the point: a poster
+   does not change, so re-fetching it daily is pure waste of radio and battery.
+
+   Stored decoded, at one fixed size, as raw RGB565 behind a four byte header.
+   Keeping the original JPEG would mean decoding it again on every wake; this
+   way display is a file read straight into a buffer LVGL can draw.
+ * ---------------------------------------------------------------------- */
+static const int16_t MEDIA_ART_SIZE = 96;   // Covers the expanded card; LVGL scales down.
+static const char *MEDIA_ART_DIR = "/media/art";
+
+// FNV-1a over the address. A hash rather than the title because two shows can
+// share a name and the same show can change its poster - the address is what
+// actually identifies the image.
+void mediaArtFileForUrl(const char *url, char *out, size_t outSize) {
+  uint32_t hash = 2166136261UL;
+  for (const char *c = url; *c; c++) {
+    hash ^= (uint8_t)*c;
+    hash *= 16777619UL;
+  }
+  snprintf(out, outSize, "%s/%08lx.565", MEDIA_ART_DIR, (unsigned long)hash);
+}
+
+void mediaArtRelease() {
+  if (mediaArtPixels) { free(mediaArtPixels); mediaArtPixels = nullptr; }
+  mediaArtDescriptor = lv_img_dsc_t{};
+  nowPlaying.artworkPath[0] = '\0';
+}
+
+// Reads a cached poster into memory and points the widget at it.
+bool mediaArtLoadFromCard(const char *path) {
+  if (!sdReady || !SD.exists(path)) return false;
+  File file = SD.open(path, FILE_READ);
+  if (!file) return false;
+  uint16_t width = 0, height = 0;
+  if (file.read((uint8_t *)&width, 2) != 2 || file.read((uint8_t *)&height, 2) != 2 ||
+      !width || !height || width > 256 || height > 256) {
+    file.close();
+    return false;
+  }
+  size_t bytes = (size_t)width * height * 2;
+  uint8_t *pixels = (uint8_t *)(psramFound() ? ps_malloc(bytes) : malloc(bytes));
+  if (!pixels) { file.close(); return false; }
+  size_t got = file.read(pixels, bytes);
+  file.close();
+  if (got != bytes) { free(pixels); return false; }
+
+  mediaArtRelease();
+  mediaArtPixels = pixels;
+  mediaArtDescriptor.header.always_zero = 0;
+  mediaArtDescriptor.header.w = width;
+  mediaArtDescriptor.header.h = height;
+  mediaArtDescriptor.header.cf = LV_IMG_CF_TRUE_COLOR;
+  mediaArtDescriptor.data_size = bytes;
+  mediaArtDescriptor.data = mediaArtPixels;
+  // The widget takes a source pointer, so this marker only has to be non-empty
+  // for the "is there artwork" test; mediaArtSource() supplies the real one.
+  strlcpy(nowPlaying.artworkPath, path, sizeof(nowPlaying.artworkPath));
+  return true;
+}
+
+const void *mediaArtSource() {
+  return mediaArtPixels ? (const void *)&mediaArtDescriptor : nullptr;
+}
+
+/*
+  Downloads the poster, scales it and writes it to the card.
+
+  Only ever called from serviceMediaArtwork(), which keeps it off the wake path.
+  LovyanGFX decodes both JPEG and PNG into an off-screen sprite, which is also
+  where the scaling happens, so what lands on the card is already the size the
+  widget draws.
+*/
+bool mediaArtFetch(const char *url, const char *path) {
+  if (!sdReady) return false;
+  if (!ensureStationConnected(12000)) return false;
+
+  NetworkClientSecure secure;
+  secure.setInsecure();          // Poster hosts vary; the remote carries no root store.
+  HTTPClient http;
+  http.setConnectTimeout(5000);
+  http.setTimeout(9000);
+  bool https = strncmp(url, "https://", 8) == 0;
+  bool begun = https ? http.begin(secure, url) : http.begin(url);
+  if (!begun) return false;
+  int status = http.GET();
+  if (status != 200) { http.end(); Serial.printf("Artwork: HTTP %d\n", status); return false; }
+  int length = http.getSize();
+  if (length <= 0 || length > 512 * 1024) {
+    http.end();
+    Serial.printf("Artwork: refusing a %d byte image\n", length);
+    return false;
+  }
+  uint8_t *raw = (uint8_t *)(psramFound() ? ps_malloc(length) : malloc(length));
+  if (!raw) { http.end(); return false; }
+  int got = http.getStream().readBytes(raw, length);
+  http.end();
+  if (got != length) { free(raw); return false; }
+
+  LGFX_Sprite sprite(&tft);
+  sprite.setColorDepth(16);
+  if (!sprite.createSprite(MEDIA_ART_SIZE, MEDIA_ART_SIZE)) { free(raw); return false; }
+  sprite.fillSprite(0);
+  bool drawn = sprite.drawJpg(raw, (size_t)length, 0, 0, MEDIA_ART_SIZE, MEDIA_ART_SIZE,
+                              0, 0, ::lgfx::v1::datum_t::middle_center) ||
+               sprite.drawPng(raw, (size_t)length, 0, 0, MEDIA_ART_SIZE, MEDIA_ART_SIZE,
+                              0, 0, ::lgfx::v1::datum_t::middle_center);
+  free(raw);
+  if (!drawn) { sprite.deleteSprite(); Serial.println("Artwork: could not decode the image"); return false; }
+
+  SD.mkdir(MEDIA_ART_DIR);
+  String temp = String(path) + ".part";
+  SD.remove(temp);
+  File file = SD.open(temp, FILE_WRITE);
+  if (!file) { sprite.deleteSprite(); return false; }
+  uint16_t dimension = (uint16_t)MEDIA_ART_SIZE;
+  file.write((const uint8_t *)&dimension, 2);
+  file.write((const uint8_t *)&dimension, 2);
+  size_t written = file.write((const uint8_t *)sprite.getBuffer(),
+                              (size_t)MEDIA_ART_SIZE * MEDIA_ART_SIZE * 2);
+  file.close();
+  sprite.deleteSprite();
+  // Written to a temporary name and renamed, so a fetch interrupted by a flat
+  // battery cannot leave a half-written file that loads as a corrupt poster
+  // forever afterwards.
+  if (written != (size_t)MEDIA_ART_SIZE * MEDIA_ART_SIZE * 2) { SD.remove(temp); return false; }
+  SD.remove(path);
+  return SD.rename(temp, path);
+}
+
+/*
+  Decides when the poster is allowed to cost anything.
+
+  A cache hit is free and happens immediately, including on the wake path -
+  it is one file read. A miss needs Wi-Fi and a decode, so it waits until the
+  display is properly awake and the widget is actually on screen, and backs off
+  after repeated failures rather than retrying a dead address forever.
+*/
+void serviceMediaArtwork(uint32_t now) {
+  if (mediaArtUrlChanged) {
+    mediaArtUrlChanged = false;
+    mediaArtFailures = 0;
+    mediaArtNextTryMs = 0;
+    mediaArtFetchWanted = false;
+    if (!mediaArtUrl[0]) {
+      mediaArtRelease();
+      mediaArtFile[0] = '\0';
+      nowPlayingDirty = true;
+      return;
+    }
+    mediaArtFileForUrl(mediaArtUrl, mediaArtFile, sizeof(mediaArtFile));
+    if (mediaArtLoadFromCard(mediaArtFile)) {
+      Serial.printf("Artwork: %s already on the card\n", mediaArtFile);
+      nowPlayingDirty = true;
+    } else {
+      mediaArtRelease();
+      mediaArtFetchWanted = true;
+    }
+  }
+
+  if (!mediaArtFetchWanted || !widgetSettings.mediaArtwork) return;
+  if (displaySleeping || !mediaWidgetOnScreen()) return;
+  if (mediaArtNextTryMs && (int32_t)(now - mediaArtNextTryMs) < 0) return;
+
+  mediaArtFetchWanted = false;
+  Serial.printf("Artwork: fetching %s\n", mediaArtUrl);
+  if (mediaArtFetch(mediaArtUrl, mediaArtFile) && mediaArtLoadFromCard(mediaArtFile)) {
+    mediaArtFailures = 0;
+    nowPlayingDirty = true;
+    Serial.printf("Artwork: cached as %s\n", mediaArtFile);
+    return;
+  }
+  // Backs off rather than hammering: some posters are simply unreachable from
+  // this network, and a widget without an image is a much smaller problem than
+  // a remote that keeps waking its radio to be refused.
+  if (++mediaArtFailures < 3) {
+    mediaArtFetchWanted = true;
+    mediaArtNextTryMs = now + 60000UL * mediaArtFailures;
+  } else {
+    Serial.println("Artwork: giving up on this poster");
+  }
+}
+
 bool mediaWidgetOnScreen() {
   if (displaySleeping) return false;
   if (widgetExpandedOverlay && widgetExpandedKind == WIDGET_MEDIA) return true;
@@ -29843,10 +30115,22 @@ void serviceMediaRadio(uint32_t now) {
   bool justAppeared = !wasOnScreen;
   wasOnScreen = true;
 
+  /*
+    Five seconds while the widget is on screen, not thirty.
+
+    Thirty was chosen to be frugal and was simply too slow to be believed: stop
+    something and the widget went on showing it for up to half a minute, which
+    reads as broken rather than thrifty. A request is one short link bring-up -
+    around twelve milliseconds - so five seconds is roughly a quarter of one
+    percent of radio-on time, and only while a person is actually looking at
+    the widget. The position still advances locally between requests; this
+    interval only decides how quickly a change made somewhere else shows up.
+  */
+  static const uint32_t MEDIA_POLL_MS = 5000;
   bool due = nextPollMs == 0 || (int32_t)(now - nextPollMs) >= 0;
   if (!justAppeared && !nowPlayingRefreshWanted && !due) return;
   nowPlayingRefreshWanted = false;
-  nextPollMs = now + 30000;
+  nextPollMs = now + MEDIA_POLL_MS;
   requestNowPlaying();
 }
 
@@ -31844,6 +32128,7 @@ void loop() {
   if (!displaySleeping) serviceWidgets(now);
   serviceMediaTarget(now);
   serviceMediaRadio(now);
+  serviceMediaArtwork(now);
   serviceWeatherWidget(now);
   serviceMqtt(now);
   serviceHomeAssistantLive(now);

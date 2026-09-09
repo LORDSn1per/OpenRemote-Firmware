@@ -1,6 +1,30 @@
 /*
   OpenRemote Dock firmware change log (newest first)
 
+  1.61 - 2026-09-09
+    - Reports the poster address for the current title. Only the address
+      travels, never the image: the remote fetches it once, scales it and keeps
+      it on its own SD card, so a show costs one download ever rather than one
+      per play. Sent in its own frame and only when it changes, since a URL is
+      long and most updates - a position ticking on - do not change it.
+    - Whether an app publishes a poster at all is its own choice. SmartTube
+      publishes none, so this is often empty and the widget keeps its
+      placeholder rather than showing the last title's image.
+
+  1.60 - 2026-09-09
+    - Clears the title when the app or the playback session changes. Cast omits
+      the media block from its frequent position-only updates, so the text has
+      to be carried forward between them - but that was being carried across a
+      change of app as well, which left SmartTube's title sitting on the widget
+      while the Apple TV app was playing something else entirely. A stale title
+      is worse than no title, being indistinguishable from a correct one.
+    - A status request from the remote now polls the Chromecast before
+      answering instead of replying from cache. The remote asks right after a
+      button is pressed and stop is exactly the press that matters, but the
+      dock's own poll runs every few seconds, so a cached answer described the
+      state from before the press. A poll takes about a second, well inside the
+      hold the request has already armed.
+
   1.59 - 2026-09-09
     - Answers a "what is playing" request from the remote instead of relying on
       pushes landing. The remote's ESP-NOW radio is on demand and off almost
@@ -983,7 +1007,7 @@ static inline bool serialHostAttached() {
 }
 
 
-#define OPENREMOTE_DOCK_VERSION_STRING "1.59"
+#define OPENREMOTE_DOCK_VERSION_STRING "1.61"
 
 // A literal in the built image, so a tool holding the .bin can tell what it is
 // without running it. The remote firmware carries the same idea under
@@ -1167,6 +1191,22 @@ static const uint32_t ESPNOW_DOCK_INFO_MAGIC = 0x4F524449UL;  // "ORDI"
 static const uint32_t ESPNOW_NOWPLAYING_MAGIC = 0x4F524E50UL;  // "ORNP"
 static const uint32_t ESPNOW_MEDIA_TARGET_MAGIC = 0x4F524D54UL;  // "ORMT"
 static const uint32_t ESPNOW_NOWPLAYING_REQ_MAGIC = 0x4F524E52UL;  // "ORNR"
+static const uint32_t ESPNOW_ARTWORK_MAGIC = 0x4F524157UL;        // "ORAW"
+
+/*
+  Dock -> remote: where the poster for the current title lives.
+
+  Only the address travels, never the image. The remote fetches it once, scales
+  it and keeps it on its own SD card, so the same show costs one download ever
+  rather than one per play. Sent in its own frame because a URL is long and
+  most updates - a position ticking on - do not change it.
+*/
+struct __attribute__((packed)) EspNowArtworkPacket {
+  uint32_t magic;
+  char url[200];
+};
+static_assert(sizeof(EspNowArtworkPacket) == 204,
+              "artwork layout drifted from the remote");
 static const uint32_t ESPNOW_CAST_SCAN_MAGIC = 0x4F524353UL;   // "ORCS"
 
 /*
@@ -3727,6 +3767,12 @@ struct CastNowPlaying {
   char title[64];
   char subtitle[48];
   char source[24];
+  char artUrl[200];
+  // Which playback this text belongs to. Cast omits the media block from its
+  // frequent position-only updates, so the text has to be carried forward -
+  // but only within one session. Carrying it across a change of app is what
+  // left SmartTube's title sitting on the widget while the Apple TV app played.
+  uint32_t sessionId;
 };
 CastNowPlaying castState = {};
 
@@ -3944,16 +3990,32 @@ bool castPollDevice(uint8_t index, CastNowPlaying &out) {
       JsonObject entry = filter["status"][0].to<JsonObject>();
       entry["playerState"] = true;
       entry["currentTime"] = true;
+      entry["mediaSessionId"] = true;
       JsonObject media = entry["media"].to<JsonObject>();
       media["duration"] = true;
       JsonObject meta = media["metadata"].to<JsonObject>();
       meta["title"] = true;
       meta["subtitle"] = true;
       meta["artist"] = true;
+      meta["images"][0]["url"] = true;
       JsonDocument doc;
       if (deserializeJson(doc, payload, DeserializationOption::Filter(filter))) continue;
       JsonObjectConst status = doc["status"][0].as<JsonObjectConst>();
       if (status.isNull()) continue;
+      /*
+        A different session, or a different app, means the text carried over
+        from the last poll describes something that is no longer playing. Clear
+        it rather than let it stand: a stale title is worse than none, because
+        it is indistinguishable from a correct one.
+      */
+      uint32_t session = (uint32_t)(status["mediaSessionId"] | 0);
+      if (session != out.sessionId || strcmp(out.source, appName.c_str()) != 0) {
+        out.title[0] = '\0';
+        out.subtitle[0] = '\0';
+        out.artUrl[0] = '\0';
+        out.duration = 0;
+      }
+      out.sessionId = session;
       out.valid = true;
       const char *state = status["playerState"] | "";
       out.playing = strcmp(state, "PLAYING") == 0;
@@ -3971,6 +4033,11 @@ bool castPollDevice(uint8_t index, CastNowPlaying &out) {
         const char *sub = metadata["subtitle"] | "";
         if (!sub[0]) sub = metadata["artist"] | "";
         strlcpy(out.subtitle, sub, sizeof(out.subtitle));
+        // Whether an app publishes a poster is its own choice: SmartTube
+        // publishes none, so this is frequently empty and the widget keeps its
+        // placeholder rather than showing the previous title's image.
+        const char *art = metadata["images"][0]["url"] | "";
+        strlcpy(out.artUrl, art, sizeof(out.artUrl));
       }
       strlcpy(out.source, appName.c_str(), sizeof(out.source));
       gotAnswer = true;
@@ -3988,11 +4055,27 @@ bool castStateDiffers(const CastNowPlaying &a, const CastNowPlaying &b) {
   if (strcmp(a.title, b.title) || strcmp(a.subtitle, b.subtitle) ||
       strcmp(a.source, b.source)) return true;
   if (a.duration != b.duration) return true;
+  if (strcmp(a.artUrl, b.artUrl)) return true;
   // Position moves constantly, so it alone is not a reason to spend a frame -
   // the remote advances its own clock between updates. Only a jump that a
   // seek or a track change would produce is worth reporting.
   int32_t drift = (int32_t)a.position - (int32_t)b.position;
   return drift > 10 || drift < -10;
+}
+
+// Sent only when the address actually changes, which is once per title rather
+// than once per status.
+void castSendArtwork() {
+  static char lastSent[200] = "";
+  if (!remoteKnown) return;
+  if (strcmp(lastSent, castState.artUrl) == 0) return;
+  strlcpy(lastSent, castState.artUrl, sizeof(lastSent));
+  EspNowArtworkPacket packet = {};
+  packet.magic = ESPNOW_ARTWORK_MAGIC;
+  strlcpy(packet.url, castState.artUrl, sizeof(packet.url));
+  esp_now_send(remoteMac, (const uint8_t *)&packet, sizeof(packet));
+  Serial.printf("Cast: artwork %s\n",
+                castState.artUrl[0] ? castState.artUrl : "(none published)");
 }
 
 void castSendToRemote() {
@@ -4007,6 +4090,7 @@ void castSendToRemote() {
   strlcpy(packet.subtitle, castState.subtitle, sizeof(packet.subtitle));
   strlcpy(packet.source, castState.source, sizeof(packet.source));
   esp_now_send(remoteMac, (const uint8_t *)&packet, sizeof(packet));
+  castSendArtwork();
 }
 
 /*
@@ -4053,10 +4137,30 @@ void serviceCast(unsigned long now) {
   // ESPmDNS "Query Failed" on every pass until the station associates.
   if (!castMdnsStarted) return;
 
-  // Answered from whatever is already known, so the remote gets a reply inside
-  // the couple of seconds its radio stays up rather than waiting on a poll.
+  /*
+    A request polls the Chromecast before answering rather than replying from
+    cache.
+
+    The remote asks right after a button is pressed, and stop is exactly the
+    press that matters - but the dock's own poll runs every few seconds, so a
+    cached answer describes the state from before the press. The widget kept
+    showing a title that had already stopped playing. A poll is about a second,
+    which fits inside the hold the remote's request has already armed.
+  */
   if (castReplyRequested) {
     castReplyRequested = false;
+    if (castTargetName[0]) {
+      int8_t index = castFindTarget();
+      if (index >= 0) {
+        CastNowPlaying fresh = castState;
+        fresh.valid = false;
+        if (!castPollDevice((uint8_t)index, fresh) || !fresh.valid) {
+          fresh = CastNowPlaying{};
+        }
+        castState = fresh;
+        castNextPollMs = now + CAST_POLL_ACTIVE_MS;
+      }
+    }
     castSendToRemote();
   }
 
