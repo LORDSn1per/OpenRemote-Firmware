@@ -1,6 +1,34 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.45 - 2026-09-09
+    - Fixes the media widget never updating even with the dock polling
+      correctly. The dock pushes now-playing as it changes, which is the right
+      shape - a track simply playing costs no radio traffic that way - but the
+      remote's ESP-NOW radio is on demand and off almost all of the time, so
+      every push landed on a receiver that was not listening. The dock had been
+      doing its half properly the whole time and saying so on its own serial.
+      The radio is now held up while a media widget is drawn on the current
+      page and the display is awake, which is exactly when an update is worth
+      having. With the screen off nothing is watching and it sleeps as before.
+    - The watched Chromecast is re-sent to the dock every minute instead of
+      only when it changes. The dock keeps that name in RAM, so a reboot or a
+      firmware update loses it and leaves it with nothing to poll - silently,
+      because from the remote's side nothing has changed and there is nothing
+      to re-send.
+
+  4.44 - 2026-09-09
+    - Fixes the Chromecast scan always returning an empty list. The dock did
+      its part correctly every time:
+        Cast: found 6 device(s) of 7 answering
+        Cast: reported 6 name(s) to the remote
+      but the remote answered "scanned: false, names: []". Its own log gave the
+      reason - "ESP-NOW: link released (hold expired)". The on-demand radio hold
+      is about two seconds and the scan waits up to six for a reply that needs
+      an mDNS query first, so the radio shut down mid-wait and the dock's answer
+      arrived at a receiver that was no longer listening.
+      The wait now re-arms the hold on every pass.
+
   4.43 - 2026-09-09
     - Adds /api/cast/scan, so WebConfig can offer a list of the Chromecasts on
       the network instead of asking for a name to be typed in. The dock owns
@@ -5478,7 +5506,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.43"
+#define OPENREMOTE_VERSION_STRING "4.45"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -19547,11 +19575,20 @@ void handleCastScanApi() {
   for (uint8_t i = 0; i < espNowDeviceCount; i++) {
     sendEspNowWithRetry(espNowDevices[i].mac, (const uint8_t *)&packet, sizeof(packet));
   }
-  // An mDNS query on the dock takes a second or two, and the reply comes back
-  // through its loop, so this waits rather than reporting an empty list that
-  // simply arrived too early.
+  /*
+    Wait for the reply, holding the radio open for the whole wait.
+
+    An mDNS query on the dock takes a second or two and its answer comes back
+    through the dock's loop, so this has to wait. The catch is that the ESP-NOW
+    radio is on demand and its hold is about two seconds: without refreshing it
+    the radio shut down mid-wait, the dock's reply landed on a receiver that
+    was no longer listening, and the scan returned an empty list while the dock
+    logged "reported 6 name(s) to the remote". ensureEspNowLink() re-arms the
+    hold each time round, which is exactly what it is for.
+  */
   unsigned long until = millis() + 6000;
   while (!castListDirty && (long)(millis() - until) < 0) {
+    ensureEspNowLink();
     delay(20);
     serviceUiDuringLongHttpTransfer();
   }
@@ -29721,9 +29758,51 @@ void serviceWeatherWidget(uint32_t now) {
   Only sent when it changes. The dock keeps the name until told otherwise, so
   repeating it on a timer would spend radio on saying nothing new.
 */
+/*
+  Holds the ESP-NOW radio up while a media widget is actually on screen.
+
+  The dock pushes now-playing as it changes, which is the right shape - a track
+  simply playing then costs no radio traffic. But the remote's ESP-NOW radio is
+  on demand and off almost all of the time, so those pushes were landing on a
+  receiver that was not listening and the widget never updated. The dock was
+  polling its Chromecast and reporting correctly the whole time.
+
+  Kept up only while a media widget is drawn on the current page and the
+  display is awake, which is exactly when an update is worth having. With the
+  screen off nothing is watching, and the radio goes back to sleep on its own.
+*/
+bool mediaWidgetOnScreen() {
+  if (displaySleeping) return false;
+  if (widgetExpandedOverlay && widgetExpandedKind == WIDGET_MEDIA) return true;
+  for (uint8_t i = 0; i < widgetInstanceCount; i++) {
+    if (widgetInstances[i].kind == WIDGET_MEDIA) return true;
+  }
+  return false;
+}
+
+void serviceMediaRadio(uint32_t now) {
+  static uint32_t nextHoldMs = 0;
+  if (!mediaWidgetOnScreen()) return;
+  if (espNowDeviceCount == 0 || !espNowEnabled) return;
+  if (nextHoldMs && (int32_t)(now - nextHoldMs) < 0) return;
+  // Re-armed well inside the on-demand hold so the link never actually drops
+  // while the widget is visible.
+  nextHoldMs = now + 1000;
+  ensureEspNowLink();
+}
+
 void serviceMediaTarget(uint32_t now) {
   static char lastSent[32] = "";
   static uint32_t nextRetryMs = 0;
+  static uint32_t resendMs = 0;
+  /*
+    Repeated every minute rather than only on change. The dock keeps the target
+    in RAM, so it loses it on a reboot or a firmware update and then has
+    nothing to poll - silently, because from the remote's side nothing has
+    changed and there is nothing to re-send. A minute of staleness after a dock
+    restart is not worth a person having to work out why the widget went blank.
+  */
+  if (resendMs && (int32_t)(now - resendMs) >= 0) { lastSent[0] = '\0'; resendMs = 0; }
 
   char wanted[32] = "";
   // An explicitly configured Cast name wins over everything, because it is the
@@ -29754,6 +29833,7 @@ void serviceMediaTarget(uint32_t now) {
   if (!sent) { nextRetryMs = now + 5000; return; }
   strlcpy(lastSent, wanted, sizeof(lastSent));
   nextRetryMs = 0;
+  resendMs = now + 60000;
   Serial.printf("Media: watching '%s'\n", wanted[0] ? wanted : "(nothing)");
 }
 
@@ -31704,6 +31784,7 @@ void loop() {
   serviceBatteryHistory(now);
   if (!displaySleeping) serviceWidgets(now);
   serviceMediaTarget(now);
+  serviceMediaRadio(now);
   serviceWeatherWidget(now);
   serviceMqtt(now);
   serviceHomeAssistantLive(now);

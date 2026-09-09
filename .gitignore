@@ -41,3 +41,7 @@ archive/git-history/*.bundle
 # repository and does not belong inside this history; the fork relationship is
 # recorded by the "upstream" remote instead.
 archive/reference-projects/Official OMOTE Firmware References/OMOTE-Firmware-official/
+
+# Written handoffs. Kept on disk and published as artifacts rather than
+# versioned here - they describe the work, they are not part of it.
+Handoffs/
