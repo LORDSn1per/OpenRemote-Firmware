@@ -1,6 +1,17 @@
 /*
   OpenRemote Dock firmware change log (newest first)
 
+  1.55 - 2026-09-09
+    - Writes flash once a channel change has settled instead of on every hop.
+      Following the remote has to be immediate - it is the only thing keeping
+      the two reachable - but saving does not, and saving each intermediate
+      channel cost a flash write apiece. One capture moved 6 then 8 inside two
+      seconds, each logged as "(saved)". The move is still applied at once; the
+      write now waits six seconds and restarts that clock on every further
+      move, so a burst of hops produces exactly one write of the final value.
+      A new remote MAC still saves immediately - that is a pairing, it is rare,
+      and losing it to a power cut moments later would mean pairing again.
+
   1.54 - 2026-09-09
     - Adds Kaseikyo, NEC42, Pioneer and RCA, from the shared encoder header the
       remote compiles too, so both build identical frames. These are the four
@@ -920,7 +931,7 @@ static inline bool serialHostAttached() {
 }
 
 
-#define OPENREMOTE_DOCK_VERSION_STRING "1.54"
+#define OPENREMOTE_DOCK_VERSION_STRING "1.55"
 
 // A literal in the built image, so a tool holding the .bin can tell what it is
 // without running it. The remote firmware carries the same idea under
@@ -2672,9 +2683,40 @@ bool ensurePeer(const uint8_t mac[6]) {
   return esp_now_add_peer(&peer) == ESP_OK;
 }
 
+/*
+  Flash is written only once the channel has stopped moving.
+
+  Following the remote has to be immediate - it is the only way the two stay
+  reachable - but saving has no such urgency, and saving every hop was costing
+  a flash write per intermediate channel. One capture went 6 then 8 within two
+  seconds, each one logged as "(saved)". A remote that has finished associating
+  will not move again, so waiting a few seconds writes once instead.
+
+  A new remote MAC still saves immediately: that is a pairing, it is rare, and
+  losing it to a power cut moments later would mean pairing again.
+*/
+static const unsigned long CHANNEL_SAVE_SETTLE_MS = 6000;
+bool channelSavePending = false;
+unsigned long channelSaveDueMs = 0;
+
+void saveRemoteToFlash() {
+  prefs.begin("dock", false);
+  prefs.putBytes("remoteMac", remoteMac, 6);
+  prefs.putUChar("channel", lockedChannel);
+  prefs.end();
+  Serial.printf("Dock: remote %s locked on channel %u (saved)\n",
+                macToString(remoteMac).c_str(), lockedChannel);
+}
+
+void serviceChannelSave(unsigned long now) {
+  if (!channelSavePending || (long)(now - channelSaveDueMs) < 0) return;
+  channelSavePending = false;
+  saveRemoteToFlash();
+}
+
 void rememberRemote(const uint8_t mac[6], uint8_t channel) {
-  bool changed = !remoteKnown || memcmp(remoteMac, mac, 6) != 0 ||
-                 lockedChannel != channel;
+  bool newRemote = !remoteKnown || memcmp(remoteMac, mac, 6) != 0;
+  bool changed = newRemote || lockedChannel != channel;
   memcpy(remoteMac, mac, 6);
   remoteKnown = true;
   lockedChannel = channel;
@@ -2684,12 +2726,16 @@ void rememberRemote(const uint8_t mac[6], uint8_t channel) {
   // rather than left wherever the sweep happened to be.
   setRadioChannel(lockedChannel);
   if (!changed) return;
-  prefs.begin("dock", false);
-  prefs.putBytes("remoteMac", remoteMac, 6);
-  prefs.putUChar("channel", lockedChannel);
-  prefs.end();
-  Serial.printf("Dock: remote %s locked on channel %u (saved)\n",
-                macToString(remoteMac).c_str(), lockedChannel);
+  if (newRemote) {
+    channelSavePending = false;
+    saveRemoteToFlash();
+    return;
+  }
+  // Channel-only change: hold off, and restart the clock on every further
+  // move, so a burst of hops results in exactly one write of the final value.
+  channelSavePending = true;
+  channelSaveDueMs = millis() + CHANNEL_SAVE_SETTLE_MS;
+  Serial.printf("Dock: following remote to channel %u\n", (unsigned)lockedChannel);
 }
 
 void loadRemote() {
@@ -4638,6 +4684,7 @@ void loop() {
   serviceButton(now);
   servicePairing(now);
   serviceChannelMove();
+  serviceChannelSave(now);
   serviceHomebridgeConfig();
   serviceHomebridgeWifi(now);
   serviceHomebridge(now);

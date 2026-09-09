@@ -1,6 +1,59 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.36 - 2026-09-09
+    - Narrows 4.35's channel sweep back to standalone, because widening it was
+      wrong. The reasoning was that an unassociated station pins nothing, so
+      the sweep was safe there. Measured on hardware it is useless there: an
+      unassociated station is usually scanning and hops away from each channel
+      the sweep sets before the send can land, so it tried all thirteen and
+      reported
+        ESP-NOW: no dock answered on any channel (swept 1-13), staying on 1
+      about a dock that was on channel 8 and answered normally seconds later -
+      having spent close to a second doing it, on every failed send.
+      Standalone is the one state where this code owns the radio and a channel
+      it sets holds. A stale remembered channel in any other state is repaired
+      by the association itself, which 4.34 made authoritative.
+
+  4.35 - 2026-09-09
+    - Stops the remote transmitting on the wrong channel while its station is
+      up but not associated. "The network stack is active" was being taken to
+      mean the channel was spoken for, so ESP-NOW rode whatever the radio
+      happened to be on - channel 1 by default - with the dock, the router and
+      everything else on 8:
+        ESP-NOW: link up in 1 ms (on the station, channel 1)
+        ESP-NOW: send failed after 3 attempts   (x4)
+      Only an association pins a channel. Until one exists the radio is now
+      pointed at the remembered dock channel instead. It deliberately does not
+      take the standalone path to do that, because that path's
+      WiFi.disconnect() would abort the association attempt usually in
+      progress; a successful association moves the channel itself anyway.
+    - The channel recovery sweep runs in that state too. It was gated on this
+      code having brought the radio up itself, so a stale remembered channel
+      could never be repaired while the network stack happened to be up - even
+      with no association to protect.
+
+  4.34 - 2026-09-09
+    - Stops the remote dragging the dock across channels while its own Wi-Fi is
+      still settling. Captured on one boot:
+        ESP-NOW: ready on channel 1 (asked for 1, radio reports 1)
+        ESP-NOW: send failed after 3 attempts   (x4)
+        Dock: remote says it is on channel 6, we are on 8 - following
+        Dock: remote says it is on channel 8, we are on 6 - following
+      with the access point and the dock both on 8 throughout.
+      Two causes, both here. The keepalive ping states the remote's channel and
+      the dock believes it, but that byte was the radio's instantaneous
+      channel - which hops while the station associates - so the dock chased
+      each intermediate value and was left on a channel the remote had already
+      left. It now states a channel only when the remote is settled on one:
+      standalone, where this code chose it, or associated, where the router
+      did. Otherwise it sends 0, which the dock reads as "no statement" and
+      leaves its channel alone, exactly as an older dock treats the byte.
+    - startEspNow() also adopted and persisted whatever channel it read back
+      when riding the station, including mid-connect. That is how a 1 got into
+      NVS on a network running on 8, and standalone bring-ups then used it. It
+      now only adopts once the station is actually associated.
+
   4.33 - 2026-09-09
     - Fixes the remote losing its dock pairing after a reboot. WebConfig parses
       runtime.json into its own model and rebuilds the upload from it, so any
@@ -5311,7 +5364,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.33"
+#define OPENREMOTE_VERSION_STRING "4.36"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -21035,8 +21088,34 @@ bool ensureEspNowLink() {
   if (!espNowEnabled || espNowDeviceCount == 0) return false;
 
   unsigned long began = millis();
-  if (networkStackActive) {
+  /*
+    "The network stack is up" is not the same as "the channel is spoken for".
+
+    Only an associated station pins the channel; a station that is merely
+    initialised, or still hunting for its access point, sits on whatever
+    channel it last used - channel 1 by default - and nothing is holding it
+    there. Riding that blindly is how the remote ended up transmitting on 1
+    with the dock, the router and everything else on 8:
+      ESP-NOW: link up in 1 ms (on the station, channel 1)
+      ESP-NOW: send failed after 3 attempts   (x4)
+    Retuning is safe until the association exists, so an unassociated station
+    is treated the same as no station at all and put on the remembered dock
+    channel.
+  */
+  bool stationPinsChannel = networkStackActive && WiFi.status() == WL_CONNECTED;
+  if (stationPinsChannel) {
     startEspNow();                       // Ride the station that is already up.
+  } else if (networkStackActive) {
+    /*
+      Station up but not associated. Point the radio at the remembered dock
+      channel, and touch nothing else - in particular do not take the
+      standalone path below, whose WiFi.disconnect() would abort an
+      association attempt that is very likely in progress. If that attempt
+      succeeds it moves the channel itself, which is the correct outcome and
+      needs no help from here.
+    */
+    if (espNowChannel) esp_wifi_set_channel(espNowChannel, WIFI_SECOND_CHAN_NONE);
+    startEspNow();
   } else {
     if (!espNowChannel) {
       Serial.println("ESP-NOW: no channel remembered yet - pair from the Dock menu once");
@@ -21109,9 +21188,20 @@ void startEspNow() {
   wifi_second_chan_t second;
   bool readChannel = esp_wifi_get_channel(&primary, &second) == ESP_OK && primary;
   if (readChannel && !espNowStandalone) {
-    // Riding an association: the router chose this channel, so it is
-    // authoritative and worth remembering for next time.
-    if (primary != espNowChannel) {
+    /*
+      Riding an association: the router chose this channel, so it is
+      authoritative and worth remembering - but only once the station has
+      actually associated.
+
+      Bringing ESP-NOW up during a connect attempt reads back whatever channel
+      the station is scanning at that instant, and that was being adopted and
+      written to NVS as though it were the router's. A stale 1 persisted this
+      way is what later produced
+        ESP-NOW: ready on channel 1 (asked for 1, radio reports 1)
+      followed by every send failing, on a remote whose access point and dock
+      were both on 8.
+    */
+    if (WiFi.status() == WL_CONNECTED && primary != espNowChannel) {
       espNowChannel = primary;
       preferences.begin(PREFERENCES_NAMESPACE, false);
       preferences.putUChar("enChan", espNowChannel);
@@ -21290,9 +21380,25 @@ void serviceDockLink(unsigned long now) {
   uint8_t ping[5];
   uint32_t pingMagic = ESPNOW_DOCK_PING_MAGIC;
   memcpy(ping, &pingMagic, sizeof(pingMagic));
+  /*
+    Only state a channel the remote has actually settled on.
+
+    The dock believes this byte and moves to it, so advertising an unsettled
+    channel drags the dock along for the ride. While the station is
+    associating its channel hops - one capture went 1, then 6, then 8 - and
+    the dock followed each one, saving as it went, with sends failing in
+    between. It ended up chasing a channel the remote had already left.
+
+    Settled means one of two things: standalone, where this code set the
+    channel itself, or an associated station, where the router did. Anything
+    else sends 0, which the dock reads as "no statement" and leaves its
+    current channel alone - the same thing an older dock does with the byte.
+  */
   uint8_t primary = 0;
   wifi_second_chan_t second;
-  ping[4] = (esp_wifi_get_channel(&primary, &second) == ESP_OK && primary) ? primary : 0;
+  bool haveChannel = esp_wifi_get_channel(&primary, &second) == ESP_OK && primary;
+  bool settled = espNowStandalone || WiFi.status() == WL_CONNECTED;
+  ping[4] = (haveChannel && settled) ? primary : 0;
   // Every paired dock. Pinging only the first meant a second dock never
   // answered, so it never reported a version and never looked reachable.
   for (uint8_t i = 0; i < espNowDeviceCount; i++) {
@@ -21970,6 +22076,22 @@ bool sendEspNowWithRetry(const uint8_t mac[6], const uint8_t *payload, size_t le
   and the caller's failure stands.
 */
 bool espNowRecoverChannel(const uint8_t mac[6], const uint8_t *payload, size_t len) {
+  /*
+    Standalone only, and that restriction is load bearing.
+
+    4.35 widened this to any unassociated station, on the reasoning that
+    nothing was pinning the channel. Measured, it does not work: an
+    unassociated station is usually scanning, so it hops away from each
+    channel this sets before the send can land. The sweep dutifully tried all
+    thirteen and reported "no dock answered on any channel" about a dock that
+    was sitting on 8 and answered normally moments later - while costing the
+    best part of a second on every failed send.
+
+    Standalone is the one state where this code owns the radio and a channel
+    it sets actually holds. A stale remembered channel in any other state is
+    repaired by the association itself: startEspNow() adopts the router's
+    channel the moment the station connects.
+  */
   if (!espNowStandalone || !espNowRadioActive) return false;
   uint8_t original = espNowChannel;
   for (uint8_t channel = ESPNOW_CHANNEL_MIN; channel <= ESPNOW_CHANNEL_MAX; channel++) {
