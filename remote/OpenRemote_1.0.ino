@@ -1,6 +1,15 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.43 - 2026-09-09
+    - Adds /api/cast/scan, so WebConfig can offer a list of the Chromecasts on
+      the network instead of asking for a name to be typed in. The dock owns
+      discovery, being the end with a permanent network connection, so the
+      remote asks it to scan and waits for the reply - an mDNS query takes a
+      second or two and the answer comes back through the dock's loop, so
+      returning immediately would have reported an empty list that had merely
+      arrived too early.
+
   4.42 - 2026-09-09
     - The media widget can be told which Chromecast to watch by its network
       name. The dock finds Chromecasts by the name they advertise, and that is
@@ -5469,7 +5478,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.42"
+#define OPENREMOTE_VERSION_STRING "4.43"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -6219,6 +6228,32 @@ static const uint32_t ESPNOW_DOCK_LINK_DOWN_MAGIC = 0x4F524C44UL;  // "ORLD"
 static const uint32_t ESPNOW_DOCK_INFO_MAGIC = 0x4F524449UL;  // "ORDI"
 static const uint32_t ESPNOW_NOWPLAYING_MAGIC = 0x4F524E50UL;  // "ORNP"
 static const uint32_t ESPNOW_MEDIA_TARGET_MAGIC = 0x4F524D54UL;  // "ORMT"
+static const uint32_t ESPNOW_CAST_SCAN_MAGIC = 0x4F524353UL;   // "ORCS"
+static const uint32_t ESPNOW_CAST_LIST_MAGIC = 0x4F52434CUL;   // "ORCL"
+
+// Remote -> dock: look for Chromecasts now, and say what you find.
+struct __attribute__((packed)) EspNowCastScanPacket {
+  uint32_t magic;
+};
+
+/*
+  Dock -> remote: the Chromecasts on the network, by advertised name, so
+  WebConfig can offer them as a list. Six names of thirty-two characters is
+  197 bytes with the header - inside one ESP-NOW frame, so nothing has to be
+  reassembled.
+*/
+struct __attribute__((packed)) EspNowCastListPacket {
+  uint32_t magic;
+  uint8_t count;
+  char names[6][32];
+};
+static_assert(sizeof(EspNowCastListPacket) == 197,
+              "cast list layout drifted from the dock");
+
+// Last list the dock reported, held for WebConfig to read back.
+char castDiscoveredNames[6][32] = {};
+uint8_t castDiscoveredCount = 0;
+volatile bool castListDirty = false;
 
 /*
   Remote -> dock: the one Chromecast the media widget is about.
@@ -19484,6 +19519,52 @@ void handleDockUpdateCancel() {
   sendJson(200, "{\"ok\":true}");
 }
 
+/*
+  Asks the dock to scan for Chromecasts and returns what it found.
+
+  The dock owns discovery - it is the one with a permanent network connection -
+  so this sends a request, waits for the reply, and answers with the names.
+  Without it a person had to find out what their Chromecast calls itself on the
+  network and type it in by hand, which is not something anyone should be asked
+  to do.
+*/
+void handleCastScanApi() {
+  if (!requestAuthorized()) {
+    sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
+    return;
+  }
+  if (espNowDeviceCount == 0 || !espNowEnabled) {
+    sendJson(409, "{\"ok\":false,\"error\":\"Pair a dock first - the dock is what scans the network\"}");
+    return;
+  }
+  if (!ensureEspNowLink()) {
+    sendJson(503, "{\"ok\":false,\"error\":\"Could not reach the dock\"}");
+    return;
+  }
+  castListDirty = false;
+  EspNowCastScanPacket packet = {};
+  packet.magic = ESPNOW_CAST_SCAN_MAGIC;
+  for (uint8_t i = 0; i < espNowDeviceCount; i++) {
+    sendEspNowWithRetry(espNowDevices[i].mac, (const uint8_t *)&packet, sizeof(packet));
+  }
+  // An mDNS query on the dock takes a second or two, and the reply comes back
+  // through its loop, so this waits rather than reporting an empty list that
+  // simply arrived too early.
+  unsigned long until = millis() + 6000;
+  while (!castListDirty && (long)(millis() - until) < 0) {
+    delay(20);
+    serviceUiDuringLongHttpTransfer();
+  }
+  JsonDocument doc;
+  doc["ok"] = true;
+  doc["scanned"] = castListDirty;
+  JsonArray names = doc["names"].to<JsonArray>();
+  for (uint8_t i = 0; i < castDiscoveredCount; i++) names.add(castDiscoveredNames[i]);
+  String body;
+  serializeJson(doc, body);
+  sendJson(200, body);
+}
+
 void handleEspNowDevicesList() {
   if (!requestAuthorized()) {
     sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
@@ -20639,6 +20720,7 @@ void configureWebServer() {
   webServer.on("/api/dock/update", HTTP_POST, handleDockUpdateStart);
   webServer.on("/api/dock/update/status", HTTP_GET, handleDockUpdateStatus);
   webServer.on("/api/dock/update/cancel", HTTP_POST, handleDockUpdateCancel);
+  webServer.on("/api/cast/scan", HTTP_POST, handleCastScanApi);
   webServer.on("/api/espnow/devices", HTTP_GET, handleEspNowDevicesList);
   webServer.on("/api/espnow/devices", HTTP_POST, handleEspNowDeviceAdd);
   webServer.on("/api/espnow/devices", HTTP_DELETE, handleEspNowDeviceDelete);
@@ -21083,6 +21165,23 @@ void onEspNowDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int 
   // A firmware ack from the dock we are currently updating. Checked before the
   // scan and learn windows because a transfer can be running while neither is
   // open, and only ever accepted from the dock this transfer is addressed to.
+  if ((size_t)len >= sizeof(EspNowCastListPacket) &&
+      findEspNowDeviceIndexByMac(info->src_addr) >= 0) {
+    uint32_t magic = 0;
+    memcpy(&magic, data, sizeof(magic));
+    if (magic == ESPNOW_CAST_LIST_MAGIC) {
+      EspNowCastListPacket packet;
+      memcpy(&packet, data, sizeof(packet));
+      castDiscoveredCount = packet.count > 6 ? 6 : packet.count;
+      for (uint8_t i = 0; i < castDiscoveredCount; i++) {
+        packet.names[i][sizeof(packet.names[i]) - 1] = '\0';
+        strlcpy(castDiscoveredNames[i], packet.names[i], sizeof(castDiscoveredNames[i]));
+      }
+      castListDirty = true;
+      return;
+    }
+  }
+
   /*
     Now playing, from the dock's Chromecast poller.
 

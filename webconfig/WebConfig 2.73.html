@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="openremote-webconfig-version" content="2.72">
+<meta name="openremote-webconfig-version" content="2.73">
 <title>OpenRemote Web Config v2.47</title>
 <style>
 :root{--bg:#07101c;--side:#081629;--panel:#101d31;--panel2:#0c1728;--line:rgba(255,255,255,.1);--line2:rgba(255,255,255,.06);--text:#f4f8ff;--muted:#91a4bd;--muted2:#60748f;--blue:#2f8cff;--blue2:#58a6ff;--green:#30d158;--red:#ff453a;--orange:#ff9f0a}
@@ -298,6 +298,10 @@
 .commandPillDelete{border:0;background:rgba(255,69,58,.22);color:#ff9d95;border-radius:999px;width:15px;height:15px;line-height:1;font-size:11px;font-weight:900;cursor:pointer;padding:0;display:inline-flex;align-items:center;justify-content:center}
 .commandPillDelete:hover{background:rgba(255,69,58,.6);color:#fff}
 .commandEditHint{width:100%;font-size:11px;color:#ffb454;margin-top:2px}
+/* The picker and its Scan button share a row so the button reads as belonging
+   to the list rather than to the free-text field beneath it. */
+.castPickRow{display:flex;gap:8px;align-items:center}
+.castPickRow select{flex:1 1 auto;min-width:0}
 .addCommandStatus{margin-top:10px;font-size:12px;color:#9fb0c9;min-height:16px}
 .addCommandDialog{max-height:calc(100vh - 40px);overflow:auto;background:#0f151d;border:1px solid rgba(255,255,255,.1);border-radius:14px;padding:18px;width:min(420px,94vw);box-shadow:0 24px 60px rgba(0,0,0,.5)}
 .statusMetaActions{display:flex;align-items:center;justify-content:space-between;gap:8px}
@@ -5327,9 +5331,13 @@
             <select class="textInput" id="widgetMediaDevice"></select>
           </label>
           <label>
-            <span class="fieldLabel">Chromecast name on the network</span>
-            <input class="textInput" id="widgetMediaCastName" maxlength="30" placeholder="Lounge Room TV">
-            <div class="settingHint">The name the Chromecast advertises to the network, which is usually not what the device is called here &mdash; a device named "Chromecast" in OpenRemote might be "Lounge Room TV" to the network, and the dock has no way to connect the two. Leave it empty to use the device name instead. Part of the name is enough.</div>
+            <span class="fieldLabel">Chromecast on the network</span>
+            <div class="castPickRow">
+              <select class="textInput" id="widgetMediaCastPick"><option value="">Scan to choose a Chromecast</option></select>
+              <button class="deviceSmallBtn" id="widgetMediaCastScan" type="button">Scan</button>
+            </div>
+            <input class="textInput" id="widgetMediaCastName" maxlength="30" placeholder="Or type a name">
+            <div class="settingHint" id="widgetMediaCastHint">The dock scans the network and lists what it finds. The name a Chromecast advertises is usually not what the device is called here &mdash; "Chromecast" in OpenRemote might be "Lounge Room TV" on the network. Leave it empty to use the device name instead. Part of the name is enough.</div>
           </label>
           <div class="settingRow">
             <div><div class="settingName">Fetch through the dock</div><div class="settingHint">The dock is mains powered, so it can hold a permanent connection to the player and hand the remote a status instantly over ESP-NOW. With this off the remote brings its own Wi-Fi up each time the screen wakes, which is slower and costs battery.</div></div>
@@ -5987,6 +5995,50 @@
     if(castName) castName.addEventListener("input",function(){
       widgetSettings.media.castName=castName.value.trim().slice(0,30);
       markSyncChanged();
+    },false);
+    var castPick=document.getElementById("widgetMediaCastPick");
+    if(castPick) castPick.addEventListener("change",function(){
+      if(!castPick.value) return;
+      // The picker fills the text field rather than replacing it: a name that
+      // is not on the air right now - a television that is switched off - must
+      // still be settable, and the field is the thing that is actually saved.
+      widgetSettings.media.castName=castPick.value.slice(0,30);
+      if(castName) castName.value=widgetSettings.media.castName;
+      markSyncChanged();
+    },false);
+    var castScan=document.getElementById("widgetMediaCastScan");
+    if(castScan) castScan.addEventListener("click",function(){
+      var hint=document.getElementById("widgetMediaCastHint");
+      castScan.disabled=true;
+      var previous=castScan.textContent;
+      castScan.textContent="Scanning...";
+      if(hint) hint.textContent="Asking the dock to look for Chromecasts. This takes a few seconds.";
+      remoteFetch("/api/cast/scan",{method:"POST"}).then(function(result){
+        var names=(result && Array.isArray(result.names)) ? result.names : [];
+        if(castPick){
+          castPick.innerHTML="";
+          var first=document.createElement("option");
+          first.value="";
+          first.textContent=names.length ? "Choose a Chromecast" : "None found";
+          castPick.appendChild(first);
+          names.forEach(function(name){
+            var option=document.createElement("option");
+            option.value=name; option.textContent=name;
+            castPick.appendChild(option);
+          });
+          if(widgetSettings.media.castName) castPick.value=widgetSettings.media.castName;
+        }
+        if(hint){
+          hint.textContent=names.length
+            ? "Found "+names.length+" Chromecast"+(names.length===1?"":"s")+". Choose one, or type a name."
+            : "No Chromecasts answered. They must be powered on and on the same network as the dock.";
+        }
+      }).catch(function(error){
+        if(hint) hint.textContent="Could not scan: "+error.message;
+      }).then(function(){
+        castScan.disabled=false;
+        castScan.textContent=previous;
+      });
     },false);
     bindSwitch("widgetMediaViaDock",function(v){ widgetSettings.media.viaDock=v; });
     bindSwitch("widgetMediaAutoExpand",function(v){ widgetSettings.media.autoExpand=v; });

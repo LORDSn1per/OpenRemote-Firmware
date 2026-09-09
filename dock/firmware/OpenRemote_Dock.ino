@@ -1,6 +1,13 @@
 /*
   OpenRemote Dock firmware change log (newest first)
 
+  1.58 - 2026-09-09
+    - Answers a scan request from the remote with the Chromecast names it can
+      see, so WebConfig can offer a list instead of asking a person to find out
+      what their Chromecast calls itself and type it in. A scan is answered
+      whether or not a target has been chosen, since choosing one is the whole
+      point of the scan.
+
   1.57 - 2026-09-09
     - Watches the one Chromecast the remote names, instead of rotating through
       all of them. The remote is the end that knows which device the user is
@@ -965,7 +972,7 @@ static inline bool serialHostAttached() {
 }
 
 
-#define OPENREMOTE_DOCK_VERSION_STRING "1.57"
+#define OPENREMOTE_DOCK_VERSION_STRING "1.58"
 
 // A literal in the built image, so a tool holding the .bin can tell what it is
 // without running it. The remote firmware carries the same idea under
@@ -1148,6 +1155,28 @@ static const uint32_t ESPNOW_DOCK_LINK_DOWN_MAGIC = 0x4F524C44UL;  // "ORLD"
 static const uint32_t ESPNOW_DOCK_INFO_MAGIC = 0x4F524449UL;  // "ORDI"
 static const uint32_t ESPNOW_NOWPLAYING_MAGIC = 0x4F524E50UL;  // "ORNP"
 static const uint32_t ESPNOW_MEDIA_TARGET_MAGIC = 0x4F524D54UL;  // "ORMT"
+static const uint32_t ESPNOW_CAST_SCAN_MAGIC = 0x4F524353UL;   // "ORCS"
+static const uint32_t ESPNOW_CAST_LIST_MAGIC = 0x4F52434CUL;   // "ORCL"
+
+// Remote -> dock: look for Chromecasts now, and say what you find.
+struct __attribute__((packed)) EspNowCastScanPacket {
+  uint32_t magic;
+};
+
+/*
+  Dock -> remote: the Chromecasts on the network, by advertised name.
+
+  Six names of thirty-two characters is 197 bytes with the header, inside the
+  250 an ESP-NOW frame allows, so the whole list travels in one frame and the
+  remote never has to reassemble anything.
+*/
+struct __attribute__((packed)) EspNowCastListPacket {
+  uint32_t magic;
+  uint8_t count;
+  char names[6][32];
+};
+static_assert(sizeof(EspNowCastListPacket) == 197,
+              "cast list layout drifted from the remote");
 
 // Remote -> dock: the one Chromecast the media widget is about. The remote
 // decides - it is the end that knows which device the user is on - and the
@@ -1172,6 +1201,7 @@ static_assert(sizeof(EspNowMediaTargetPacket) == 36,
 */
 char castTargetName[32] = "";
 volatile bool castTargetChanged = false;
+volatile bool castScanRequested = false;
 
 // Dock -> remote, for the media widget. Sent only when something meaningful
 // changes: the remote advances the position itself between updates, so a
@@ -3092,6 +3122,13 @@ void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len)
     }
     return;
   }
+  if (magic == ESPNOW_CAST_SCAN_MAGIC) {
+    if (remoteKnown && memcmp(info->src_addr, remoteMac, 6) == 0) {
+      castScanRequested = true;   // Done from loop(); mDNS has no place here.
+    }
+    return;
+  }
+
   if (magic == ESPNOW_MEDIA_TARGET_MAGIC &&
       len >= (int)sizeof(EspNowMediaTargetPacket)) {
     if (remoteKnown && memcmp(info->src_addr, remoteMac, 6) == 0) {
@@ -3961,13 +3998,39 @@ int8_t castFindTarget() {
   return -1;
 }
 
+// Sends the discovered names back so a person can pick one instead of having
+// to find out what their Chromecast calls itself and type it in.
+void castSendList() {
+  if (!remoteKnown) return;
+  EspNowCastListPacket packet = {};
+  packet.magic = ESPNOW_CAST_LIST_MAGIC;
+  packet.count = castDeviceCount > 6 ? 6 : castDeviceCount;
+  for (uint8_t i = 0; i < packet.count; i++) {
+    strlcpy(packet.names[i], castDevices[i].name, sizeof(packet.names[i]));
+  }
+  esp_now_send(remoteMac, (const uint8_t *)&packet, sizeof(packet));
+  Serial.printf("Cast: reported %u name(s) to the remote\n", (unsigned)packet.count);
+}
+
 void serviceCast(unsigned long now) {
   if (!castEnabled || otaActive || rfLearnActive) return;
   if (WiFi.status() != WL_CONNECTED) return;
   // Nothing can be queried before mDNS is up, and asking anyway just logs an
   // ESPmDNS "Query Failed" on every pass until the station associates.
   if (!castMdnsStarted) return;
-  // Nothing to do until the remote says which Chromecast it cares about.
+
+  /*
+    A scan is answered whether or not a target has been chosen - it is how the
+    target gets chosen in the first place, so requiring one would be circular.
+  */
+  if (castScanRequested) {
+    castScanRequested = false;
+    castDiscover();
+    castNextDiscoverMs = now + CAST_DISCOVER_MS;
+    castSendList();
+  }
+
+  // Nothing more to do until the remote says which Chromecast it cares about.
   if (!castTargetName[0]) return;
 
   if (castTargetChanged) {
