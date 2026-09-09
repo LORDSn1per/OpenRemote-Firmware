@@ -1,6 +1,17 @@
 /*
   OpenRemote Dock firmware change log (newest first)
 
+  1.59 - 2026-09-09
+    - Answers a "what is playing" request from the remote instead of relying on
+      pushes landing. The remote's ESP-NOW radio is on demand and off almost
+      all of the time, so a push sent on the dock's own schedule was frequently
+      lost. Asking means the radio is already up for the answer and can sleep
+      again immediately, and between answers the remote advances the position
+      clock itself - so a track playing normally costs no radio traffic.
+    - Says so once a minute when no Chromecast has been chosen. A dock sitting
+      silent because it was never given a target looked exactly like a dock
+      that was broken, which cost real time.
+
   1.58 - 2026-09-09
     - Answers a scan request from the remote with the Chromecast names it can
       see, so WebConfig can offer a list instead of asking a person to find out
@@ -972,7 +983,7 @@ static inline bool serialHostAttached() {
 }
 
 
-#define OPENREMOTE_DOCK_VERSION_STRING "1.58"
+#define OPENREMOTE_DOCK_VERSION_STRING "1.59"
 
 // A literal in the built image, so a tool holding the .bin can tell what it is
 // without running it. The remote firmware carries the same idea under
@@ -1155,7 +1166,22 @@ static const uint32_t ESPNOW_DOCK_LINK_DOWN_MAGIC = 0x4F524C44UL;  // "ORLD"
 static const uint32_t ESPNOW_DOCK_INFO_MAGIC = 0x4F524449UL;  // "ORDI"
 static const uint32_t ESPNOW_NOWPLAYING_MAGIC = 0x4F524E50UL;  // "ORNP"
 static const uint32_t ESPNOW_MEDIA_TARGET_MAGIC = 0x4F524D54UL;  // "ORMT"
+static const uint32_t ESPNOW_NOWPLAYING_REQ_MAGIC = 0x4F524E52UL;  // "ORNR"
 static const uint32_t ESPNOW_CAST_SCAN_MAGIC = 0x4F524353UL;   // "ORCS"
+
+/*
+  Remote -> dock: send what is playing, now.
+
+  The remote asks rather than the dock pushing on its own schedule, because the
+  remote's ESP-NOW radio is on demand: it is off almost all the time, and a
+  push arriving while it is off is simply lost. Asking means the radio is
+  already up for the answer, and it can go straight back to sleep afterwards.
+  Between answers the remote advances the position clock itself, so a track
+  playing normally costs no radio traffic at all.
+*/
+struct __attribute__((packed)) EspNowNowPlayingRequestPacket {
+  uint32_t magic;
+};
 static const uint32_t ESPNOW_CAST_LIST_MAGIC = 0x4F52434CUL;   // "ORCL"
 
 // Remote -> dock: look for Chromecasts now, and say what you find.
@@ -1202,6 +1228,7 @@ static_assert(sizeof(EspNowMediaTargetPacket) == 36,
 char castTargetName[32] = "";
 volatile bool castTargetChanged = false;
 volatile bool castScanRequested = false;
+volatile bool castReplyRequested = false;
 
 // Dock -> remote, for the media widget. Sent only when something meaningful
 // changes: the remote advances the position itself between updates, so a
@@ -3122,6 +3149,13 @@ void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len)
     }
     return;
   }
+  if (magic == ESPNOW_NOWPLAYING_REQ_MAGIC) {
+    if (remoteKnown && memcmp(info->src_addr, remoteMac, 6) == 0) {
+      castReplyRequested = true;   // Sent from loop(); this is the Wi-Fi task.
+    }
+    return;
+  }
+
   if (magic == ESPNOW_CAST_SCAN_MAGIC) {
     if (remoteKnown && memcmp(info->src_addr, remoteMac, 6) == 0) {
       castScanRequested = true;   // Done from loop(); mDNS has no place here.
@@ -4019,6 +4053,13 @@ void serviceCast(unsigned long now) {
   // ESPmDNS "Query Failed" on every pass until the station associates.
   if (!castMdnsStarted) return;
 
+  // Answered from whatever is already known, so the remote gets a reply inside
+  // the couple of seconds its radio stays up rather than waiting on a poll.
+  if (castReplyRequested) {
+    castReplyRequested = false;
+    castSendToRemote();
+  }
+
   /*
     A scan is answered whether or not a target has been chosen - it is how the
     target gets chosen in the first place, so requiring one would be circular.
@@ -4030,8 +4071,19 @@ void serviceCast(unsigned long now) {
     castSendList();
   }
 
-  // Nothing more to do until the remote says which Chromecast it cares about.
-  if (!castTargetName[0]) return;
+  /*
+    Nothing more to do until the remote says which Chromecast it cares about.
+    Said out loud once a minute, because a dock sitting silent because it was
+    never given a target looks identical to one that is broken.
+  */
+  if (!castTargetName[0]) {
+    static unsigned long nextIdleLogMs = 0;
+    if ((long)(now - nextIdleLogMs) >= 0) {
+      nextIdleLogMs = now + 60000;
+      Serial.println("Cast: no Chromecast chosen yet - waiting for the remote to name one");
+    }
+    return;
+  }
 
   if (castTargetChanged) {
     castTargetChanged = false;

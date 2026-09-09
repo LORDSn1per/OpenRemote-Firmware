@@ -1,6 +1,21 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.46 - 2026-09-09
+    - The media widget asks the dock for a status instead of holding the radio
+      open waiting to be told. 4.45 kept the ESP-NOW radio up for as long as a
+      media widget was on screen, which worked and was the wrong trade: this is
+      a battery remote and the radio was awake continuously to carry a position
+      counter the remote can keep itself.
+      The dock is now asked only when the answer can differ from what is shown:
+      when the widget comes into view or the display wakes, right after a
+      command is sent - pause, play and skip being exactly what changes it -
+      and otherwise once every thirty seconds, which catches someone using a
+      different remote in the same room. Between those the position advances
+      from positionAtMs and no radio is used at all.
+      Each request is one short link bring-up, around twelve milliseconds, and
+      the reply lands inside the hold that request already armed.
+
   4.45 - 2026-09-09
     - Fixes the media widget never updating even with the dock polling
       correctly. The dock pushes now-playing as it changes, which is the right
@@ -5506,7 +5521,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.45"
+#define OPENREMOTE_VERSION_STRING "4.46"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -6256,7 +6271,13 @@ static const uint32_t ESPNOW_DOCK_LINK_DOWN_MAGIC = 0x4F524C44UL;  // "ORLD"
 static const uint32_t ESPNOW_DOCK_INFO_MAGIC = 0x4F524449UL;  // "ORDI"
 static const uint32_t ESPNOW_NOWPLAYING_MAGIC = 0x4F524E50UL;  // "ORNP"
 static const uint32_t ESPNOW_MEDIA_TARGET_MAGIC = 0x4F524D54UL;  // "ORMT"
+static const uint32_t ESPNOW_NOWPLAYING_REQ_MAGIC = 0x4F524E52UL;  // "ORNR"
 static const uint32_t ESPNOW_CAST_SCAN_MAGIC = 0x4F524353UL;   // "ORCS"
+
+// Remote -> dock: send what is playing, now. See serviceMediaRadio().
+struct __attribute__((packed)) EspNowNowPlayingRequestPacket {
+  uint32_t magic;
+};
 static const uint32_t ESPNOW_CAST_LIST_MAGIC = 0x4F52434CUL;   // "ORCL"
 
 // Remote -> dock: look for Chromecasts now, and say what you find.
@@ -8191,6 +8212,7 @@ bool sendEspNowCommand(const DeviceCommand &command);
 bool dockOtaPrepare(uint8_t deviceIndex, String &error);
 bool relayIrToDock(const DeviceCommand &command);
 bool dockConnected();
+extern bool nowPlayingRefreshWanted;
 // Set by whichever task sends a command - including the HTTP task - and acted
 // on by the Arduino loop, which is the only task allowed to touch LVGL.
 // Set by the ESP-NOW receive callback, acted on by loop(). The widget redraw
@@ -14894,6 +14916,9 @@ bool transmitIrCommand(const DeviceCommand &command) {
     }
     return false;
   }
+  // A press is one of the few things that changes what is playing, so the
+  // widget asks the dock for a fresh status right after it.
+  nowPlayingRefreshWanted = true;
   if (command.kind == DeviceCommand::ESPNOW) {
     // Blue, not red. This command leaves via the dock, and red is reserved for
     // this remote's own emitter - the outline is what says "the dock is
@@ -29759,17 +29784,25 @@ void serviceWeatherWidget(uint32_t now) {
   repeating it on a timer would spend radio on saying nothing new.
 */
 /*
-  Holds the ESP-NOW radio up while a media widget is actually on screen.
+  Asks the dock what is playing, at the few moments it can have changed.
 
-  The dock pushes now-playing as it changes, which is the right shape - a track
-  simply playing then costs no radio traffic. But the remote's ESP-NOW radio is
-  on demand and off almost all of the time, so those pushes were landing on a
-  receiver that was not listening and the widget never updated. The dock was
-  polling its Chromecast and reporting correctly the whole time.
+  An earlier attempt held the ESP-NOW radio up for as long as a media widget
+  was on screen. That worked and was the wrong trade: this is a battery remote,
+  and the radio was awake continuously to carry a position counter the remote
+  can perfectly well keep itself.
 
-  Kept up only while a media widget is drawn on the current page and the
-  display is awake, which is exactly when an update is worth having. With the
-  screen off nothing is watching, and the radio goes back to sleep on its own.
+  So the dock is asked, not listened for, and only when the answer can differ
+  from what is already shown:
+
+    - the widget has just come into view, or the display has just woken
+    - a command has just been sent, since pause, play and skip are exactly the
+      things that change it
+    - once every thirty seconds otherwise, to catch someone using a different
+      remote in the same room
+
+  Between those the position advances from positionAtMs and no radio is used at
+  all. Each request costs one short link bring-up - about twelve milliseconds -
+  and the reply arrives inside the on-demand hold that request already armed.
 */
 bool mediaWidgetOnScreen() {
   if (displaySleeping) return false;
@@ -29780,15 +29813,41 @@ bool mediaWidgetOnScreen() {
   return false;
 }
 
-void serviceMediaRadio(uint32_t now) {
-  static uint32_t nextHoldMs = 0;
-  if (!mediaWidgetOnScreen()) return;
+// Set by the command path so a pause or a skip refreshes the widget rather
+// than leaving it showing the state from before the press.
+bool nowPlayingRefreshWanted = false;
+
+void requestNowPlaying() {
   if (espNowDeviceCount == 0 || !espNowEnabled) return;
-  if (nextHoldMs && (int32_t)(now - nextHoldMs) < 0) return;
-  // Re-armed well inside the on-demand hold so the link never actually drops
-  // while the widget is visible.
-  nextHoldMs = now + 1000;
-  ensureEspNowLink();
+  if (!ensureEspNowLink()) return;
+  EspNowNowPlayingRequestPacket packet = {};
+  packet.magic = ESPNOW_NOWPLAYING_REQ_MAGIC;
+  for (uint8_t i = 0; i < espNowDeviceCount; i++) {
+    sendEspNowWithRetry(espNowDevices[i].mac, (const uint8_t *)&packet, sizeof(packet));
+  }
+}
+
+void serviceMediaRadio(uint32_t now) {
+  static bool wasOnScreen = false;
+  static uint32_t nextPollMs = 0;
+
+  bool onScreen = mediaWidgetOnScreen();
+  if (!onScreen) {
+    wasOnScreen = false;
+    nowPlayingRefreshWanted = false;
+    return;
+  }
+
+  // Coming into view is the one moment the widget is certainly stale: it may
+  // have been off screen for hours.
+  bool justAppeared = !wasOnScreen;
+  wasOnScreen = true;
+
+  bool due = nextPollMs == 0 || (int32_t)(now - nextPollMs) >= 0;
+  if (!justAppeared && !nowPlayingRefreshWanted && !due) return;
+  nowPlayingRefreshWanted = false;
+  nextPollMs = now + 30000;
+  requestNowPlaying();
 }
 
 void serviceMediaTarget(uint32_t now) {
