@@ -1,6 +1,37 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.38 - 2026-09-09
+    - Completes 4.37: a restored forecast is no longer followed by a fetch
+      anyway. The slot check asked whether the current slot differed from the
+      stored one, and at boot seedSystemClock() installs the last known time,
+      which is usually behind - so the computed slot was often *earlier* than
+      the slot the stored forecast already covered, and "different" read as
+      "due". It now fetches only when the slot is genuinely later, which is
+      the only direction that can mean a refresh is owed. A clock correction
+      that moves time backwards now costs at worst a delayed refresh instead
+      of an immediate pointless one.
+
+  4.37 - 2026-09-09
+    - The forecast survives deep sleep, so waking no longer means switching the
+      Wi-Fi on. The refresh schedule was already right - fetch only when the
+      clock crosses into a new slot - but two things defeated it.
+      The reading and the slot it belonged to lived only in RAM, so deep sleep
+      reset weatherLastSlotEpoch to zero, every slot looked new on waking, and
+      the remote fetched a forecast it had already had. And the config loader
+      set weatherFetchWanted unconditionally, so every boot, every reload and
+      every WebConfig sync demanded a fresh one regardless of the schedule.
+      The reading is now kept in NVS and restored at boot, and a fetch is only
+      requested when there is nothing to show. Wi-Fi comes up for the weather
+      when a slot is genuinely due and at no other time.
+    - NVS rather than RTC memory deliberately: RTC memory would cover deep
+      sleep but not a power cycle or a crash reboot, which lose the forecast
+      just as effectively. A fetch writes at most once per slot - twenty-four
+      times a day at the shortest interval, once at the longest.
+    - The stored latitude and longitude are checked against the configured
+      ones, so a cached forecast is discarded if the location has changed
+      rather than shown for somewhere the remote no longer is.
+
   4.36 - 2026-09-09
     - Narrows 4.35's channel sweep back to standalone, because widening it was
       wrong. The reasoning was that an unassociated station pins nothing, so
@@ -5364,7 +5395,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.36"
+#define OPENREMOTE_VERSION_STRING "4.38"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -6287,9 +6318,16 @@ struct WeatherReading {
   bool rangeValid;
   int16_t code;          // WMO weather code, -1 when unknown
   char condition[24];
+  /*
+    Whether this reading came off the network during this run rather than out
+    of storage at boot. Not persisted, and only used to decide whether the
+    slot-adoption grace below applies: a restored reading has a fetchedAtMs
+    from a previous run, which says nothing about how long ago "now" was.
+  */
+  bool fetchedThisSession;
 };
 
-WeatherReading weatherReading = { false, 0, 0.0f, 0.0f, 0.0f, false, -1, "" };
+WeatherReading weatherReading = { false, 0, 0.0f, 0.0f, 0.0f, false, -1, "", false };
 uint32_t weatherNextAttemptMs = 0;
 bool weatherWidgetPlaced = false;
 bool weatherFetchWanted = false;
@@ -7937,6 +7975,8 @@ void suspendBacklightPwmForSleep();
 void restoreBacklightPwmAfterSleep();
 void saveSettings();
 void scheduleRuntimeSettingsSave();
+void saveWeatherReading();
+void loadWeatherReading();
 bool persistSettingsToRuntimeConfig();
 void rebuildDisplayColourLut();
 void applyDisplayControllerSettings();
@@ -14887,7 +14927,26 @@ void applyWidgetSettingsJson(JsonObjectConst widgets) {
     widgetSettings.mediaArtwork = media["artwork"] | true;
   }
 
-  if (weatherWidgetPlaced && widgetSettings.weatherValidLocation) weatherFetchWanted = true;
+  /*
+    Restore the stored forecast before deciding whether one is needed, and
+    only ask for a fetch when there is genuinely nothing to show.
+
+    This line used to set weatherFetchWanted unconditionally, so every config
+    load - which means every boot, every wake that reloads, and every
+    WebConfig sync - forced a trip to the network for a forecast the remote
+    very often already had. Together with the reading living only in RAM,
+    that is what made the remote turn Wi-Fi on almost every time it woke.
+
+    With a stored reading in hand the slot schedule in serviceWeatherWidget()
+    decides when the next fetch is due, which is what it was always meant to
+    do. Only re-read from storage when nothing is held, so a sync partway
+    through a session does not discard a fresher reading for an identical one.
+  */
+  if (!weatherReading.valid) loadWeatherReading();
+  if (weatherWidgetPlaced && widgetSettings.weatherValidLocation &&
+      !weatherReading.valid) {
+    weatherFetchWanted = true;
+  }
 
   Serial.printf("Widgets: weather=%s battery(warn %u%%) media(%s, %s)\n",
                 widgetSettings.weatherValidLocation ? widgetSettings.weatherLocation : "no location",
@@ -29034,6 +29093,76 @@ const char *weatherConditionText(int code) {
   than an hour-of-day) means day, month and year rollover need no special
   handling: a slot we have already fetched simply has the same start time.
 */
+/*
+  The forecast survives deep sleep and reboots.
+
+  The refresh schedule was already correct - fetch only when the clock crosses
+  into a new slot - but both the reading and the slot it belonged to lived
+  only in RAM. Deep sleep therefore reset weatherLastSlotEpoch to zero, every
+  slot looked new on waking, and the remote brought Wi-Fi up for a forecast it
+  had already had. On a remote that sleeps often that is most of its Wi-Fi
+  usage, spent re-fetching a number that does not change more than once an
+  hour at best, and up to once a day at the longest interval.
+
+  Stored in NVS rather than RTC memory on purpose: RTC memory would cover deep
+  sleep but not a power cycle or a crash reboot, and those lose the forecast
+  just as effectively. A fetch writes at most once per slot, so twenty-four
+  writes a day at the shortest interval and one at the longest - nothing
+  against the flash's endurance.
+*/
+void saveWeatherReading() {
+  preferences.begin(PREFERENCES_NAMESPACE, false);
+  preferences.putBool("wxValid", weatherReading.valid);
+  preferences.putFloat("wxTemp", weatherReading.temperatureC);
+  preferences.putFloat("wxHigh", weatherReading.highC);
+  preferences.putFloat("wxLow", weatherReading.lowC);
+  preferences.putBool("wxRange", weatherReading.rangeValid);
+  preferences.putShort("wxCode", weatherReading.code);
+  preferences.putString("wxCond", weatherReading.condition);
+  preferences.putULong64("wxSlot", (uint64_t)weatherLastSlotEpoch);
+  // Stored beside the reading so a change of location or interval invalidates
+  // it: a cached Canberra forecast must not be shown for a remote that has
+  // since been pointed somewhere else.
+  preferences.putFloat("wxLat", widgetSettings.weatherLatitude);
+  preferences.putFloat("wxLon", widgetSettings.weatherLongitude);
+  preferences.end();
+}
+
+void loadWeatherReading() {
+  preferences.begin(PREFERENCES_NAMESPACE, true);
+  bool valid = preferences.getBool("wxValid", false);
+  float lat = preferences.getFloat("wxLat", 0.0f);
+  float lon = preferences.getFloat("wxLon", 0.0f);
+  if (valid) {
+    weatherReading.temperatureC = preferences.getFloat("wxTemp", 0.0f);
+    weatherReading.highC = preferences.getFloat("wxHigh", 0.0f);
+    weatherReading.lowC = preferences.getFloat("wxLow", 0.0f);
+    weatherReading.rangeValid = preferences.getBool("wxRange", false);
+    weatherReading.code = preferences.getShort("wxCode", -1);
+    String condition = preferences.getString("wxCond", "");
+    strlcpy(weatherReading.condition, condition.c_str(),
+            sizeof(weatherReading.condition));
+    weatherLastSlotEpoch = (time_t)preferences.getULong64("wxSlot", 0);
+  }
+  preferences.end();
+  if (!valid) return;
+  // A tenth of a degree of latitude is roughly 11km - close enough that the
+  // forecast is the same, far enough that a genuine move is caught.
+  bool sameLocation = fabsf(lat - widgetSettings.weatherLatitude) < 0.1f &&
+                      fabsf(lon - widgetSettings.weatherLongitude) < 0.1f;
+  if (!sameLocation) {
+    weatherLastSlotEpoch = 0;   // Force a fetch for the new location.
+    Serial.println("Weather: stored forecast was for a different location, ignoring it");
+    return;
+  }
+  weatherReading.valid = true;
+  weatherReading.fetchedThisSession = false;
+  Serial.printf("Weather: restored %s %.1fC (%.1f/%.1f) from storage, no fetch needed "
+                "until the next slot\n",
+                weatherReading.condition, weatherReading.temperatureC,
+                weatherReading.highC, weatherReading.lowC);
+}
+
 time_t weatherSlotStart(time_t epoch, uint8_t intervalHours) {
   if (intervalHours < 1) intervalHours = 1;
   tm local = {};
@@ -29092,7 +29221,21 @@ void serviceWeatherWidget(uint32_t now) {
   bool clockUsable = epoch > 1700000000;
   time_t slot = clockUsable
     ? weatherSlotStart(epoch, widgetSettings.weatherIntervalHours) : 0;
-  if (clockUsable && slot != weatherLastSlotEpoch) {
+  /*
+    Later than the stored slot, not merely different from it.
+
+    At boot seedSystemClock() installs the last known time, which is usually
+    behind the real one, so the slot computed here is often earlier than the
+    slot the stored forecast belongs to. Testing for inequality treated that
+    as "a new slot has begun" and fetched immediately - which is why a
+    restored forecast was still followed by a trip to the network on every
+    boot. A slot that is earlier than the one already covered cannot be due;
+    only a later one can.
+
+    It also means a clock correction that moves time backwards costs at worst
+    a delayed refresh rather than a spurious one.
+  */
+  if (clockUsable && slot > weatherLastSlotEpoch) {
     /*
       The boot fetch runs against a seeded clock - seedSystemClock() installs
       the last manual time during startup so nothing has to handle an epoch
@@ -29107,7 +29250,7 @@ void serviceWeatherWidget(uint32_t now) {
       can never swallow a scheduled slot.
     */
     static const uint32_t SLOT_ADOPT_GRACE_MS = 10UL * 60UL * 1000UL;
-    bool readingJustTaken = weatherReading.valid &&
+    bool readingJustTaken = weatherReading.valid && weatherReading.fetchedThisSession &&
       (now - weatherReading.fetchedAtMs) < SLOT_ADOPT_GRACE_MS;
     if (readingJustTaken) weatherLastSlotEpoch = slot;
     else weatherFetchWanted = true;
@@ -29233,6 +29376,7 @@ void serviceWeatherWidget(uint32_t now) {
 
   weatherReading.valid = true;
   weatherReading.fetchedAtMs = now;
+  weatherReading.fetchedThisSession = true;
   weatherNextAttemptMs = 0;
   weatherFetchWanted = false;
   /*
@@ -29241,6 +29385,7 @@ void serviceWeatherWidget(uint32_t now) {
     after NTP finally lands.
   */
   if (clockUsable) weatherLastSlotEpoch = slot;
+  saveWeatherReading();
   releaseWeatherRadio();
   Serial.printf("Weather: %s %.1fC (%.1f/%.1f) for %s, next slot in %u hour(s)\n",
                 weatherReading.condition, weatherReading.temperatureC,
