@@ -1,6 +1,45 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.33 - 2026-09-09
+    - Fixes the remote losing its dock pairing after a reboot. WebConfig parses
+      runtime.json into its own model and rebuilds the upload from it, so any
+      key it does not model is dropped on sync - and it does not model
+      espNowDevices. Every sync therefore removed the pairing from the file.
+      Nothing appeared wrong at the time, because loadRuntimeModel() only
+      replaces the paired list when the incoming config actually carries the
+      key, so the docks stayed paired in RAM and carried on working. The loss
+      only surfaced at the next boot, reading the list back from a file that no
+      longer held it - which is why it looked like a reboot problem rather than
+      a sync problem.
+      After a sync reload the firmware now rewrites its own settings block from
+      live state, which puts espNowDevices - and anything else the firmware
+      owns and WebConfig does not model - straight back into the file.
+
+  4.32 - 2026-09-09
+    - Fixes the remote crashing after a few commands sent from WebConfig. The
+      panic was heap corruption, reported from somewhere entirely innocent:
+        CORRUPT HEAP: Bad head at 0x3c3849a4. Expected 0xabba1234 got 0x3c280014
+        assert failed: multi_heap_free multi_heap_poisoning.c:279 (head != NULL)
+        Backtrace: ... lv_mem_free / lv_mem_buf_free_all / _lv_disp_refr_timer
+                       / lv_timer_handler / loop()
+      which is LVGL freeing its own scratch buffers during a display refresh -
+      the victim, not the culprit.
+      The culprit was flashCommandFeedback() and flashEspNowCommandFeedback().
+      Both changed a style and then called lv_refr_now(), a synchronous
+      full-screen repaint, from wherever the send happened to originate. From a
+      keypress that is the Arduino loop and is fine. From WebConfig it is the
+      HTTP task on core 0, running at the same time as lv_timer_handler() on
+      core 1 - two tasks inside LVGL at once, which it is not built for, and
+      its buffer allocator was what gave way. The rule this broke is already
+      written down beside serviceUiDuringLongHttpTransfer(): LVGL, touch and
+      keypad belong exclusively to the loop on core 1.
+      Both functions now only record that the pill should flash. The style
+      change and the redraw happen in their service functions, which run on the
+      loop, so no task but that one ever enters LVGL. The cost is one loop
+      iteration of latency, which is not perceptible - and the redraw is still
+      skipped when the pill is already lit, so held repeats are unaffected.
+
   4.31 - 2026-09-09
     - Reports firmware and reachability for every paired dock, not just the
       first. A second dock could never say anything about itself: its info
@@ -5272,7 +5311,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.31"
+#define OPENREMOTE_VERSION_STRING "4.33"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -7875,6 +7914,10 @@ bool sendEspNowCommand(const DeviceCommand &command);
 bool dockOtaPrepare(uint8_t deviceIndex, String &error);
 bool relayIrToDock(const DeviceCommand &command);
 bool dockConnected();
+// Set by whichever task sends a command - including the HTTP task - and acted
+// on by the Arduino loop, which is the only task allowed to touch LVGL.
+volatile bool commandFeedbackWanted = false;
+volatile bool espNowCommandFeedbackWanted = false;
 void sendDockSettings();
 void serviceDockLink(unsigned long now);
 void serviceDockPairAck(unsigned long now);
@@ -13142,23 +13185,45 @@ void applyCommandFeedbackStyle(bool active) {
   }
 }
 
+/*
+  Only records that the pill should flash. The LVGL work happens in
+  serviceCommandFeedback(), on the Arduino loop, because this function is also
+  reached from the HTTP task.
+
+  It used to change the style and call lv_refr_now() inline, which was fine
+  from a keypress but not from WebConfig: /api/command/test runs on core 0
+  while lv_timer_handler() is running on core 1, so two tasks ended up inside
+  LVGL at once. LVGL is not thread safe, and its scratch-buffer allocator was
+  the casualty - a few commands sent from WebConfig and the remote died with
+
+    CORRUPT HEAP: Bad head at 0x3c3849a4. Expected 0xabba1234 got 0x3c280014
+    assert failed: multi_heap_free multi_heap_poisoning.c:279
+
+  detected in lv_mem_buf_free_all() during the display refresh, nowhere near
+  the code that actually caused it. The rule this broke is already written down
+  beside serviceUiDuringLongHttpTransfer(): LVGL, touch and keypad belong
+  exclusively to the loop on core 1.
+
+  Deferring costs one loop iteration of latency, which is not perceptible.
+*/
 void flashCommandFeedback() {
   commandFeedbackUntilMs = millis() + 80UL;
-  if (!commandFeedbackActive) {
-    commandFeedbackActive = true;
-    applyCommandFeedbackStyle(true);
-    // Inside the state change, not outside it. lv_refr_now() is a synchronous
-    // full-screen redraw costing tens of milliseconds, and this ran on EVERY
-    // call - so a held volume repeat paid for a complete repaint on every
-    // press even though the pill already looked exactly as it was about to be
-    // painted. Against the 210ms dock pace that is a large slice of the budget
-    // spent redrawing nothing, and it is why held repeats were dropped. The
-    // redraw still happens the moment the pill actually changes.
-    lv_refr_now(nullptr);
-  }
+  commandFeedbackWanted = true;
 }
 
 void serviceCommandFeedback(unsigned long now) {
+  // The state change and the redraw, both on the LVGL task. lv_refr_now() is a
+  // synchronous full-screen repaint, so it stays inside the "not already lit"
+  // branch: a held repeat would otherwise pay for a complete redraw on every
+  // press to paint a pill that already looks exactly right.
+  if (commandFeedbackWanted) {
+    commandFeedbackWanted = false;
+    if (!commandFeedbackActive) {
+      commandFeedbackActive = true;
+      applyCommandFeedbackStyle(true);
+      lv_refr_now(nullptr);
+    }
+  }
   if (!commandFeedbackActive || (int32_t)(now - commandFeedbackUntilMs) < 0) return;
   commandFeedbackActive = false;
   applyCommandFeedbackStyle(false);
@@ -13197,13 +13262,11 @@ void applyEspNowPulse(bool bright) {
   }
 }
 
+// Same split as flashCommandFeedback(), and for the same reason: a dock-routed
+// command sent from WebConfig arrives here on the HTTP task.
 void flashEspNowCommandFeedback() {
   espNowPulseUntilMs = millis() + ESPNOW_PULSE_MS;
-  if (!espNowCommandFeedbackActive) {
-    espNowCommandFeedbackActive = true;
-    applyEspNowPulse(true);
-    lv_refr_now(nullptr);
-  }
+  espNowCommandFeedbackWanted = true;
 }
 
 void clearEspNowCommandFeedback() {
@@ -13222,6 +13285,14 @@ void clearEspNowCommandFeedback() {
 // Runs from loop(): pulses while the send is in flight, then hands the pill
 // back to its resting outline.
 void serviceEspNowCommandFeedback(unsigned long now) {
+  if (espNowCommandFeedbackWanted) {
+    espNowCommandFeedbackWanted = false;
+    if (!espNowCommandFeedbackActive) {
+      espNowCommandFeedbackActive = true;
+      applyEspNowPulse(true);
+      lv_refr_now(nullptr);
+    }
+  }
   if (!espNowCommandFeedbackActive) return;
   if ((int32_t)(now - espNowPulseUntilMs) >= 0) {
     clearEspNowCommandFeedback();
@@ -31006,6 +31077,26 @@ void loop() {
     }
     runtimeReloadCanRollback = false;
     if (loaded && wasSleeping) wakeDisplay();
+    /*
+      Write the firmware's own settings back into the file WebConfig just
+      uploaded, because that file does not contain all of them.
+
+      WebConfig parses runtime.json into its own model and rebuilds the upload
+      from it, so any key it does not model is dropped - and it does not model
+      espNowDevices. The pairing therefore vanished from the file on every
+      sync. Nothing looked wrong at the time, because loadRuntimeModel() only
+      replaces the paired list when the incoming config actually carries the
+      key, so the docks stayed paired in RAM and kept working. The loss only
+      showed up at the next boot, when the list was read back from a file that
+      no longer had it - which is exactly how it presented: "the remote lost
+      its pairing after a reboot", with no obvious connection to the sync that
+      really caused it.
+
+      persistSettingsToRuntimeConfig() rewrites the settings block from live
+      state, so scheduling it here puts espNowDevices - and anything else the
+      firmware owns and WebConfig does not model - straight back.
+    */
+    if (loaded) scheduleRuntimeSettingsSave();
     now = millis();
   }
   if (pendingNetworkApply) {
