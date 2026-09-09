@@ -1,6 +1,18 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.42 - 2026-09-09
+    - The media widget can be told which Chromecast to watch by its network
+      name. The dock finds Chromecasts by the name they advertise, and that is
+      rarely what the device is called in a user's own configuration - a device
+      named "Chromecast" here is "Lounge Room TV" on the air, and no amount of
+      matching can connect those two. The widget now takes that name directly
+      and it takes precedence over the device name, which is only a fallback.
+    - Without it nothing was ever polled. The name is otherwise taken from the
+      device page currently open, so with the Activities page showing there was
+      no name to send, the dock was never given a target, and it sat idle -
+      correctly, but invisibly.
+
   4.41 - 2026-09-09
     - Fixes Bluetooth pairing failing for every host once the bond store filled
       up. Captured on hardware, pairing negotiated completely and then died at
@@ -5457,7 +5469,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.41"
+#define OPENREMOTE_VERSION_STRING "4.42"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -6398,6 +6410,13 @@ struct WidgetSettings {
 
   bool mediaUseNamedDevice;
   char mediaDeviceId[48];
+  /*
+    The name the Chromecast advertises to the network, which is usually not
+    what the device is called here - "Chromecast" in a device list against
+    "Lounge Room TV" on the air. Nothing can connect those two names
+    automatically, so this is asked for directly rather than guessed at.
+  */
+  char mediaCastName[32];
   bool mediaViaDock;
   bool mediaAutoExpand;
   bool mediaArtwork;
@@ -15056,6 +15075,8 @@ void applyWidgetSettingsJson(JsonObjectConst widgets) {
     widgetSettings.mediaUseNamedDevice = strcmp(media["source"] | "auto", "device") == 0;
     strlcpy(widgetSettings.mediaDeviceId, media["deviceId"] | "",
             sizeof(widgetSettings.mediaDeviceId));
+    strlcpy(widgetSettings.mediaCastName, media["castName"] | "",
+            sizeof(widgetSettings.mediaCastName));
     widgetSettings.mediaViaDock = media["viaDock"] | true;
     widgetSettings.mediaAutoExpand = media["autoExpand"] | true;
     widgetSettings.mediaArtwork = media["artwork"] | true;
@@ -29606,7 +29627,11 @@ void serviceMediaTarget(uint32_t now) {
   static uint32_t nextRetryMs = 0;
 
   char wanted[32] = "";
-  if (widgetSettings.mediaUseNamedDevice && widgetSettings.mediaDeviceId[0]) {
+  // An explicitly configured Cast name wins over everything, because it is the
+  // only one guaranteed to match what the Chromecast actually advertises.
+  if (widgetSettings.mediaCastName[0]) {
+    strlcpy(wanted, widgetSettings.mediaCastName, sizeof(wanted));
+  } else if (widgetSettings.mediaUseNamedDevice && widgetSettings.mediaDeviceId[0]) {
     Device *pinned = findRuntimeDevice(widgetSettings.mediaDeviceId);
     if (pinned) strlcpy(wanted, pinned->name, sizeof(wanted));
   } else if (currentPage < pageCount && pages[currentPage].kind == PAGE_DEVICE &&

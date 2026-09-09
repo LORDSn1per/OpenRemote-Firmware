@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="openremote-webconfig-version" content="2.71">
+<meta name="openremote-webconfig-version" content="2.72">
 <title>OpenRemote Web Config v2.47</title>
 <style>
 :root{--bg:#07101c;--side:#081629;--panel:#101d31;--panel2:#0c1728;--line:rgba(255,255,255,.1);--line2:rgba(255,255,255,.06);--text:#f4f8ff;--muted:#91a4bd;--muted2:#60748f;--blue:#2f8cff;--blue2:#58a6ff;--green:#30d158;--red:#ff453a;--orange:#ff9f0a}
@@ -5326,6 +5326,11 @@
             <span class="fieldLabel">Device</span>
             <select class="textInput" id="widgetMediaDevice"></select>
           </label>
+          <label>
+            <span class="fieldLabel">Chromecast name on the network</span>
+            <input class="textInput" id="widgetMediaCastName" maxlength="30" placeholder="Lounge Room TV">
+            <div class="settingHint">The name the Chromecast advertises to the network, which is usually not what the device is called here &mdash; a device named "Chromecast" in OpenRemote might be "Lounge Room TV" to the network, and the dock has no way to connect the two. Leave it empty to use the device name instead. Part of the name is enough.</div>
+          </label>
           <div class="settingRow">
             <div><div class="settingName">Fetch through the dock</div><div class="settingHint">The dock is mains powered, so it can hold a permanent connection to the player and hand the remote a status instantly over ESP-NOW. With this off the remote brings its own Wi-Fi up each time the screen wakes, which is slower and costs battery.</div></div>
             <label class="switch"><input type="checkbox" id="widgetMediaViaDock" checked><span></span></label>
@@ -5640,7 +5645,7 @@
     return {
       weather:{location:"",latitude:null,longitude:null,units:"c",showRange:true,intervalHours:6},
       battery:{showPercent:true,showVoltage:false,warnBelow:20},
-      media:{source:"auto",deviceId:"",viaDock:true,autoExpand:true,artwork:true}
+      media:{source:"auto",deviceId:"",castName:"",viaDock:true,autoExpand:true,artwork:true}
     };
   }
 
@@ -5665,6 +5670,7 @@
     var media=raw.media && typeof raw.media==="object" ? raw.media : {};
     out.media.source=media.source==="device" ? "device" : "auto";
     out.media.deviceId=typeof media.deviceId==="string" ? media.deviceId : "";
+    out.media.castName=typeof media.castName==="string" ? media.castName.slice(0,30) : "";
     out.media.viaDock=media.viaDock!==false;
     out.media.autoExpand=media.autoExpand!==false;
     out.media.artwork=media.artwork!==false;
@@ -5863,6 +5869,8 @@
     if(autoExpand) autoExpand.checked=widgetSettings.media.autoExpand;
     var artwork=document.getElementById("widgetMediaArtwork");
     if(artwork) artwork.checked=widgetSettings.media.artwork;
+    var castNameInput=document.getElementById("widgetMediaCastName");
+    if(castNameInput) castNameInput.value=widgetSettings.media.castName || "";
   }
 
   function widgetSettingsToBackupItems(){
@@ -5975,6 +5983,11 @@
     bindSelect("widgetBatteryWarn",function(v){ widgetSettings.battery.warnBelow=Number(v)||20; });
     bindSelect("widgetMediaSource",function(v){ widgetSettings.media.source=v==="device" ? "device" : "auto"; });
     bindSelect("widgetMediaDevice",function(v){ widgetSettings.media.deviceId=v; });
+    var castName=document.getElementById("widgetMediaCastName");
+    if(castName) castName.addEventListener("input",function(){
+      widgetSettings.media.castName=castName.value.trim().slice(0,30);
+      markSyncChanged();
+    },false);
     bindSwitch("widgetMediaViaDock",function(v){ widgetSettings.media.viaDock=v; });
     bindSwitch("widgetMediaAutoExpand",function(v){ widgetSettings.media.autoExpand=v; });
     bindSwitch("widgetMediaArtwork",function(v){ widgetSettings.media.artwork=v; });
