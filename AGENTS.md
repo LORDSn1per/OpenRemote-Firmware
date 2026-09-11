@@ -152,6 +152,8 @@ Before reporting a release complete, verify the embedded firmware version marker
 
 A normal Git commit and push updates repository source only. It does **not** update the downloadable files on the GitHub Releases page. Every completed Remote, Dock, WebConfig, or Studio version bump must also update the existing `latest-builds` release at `https://github.com/LORDSn1per/OpenRemote-Firmware/releases/tag/latest-builds` before the release may be reported complete.
 
+- Never push commits, tags, assets, releases, or any other change to the GitHub website unless Phillip explicitly asks for that GitHub push in the current request. Local commits and required local/NAS release packaging do not authorize a GitHub push. If a completed version is waiting for permission, keep its verified artifacts and commits local and report that GitHub publishing remains pending.
+
 1. Build from the local source tree and verify the embedded firmware version marker.
 2. Create the prescribed versioned local and NAS artifacts without overwriting any older version, then use SHA-256 and byte comparison to prove that the build output, local artifact, and NAS artifact match. For WebConfig, compare the local versioned HTML directly with its NAS copy.
 3. Give GitHub assets these exact public names:
