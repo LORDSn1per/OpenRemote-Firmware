@@ -81,7 +81,9 @@ class AppleTvMetadataClient {
                                AndroidMediaSession &session,
                                bool force = false);
   bool decodeArtwork(const char *url, uint16_t *rgb565, uint16_t width,
-                     uint16_t height);
+                     uint16_t height, bool preservePortrait = false,
+                     uint16_t *outputWidth = nullptr,
+                     uint16_t *outputHeight = nullptr);
 
  private:
   bool readCurrentContentId(const IPAddress &googleTv, char *contentId,
