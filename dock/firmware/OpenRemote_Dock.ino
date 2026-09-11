@@ -1,6 +1,14 @@
 /*
   OpenRemote Dock firmware change log (newest first)
 
+  1.81 - 2026-09-12
+    - Prioritises dock-info replies, OTA state and LED timing ahead of blocking
+      Cast, ADB and HTTP work. WebConfig range checks now receive a current
+      reply, and the five-second identify blink no longer skips most of its
+      90 ms phases while a metadata query occupies the C3.
+    - Adds on-demand ADB connection status and local saved-connection deletion
+      for WebConfig, using the dock's existing persistent approved identity.
+
   1.80 - 2026-09-11
     - Preserves the source aspect ratio of portrait Plex, Stremio and Prime
       Video artwork instead of centre-cropping every image to 96x96. A 2:3
@@ -1197,7 +1205,7 @@ static inline bool serialHostAttached() {
 }
 
 
-#define OPENREMOTE_DOCK_VERSION_STRING "1.80"
+#define OPENREMOTE_DOCK_VERSION_STRING "1.81"
 
 // A literal in the built image, so a tool holding the .bin can tell what it is
 // without running it. The remote firmware carries the same idea under
@@ -1542,6 +1550,24 @@ static const uint32_t ESPNOW_HA_WATCH_MAGIC    = 0x4F524157UL;  // "ORAW"
 static const uint32_t ESPNOW_HA_STATE_MAGIC    = 0x4F524153UL;  // "ORAS"
 // Sent by the remote's Ping button. Answered by blinking, nothing else.
 static const uint32_t ESPNOW_DOCK_IDENTIFY_MAGIC = 0x4F524944UL;  // "ORID"
+static const uint32_t ESPNOW_ADB_CONTROL_MAGIC   = 0x4F524441UL;  // "ORDA"
+static const uint32_t ESPNOW_ADB_RESULT_MAGIC    = 0x4F524452UL;  // "ORDR"
+
+struct __attribute__((packed)) EspNowAdbControlPacket {
+  uint32_t magic;
+  uint8_t action;
+  char address[48];
+  char code[7];
+};
+
+struct __attribute__((packed)) EspNowAdbResultPacket {
+  uint32_t magic;
+  uint8_t status;
+  char message[96];
+};
+
+static_assert(sizeof(EspNowAdbControlPacket) == 60, "ADB control layout drifted from the remote");
+static_assert(sizeof(EspNowAdbResultPacket) == 101, "ADB result layout drifted from the remote");
 static const uint32_t ESPNOW_HOMEBRIDGE_RESULT_MAGIC = 0x4F524852UL;  // "ORHR"
 
 struct __attribute__((packed)) EspNowDockInfoPacket {
@@ -2024,6 +2050,8 @@ volatile bool pendingOta = false;      // A chunk or control packet is waiting.
 // do not belong there.
 volatile bool ledStateDirty = false;
 volatile bool pendingInfoReply = false;
+volatile bool pendingAdbControl = false;
+EspNowAdbControlPacket pendingAdbControlPacket = {};
 volatile uint32_t commandsDroppedBusy = 0;
 volatile unsigned long lastIrCommandReceivedMs = 0;
 unsigned long ledTxUntilMs = 0;
@@ -3405,6 +3433,17 @@ void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len)
   if (magic == ESPNOW_DOCK_IDENTIFY_MAGIC) {
     if (!remoteKnown || memcmp(info->src_addr, remoteMac, 6) != 0) return;
     pendingIdentify = true;
+    return;
+  }
+
+  if (magic == ESPNOW_ADB_CONTROL_MAGIC &&
+      len >= (int)sizeof(EspNowAdbControlPacket)) {
+    if (!remoteKnown || memcmp(info->src_addr, remoteMac, 6) != 0) return;
+    if (pendingAdbControl) return;
+    memcpy(&pendingAdbControlPacket, data, sizeof(pendingAdbControlPacket));
+    pendingAdbControlPacket.address[sizeof(pendingAdbControlPacket.address) - 1] = '\0';
+    pendingAdbControlPacket.code[sizeof(pendingAdbControlPacket.code) - 1] = '\0';
+    pendingAdbControl = true;
     return;
   }
 
@@ -4894,6 +4933,68 @@ void castSendList() {
   Serial.printf("Cast: reported %u name(s) to the remote\n", (unsigned)packet.count);
 }
 
+void sendAdbControlResult(uint8_t status, const char *message) {
+  if (!remoteKnown) return;
+  EspNowAdbResultPacket result = {};
+  result.magic = ESPNOW_ADB_RESULT_MAGIC;
+  result.status = status;
+  strlcpy(result.message, message ? message : "", sizeof(result.message));
+  for (uint8_t attempt = 0; attempt < 3; attempt++) {
+    if (esp_now_send(remoteMac, (const uint8_t *)&result, sizeof(result)) == ESP_OK) return;
+    delay(3);
+  }
+}
+
+void serviceAdbControl() {
+  if (!pendingAdbControl) return;
+  EspNowAdbControlPacket request = pendingAdbControlPacket;
+  pendingAdbControl = false;
+
+  if (request.action == 2) {
+    appleTvMetadataClient.resetAdbSession();
+    castTargetName[0] = '\0';
+    castTargetChanged = false;
+    castState = CastNowPlaying{};
+    prefs.begin("dock", false);
+    prefs.remove("castTarget");
+    prefs.end();
+    sendAdbControlResult(3, "Saved Chromecast connection deleted from the dock.");
+    return;
+  }
+
+  IPAddress target;
+  if (request.action == 1 && request.address[0]) {
+    String address(request.address);
+    int colon = address.indexOf(':');
+    if (colon >= 0) address.remove(colon);
+    if (!target.fromString(address)) {
+      sendAdbControlResult(1, "That IP address is not valid.");
+      return;
+    }
+  } else {
+    int8_t index = castFindTarget();
+    if (index < 0 && castTargetName[0]) {
+      castDiscover();
+      index = castFindTarget();
+    }
+    if (index < 0) {
+      sendAdbControlResult(0, "Choose a Chromecast first, then Synchronise once.");
+      return;
+    }
+    target = castDevices[index].ip;
+  }
+
+  bool connected = appleTvMetadataClient.testAdbConnection(target);
+  if (connected) {
+    sendAdbControlResult(2, "ADB is enabled and the dock is connected.");
+  } else if (request.action == 1) {
+    sendAdbControlResult(1,
+      "ADB is not connected. Keep Wireless debugging open and approve OpenRemote on the TV if prompted.");
+  } else {
+    sendAdbControlResult(1, "ADB is enabled in WebConfig but the TV is not currently accepting the dock.");
+  }
+}
+
 void serviceCast(unsigned long now) {
   if (!castEnabled || otaActive || rfLearnActive) return;
   // Cast discovery and TLS/media-owner queries can occupy this single-core C3
@@ -6336,15 +6437,6 @@ void loop() {
   serviceChannelSave(now);
   // IR is latency-sensitive and network services below can block for seconds.
   serviceIncoming();
-  serviceCast(now);
-  serviceArtworkTransfer();
-  serviceHomebridgeConfig();
-  serviceHomebridgeWifi(now);
-  serviceHomebridge(now);
-  serviceMqtt(now);
-  serviceMqttUnavailable();
-  serviceHomeAssistant(now);
-  serviceHaWebSocket(now);
   if (pendingIdentify) {
     pendingIdentify = false;
     // Never interrupts pairing or a firmware transfer - a dock mid-OTA
@@ -6354,12 +6446,34 @@ void loop() {
       enterState(DOCK_IDENTIFY);
     }
   }
+  // Info replies, OTA state and visible LED timing are direct ESP-NOW work.
+  // Run them before any Cast/ADB/HTTP call can occupy this single-core C3 for
+  // seconds. This is what makes WebConfig's live range probe dependable and
+  // keeps every 90 ms identify edge visible rather than skipping whole
+  // flashes whenever a metadata query happens to be in progress.
+  serviceInfoReply();
   serviceOta(now);
+  serviceLedStates(millis());
+
+  // A five-second identify is an explicit user action.  Defer background
+  // network work for that short interval so the LED cadence remains even.
+  // OTA and IR already refuse to enter this state, so nothing urgent waits.
+  if (dockState != DOCK_IDENTIFY) {
+    serviceAdbControl();
+    serviceCast(now);
+    serviceArtworkTransfer();
+    serviceHomebridgeConfig();
+    serviceHomebridgeWifi(now);
+    serviceHomebridge(now);
+    serviceMqtt(now);
+    serviceMqttUnavailable();
+    serviceHomeAssistant(now);
+    serviceHaWebSocket(now);
+  }
   serviceRfLearn(now);
   serviceSettings();
-  serviceInfoReply();
   serviceLinkLed(now);
   serviceStateLog(now);
-  serviceLedStates(now);
+  serviceLedStates(millis());
   delay(2);
 }
