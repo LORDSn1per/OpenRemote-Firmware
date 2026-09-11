@@ -1006,7 +1006,7 @@ bool AppleTvMetadataClient::resolvePlexSession(const IPAddress &googleTv,
     String duration = xmlAttribute(videoTag, "duration");
     String offset = xmlAttribute(videoTag, "viewOffset");
     String state = xmlAttribute(playerTag, "state");
-    String cacheKey = String("plex://") + googleTv.toString() + "/" + ratingKey;
+    String cacheKey = String("plex://v2/") + googleTv.toString() + "/" + ratingKey;
     String fetchUrl;
     if (thumb.length()) {
       fetchUrl = String(plexServer_) +
@@ -1090,7 +1090,7 @@ bool AppleTvMetadataClient::resolvePlexItem(PlexRichMetadata &metadata) {
   String offset = xmlAttribute(videoTag, "viewOffset");
   String identity = plexMachineId_[0] ? String(plexMachineId_)
                                       : String(plexServer_);
-  String cacheKey = String("plex://") + identity + "/" + ratingKey;
+  String cacheKey = String("plex://v2/") + identity + "/" + ratingKey;
   String fetchUrl;
   if (thumb.length()) {
     fetchUrl = String(plexServer_) +
@@ -1186,7 +1186,7 @@ bool AppleTvMetadataClient::pollStremio(
 
   // v2 invalidates images decoded before the JPEGDEC scale-option fix. Those
   // files contain only the top-left of the source and must not be reused.
-  String artworkKey = String("stremio://v4/") + type + "/" + catalogueId;
+  String artworkKey = String("stremio://v5/") + type + "/" + catalogueId;
   String artworkUrl = String("https://images.metahub.space/poster/small/") +
                       catalogueId + "/img";
   metadata = {};
@@ -1380,12 +1380,11 @@ bool AppleTvMetadataClient::resolvePrimeCatalogue(
   http.end();
   if (!title.length()) return false;
 
-  // Amazon's unmodified packshot can be several megabytes and portrait. The
-  // SS rendition is a filled 192px square JPEG, normally around 10-20 KB, so
-  // the existing half-scale decoder produces the remote's 96px cache image
-  // without black bars.
+  // Amazon's unmodified packshot can be several megabytes. SX keeps the
+  // packshot's portrait aspect ratio while bounding its width; the old SS
+  // square rendition baked white side bars around portrait covers.
   int jpg = artwork.lastIndexOf(".jpg");
-  if (jpg > 8) artwork = artwork.substring(0, jpg) + "._SS192_.jpg";
+  if (jpg > 8) artwork = artwork.substring(0, jpg) + "._SX128_.jpg";
   String subtitle;
   if (releaseYear) subtitle = String(releaseYear);
   if (titleType.length()) {
@@ -1396,7 +1395,7 @@ bool AppleTvMetadataClient::resolvePrimeCatalogue(
   String artworkKey;
   // v2 invalidates images decoded before the JPEGDEC scale-option fix. Those
   // files contain only the top-left of the 192px Amazon square rendition.
-  if (artwork.length()) artworkKey = String("prime://v4/") + contentId;
+  if (artwork.length()) artworkKey = String("prime://v5/") + contentId;
 
   metadata = {};
   metadata.valid = true;
@@ -1561,7 +1560,10 @@ bool AppleTvMetadataClient::poll(const IPAddress &googleTv,
 }
 
 bool AppleTvMetadataClient::decodeArtwork(const char *url, uint16_t *rgb565,
-                                          uint16_t width, uint16_t height) {
+                                          uint16_t width, uint16_t height,
+                                          bool preservePortrait,
+                                          uint16_t *outputWidth,
+                                          uint16_t *outputHeight) {
   if (!url || !url[0] || !rgb565 || !width || !height) return false;
   NetworkClientSecure secure;
   secure.setInsecure();
@@ -1617,7 +1619,6 @@ bool AppleTvMetadataClient::decodeArtwork(const char *url, uint16_t *rgb565,
     return false;
   }
 
-  memset(rgb565, 0, (size_t)width * height * 2);
   // JPEGDEC carries about 17.5 KB of decoder workspace. A local instance
   // overflows Arduino's loopTask stack on the ESP32-C3, so keep that workspace
   // on the heap for the duration of the conversion.
@@ -1637,6 +1638,21 @@ bool AppleTvMetadataClient::decodeArtwork(const char *url, uint16_t *rgb565,
   }
   int imageWidth = jpeg->getWidth();
   int imageHeight = jpeg->getHeight();
+  uint16_t targetWidth = width;
+  uint16_t targetHeight = height;
+  if (preservePortrait && imageHeight > imageWidth) {
+    // Use the full available height and retain the JPEG's own portrait ratio.
+    // A conventional 2:3 poster therefore becomes 64x96 rather than losing
+    // its top and bottom to a square centre crop. Rounding is done by LVGL on
+    // the remote, so the transferred pixels remain a clean rectangle.
+    uint32_t proportional =
+      ((uint32_t)height * (uint32_t)imageWidth + imageHeight / 2U) /
+      (uint32_t)imageHeight;
+    targetWidth = (uint16_t)constrain((int)proportional, 1, (int)width);
+  }
+  if (outputWidth) *outputWidth = targetWidth;
+  if (outputHeight) *outputHeight = targetHeight;
+  memset(rgb565, 0, (size_t)targetWidth * targetHeight * 2);
   // JPEGDEC can decode at 1/2, 1/4 or 1/8 size. Choose the smallest rendition
   // that still covers the square target, then crop the excess centrally. This
   // lets Stremio's compact 300x450 series poster fit the C3 and fill the 96x96
@@ -1644,17 +1660,17 @@ bool AppleTvMetadataClient::decodeArtwork(const char *url, uint16_t *rgb565,
   // art at full resolution.
   int scale = 0;
   while (scale < 3 &&
-         (imageWidth >> (scale + 1)) >= width &&
-         (imageHeight >> (scale + 1)) >= height) {
+         (imageWidth >> (scale + 1)) >= targetWidth &&
+         (imageHeight >> (scale + 1)) >= targetHeight) {
     scale++;
   }
   int decodedWidth = max(1, imageWidth >> scale);
   int decodedHeight = max(1, imageHeight >> scale);
   jpegTarget = rgb565;
-  jpegTargetWidth = width;
-  jpegTargetHeight = height;
-  int x = ((int)width - decodedWidth) / 2;
-  int y = ((int)height - decodedHeight) / 2;
+  jpegTargetWidth = targetWidth;
+  jpegTargetHeight = targetHeight;
+  int x = ((int)targetWidth - decodedWidth) / 2;
+  int y = ((int)targetHeight - decodedHeight) / 2;
   // The third JPEGDEC argument is an option bit field, not a shift count.
   // Passing 1 for a half-size decode actually requested an unrelated option,
   // so JPEGDEC returned the full 192px image and our 96px target clipped it to

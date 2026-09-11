@@ -1,6 +1,14 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.66 - 2026-09-11
+    - Renders portrait media artwork at its received aspect ratio with rounded
+      corners instead of forcing it into a square frame. A 2:3 poster displays
+      at 44x66 in the compact widget and 84x126 when expanded.
+    - Accepts variable-width artwork transfers up to the existing 96x96 buffer
+      ceiling. Apple TV and ABC square art remain unchanged, while Dock 1.80
+      can send uncropped Plex, Stremio and Prime Video posters.
+
   4.65 - 2026-09-11
     - Makes collision-free Remote-then-dock IR an explicit fourth routing
       choice instead of changing the existing Remote-and-dock behaviour.
@@ -5713,7 +5721,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.65"
+#define OPENREMOTE_VERSION_STRING "4.66"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -21853,10 +21861,14 @@ void onEspNowDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int 
     EspNowArtworkBeginPacket begin;
     memcpy(&begin, data, sizeof(begin));
     begin.url[sizeof(begin.url) - 1] = '\0';
-    bool accepted = mediaArtIncoming &&
-                    begin.width == ESPNOW_ARTWORK_DIMENSION &&
-                    begin.height == ESPNOW_ARTWORK_DIMENSION &&
-                    begin.totalBytes == (uint32_t)begin.width * begin.height * 2U &&
+    uint32_t expectedBytes = (uint32_t)begin.width * begin.height * 2U;
+    uint32_t capacity = (uint32_t)ESPNOW_ARTWORK_DIMENSION *
+                        ESPNOW_ARTWORK_DIMENSION * 2U;
+    bool accepted = mediaArtIncoming && begin.width && begin.height &&
+                    begin.width <= ESPNOW_ARTWORK_DIMENSION &&
+                    begin.height <= ESPNOW_ARTWORK_DIMENSION &&
+                    begin.totalBytes == expectedBytes &&
+                    expectedBytes <= capacity &&
                     strcmp(begin.url, mediaArtUrl) == 0;
     if (accepted) {
       mediaArtTransferId = begin.transferId;
@@ -29612,6 +29624,16 @@ Device *widgetMediaDevice() {
 }
 
 /* ---------------------------------------------------------------- media */
+void widgetMediaArtworkSize(bool expanded, int &width, int &height) {
+  height = expanded ? 126 : 66;
+  width = height;
+  if (!mediaArtPixels || !mediaArtDescriptor.header.w ||
+      mediaArtDescriptor.header.h <= mediaArtDescriptor.header.w) return;
+  width = max(1, (int)(((uint32_t)height * mediaArtDescriptor.header.w +
+                        mediaArtDescriptor.header.h / 2U) /
+                       mediaArtDescriptor.header.h));
+}
+
 void applyWidgetMediaLayout(WidgetInstance &instance, bool showVisual) {
   if (!instance.card || !lv_obj_is_valid(instance.card)) return;
 
@@ -29619,21 +29641,30 @@ void applyWidgetMediaLayout(WidgetInstance &instance, bool showVisual) {
   const int width = instance.faceWidth;
   const int height = instance.faceHeight;
   const int pad = expanded ? 14 : 8;
-  const int artSize = expanded ? 126 : 66;
-  const int artX = expanded ? (width - artSize) / 2 : pad;
-  const int artY = expanded ? pad : (height - artSize) / 2;
+  int artWidth = 0;
+  int artHeight = 0;
+  widgetMediaArtworkSize(expanded, artWidth, artHeight);
+  const int artX = expanded ? (width - artWidth) / 2 : pad;
+  const int artY = expanded ? pad : (height - artHeight) / 2;
 
   if (instance.mediaArtBox && lv_obj_is_valid(instance.mediaArtBox)) {
     lv_obj_set_pos(instance.mediaArtBox, artX, artY);
-    lv_obj_set_size(instance.mediaArtBox, artSize, artSize);
+    lv_obj_set_size(instance.mediaArtBox, artWidth, artHeight);
     if (showVisual) lv_obj_clear_flag(instance.mediaArtBox, LV_OBJ_FLAG_HIDDEN);
     else lv_obj_add_flag(instance.mediaArtBox, LV_OBJ_FLAG_HIDDEN);
   }
+  if (instance.mediaArt && lv_obj_is_valid(instance.mediaArt) &&
+      mediaArtDescriptor.header.h) {
+    lv_img_set_zoom(instance.mediaArt,
+                    (uint16_t)((uint32_t)artHeight * 256UL /
+                               mediaArtDescriptor.header.h));
+    lv_obj_center(instance.mediaArt);
+  }
 
-  int textX = showVisual && !expanded ? pad + artSize + 10 : pad;
+  int textX = showVisual && !expanded ? pad + artWidth + 10 : pad;
   int textWidth = width - textX - pad;
   int textY = showVisual
-    ? (expanded ? pad + artSize + 12 : artY + 2)
+    ? (expanded ? pad + artHeight + 12 : artY + 2)
     : (expanded ? 42 : 12);
   lv_text_align_t align = expanded ? LV_TEXT_ALIGN_CENTER : LV_TEXT_ALIGN_LEFT;
   const lv_font_t *primaryFont = showVisual
@@ -29686,15 +29717,17 @@ void buildWidgetMediaFace(WidgetInstance &instance, lv_obj_t *parent,
   bool haveMedia = nowPlaying.valid;
   int pad = expanded ? 14 : 8;
 
-  int artSize = expanded ? 126 : 66;
-  int artX = expanded ? (width - artSize) / 2 : pad;
-  int artY = expanded ? pad : (height - artSize) / 2;
+  int artWidth = 0;
+  int artHeight = 0;
+  widgetMediaArtworkSize(expanded, artWidth, artHeight);
+  int artX = expanded ? (width - artWidth) / 2 : pad;
+  int artY = expanded ? pad : (height - artHeight) / 2;
 
   lv_obj_t *art = lv_obj_create(parent);
   instance.mediaArtBox = art;
   lv_obj_remove_style_all(art);
   lv_obj_set_pos(art, artX, artY);
-  lv_obj_set_size(art, artSize, artSize);
+  lv_obj_set_size(art, artWidth, artHeight);
   lv_obj_set_style_radius(art, expanded ? 16 : 10, 0);
   lv_obj_set_style_bg_color(art, lvRgb(38, 48, 62), 0);
   lv_obj_set_style_bg_opa(art, LV_OPA_COVER, 0);
@@ -29707,8 +29740,10 @@ void buildWidgetMediaFace(WidgetInstance &instance, lv_obj_t *parent,
 
   const void *artSource = mediaArtSource();
   instance.mediaArt = lv_img_create(art);
+  uint16_t sourceHeight = mediaArtDescriptor.header.h
+    ? mediaArtDescriptor.header.h : ESPNOW_ARTWORK_DIMENSION;
   lv_img_set_zoom(instance.mediaArt,
-                  (uint16_t)((uint32_t)artSize * 256UL / ESPNOW_ARTWORK_DIMENSION));
+                  (uint16_t)((uint32_t)artHeight * 256UL / sourceHeight));
   lv_obj_center(instance.mediaArt);
   lv_obj_clear_flag(instance.mediaArt, LV_OBJ_FLAG_CLICKABLE);
   // A slow poster transfer is not an error and should not be represented by a
@@ -29745,9 +29780,9 @@ void buildWidgetMediaFace(WidgetInstance &instance, lv_obj_t *parent,
   if (showYoutube) lv_obj_clear_flag(instance.mediaYoutubeLogo, LV_OBJ_FLAG_HIDDEN);
   else lv_obj_add_flag(instance.mediaYoutubeLogo, LV_OBJ_FLAG_HIDDEN);
 
-  int textX = expanded ? pad : pad + artSize + 10;
+  int textX = expanded ? pad : pad + artWidth + 10;
   int textWidth = expanded ? width - pad * 2 : width - textX - pad;
-  int textY = expanded ? pad + artSize + 12 : artY + 2;
+  int textY = expanded ? pad + artHeight + 12 : artY + 2;
   lv_text_align_t align = expanded ? LV_TEXT_ALIGN_CENTER : LV_TEXT_ALIGN_LEFT;
 
   instance.primary = makeWidgetLabel(parent,

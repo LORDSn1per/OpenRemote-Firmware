@@ -1,6 +1,13 @@
 /*
   OpenRemote Dock firmware change log (newest first)
 
+  1.80 - 2026-09-11
+    - Preserves the source aspect ratio of portrait Plex, Stremio and Prime
+      Video artwork instead of centre-cropping every image to 96x96. A 2:3
+      poster is transferred as 64x96 RGB565; Apple TV and ABC remain square.
+    - Versions the affected artwork cache keys so remotes replace previously
+      cropped posters with the new portrait assets.
+
   1.79 - 2026-09-11
     - Services queued IR before Chromecast and other network work, and defers
       blocking Cast polls while a held IR stream is arriving. A slow poll can
@@ -1190,7 +1197,7 @@ static inline bool serialHostAttached() {
 }
 
 
-#define OPENREMOTE_DOCK_VERSION_STRING "1.79"
+#define OPENREMOTE_DOCK_VERSION_STRING "1.80"
 
 // A literal in the built image, so a tool holding the .bin can tell what it is
 // without running it. The remote firmware carries the same idea under
@@ -4755,14 +4762,23 @@ void serviceArtworkTransfer() {
   else if (castIsAbcIview(castState)) fetchUrl = abcIviewRich.artworkUrl;
   if (!fetchUrl[0]) return;
   Serial.printf("Media: preparing cached artwork %s\n", castState.artUrl);
+  bool preservePortrait = castIsPlex(castState) ||
+                          castIsStremio(castState) ||
+                          castIsPrimeVideo(castState);
+  uint16_t artworkWidth = MEDIA_ART_WIDTH;
+  uint16_t artworkHeight = MEDIA_ART_HEIGHT;
   if (!appleTvMetadataClient.decodeArtwork(fetchUrl, dockArtworkRgb,
                                             MEDIA_ART_WIDTH,
-                                            MEDIA_ART_HEIGHT)) {
+                                            MEDIA_ART_HEIGHT,
+                                            preservePortrait,
+                                            &artworkWidth,
+                                            &artworkHeight)) {
     Serial.println("Media: artwork download or JPEG conversion failed");
     return;
   }
 
-  const uint32_t totalBytes = sizeof(dockArtworkRgb);
+  const uint32_t totalBytes =
+    (uint32_t)artworkWidth * artworkHeight * sizeof(uint16_t);
   uint32_t crc = 0xffffffffUL;
   crc = esp_rom_crc32_le(crc, (const uint8_t *)dockArtworkRgb, totalBytes);
   crc ^= 0xffffffffUL;
@@ -4777,8 +4793,8 @@ void serviceArtworkTransfer() {
   begin.transferId = transferId;
   begin.totalBytes = totalBytes;
   begin.crc32 = crc;
-  begin.width = MEDIA_ART_WIDTH;
-  begin.height = MEDIA_ART_HEIGHT;
+  begin.width = artworkWidth;
+  begin.height = artworkHeight;
   strlcpy(begin.url, castState.artUrl, sizeof(begin.url));
   if (!artworkSendAndWait((const uint8_t *)&begin, sizeof(begin), transferId,
                           0, 0)) {
