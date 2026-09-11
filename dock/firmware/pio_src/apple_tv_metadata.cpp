@@ -488,6 +488,19 @@ void AppleTvMetadataClient::begin() {
   }
 }
 
+bool AppleTvMetadataClient::testAdbConnection(const IPAddress &googleTv) {
+  String output;
+  return runAdbShell(googleTv, "shell:echo OPENREMOTE_ADB_OK", output, 96) &&
+         output.indexOf("OPENREMOTE_ADB_OK") >= 0;
+}
+
+void AppleTvMetadataClient::resetAdbSession() {
+  cachedTlsHost = IPAddress();
+  cachedTlsPort = 0;
+  cachedMediaSession_ = {};
+  nextMediaSessionPollMs_ = 0;
+}
+
 bool AppleTvMetadataClient::runAdbShell(const IPAddress &googleTv,
                                         const char *command, String &output,
                                         size_t maximumBytes) {

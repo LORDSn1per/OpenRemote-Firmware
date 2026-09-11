@@ -1,6 +1,17 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.67 - 2026-09-12
+    - Reinitialises ESP-NOW after every WebConfig Wi-Fi mode transition instead
+      of trusting a stale active flag after the driver discarded the protocol.
+      Live dock probes and dock OTA can no longer fail with "esp now not init"
+      until both devices are restarted.
+    - Adds immediate WebConfig actions for clearing `/media/art`, identifying
+      the remote with four white/black LCD flashes, identifying a dock, and
+      checking/deleting the dock's saved Chromecast/ADB connection.
+    - Keeps the QR page alive underneath the identify animation and restores it
+      exactly when the flashes finish.
+
   4.66 - 2026-09-11
     - Renders portrait media artwork at its received aspect ratio with rounded
       corners instead of forcing it into a square frame. A 2:3 poster displays
@@ -5721,7 +5732,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.66"
+#define OPENREMOTE_VERSION_STRING "4.67"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -6564,6 +6575,10 @@ char castDiscoveredNames[6][32] = {};
 uint8_t castDiscoveredCount = 0;
 volatile bool castListDirty = false;
 volatile bool castListRequestPending = false;
+volatile bool adbControlPending = false;
+volatile bool adbControlReplyReady = false;
+volatile uint8_t adbControlStatus = 0;
+char adbControlMessage[96] = "";
 
 /*
   Remote -> dock: the one Chromecast the media widget is about.
@@ -6624,6 +6639,8 @@ static const uint32_t ESPNOW_HA_RESULT_MAGIC   = 0x4F524152UL;  // "ORAR"
 static const uint32_t ESPNOW_HA_WATCH_MAGIC    = 0x4F524157UL;  // "ORAW"
 static const uint32_t ESPNOW_HA_STATE_MAGIC    = 0x4F524153UL;  // "ORAS"
 static const uint32_t ESPNOW_DOCK_IDENTIFY_MAGIC = 0x4F524944UL;  // "ORID"
+static const uint32_t ESPNOW_ADB_CONTROL_MAGIC   = 0x4F524441UL;  // "ORDA"
+static const uint32_t ESPNOW_ADB_RESULT_MAGIC    = 0x4F524452UL;  // "ORDR"
 
 struct __attribute__((packed)) EspNowDockInfoPacket {
   uint32_t magic;
@@ -6643,6 +6660,22 @@ struct __attribute__((packed)) EspNowDockSettingsPacket {
   uint8_t reserved[2];
 };
 static_assert(sizeof(EspNowDockSettingsPacket) == 8, "dock settings layout drifted from the dock");
+
+struct __attribute__((packed)) EspNowAdbControlPacket {
+  uint32_t magic;
+  uint8_t action;              // 0 status, 1 authorize/check address, 2 forget.
+  char address[48];
+  char code[7];
+};
+
+struct __attribute__((packed)) EspNowAdbResultPacket {
+  uint32_t magic;
+  uint8_t status;              // 0 no target, 1 disconnected, 2 connected, 3 forgotten.
+  char message[96];
+};
+
+static_assert(sizeof(EspNowAdbControlPacket) == 60, "ADB control layout drifted from the dock");
+static_assert(sizeof(EspNowAdbResultPacket) == 101, "ADB result layout drifted from the dock");
 
 struct PhysicalBinding {
   uint8_t deviceIndex;
@@ -7470,6 +7503,10 @@ bool setupApPausedBle = false;
 bool webConfigPausedBle = false;
 volatile bool restartPending = false;
 volatile bool hardRestartPending = false;
+volatile bool remoteIdentifyRequested = false;
+lv_obj_t *remoteIdentifyOverlay = nullptr;
+uint8_t remoteIdentifyPhase = 0;
+unsigned long remoteIdentifyNextMs = 0;
 bool firmwareUploadOk = false;
 bool firmwareStageOk = false;
 bool webConfigUploadOk = false;
@@ -8489,6 +8526,7 @@ extern bool nowPlayingRefreshWanted;
 // Both are defined down with the media widget, and both are used above it.
 const void *mediaArtSource();
 bool mediaWidgetOnScreen();
+void mediaArtRelease();
 // Set by whichever task sends a command - including the HTTP task - and acted
 // on by the Arduino loop, which is the only task allowed to touch LVGL.
 // Set by the ESP-NOW receive callback, acted on by loop(). The widget redraw
@@ -8504,6 +8542,7 @@ bool mediaWidgetOnScreen();
 */
 char mediaArtUrl[200] = "";
 char mediaArtFile[48] = "";
+static const char *MEDIA_ART_DIR = "/media/art";
 volatile bool mediaArtUrlChanged = false;
 lv_img_dsc_t mediaArtDescriptor = {};
 uint8_t *mediaArtPixels = nullptr;
@@ -20054,6 +20093,80 @@ void handleCastScanApi() {
   sendJson(200, body);
 }
 
+void handleAdbControlApi() {
+  if (!requestAuthorized()) {
+    sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
+    return;
+  }
+  if (!espNowEnabled || espNowDeviceCount == 0) {
+    sendJson(409, "{\"ok\":false,\"error\":\"Pair a dock first\"}");
+    return;
+  }
+  JsonDocument input;
+  if (deserializeJson(input, webServer.arg("plain"))) {
+    sendJson(400, "{\"ok\":false,\"error\":\"Invalid ADB request\"}");
+    return;
+  }
+  String action = input["action"] | "status";
+  EspNowAdbControlPacket packet = {};
+  packet.magic = ESPNOW_ADB_CONTROL_MAGIC;
+  if (action == "status") {
+    packet.action = 0;
+  } else if (action == "pair") {
+    String address = input["address"] | "";
+    String code = input["code"] | "";
+    if (!address.length() || code.length() != 6) {
+      sendJson(400, "{\"ok\":false,\"error\":\"Enter the IP address, pairing port and six-digit code\"}");
+      return;
+    }
+    for (size_t i = 0; i < code.length(); i++) {
+      if (!isdigit((unsigned char)code[i])) {
+        sendJson(400, "{\"ok\":false,\"error\":\"The pairing code must contain six digits\"}");
+        return;
+      }
+    }
+    packet.action = 1;
+    strlcpy(packet.address, address.c_str(), sizeof(packet.address));
+    strlcpy(packet.code, code.c_str(), sizeof(packet.code));
+  } else if (action == "forget") {
+    packet.action = 2;
+  } else {
+    sendJson(400, "{\"ok\":false,\"error\":\"Unknown ADB action\"}");
+    return;
+  }
+  if (!ensureEspNowLink()) {
+    sendJson(503, "{\"ok\":false,\"error\":\"Could not reach the dock\"}");
+    return;
+  }
+  adbControlReplyReady = false;
+  adbControlPending = true;
+  adbControlMessage[0] = '\0';
+  if (!sendEspNowWithRetry(espNowDevices[0].mac,
+                           (const uint8_t *)&packet, sizeof(packet))) {
+    adbControlPending = false;
+    sendJson(504, "{\"ok\":false,\"error\":\"The dock did not receive the ADB request\"}");
+    return;
+  }
+  unsigned long until = millis() + 38000UL;
+  while (!adbControlReplyReady && (int32_t)(millis() - until) < 0) {
+    delay(20);
+    serviceUiDuringLongHttpTransfer();
+  }
+  if (!adbControlReplyReady) {
+    adbControlPending = false;
+    sendJson(504, "{\"ok\":false,\"error\":\"The dock did not finish the ADB check\"}");
+    return;
+  }
+  JsonDocument response;
+  response["ok"] = true;
+  response["status"] = adbControlStatus;
+  response["connected"] = adbControlStatus == 2;
+  response["message"] = adbControlMessage;
+  String body;
+  serializeJson(response, body);
+  sendJson(200, body);
+}
+
 void handleEspNowDevicesList() {
   if (!requestAuthorized()) {
     sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
@@ -21249,6 +21362,86 @@ void handleBluetoothApi() {
   sendJson(200, buildStatusJson());
 }
 
+void handleRemoteIdentifyApi() {
+  if (!requestAuthorized()) {
+    sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
+    return;
+  }
+  if (!webConfigQrPageActive()) {
+    sendJson(409, "{\"ok\":false,\"error\":\"Open the WebConfig QR page on the remote first\"}");
+    return;
+  }
+  // The HTTP worker runs on core 0; LVGL belongs exclusively to loop() on
+  // core 1.  Publish one flag and let the display task create the flashes.
+  remoteIdentifyRequested = true;
+  sendJson(202, "{\"ok\":true,\"state\":\"flashing\"}");
+}
+
+void handleDockIdentifyApi() {
+  if (!requestAuthorized()) {
+    sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
+    return;
+  }
+  int index = webServer.hasArg("device") ? webServer.arg("device").toInt() : 0;
+  if (index < 0 || index >= espNowDeviceCount) {
+    sendJson(404, "{\"ok\":false,\"error\":\"That dock is not paired\"}");
+    return;
+  }
+  if (!ensureEspNowLink()) {
+    sendJson(503, "{\"ok\":false,\"error\":\"The dock link could not be started\"}");
+    return;
+  }
+  uint32_t magic = ESPNOW_DOCK_IDENTIFY_MAGIC;
+  if (!sendEspNowWithRetry(espNowDevices[index].mac,
+                           (const uint8_t *)&magic, sizeof(magic))) {
+    sendJson(504, "{\"ok\":false,\"error\":\"The dock did not answer\"}");
+    return;
+  }
+  sendJson(202, "{\"ok\":true,\"state\":\"blinking\"}");
+}
+
+void handleMediaArtworkClearApi() {
+  if (!requestAuthorized()) {
+    sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
+    return;
+  }
+  if (!sdReady) {
+    sendJson(503, "{\"ok\":false,\"error\":\"SD card unavailable\"}");
+    return;
+  }
+  // WebConfig is only reachable while its QR page is visible, so no Media
+  // widget transaction can be active.  Remove only the dedicated artwork
+  // cache; source wallpapers, icons and media settings are untouched.
+  uint16_t removed = 0;
+  File directory = SD.open(MEDIA_ART_DIR);
+  if (directory && directory.isDirectory()) {
+    File entry = directory.openNextFile();
+    while (entry) {
+      String path = entry.path();
+      bool regular = !entry.isDirectory();
+      entry.close();
+      if (regular && path.startsWith(String(MEDIA_ART_DIR) + "/") && SD.remove(path)) {
+        removed++;
+      }
+      entry = directory.openNextFile();
+    }
+    directory.close();
+  }
+  mediaArtRelease();
+  mediaArtFile[0] = '\0';
+  mediaArtRequestWanted = mediaArtUrl[0] != '\0';
+  mediaArtUrlChanged = mediaArtUrl[0] != '\0';
+  nowPlayingDirty = true;
+  JsonDocument response;
+  response["ok"] = true;
+  response["removed"] = removed;
+  String body;
+  serializeJson(response, body);
+  sendJson(200, body);
+  Serial.printf("Artwork: cleared %u cached file(s) from %s\n",
+                (unsigned)removed, MEDIA_ART_DIR);
+}
+
 void handleFileBackedDeviceDelete() {
   if (!requestAuthorized()) {
     sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
@@ -21346,6 +21539,9 @@ void configureWebServer() {
   webServer.on("/api/homebridge/status", HTTP_GET, handleHomebridgeStatus);
   webServer.on("/api/homebridge/control", HTTP_POST, handleHomebridgeControl);
   webServer.on("/api/bluetooth/pair", HTTP_POST, handleBluetoothApi);
+  webServer.on("/api/identify/remote", HTTP_POST, handleRemoteIdentifyApi);
+  webServer.on("/api/identify/dock", HTTP_POST, handleDockIdentifyApi);
+  webServer.on("/api/media/artwork/clear", HTTP_POST, handleMediaArtworkClearApi);
   webServer.on("/api/devices/file", HTTP_DELETE, handleFileBackedDeviceDelete);
   webServer.on("/api/devices/file", HTTP_POST, []() {
     if (!requestAuthorized()) webServer.send(403, "application/json", "{\"ok\":false}");
@@ -21374,6 +21570,7 @@ void configureWebServer() {
   webServer.on("/api/dock/update/status", HTTP_GET, handleDockUpdateStatus);
   webServer.on("/api/dock/update/cancel", HTTP_POST, handleDockUpdateCancel);
   webServer.on("/api/cast/scan", HTTP_POST, handleCastScanApi);
+  webServer.on("/api/media/adb", HTTP_POST, handleAdbControlApi);
   webServer.on("/api/espnow/devices", HTTP_GET, handleEspNowDevicesList);
   webServer.on("/api/espnow/devices", HTTP_POST, handleEspNowDeviceAdd);
   webServer.on("/api/espnow/devices", HTTP_DELETE, handleEspNowDeviceDelete);
@@ -21614,6 +21811,14 @@ bool recoverWifiRadio(wifi_mode_t targetMode, const char *reason) {
   wifiScanPending = false;
   wifiScanStartPending = false;
   MDNS.end();
+  // A Wi-Fi mode transition destroys the driver's ESP-NOW instance even
+  // though our software flag cannot observe that.  Leaving espNowRadioActive
+  // true here made the next dock probe/update skip esp_now_init() and every
+  // send failed with "esp now not init" until both devices were restarted.
+  // Tear the protocol down while the old interface is still valid so the
+  // next explicit transaction always creates a real, fresh instance.
+  stopEspNow();
+  espNowStandalone = false;
   WiFi.persistent(false);
   WiFi.setAutoReconnect(false);
   // Always perform a cold radio transition. Leaving STA partially alive while
@@ -22054,6 +22259,21 @@ void onEspNowDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int 
         if (mqttViaDock) mqttConfigPushWanted = true;
         if (haViaDock) haConfigPushWanted = true;
       }
+      return;
+    }
+  }
+
+  if (adbControlPending && (size_t)len >= sizeof(EspNowAdbResultPacket) &&
+      espNowDeviceCount > 0 &&
+      memcmp(espNowDevices[0].mac, info->src_addr, 6) == 0) {
+    EspNowAdbResultPacket result;
+    memcpy(&result, data, sizeof(result));
+    if (result.magic == ESPNOW_ADB_RESULT_MAGIC) {
+      result.message[sizeof(result.message) - 1] = '\0';
+      adbControlStatus = result.status;
+      strlcpy(adbControlMessage, result.message, sizeof(adbControlMessage));
+      adbControlReplyReady = true;
+      adbControlPending = false;
       return;
     }
   }
@@ -22608,7 +22828,7 @@ bool espNowOperationBusy() {
          dockOtaBusy() || dockPairAckRetriesLeft ||
          (heldRepeatCommand && irRoute != IR_ROUTE_REMOTE) ||
          homebridgeDockPending || mqttDockPending || haDockPending ||
-         espNowProbePending || castListRequestPending ||
+         espNowProbePending || castListRequestPending || adbControlPending ||
          nowPlayingReplyPending || mediaArtUrlChanged ||
          mediaArtRequestAwaitingDock || mediaArtTransferActive ||
          mediaArtTransferComplete || mediaArtAckPending ||
@@ -26697,6 +26917,42 @@ void renderWifiQrPage() {
   setupApStatusLabel = makeLabel(content, "", 24, 255, &lv_font_montserrat_10, lvRgb(155, 165, 180));
   refreshSetupApStatusLabel();
   nextSetupApStatusRefreshMs = millis() + 1000UL;
+}
+
+void serviceRemoteIdentify(unsigned long now) {
+  if (remoteIdentifyRequested) {
+    remoteIdentifyRequested = false;
+    if (!webConfigQrPageActive()) return;
+    if (remoteIdentifyOverlay && lv_obj_is_valid(remoteIdentifyOverlay)) {
+      lv_obj_del(remoteIdentifyOverlay);
+    }
+    remoteIdentifyOverlay = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(remoteIdentifyOverlay);
+    lv_obj_set_pos(remoteIdentifyOverlay, 0, 0);
+    lv_obj_set_size(remoteIdentifyOverlay, LCD_W, LCD_H);
+    lv_obj_set_style_bg_opa(remoteIdentifyOverlay, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(remoteIdentifyOverlay, lv_color_white(), 0);
+    lv_obj_clear_flag(remoteIdentifyOverlay, LV_OBJ_FLAG_SCROLLABLE);
+    remoteIdentifyPhase = 0;
+    remoteIdentifyNextMs = now + 140UL;
+    lv_obj_move_foreground(remoteIdentifyOverlay);
+    lv_obj_invalidate(remoteIdentifyOverlay);
+  }
+  if (!remoteIdentifyOverlay || !lv_obj_is_valid(remoteIdentifyOverlay)) return;
+  if ((int32_t)(now - remoteIdentifyNextMs) < 0) return;
+  remoteIdentifyPhase++;
+  if (remoteIdentifyPhase >= 8 || !webConfigQrPageActive()) {
+    lv_obj_del(remoteIdentifyOverlay);
+    remoteIdentifyOverlay = nullptr;
+    // The QR objects stayed alive underneath the opaque flash layer.  A full
+    // invalidation redraws that exact page; it cannot strand a white screen.
+    lv_obj_invalidate(lv_scr_act());
+    return;
+  }
+  lv_obj_set_style_bg_color(remoteIdentifyOverlay,
+    (remoteIdentifyPhase & 1U) ? lv_color_black() : lv_color_white(), 0);
+  lv_obj_invalidate(remoteIdentifyOverlay);
+  remoteIdentifyNextMs = now + 140UL;
 }
 
 void buildNumberOptions(char *buffer, size_t size, int start, int end, uint8_t width) {
@@ -30933,7 +31189,6 @@ void serviceWeatherWidget(uint32_t now) {
    way display is a file read straight into a buffer LVGL can draw.
  * ---------------------------------------------------------------------- */
 static const int16_t MEDIA_ART_SIZE = 96;   // Covers the expanded card; LVGL scales down.
-static const char *MEDIA_ART_DIR = "/media/art";
 
 // FNV-1a over the address. A hash rather than the title because two shows can
 // share a name and the same show can change its poster - the address is what
@@ -33093,6 +33348,7 @@ void loop() {
   if (!displaySleeping) {
     lv_timer_handler();
     servicePageStripChange();
+    serviceRemoteIdentify(now);
   }
 
   if (dnsServerStarted) dnsServer.processNextRequest();
