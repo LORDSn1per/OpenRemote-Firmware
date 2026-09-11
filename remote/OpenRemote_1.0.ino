@@ -1,6 +1,18 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.64 - 2026-09-11
+    - Keeps the ESP-NOW link open for the full life of a held dock-routed IR
+      command instead of stopping and restarting the radio for every repeat.
+      Dock-only volume repeats can now run at their intended steady cadence.
+    - Sends Remote-and-dock IR as two clean back-to-back frames, local first,
+      instead of starting the local emitter while the dock frame may already
+      be on air. Independent 38 kHz carriers cannot be phase-synchronised over
+      ESP-NOW; preventing overlap avoids the destructive combined waveform.
+    - Shows dock transmission with a solid, saturated blue time-pill outline
+      for at least 320 ms. Held commands extend one continuous blue indication
+      rather than flashing a pale blue/white ring on every repeat.
+
   4.63 - 2026-09-11
     - Gives local IR/Bluetooth command feedback a complete 240 ms visible
       interval after any synchronous transmitter work finishes. A long raw IR
@@ -5692,7 +5704,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.63"
+#define OPENREMOTE_VERSION_STRING "4.64"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -13854,37 +13866,22 @@ void serviceCommandFeedback(unsigned long now) {
   applyCommandFeedbackStyle(false);
 }
 
-// A dock send is shown as the outline only, never a fill: the fill said "this
-// state is special" and stayed for the life of the link, which drowned out the
-// resting green that means the radio is simply up. This pulses the same outline
-// thicker and brighter for as long as the send takes - the green counterpart of
-// the red flash for the remote's own emitter.
-static const uint32_t ESPNOW_PULSE_MS = 240;      // Whole visible pulse train.
-static const uint32_t ESPNOW_PULSE_STEP_MS = 40;  // On/off period within it.
+// A dock send is shown as the outline only, never a fill. Keep it solid and
+// saturated: alternating a pale highlight every 40 ms looked white and blinked
+// too quickly to read as a deliberate dock-transmit indication.
+static const uint32_t ESPNOW_PULSE_MS = 320;
 
 void applyEspNowPulse(bool bright) {
-  // Brightness only. The border width never changes - a thickening outline
-  // made the pill jump about, and the geometry shifting is more distracting
-  // than the colour change it was meant to support.
-  // Keep the bright phase saturated. The old near-white blue read as a white
-  // outline beside the red fill when both local and dock IR were active.
-  lv_color_t hot = lv_color_hex(0x5AB2FF);
-  // Both phases of the pulse mean "the dock is transmitting", so the dim phase
-  // is the dock blue rather than pillIdleColour(). It used to be the idle
-  // colour, which is WHITE whenever the link is not currently proved - so a
-  // transmit whose latch had lapsed flickered white mid-pulse and, worse, left
-  // white behind when the pulse ended, painted at the full opacity the pulse
-  // forces. That is the "thick white ring": the width never changed, only a
-  // dim white became a bold one.
-  lv_color_t base = lv_color_hex(0x0A84FF);
+  (void)bright;
+  lv_color_t dockBlue = lv_color_hex(0x007AFF);
   for (uint8_t slot = 0; slot < PAGE_SLOT_COUNT; slot++) {
     PageUi &ui = pageUi[slot];
     if (ui.statusPill && lv_obj_is_valid(ui.statusPill)) {
-      lv_obj_set_style_border_color(ui.statusPill, bright ? hot : base, 0);
+      lv_obj_set_style_border_color(ui.statusPill, dockBlue, 0);
       lv_obj_set_style_border_opa(ui.statusPill, LV_OPA_COVER, 0);
     }
     if (ui.statusBattery && lv_obj_is_valid(ui.statusBattery)) {
-      lv_obj_set_style_border_color(ui.statusBattery, bright ? hot : base, 0);
+      lv_obj_set_style_border_color(ui.statusBattery, dockBlue, 0);
     }
   }
 }
@@ -13908,8 +13905,8 @@ void clearEspNowCommandFeedback() {
   else applyDockLinkPillColour();
 }
 
-// Runs from loop(): pulses while the send is in flight, then hands the pill
-// back to its resting outline.
+// Runs from loop(): holds solid blue for the visible interval, then hands the
+// pill back to its resting outline. Held repeats extend the same interval.
 void serviceEspNowCommandFeedback(unsigned long now) {
   if (espNowCommandFeedbackWanted) {
     espNowCommandFeedbackWanted = false;
@@ -13928,8 +13925,7 @@ void serviceEspNowCommandFeedback(unsigned long now) {
     clearEspNowCommandFeedback();
     return;
   }
-  bool bright = ((now / ESPNOW_PULSE_STEP_MS) % 2) == 0;
-  applyEspNowPulse(bright);
+  applyEspNowPulse(true);
 }
 
 // Button Test mode never transmits a real IR/BLE command (see buttonTestModeActive()
@@ -15187,6 +15183,51 @@ void endVoiceSearchHold(const DeviceCommand *command) {
   }
 }
 
+bool transmitLocalIrCommand(const DeviceCommand &command) {
+  if (command.kind == DeviceCommand::RAW && command.rawTimings && command.rawCount) {
+    flashCommandFeedback();
+    IrSender.sendRaw(command.rawTimings, command.rawCount,
+                     command.frequencyKhz ? command.frequencyKhz : 38);
+    return true;
+  }
+  if (command.kind != DeviceCommand::PARSED) return false;
+  if (strcmp(command.protocol, "NEC") == 0) {
+    flashCommandFeedback();
+    IrSender.sendNEC((uint16_t)command.address, (uint16_t)command.command, 0);
+  } else if (strcmp(command.protocol, "NECext") == 0 ||
+             strcmp(command.protocol, "NEC1") == 0) {
+    flashCommandFeedback();
+    IrSender.sendOnkyo((uint16_t)command.address, (uint16_t)command.command, 0);
+  } else if (strcmp(command.protocol, "Samsung32") == 0) {
+    flashCommandFeedback();
+    IrSender.sendSamsung((uint16_t)command.address, (uint16_t)command.command, 0);
+  } else if (strcmp(command.protocol, "RC5") == 0 ||
+             strcmp(command.protocol, "RC5X") == 0) {
+    flashCommandFeedback();
+    IrSender.sendRC5((uint8_t)command.address, (uint8_t)command.command, 0);
+  } else if (strcmp(command.protocol, "RC6") == 0) {
+    flashCommandFeedback();
+    IrSender.sendRC6((uint8_t)command.address, (uint8_t)command.command, 0);
+  } else if (strncmp(command.protocol, "SIRC", 4) == 0) {
+    flashCommandFeedback();
+    IrSender.sendSony((uint16_t)command.address, (uint8_t)command.command, 2,
+                      command.sonyBits ? command.sonyBits : 12);
+  } else {
+    static uint16_t extraTimings[110];
+    uint16_t extraKhz = 38;
+    uint16_t extraCount = orIrEncodeExtraProtocol(
+      command.protocol, command.address, command.command, extraTimings,
+      (uint16_t)(sizeof(extraTimings) / sizeof(extraTimings[0])), extraKhz);
+    if (!extraCount) {
+      Serial.printf("IR protocol not yet supported: %s\n", command.protocol);
+      return false;
+    }
+    flashCommandFeedback();
+    IrSender.sendRaw(extraTimings, extraCount, extraKhz);
+  }
+  return true;
+}
+
 bool transmitIrCommand(const DeviceCommand &command) {
   if (command.kind == DeviceCommand::HOMEBRIDGE) {
     return transmitHomebridgeCommand(command);
@@ -15230,70 +15271,14 @@ bool transmitIrCommand(const DeviceCommand &command) {
   // nothing a dock could transmit, and those returned above.
   bool useDock = irRoute != IR_ROUTE_REMOTE && espNowDeviceCount > 0;
   bool useLocal = irRoute != IR_ROUTE_DOCK;
+  // Two independent 38 kHz oscillators cannot be phase-synchronised through a
+  // packet radio. In BOTH mode an overlapping pair can merge into a malformed
+  // envelope at the appliance. Finish the local frame first, then hand the
+  // identical command to the dock so both paths remain useful without collision.
+  bool wentLocal = useLocal && transmitLocalIrCommand(command);
   bool wentViaDock = useDock && relayIrToDock(command);
-
-  // Green when the dock carried it, red when this remote's own emitter did.
-  // Never both: each colour is a claim about where the signal came from.
   if (wentViaDock) flashEspNowCommandFeedback();
-
-  if (command.kind == DeviceCommand::RAW && command.rawTimings && command.rawCount) {
-    // Red belongs whenever this remote's own emitter is genuinely about to
-    // fire - "Remote and dock" really does transmit locally too, and that
-    // deserves the same red flash a remote-only send gets.
-    if (useLocal) flashCommandFeedback();
-    if (useLocal) {
-      IrSender.sendRaw(command.rawTimings, command.rawCount,
-                       command.frequencyKhz ? command.frequencyKhz : 38);
-    }
-    return true;
-  }
-  if (command.kind != DeviceCommand::PARSED) return false;
-  if (!useLocal) {
-    // Dock-only: the dock has been given the command and the remote's own
-    // emitter stays dark, so there is genuinely nothing local to flash red for.
-    return true;
-  }
-  if (strcmp(command.protocol, "NEC") == 0) {
-    flashCommandFeedback();
-    IrSender.sendNEC((uint16_t)command.address, (uint16_t)command.command, 0);
-  } else if (strcmp(command.protocol, "NECext") == 0 ||
-             strcmp(command.protocol, "NEC1") == 0) {
-    flashCommandFeedback();
-    IrSender.sendOnkyo((uint16_t)command.address, (uint16_t)command.command, 0);
-  } else if (strcmp(command.protocol, "Samsung32") == 0) {
-    flashCommandFeedback();
-    IrSender.sendSamsung((uint16_t)command.address, (uint16_t)command.command, 0);
-  } else if (strcmp(command.protocol, "RC5") == 0 ||
-             strcmp(command.protocol, "RC5X") == 0) {
-    flashCommandFeedback();
-    IrSender.sendRC5((uint8_t)command.address, (uint8_t)command.command, 0);
-  } else if (strcmp(command.protocol, "RC6") == 0) {
-    flashCommandFeedback();
-    IrSender.sendRC6((uint8_t)command.address, (uint8_t)command.command, 0);
-  } else if (strncmp(command.protocol, "SIRC", 4) == 0) {
-    flashCommandFeedback();
-    IrSender.sendSony((uint16_t)command.address, (uint8_t)command.command, 2,
-                      command.sonyBits ? command.sonyBits : 12);
-  } else {
-    /*
-      Kaseikyo, NEC42, Pioneer and RCA - the four protocols in the Flipper
-      database that IRremote has no sender for. They are rendered to raw
-      timings by the shared header and handed to sendRaw(), which is the same
-      code the dock compiles, so both emitters build identical frames.
-    */
-    static uint16_t extraTimings[110];
-    uint16_t extraKhz = 38;
-    uint16_t extraCount = orIrEncodeExtraProtocol(
-      command.protocol, command.address, command.command, extraTimings,
-      (uint16_t)(sizeof(extraTimings) / sizeof(extraTimings[0])), extraKhz);
-    if (!extraCount) {
-      Serial.printf("IR protocol not yet supported: %s\n", command.protocol);
-      return false;
-    }
-    flashCommandFeedback();
-    IrSender.sendRaw(extraTimings, extraCount, extraKhz);
-  }
-  return true;
+  return wentLocal || wentViaDock;
 }
 
 bool configureBluetoothCommand(DeviceCommand &command, const char *label,
@@ -22588,6 +22573,7 @@ void stopEspNow() {
 bool espNowOperationBusy() {
   return espNowSendWaiting || espNowScanActive || rfLearnActive ||
          dockOtaBusy() || dockPairAckRetriesLeft ||
+         (heldRepeatCommand && irRoute != IR_ROUTE_REMOTE) ||
          homebridgeDockPending || mqttDockPending || haDockPending ||
          espNowProbePending || castListRequestPending ||
          nowPlayingReplyPending || mediaArtUrlChanged ||
