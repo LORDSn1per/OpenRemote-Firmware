@@ -1,6 +1,33 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.68 - 2026-09-12
+    - Fixes dock firmware updates, which could not complete at all. The display
+      timeout ran enterLowPowerWait() straight through an in-flight transfer:
+      that calls stopNetworkStack(), which calls stopEspNow() DIRECTLY rather
+      than through releaseEspNowLink(), so the espNowOperationBusy() guard every
+      other teardown path relies on to notice a running transfer was never
+      consulted. A few seconds after "Send to Dock" - with nobody touching the
+      remote, because there is nothing to touch while it works - the ESP-NOW
+      stack was deinitialised underneath the transfer, Wi-Fi went off and the
+      CPU stopped. Every send after that failed into a dead stack and no
+      acknowledgement could arrive, so the transfer stalled at 0% and reported
+      "the dock never accepted the transfer... it is out of range rather than
+      busy". The dock was in range and idle throughout; nothing was ever wrong
+      with the radio link. dockOtaBusy() now appears in every sleep gate that
+      already holds a WebConfig transfer out - enterLowPowerWait(),
+      enterBleConnectedIdle(), enterDeepPowerSleep(), enterDisplaySleep()'s
+      trailing gate, and loop()'s three displaySleeping re-entry checks.
+    - Fixes the other half of the same fault: uploading the dock .bin to the SD
+      card had no sleep protection either. handleRuntimeConfigUploadData()
+      raises webConfigTransferActive for exactly this reason and the dock
+      firmware handler never did, so the display timeout could stop the web
+      server and turn Wi-Fi off part way through a 1.4MB image. It now holds the
+      flag for the duration and releases it on completion or abort.
+    - The screen is still free to go dark during either operation - only light
+      sleep, BLE-connected idle and deep sleep are held off, exactly as they are
+      for a WebConfig transfer.
+
   4.67 - 2026-09-12
     - Reinitialises ESP-NOW after every WebConfig Wi-Fi mode transition instead
       of trusting a stale active flag after the driver discarded the protocol.
@@ -5732,7 +5759,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.67"
+#define OPENREMOTE_VERSION_STRING "4.68"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -19903,6 +19930,13 @@ String dockFirmwareUploadVersion;
 void handleDockFirmwareUploadData() {
   HTTPUpload &upload = webServer.upload();
   if (upload.status == UPLOAD_FILE_START) {
+    // Holds the remote out of light sleep for the duration, the same way
+    // handleRuntimeConfigUploadData() does. Without it the ordinary display
+    // timeout ran stopNetworkStack() part way through a 1.4MB image - the web
+    // server stopped and Wi-Fi went off underneath the browser, so a large
+    // dock upload simply died with no error anyone could act on.
+    webConfigTransferCancelRequested = false;
+    webConfigTransferActive = true;
     dockFirmwareUploadOk = false;
     dockFirmwareUploadError = "";
     dockFirmwareUploadBytes = 0;
@@ -19949,6 +19983,9 @@ void handleDockFirmwareUploadData() {
     return;
   }
   if (upload.status == UPLOAD_FILE_END) {
+    // Cleared first, so the error path below cannot return with the remote
+    // still pinned awake.
+    webConfigTransferActive = false;
     if (dockFirmwareUploadFile) dockFirmwareUploadFile.close();
     if (dockFirmwareUploadError.length()) { SD.remove(DOCK_FIRMWARE_PATH); return; }
 
@@ -19976,6 +20013,14 @@ void handleDockFirmwareUploadData() {
                     (unsigned long)dockFirmwareUploadBytes, dockOtaVersion);
     }
     if (!dockFirmwareUploadOk) SD.remove(DOCK_FIRMWARE_PATH);
+    return;
+  }
+  if (upload.status == UPLOAD_FILE_ABORTED) {
+    webConfigTransferActive = false;
+    if (dockFirmwareUploadFile) dockFirmwareUploadFile.close();
+    SD.remove(DOCK_FIRMWARE_PATH);
+    dockFirmwareUploadOk = false;
+    dockFirmwareUploadError = "The upload stopped before the whole image arrived.";
   }
 }
 
@@ -32457,7 +32502,8 @@ void restoreDeepSleepRuntimeState(esp_sleep_wakeup_cause_t wakeCause) {
 bool enterDeepPowerSleep(bool allowQrPage) {
   if (!lis3dhReady || !raiseToWake ||
       (webConfigQrPageActive() && !allowQrPage) ||
-      webConfigTransferActive || usbSdTransferActive() || usbStudioLinkActive() || ntpSyncPending ||
+      webConfigTransferActive || dockOtaBusy() ||
+      usbSdTransferActive() || usbStudioLinkActive() || ntpSyncPending ||
       bluetoothActivitySessionRequired() || bluetoothPairingWindowOpen() ||
       bluetoothSettingsPageActive()) {
     Serial.printf(
@@ -32563,7 +32609,8 @@ bool configureApplicationPowerMode(bool connectedIdle) {
 void enterBleConnectedIdle() {
   if (bleConnectedIdleActive || !displaySleeping ||
       !bluetoothActivitySessionRequired() || webConfigQrPageActive() ||
-      webConfigTransferActive || usbSdTransferActive() || usbStudioLinkActive() || ntpSyncPending ||
+      webConfigTransferActive || dockOtaBusy() ||
+      usbSdTransferActive() || usbStudioLinkActive() || ntpSyncPending ||
       wifiConnectPending) return;
 
   // ESP-IDF's Bluetooth controller owns a power-management lock while radio
@@ -32666,7 +32713,21 @@ void releaseBleActivitySessionForSleep() {
 }
 
 void enterLowPowerWait() {
+  // dockOtaBusy() belongs in this list, and its absence is the whole dock
+  // update failure. This function calls stopNetworkStack() before
+  // esp_light_sleep_start(), and stopNetworkStack() calls stopEspNow()
+  // DIRECTLY - it does not go through releaseEspNowLink(), whose
+  // espNowOperationBusy() guard is what every other teardown path relies on to
+  // notice a transfer in flight. So the ordinary screen timeout, a few seconds
+  // into a transfer nobody is touching the remote during, deinitialised the
+  // ESP-NOW stack underneath it and then stopped the CPU. Every send after that
+  // failed into a dead stack and no ack could ever arrive, so the transfer sat
+  // at 0% until it burned its whole retry budget and reported the dock as out
+  // of range - which it never was. A WebConfig transfer is already held out of
+  // here for exactly this reason; a firmware push is the same kind of work and
+  // lasts far longer.
   if (!displaySleeping || webConfigQrPageActive() || webConfigTransferActive ||
+      dockOtaBusy() ||
       usbSdTransferActive() || usbStudioLinkActive() || ntpSyncPending || wifiConnectPending ||
       bluetoothActivitySessionRequired()) return;
   // The display may sleep during pairing - that costs nothing - but the radio
@@ -32833,7 +32894,7 @@ void enterDisplaySleep() {
   displaySleepStartedMs = millis();
   nextDeepSleepAttemptMs = displaySleepStartedMs +
     (uint32_t)deepSleepMinutes * 60UL * 1000UL;
-  if (!webConfigQrPageActive() && !ntpSyncPending &&
+  if (!webConfigQrPageActive() && !ntpSyncPending && !dockOtaBusy() &&
       !webConfigTransferActive && !usbSdTransferActive() && !usbStudioLinkActive()) {
     if (bluetoothActivitySessionRequired()) enterBleConnectedIdle();
     else enterLowPowerWait();
@@ -33564,7 +33625,7 @@ void loop() {
     // left alone.
     if (bluetoothSleepEnabled && !bleActivitySessionReleased &&
         displaySleepStartedMs && !blePairingMode && !atvvAudioStarted &&
-        !webConfigQrPageActive() && !webConfigTransferActive &&
+        !webConfigQrPageActive() && !webConfigTransferActive && !dockOtaBusy() &&
         !usbSdTransferActive() && !usbStudioLinkActive() && !ntpSyncPending &&
         !wifiConnectPending && bluetoothActivitySessionRequired() &&
         (uint32_t)(now - displaySleepStartedMs) >=
@@ -33573,13 +33634,14 @@ void loop() {
       now = millis();
     }
     bool connectedActivityIdle = !webConfigQrPageActive() &&
-      !webConfigTransferActive && !usbSdTransferActive() && !usbStudioLinkActive() &&
+      !webConfigTransferActive && !dockOtaBusy() &&
+      !usbSdTransferActive() && !usbStudioLinkActive() &&
       !ntpSyncPending && !wifiConnectPending &&
       bluetoothActivitySessionRequired();
     if (connectedActivityIdle) {
       enterBleConnectedIdle();
     }
-    if (!connectedActivityIdle && !webConfigQrPageActive() &&
+    if (!connectedActivityIdle && !webConfigQrPageActive() && !dockOtaBusy() &&
         !webConfigTransferActive && !usbSdTransferActive() && !usbStudioLinkActive() &&
         !ntpSyncPending && !wifiConnectPending) {
       if (awaitingButtonWake) {

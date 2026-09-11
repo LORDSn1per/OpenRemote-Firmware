@@ -171,6 +171,16 @@ Never claim that GitHub downloads are updated merely because source was pushed. 
 
 Keep this section updated as active work progresses so a later session can resume without reconstructing decisions from chat history.
 
+### 2026-09-12 — Remote 4.68 makes dock firmware updates possible at all
+
+- Dock firmware updates could never complete. The remote's ordinary display timeout ran `enterLowPowerWait()` straight through an in-flight transfer, and that calls `stopNetworkStack()`, which calls `stopEspNow()` **directly** instead of going through `releaseEspNowLink()` — so the `espNowOperationBusy()` guard every other teardown path relies on to notice a running transfer was never consulted. A few seconds after "Send to Dock", with nobody touching the remote because there is nothing to touch while it works, the ESP-NOW stack was deinitialised underneath the transfer, Wi-Fi went off and the CPU stopped. Every send after that failed into a dead stack and no acknowledgement could arrive, so the transfer sat at 0% until it burned its retry budget and reported "the dock never accepted the transfer… it is out of range rather than busy". The dock was in range and idle throughout.
+- `dockOtaBusy()` now appears in every sleep gate that already holds a WebConfig transfer out: `enterLowPowerWait()`, `enterBleConnectedIdle()`, `enterDeepPowerSleep()`, `enterDisplaySleep()`'s trailing gate, and `loop()`'s three `displaySleeping` re-entry checks.
+- The same fault had an upload half. `handleDockFirmwareUploadData()` never raised `webConfigTransferActive`, although `handleRuntimeConfigUploadData()` does so for exactly this reason, so the display timeout could stop the web server and turn Wi-Fi off part way through a 1.4 MB image. It now holds the flag for the duration and releases it on completion or abort, and an aborted upload reports itself rather than leaving a truncated file.
+- The screen is still free to darken during either operation; only light sleep, BLE-connected idle and deep sleep are held off, exactly as for a WebConfig transfer.
+- Dock firmware is unchanged — nothing was ever wrong on the dock side. Dock 1.81 remains current.
+- Remote 4.68 builds at 2,680,331 bytes total image size (78.5% flash, 37.3% RAM), was flashed over USB at `0x10000` with esptool hash verification, and its boot banner confirms `OPENREMOTE_FIRMWARE_VERSION=4.68` is running. Local and NAS copies are byte-identical with SHA-256 `388b6e6170c90117d32ab0a44973e884e649efc94784f4aa8c3e0d9ddcb157c8`.
+- GitHub publishing remains pending because Phillip did not ask for a GitHub push in this request.
+
 ### 2026-09-12 — Reliable WebConfig dock actions and portrait artwork
 
 - Remote 4.67 tears down ESP-NOW before a WebConfig Wi-Fi mode transition and recreates it for the next explicit transaction. This fixes the stale software-active state that produced intermittent `not in range`, `esp now not init`, and dock-OTA `did not respond` failures after the Wi-Fi driver had already discarded ESP-NOW.
