@@ -1,6 +1,15 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.65 - 2026-09-11
+    - Makes collision-free Remote-then-dock IR an explicit fourth routing
+      choice instead of changing the existing Remote-and-dock behaviour.
+      The LCD Dock page and WebConfig 2.82 expose the same saved option.
+    - Restores Remote-and-dock as the original overlapping best-effort mode
+      for toggle commands such as Power, which must not receive two complete
+      sequential frames. Sequential remains available for commands and room
+      layouts that suffer from overlapping-emitter interference.
+
   4.64 - 2026-09-11
     - Keeps the ESP-NOW link open for the full life of a held dock-routed IR
       command instead of stopping and restarting the radio for every repeat.
@@ -5704,7 +5713,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.64"
+#define OPENREMOTE_VERSION_STRING "4.65"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -6429,8 +6438,9 @@ static const uint8_t ESPNOW_TRANSPORT_RF433 = 1;
 // LED dark while commands were plainly working. This is the routing that was
 // missing, not a fault in the dock.
 static const uint8_t IR_ROUTE_REMOTE = 0;  // The remote's own emitter only.
-static const uint8_t IR_ROUTE_BOTH   = 1;  // Both, for cabinets with a blind spot.
+static const uint8_t IR_ROUTE_BOTH   = 1;  // Both with their original overlap.
 static const uint8_t IR_ROUTE_DOCK   = 2;  // The dock only.
+static const uint8_t IR_ROUTE_SEQUENTIAL = 3;  // Remote frame, then dock frame.
 
 // The floor for a held repeat that goes through the dock. A typical captured
 // code runs ~190ms of air time and the dock reports the real figure per burst;
@@ -10237,6 +10247,7 @@ void loadSettings() {
     preferences.getUChar("atvvModel", ATVV_INTERACTION_ON_REQUEST);
   atvv16kConsecutiveFailures = preferences.getUChar("atvv16kBad", 0);
   irRoute = preferences.getUChar("irRoute", IR_ROUTE_REMOTE);
+  if (irRoute > IR_ROUTE_SEQUENTIAL) irRoute = IR_ROUTE_REMOTE;
   espNowChannel = preferences.getUChar("enChan", 0);
   dockRfEnabled = preferences.getBool("dockRf", true);
   dockLedOnTransmit = preferences.getBool("dockLed", true);
@@ -13076,7 +13087,7 @@ void applySettingsJson(JsonVariantConst settings) {
   bluetoothSleepEnabled = settings["bluetoothSleepEnabled"] | bluetoothSleepEnabled;
   espNowEnabled = settings["espNowEnabled"] | espNowEnabled;
   irRoute = settings["irRoute"] | irRoute;
-  if (irRoute > IR_ROUTE_DOCK) irRoute = IR_ROUTE_REMOTE;
+  if (irRoute > IR_ROUTE_SEQUENTIAL) irRoute = IR_ROUTE_REMOTE;
   bool previousRf = dockRfEnabled, previousLed = dockLedOnTransmit;
   dockRfEnabled = settings["dockRfEnabled"] | dockRfEnabled;
   dockLedOnTransmit = settings["dockLedOnTransmit"] | dockLedOnTransmit;
@@ -15271,12 +15282,22 @@ bool transmitIrCommand(const DeviceCommand &command) {
   // nothing a dock could transmit, and those returned above.
   bool useDock = irRoute != IR_ROUTE_REMOTE && espNowDeviceCount > 0;
   bool useLocal = irRoute != IR_ROUTE_DOCK;
-  // Two independent 38 kHz oscillators cannot be phase-synchronised through a
-  // packet radio. In BOTH mode an overlapping pair can merge into a malformed
-  // envelope at the appliance. Finish the local frame first, then hand the
-  // identical command to the dock so both paths remain useful without collision.
-  bool wentLocal = useLocal && transmitLocalIrCommand(command);
-  bool wentViaDock = useDock && relayIrToDock(command);
+  bool wentLocal = false;
+  bool wentViaDock = false;
+  if (irRoute == IR_ROUTE_BOTH) {
+    // Preserve the original best-effort overlap. The dock receives the packet
+    // first and may begin while the remote immediately emits its local copy.
+    // This avoids two complete toggle frames, but some rooms/devices can see a
+    // corrupted combined envelope; sequential mode exists for that case.
+    wentViaDock = relayIrToDock(command);
+    wentLocal = transmitLocalIrCommand(command);
+  } else {
+    // Two independent 38 kHz oscillators cannot be phase-synchronised through
+    // a packet radio. Explicit sequential mode finishes the local frame before
+    // handing the identical command to the dock, guaranteeing no collision.
+    wentLocal = useLocal && transmitLocalIrCommand(command);
+    wentViaDock = useDock && relayIrToDock(command);
+  }
   if (wentViaDock) flashEspNowCommandFeedback();
   return wentLocal || wentViaDock;
 }
@@ -27837,16 +27858,19 @@ void renderDebugPageOmote() {
 // "Transmit IR from" - deliberately about where the signal comes out rather
 // than about ESP-NOW, because that is the question the user is actually
 // answering when a cabinet door blocks the remote's own emitter.
-static const char *IR_ROUTE_OPTIONS = "This remote\nRemote and dock\nDock only";
+static const char *IR_ROUTE_OPTIONS =
+  "This remote\nRemote and dock\nDock only\nRemote then dock";
 
 void irRouteDropdownEvent(lv_event_t *e) {
   uint16_t selected = lv_dropdown_get_selected(lv_event_get_target(e));
-  irRoute = (uint8_t)(selected > IR_ROUTE_DOCK ? IR_ROUTE_REMOTE : selected);
+  irRoute = (uint8_t)(selected > IR_ROUTE_SEQUENTIAL ? IR_ROUTE_REMOTE : selected);
   saveSettings();
   scheduleRuntimeSettingsSave();
-  Serial.printf("IR route: %s\n",
-                irRoute == IR_ROUTE_REMOTE ? "remote" :
-                (irRoute == IR_ROUTE_BOTH ? "remote and dock" : "dock only"));
+  const char *routeName = irRoute == IR_ROUTE_REMOTE ? "remote" :
+                          irRoute == IR_ROUTE_BOTH ? "remote and dock" :
+                          irRoute == IR_ROUTE_DOCK ? "dock only" :
+                          "remote then dock (sequential)";
+  Serial.printf("IR route: %s\n", routeName);
 }
 
 // The switch helpers write their bool directly and offer no change callback, so
@@ -27931,7 +27955,7 @@ void renderDockPageOmote() {
   lv_obj_t *hint = makeLabel(content,
     espNowDeviceCount > 0
       ? "The dock relays IR and RF433 for devices the remote cannot reach directly. "
-        "Transmit IR from decides which emitter actually fires."
+        "Sequential sends twice, so do not use it for toggle commands such as Power."
       : "A dock relays IR and RF433 commands for devices the remote cannot reach "
         "directly. Turn ESP-NOW on, then use Paired devices to search for a dock "
         "in pairing mode.",
@@ -28033,8 +28057,8 @@ void renderDockPage() {
   lv_obj_t *hint = makeLabel(content,
     espNowDeviceCount > 0
       ? "Transmit IR from decides which emitter actually fires - this remote, the "
-        "dock, or both at once. Tx Power trades range against battery: use Low "
-        "if the dock sits close by, High if it is across the room."
+        "dock, both together, or remote then dock. Sequential sends twice, so do "
+        "not use it for toggle commands such as Power."
       : "A dock relays IR and RF433 commands for devices the remote cannot reach "
         "directly. Turn ESP-NOW on, then use Paired devices to search for a dock "
         "in pairing mode.",
