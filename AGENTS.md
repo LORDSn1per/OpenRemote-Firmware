@@ -171,6 +171,15 @@ Never claim that GitHub downloads are updated merely because source was pushed. 
 
 Keep this section updated as active work progresses so a later session can resume without reconstructing decisions from chat history.
 
+### 2026-09-11 — Selectable sequential IR in Remote 4.65 and WebConfig 2.82
+
+- `Transmit IR from` now has four stable saved values: This remote, Remote and dock, Dock only, and Remote then dock. Existing values 0–2 retain their meanings; the new sequential choice is value 3, so old runtime files, NVS settings, and backups remain compatible.
+- Remote and dock again uses the original overlapping best-effort behaviour. Remote then dock emits two complete non-overlapping frames in that order. Both LCD menu styles and WebConfig warn that sequential sends twice and must not be used for toggle commands such as Power.
+- Remote 4.65 builds successfully at 2,674,423 bytes total image size (78.3% flash, 37.3% RAM), carries `OPENREMOTE_FIRMWARE_VERSION=4.65`, and was flashed to Remote Rev6 MAC `a4:cb:8f:e8:8a:d4`; esptool verified every image. Dock firmware remains 1.79 because routing is controlled entirely by the remote.
+- WebConfig 2.82 passes JavaScript syntax, structural, unique-route-control, option-value, title, and version-marker checks. It was installed over ORUSB as `/www/index.html`; the complete 1,834,361-byte file read back from the remote is byte-identical to the versioned source.
+- Remote 4.65 SHA-256 is `f07ea0fb1d538183981f7d250afef393b6e75bf7e80d170774046df1878bd91a`; WebConfig 2.82 SHA-256 is `fa816a1ed8bf4beff1ab9484da44fea850971a5bd169763c56acc61493ebe1c1`. Their local release/source copies and NAS mirrors are byte-identical.
+- GitHub publishing remains pending unless Phillip explicitly asks for it. The source commits and release artifacts are local only.
+
 ### 2026-09-11 — Held dock IR cadence and collision-free dual IR
 
 - A simultaneous Remote/Dock serial capture reproduced the held-volume pause. The remote delivered 210 ms repeats, but a blocking dock Chromecast pass left its single pending-command slot occupied and discarded four subsequent frames before returning to the IR service.
