@@ -28,7 +28,7 @@ The working rich-media implementation is split between the dock and remote. Pres
 - The dock sends title, subtitle, source, playback state, position, duration, and a token-free artwork cache key to the remote over ESP-NOW.
 - The dock downloads artwork, decodes and centre-crops it to a 96x96 RGB565 image, then sends the 18,432 pixel bytes to the remote in acknowledged ESP-NOW chunks with an end-to-end CRC.
 - The remote caches completed RGB565 images under `/media/art` on its SD card using the artwork key. Replaying the same item should load its poster from the remote's SD cache without another download.
-- Keep the dock and remote `EspNowNowPlayingPacket` layouts byte-identical. Titles are 128-byte buffers and the packed packet is 214 bytes as of remote 4.62 and dock 1.76.
+- Keep the dock and remote `EspNowNowPlayingPacket` layouts byte-identical. Titles are 128-byte buffers and the packed packet is 214 bytes as of remote 4.63 and dock 1.78.
 - Do not put account tokens, authenticated artwork URLs, Wi-Fi credentials, or other secrets in ESP-NOW packets, serial logs, source code, release notes, or cache filenames.
 - Before applying any app-specific fallback, the dock queries Android's active
   `media_session` owner over the approved ADB connection. Treat that package
@@ -168,6 +168,14 @@ Never claim that GitHub downloads are updated merely because source was pushed. 
 ## Current implementation history
 
 Keep this section updated as active work progresses so a later session can resume without reconstructing decisions from chat history.
+
+### 2026-09-11 — Command feedback and Widget Wallpaper lifetime fixed in Remote 4.63
+
+- Local command feedback previously armed its 80 ms deadline before the synchronous IR sender ran. A long raw frame could consume that interval before LVGL painted the status pill, leaving only a one-frame red blink. Remote 4.63 starts a full 240 ms visible interval after control returns to the LVGL loop, and held repeats extend it without forcing redundant full-screen redraws.
+- When an IR command is routed through both the remote and dock, the status pill now keeps its red local-transmit fill inside a saturated blue dock-transmit outline. The dock pulse no longer brightens to a near-white blue that could be mistaken for the idle white outline.
+- The persistent page strip keeps activity and device widgets alive while Settings is rendered. `renderCurrentPage()` nevertheless freed their shared Widget Wallpaper PSRAM descriptors, so returning from Settings exposed image objects backed by freed memory. Cache invalidation now happens only once before `renderAllPageSlots()` rebuilds every dependent page.
+- Remote 4.63 builds successfully at 2,674,283 bytes total image size (78.3% flash, 37.3% RAM) and was flashed to Remote Rev6 MAC `a4:cb:8f:e8:8a:d4`; esptool verified every image and the live USB status reports firmware 4.63 with no UART overruns.
+- Byte-identical release copies are in local `releases/remote-bin/OpenRemote_4.63.bin` and NAS `SOFTWARE/FIRMWARE/BIN/OpenRemote_4.63.bin`, with SHA-256 `34abc12314fcc4fe6cd928e1cf5825129b2826ec4b10fc18e31a6e5c43fe1333`. The downloaded GitHub `latest-builds` asset was compared byte-for-byte with that artifact before Remote 4.62 was removed from the release.
 
 ### 2026-09-11 — GitHub `latest-builds` release corrected
 
