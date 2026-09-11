@@ -1,6 +1,14 @@
 /*
   OpenRemote Dock firmware change log (newest first)
 
+  1.79 - 2026-09-11
+    - Services queued IR before Chromecast and other network work, and defers
+      blocking Cast polls while a held IR stream is arriving. A slow poll can
+      no longer leave the one-command receive slot occupied and discard several
+      volume repeats at once.
+    - Copies and releases the receive slot before transmitting each IR frame,
+      allowing the following held repeat to queue while the emitter is busy.
+
   1.78 - 2026-09-11
     - Never sends Back after reading ABC iview playback controls. ABC treats
       Back as leave-player rather than hide-overlay, so the progress controls
@@ -1182,7 +1190,7 @@ static inline bool serialHostAttached() {
 }
 
 
-#define OPENREMOTE_DOCK_VERSION_STRING "1.78"
+#define OPENREMOTE_DOCK_VERSION_STRING "1.79"
 
 // A literal in the built image, so a tool holding the .bin can tell what it is
 // without running it. The remote firmware carries the same idea under
@@ -2010,6 +2018,7 @@ volatile bool pendingOta = false;      // A chunk or control packet is waiting.
 volatile bool ledStateDirty = false;
 volatile bool pendingInfoReply = false;
 volatile uint32_t commandsDroppedBusy = 0;
+volatile unsigned long lastIrCommandReceivedMs = 0;
 unsigned long ledTxUntilMs = 0;
 volatile bool pendingSettings = false;
 volatile bool pendingSettingsRf = true;
@@ -3248,10 +3257,10 @@ void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len)
   }
 
   if (magic == ESPNOW_COMMAND_MAGIC && pendingCommand) {
-    // Dropped because the previous burst is still going out. Counted rather
-    // than silently discarded: this gate sits before the log line, so a command
-    // lost here never appeared anywhere and "24 received, 24 sent" looked
-    // perfect while the user was watching presses go missing.
+    lastIrCommandReceivedMs = millis();
+    // Count rather than silently discard if the single staging slot has not
+    // yet been copied by loop(). This should now be rare because IR is serviced
+    // ahead of blocking network work and the slot is released before replay.
     commandsDroppedBusy++;
     return;
   }
@@ -3264,6 +3273,7 @@ void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len)
   // read before deciding how long the header is - a RAW frame stops after
   // rawCount, a PARSED one carries the whole struct.
   if (magic == ESPNOW_COMMAND_MAGIC && len >= (int)ESPNOW_COMMAND_RAW_HEADER_BYTES) {
+    lastIrCommandReceivedMs = millis();
     uint8_t encoding = data[offsetof(EspNowCommandHeader, encoding)];
     size_t headerBytes = encoding == 1 ? ESPNOW_COMMAND_RAW_HEADER_BYTES
                                        : sizeof(EspNowCommandHeader);
@@ -4870,6 +4880,12 @@ void castSendList() {
 
 void serviceCast(unsigned long now) {
   if (!castEnabled || otaActive || rfLearnActive) return;
+  // Cast discovery and TLS/media-owner queries can occupy this single-core C3
+  // for more than a second. Defer them for the duration of a held IR stream so
+  // every 210 ms volume repeat reaches the emitter; normal Cast work resumes
+  // 350 ms after the button is released.
+  if (pendingCommand ||
+      (lastIrCommandReceivedMs && now - lastIrCommandReceivedMs < 350UL)) return;
   if (WiFi.status() != WL_CONNECTED) return;
   // Nothing can be queried before mDNS is up, and asking anyway just logs an
   // ESPmDNS "Query Failed" on every pass until the station associates.
@@ -5832,26 +5848,36 @@ void serviceIncoming() {
 
   if (!pendingCommand) return;
 
+  // Keep the callback's one-frame staging slot occupied while copying, then
+  // release it before the blocking RMT send. A following held repeat can queue
+  // safely while this local copy is on air.
+  EspNowCommandHeader header = pendingHeader;
+  uint16_t timingCount = pendingTimingCount;
+  uint16_t timings[120];
+  if (timingCount) memcpy(timings, pendingTimings,
+                          (size_t)timingCount * sizeof(uint16_t));
+  uint8_t srcMac[6];
+  memcpy(srcMac, pendingSrcMac, sizeof(srcMac));
+  pendingCommand = false;
+
   if (serialHostAttached()) {
-    const char *what = pendingHeader.encoding == 1 ? "RAW" : "PARSED";
-    Serial.printf("Dock: IR command from %s - %s", macToString(pendingSrcMac).c_str(), what);
-    if (pendingHeader.encoding == 1) {
-      Serial.printf(", %u timing(s), %u kHz\n", (unsigned)pendingTimingCount,
-                    (unsigned)pendingHeader.frequencyKhz);
+    const char *what = header.encoding == 1 ? "RAW" : "PARSED";
+    Serial.printf("Dock: IR command from %s - %s", macToString(srcMac).c_str(), what);
+    if (header.encoding == 1) {
+      Serial.printf(", %u timing(s), %u kHz\n", (unsigned)timingCount,
+                    (unsigned)header.frequencyKhz);
     } else {
-      Serial.printf(" %s addr=0x%08lX cmd=0x%08lX\n", pendingHeader.protocol,
-                    (unsigned long)pendingHeader.address,
-                    (unsigned long)pendingHeader.command);
+      Serial.printf(" %s addr=0x%08lX cmd=0x%08lX\n", header.protocol,
+                    (unsigned long)header.address,
+                    (unsigned long)header.command);
     }
   }
 
   // Not while the pairing LED is mid-story - the flash would be indistinguishable
   // from the blink and the 10 second solid is the more useful signal.
   if (dockState == DOCK_IDLE) {
-    sendCommand(pendingHeader, pendingTimings, pendingTimingCount);
+    sendCommand(header, timings, timingCount);
   }
-
-  pendingCommand = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -6292,6 +6318,8 @@ void loop() {
   servicePairing(now);
   serviceChannelMove();
   serviceChannelSave(now);
+  // IR is latency-sensitive and network services below can block for seconds.
+  serviceIncoming();
   serviceCast(now);
   serviceArtworkTransfer();
   serviceHomebridgeConfig();
@@ -6316,7 +6344,6 @@ void loop() {
   serviceInfoReply();
   serviceLinkLed(now);
   serviceStateLog(now);
-  serviceIncoming();
   serviceLedStates(now);
   delay(2);
 }
