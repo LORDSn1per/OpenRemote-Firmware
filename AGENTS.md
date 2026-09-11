@@ -26,9 +26,9 @@ The working rich-media implementation is split between the dock and remote. Pres
 
 - The dock is the only device that connects to the Chromecast, ADB, media catalogues, or artwork servers. The remote must not join Wi-Fi to fetch media metadata or poster art.
 - The dock sends title, subtitle, source, playback state, position, duration, and a token-free artwork cache key to the remote over ESP-NOW.
-- The dock downloads artwork, decodes and centre-crops it to a 96x96 RGB565 image, then sends the 18,432 pixel bytes to the remote in acknowledged ESP-NOW chunks with an end-to-end CRC.
-- The remote caches completed RGB565 images under `/media/art` on its SD card using the artwork key. Replaying the same item should load its poster from the remote's SD cache without another download.
-- Keep the dock and remote `EspNowNowPlayingPacket` layouts byte-identical. Titles are 128-byte buffers and the packed packet is 214 bytes as of remote 4.64 and dock 1.79.
+- The dock downloads and decodes artwork into RGB565 at no more than 96x96. Apple TV and ABC remain square; portrait Plex, Stremio, and Prime Video posters preserve their source aspect ratio, so a conventional 2:3 poster is sent as 64x96 rather than centre-cropped or padded.
+- The remote caches completed RGB565 images plus their actual width and height under `/media/art` on its SD card using the artwork key. Replaying the same item should load its poster from the remote's SD cache without another download. WebConfig's `Clear Cached Artwork` action may delete only this dedicated directory's files; it must not touch Widget Wallpapers, icons, settings, or source images.
+- Keep the dock and remote `EspNowNowPlayingPacket` layouts byte-identical. Titles are 128-byte buffers and the packed packet is 214 bytes as of remote 4.67 and dock 1.81.
 - Do not put account tokens, authenticated artwork URLs, Wi-Fi credentials, or other secrets in ESP-NOW packets, serial logs, source code, release notes, or cache filenames.
 - Before applying any app-specific fallback, the dock queries Android's active
   `media_session` owner over the approved ADB connection. Treat that package
@@ -101,7 +101,7 @@ The Plex Android TV app exposes an active Cast media namespace but commonly leav
 4. Query the local Plex Media Server's `/status/sessions` endpoint using the token in an HTTP header. Select the active session whose `<Player address>` matches the chosen Chromecast/Google TV address.
 5. Read the title, media type, year or series/episode labels, `ratingKey`, `viewOffset`, duration, player state, and thumb path from that session. Plex durations and offsets are milliseconds and must be converted to seconds before sending them to the remote.
 6. Give the remote a short token-free key such as `plex://<chromecast-address>/<ratingKey>`. Keep the authenticated fetch URL only in dock memory.
-7. Request the Plex thumb through `/photo/:/transcode` with `width=96`, `height=96`, `minSize=1`, and `upscale=1`. Plex returns a cover-sized portrait in this mode, so the dock JPEG callback must centre-crop excess rows or columns into the 96x96 RGB565 output.
+7. Request the Plex thumb through `/photo/:/transcode` with `width=96`, `height=96`, `minSize=1`, and `upscale=1`. Plex commonly returns a cover-sized portrait in this mode. Preserve that aspect ratio in the RGB565 transfer and let the remote render the narrower image with rounded corners.
 8. Plex can queue a short JPEG and its TLS close together. Continue draining already-received plaintext briefly after the connection reports closed; otherwise the ESP32 can see a valid HTTP 200 and content length but read zero body bytes.
 9. Keep overlaying the last confirmed Plex record on every intervening Cast poll. Plex's native Cast record is blank, and allowing it through between the five-second server polls makes the widget flicker between rich metadata and `Nothing playing`.
 10. Plex can briefly remove the server session while starting, seeking, or changing items. Require two consecutive successful `/status/sessions` responses with no `<Player address>` matching the selected Chromecast before treating it as stopped. Then clear the prior title, timers, artwork key, and private fetch URL. A network failure is not an empty-session confirmation.
@@ -113,7 +113,7 @@ The Stremio Android TV app publishes usable title, episode and timing data throu
 1. Identify the exact Cast application name `Stremio` and retain its published text and timing.
 2. Through the dock's approved ADB connection, filter the `StremioServer` log for its latest `/local-addon/stream/<type>/<content-id>.json` request. A series episode ID resembles `tt14688458%3A3%3A1`; decode `%3A` to `:` and use the leading `tt...` catalogue ID.
 3. Use the public compact series/movie poster at `https://images.metahub.space/poster/small/<catalogue-id>/img`. Send a token-free key such as `stremio://series/<catalogue-id>` to the remote so every episode of the same show reuses the cached series poster.
-4. The compact Metahub poster is typically 300x450. Decode it at half scale, then centre-crop the result into the existing 96x96 RGB565 buffer so the rounded square is filled without black bars.
+4. The compact Metahub poster is typically 300x450. Decode it at a safe scale, preserve its portrait aspect ratio in the RGB565 transfer, and let the remote draw the resulting 2:3 poster with rounded corners.
 5. The Metahub endpoint can return an HTTP 307 redirect to its live image host. The dock artwork fetcher must follow HTTPS redirects before requiring a successful HTTP 200 JPEG response.
 6. Transfer and cache it through the same dock-to-remote ESP-NOW artwork path used by Apple TV and Plex.
 
@@ -170,6 +170,17 @@ Never claim that GitHub downloads are updated merely because source was pushed. 
 ## Current implementation history
 
 Keep this section updated as active work progresses so a later session can resume without reconstructing decisions from chat history.
+
+### 2026-09-12 — Reliable WebConfig dock actions and portrait artwork
+
+- Remote 4.67 tears down ESP-NOW before a WebConfig Wi-Fi mode transition and recreates it for the next explicit transaction. This fixes the stale software-active state that produced intermittent `not in range`, `esp now not init`, and dock-OTA `did not respond` failures after the Wi-Fi driver had already discarded ESP-NOW.
+- Dock 1.81 services incoming IR, dock-info replies, OTA state, identify requests, and LED transitions ahead of blocking Cast/ADB/HTTP work. A five-second identify temporarily defers background network work so every 90 ms LED phase remains visible and even.
+- WebConfig 2.83 makes the Remote and Dock firmware-version pills active Identify buttons. Dock Identify uses its LED; Remote Identify draws four white/black LCD flashes on top of the existing QR screen, then removes the overlay and restores that exact QR screen. Pair, ADB status, saved-connection deletion, artwork-cache clearing, and both Identify actions execute immediately without requiring Synchronise.
+- ADB status uses a prompt-free authenticated shell probe and reports connected/disconnected with a visible coloured indicator. The explicit Pair action may present Android's existing RSA debugging-approval prompt for the dock's permanent identity; passive page-load checks never enter that 30-second approval wait. The C3 implementation does not yet implement Android's separate TLS 1.3/SPAKE2 six-digit pairing-code protocol, so do not claim that the entered code itself has authorized a new identity.
+- Remote 4.66 and Dock 1.80 artwork work is included in these final releases: Plex, Stremio, and Prime posters preserve portrait proportions, Prime requests an aspect-preserving `_SX128_` rendition, and versioned `v2`/`v5` cache identities prevent old square or clipped files from being reused. Apple TV and ABC remain square.
+- Final builds succeeded and were flashed over USB with esptool verification to Remote Rev6 MAC `a4:cb:8f:e8:8a:d4` and Dock Rev6 MAC `40:4c:ca:f9:ef:54`. Remote total image size is 2,680,131 bytes (78.5% flash, 37.3% RAM); Dock total image size is 1,477,679 bytes (72.6% flash, 22.7% RAM). WebConfig 2.83 passed JavaScript syntax validation and was installed as the remote's 1,840,229-byte `/www/index.html`.
+- Verified local and NAS release copies are byte-identical. Remote 4.67 SHA-256 is `ba1d0fe6115658e07939a07731886ab80a0569e60c5f5e27083d1a0ebb1749b1`; Dock 1.81 is `0c95c2301ba6a220d87065956803af1153719fda2d2c0ce358ec103b81f113f1`; WebConfig 2.83 is `f360d1b9d257842292a744aaefa314a24c9c9b99502d2e8a1b9f68467a849b02`.
+- Source saves are local commits `1d2aa86`, `eefcf86`, and `fa31c0c`. GitHub publishing remains pending because Phillip did not ask for a GitHub push in this request.
 
 ### 2026-09-11 — Selectable sequential IR in Remote 4.65 and WebConfig 2.82
 
