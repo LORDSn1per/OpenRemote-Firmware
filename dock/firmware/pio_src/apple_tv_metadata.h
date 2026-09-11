@@ -80,7 +80,8 @@ class AppleTvMetadataClient {
   bool pollAndroidMediaSession(const IPAddress &googleTv,
                                AndroidMediaSession &session,
                                bool force = false);
-  bool testAdbConnection(const IPAddress &googleTv);
+  bool testAdbConnection(const IPAddress &googleTv,
+                         bool requestAuthorization = false);
   void resetAdbSession();
   bool decodeArtwork(const char *url, uint16_t *rgb565, uint16_t width,
                      uint16_t height, bool preservePortrait = false,

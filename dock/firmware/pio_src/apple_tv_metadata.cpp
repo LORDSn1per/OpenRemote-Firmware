@@ -137,7 +137,8 @@ bool signAdbToken(const uint8_t *token, size_t tokenLength, uint8_t *signature,
                          adbRandom, nullptr) == 0;
 }
 
-bool adbConnectLegacy(NetworkClient &client, const IPAddress &host) {
+bool adbConnectLegacy(NetworkClient &client, const IPAddress &host,
+                      bool requestAuthorization = true) {
   client.setTimeout(5000);
   if (!client.connect(host, ADB_PORT)) {
     Serial.printf("Apple TV: ADB %s:%u did not accept TCP\n",
@@ -182,6 +183,7 @@ bool adbConnectLegacy(NetworkClient &client, const IPAddress &host) {
   // the accepted key is retained by Android and this branch is skipped after
   // every later boot or power outage.
   if (header.command != A_AUTH || header.arg0 != ADB_AUTH_TOKEN) return false;
+  if (!requestAuthorization) return false;
   Serial.println("Apple TV: dock key is not approved; accept the debugging prompt on the TV");
   size_t publicLength = strlen(OPENREMOTE_DOCK_ADB_PUBLIC_KEY) + 1;
   if (!adbSend(client, A_AUTH, ADB_AUTH_RSAPUBLICKEY, 0,
@@ -488,10 +490,37 @@ void AppleTvMetadataClient::begin() {
   }
 }
 
-bool AppleTvMetadataClient::testAdbConnection(const IPAddress &googleTv) {
+bool AppleTvMetadataClient::testAdbConnection(const IPAddress &googleTv,
+                                              bool requestAuthorization) {
+  static const char command[] = "shell:echo OPENREMOTE_ADB_OK";
   String output;
-  return runAdbShell(googleTv, "shell:echo OPENREMOTE_ADB_OK", output, 96) &&
-         output.indexOf("OPENREMOTE_ADB_OK") >= 0;
+  NetworkClient legacy;
+  if (adbConnectLegacy(legacy, googleTv, requestAuthorization)) {
+    bool ok = readShellOutput(legacy, command, output, 96);
+    legacy.stop();
+    return ok && output.indexOf("OPENREMOTE_ADB_OK") >= 0;
+  }
+  legacy.stop();
+
+  // Status checks must never enter Android's 30-second RSA approval wait.
+  // An already paired TLS listener is safe to probe because its mutual TLS
+  // handshake either succeeds promptly or fails without changing TV state.
+  uint16_t tlsPort = 0;
+  bool haveCachedPort = cachedTlsPort && cachedTlsHost == googleTv;
+  if (haveCachedPort || discoverAdbTlsPort(googleTv, tlsPort)) {
+    if (haveCachedPort) tlsPort = cachedTlsPort;
+    NetworkClientSecure secure;
+    if (adbConnectTls(secure, googleTv, tlsPort)) {
+      cachedTlsHost = googleTv;
+      cachedTlsPort = tlsPort;
+      bool ok = readShellOutput(secure, command, output, 96);
+      secure.stop();
+      return ok && output.indexOf("OPENREMOTE_ADB_OK") >= 0;
+    }
+    secure.stop();
+    cachedTlsPort = 0;
+  }
+  return false;
 }
 
 void AppleTvMetadataClient::resetAdbSession() {
