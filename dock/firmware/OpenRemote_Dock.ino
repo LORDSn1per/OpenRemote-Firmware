@@ -4984,7 +4984,8 @@ void serviceAdbControl() {
     target = castDevices[index].ip;
   }
 
-  bool connected = appleTvMetadataClient.testAdbConnection(target);
+  bool connected = appleTvMetadataClient.testAdbConnection(
+      target, request.action == 1);
   if (connected) {
     sendAdbControlResult(2, "ADB is enabled and the dock is connected.");
   } else if (request.action == 1) {
