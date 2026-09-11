@@ -1,6 +1,17 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.63 - 2026-09-11
+    - Gives local IR/Bluetooth command feedback a complete 240 ms visible
+      interval after any synchronous transmitter work finishes. A long raw IR
+      frame can no longer consume the red-pill interval before LVGL draws it.
+      When IR is sent by both the remote and dock, the red fill remains visible
+      inside a saturated blue dock outline instead of a near-white pulse.
+    - Keeps compact Widget Wallpaper descriptors alive while navigating into
+      Settings and back. An individual page render no longer frees the shared
+      cache beneath still-live widgets on the persistent off-screen pages;
+      cache invalidation happens once before a complete page-strip rebuild.
+
   4.62 - 2026-09-11
     - Restores dock discovery when the normal Wi-Fi station is off and while
       WebConfig's setup access point is active. Pairing now opens a standalone
@@ -5681,7 +5692,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.62"
+#define OPENREMOTE_VERSION_STRING "4.63"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -13813,9 +13824,10 @@ void applyCommandFeedbackStyle(bool active) {
   Deferring costs one loop iteration of latency, which is not perceptible.
 */
 void flashCommandFeedback() {
-  commandFeedbackUntilMs = millis() + 80UL;
   commandFeedbackWanted = true;
 }
+
+static const uint32_t COMMAND_FEEDBACK_MS = 240UL;
 
 void serviceCommandFeedback(unsigned long now) {
   // The state change and the redraw, both on the LVGL task. lv_refr_now() is a
@@ -13829,6 +13841,13 @@ void serviceCommandFeedback(unsigned long now) {
       applyCommandFeedbackStyle(true);
       lv_refr_now(nullptr);
     }
+    // Start the visible interval here, after the command path has returned to
+    // the LVGL loop. IrSender.sendRaw() is synchronous and can occupy more
+    // than the old entire 80 ms interval, leaving only a one-frame red blink.
+    // A held repeat reaches this branch again and extends the same steady
+    // indication without forcing another full-screen redraw.
+    now = millis();
+    commandFeedbackUntilMs = now + COMMAND_FEEDBACK_MS;
   }
   if (!commandFeedbackActive || (int32_t)(now - commandFeedbackUntilMs) < 0) return;
   commandFeedbackActive = false;
@@ -13840,14 +13859,16 @@ void serviceCommandFeedback(unsigned long now) {
 // resting green that means the radio is simply up. This pulses the same outline
 // thicker and brighter for as long as the send takes - the green counterpart of
 // the red flash for the remote's own emitter.
-static const uint32_t ESPNOW_PULSE_MS = 240;      // Whole pulse train.
+static const uint32_t ESPNOW_PULSE_MS = 240;      // Whole visible pulse train.
 static const uint32_t ESPNOW_PULSE_STEP_MS = 40;  // On/off period within it.
 
 void applyEspNowPulse(bool bright) {
   // Brightness only. The border width never changes - a thickening outline
   // made the pill jump about, and the geometry shifting is more distracting
   // than the colour change it was meant to support.
-  lv_color_t hot = lv_color_hex(0xC8E4FF);   // Near-white blue, unmistakable.
+  // Keep the bright phase saturated. The old near-white blue read as a white
+  // outline beside the red fill when both local and dock IR were active.
+  lv_color_t hot = lv_color_hex(0x5AB2FF);
   // Both phases of the pulse mean "the dock is transmitting", so the dim phase
   // is the dock blue rather than pillIdleColour(). It used to be the idle
   // colour, which is WHITE whenever the link is not currently proved - so a
@@ -13871,7 +13892,6 @@ void applyEspNowPulse(bool bright) {
 // Same split as flashCommandFeedback(), and for the same reason: a dock-routed
 // command sent from WebConfig arrives here on the HTTP task.
 void flashEspNowCommandFeedback() {
-  espNowPulseUntilMs = millis() + ESPNOW_PULSE_MS;
   espNowCommandFeedbackWanted = true;
 }
 
@@ -13898,6 +13918,10 @@ void serviceEspNowCommandFeedback(unsigned long now) {
       applyEspNowPulse(true);
       lv_refr_now(nullptr);
     }
+    // Like local IR feedback, measure from the moment LVGL can actually show
+    // it, not from before a blocking raw-IR transmission completes.
+    now = millis();
+    espNowPulseUntilMs = now + ESPNOW_PULSE_MS;
   }
   if (!espNowCommandFeedbackActive) return;
   if ((int32_t)(now - espNowPulseUntilMs) >= 0) {
@@ -31496,7 +31520,6 @@ void renderCurrentPage() {
   dismissWidgetFullScreen();
   widgetInstanceCount = 0;
   memset(widgetInstances, 0, sizeof(widgetInstances));
-  clearWidgetWallpaperCache();
   liveTileBindingCount = 0;
   memset(liveTileBindings, 0, sizeof(liveTileBindings));
   memset(batteryMetricNameLabels, 0, sizeof(batteryMetricNameLabels));
@@ -31567,6 +31590,14 @@ void renderAllPageSlots() {
   if (!pageStrip || pageStripRendering) return;
   beginUiMutation();
   uint8_t active = min(currentPage, (uint8_t)(pageCount - 1));
+
+  // Wallpaper descriptors are shared by widgets on every persistent tile.
+  // Free them only when all tiles are about to be rebuilt. Clearing them from
+  // renderCurrentPage() left the still-live off-screen widget image objects
+  // pointing at freed PSRAM whenever Settings was redrawn; returning to the
+  // activity then showed the theme until expanding the widget loaded its
+  // wallpaper again.
+  clearWidgetWallpaperCache();
 
   // Tile coordinates are produced by LVGL's layout pass. Selecting a tile
   // before that pass leaves the strip at x=0 even when currentPage is not 0,
