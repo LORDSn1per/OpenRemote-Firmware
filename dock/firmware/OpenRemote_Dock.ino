@@ -1,6 +1,180 @@
 /*
   OpenRemote Dock firmware change log (newest first)
 
+  1.78 - 2026-09-11
+    - Never sends Back after reading ABC iview playback controls. ABC treats
+      Back as leave-player rather than hide-overlay, so the progress controls
+      are now allowed to disappear on their own after metadata is captured.
+
+  1.77 - 2026-09-11
+    - Prevents ABC iview metadata checks from pressing Back on its profile,
+      home, detail or other interactive screens. The dock first inspects the
+      accessibility tree without sending a key and only reveals playback
+      controls when the tree confirms full-screen video is already active.
+    - Closes the playback overlay only when the dock itself opened it and the
+      resulting hierarchy contains an actual Play or Pause control.
+
+  1.76 - 2026-09-11
+    - Adds rich now-playing support for the ABC iview Android TV app, which
+      does not create a normal Android media session. During an explicit
+      remote request the dock opens iview's playback overlay without pausing,
+      reads its accessibility description and clocks, then closes the overlay.
+    - Resolves a series portrait from ABC's public catalogue, requests a small
+      square rendition, and sends it through the existing acknowledged RGB565
+      artwork transfer with a token-free series cache identity.
+    - Uses Android's foreground activity only for this ABC fallback, keeping
+      the existing media-session owner authoritative for every app that
+      publishes one. No ESP-NOW packet layout or Rev6 pin mapping changed.
+
+  1.75 - 2026-09-11
+    - Stops resizing Android's logcat buffer before Plex connection discovery.
+      `logcat -G` clears the buffer, so the dock erased the current friend-
+      server artwork URL and token before reading them and kept querying a
+      stale saved server that returned HTTP 403.
+    - Matches Plex's `Image URL` label independently of its padded whitespace;
+      the Android app emits several spaces before `=`, so the former exact
+      `Image URL = http` grep rejected otherwise valid current connections.
+    - Supports shared/friend Plex servers whose valid user token is forbidden
+      from the owner-only `/status/sessions` endpoint. The dock extracts the
+      current server machine ID and rating key from Plex's private artwork log,
+      reads `/library/metadata/<ratingKey>`, and combines that title, duration
+      and poster with Android's authoritative playback state and position.
+    - Applies Plex's Android playback clock even when the Cast record already
+      says `Plex`; previously that branch only copied the clock when the Cast
+      source name differed, leaving shared-server items paused at 0 seconds.
+
+  1.74 - 2026-09-11
+    - Forces the authoritative Android media-owner query during a remote's
+      explicit now-playing request instead of accepting a two-second cached
+      NONE result from dock startup.
+    - Marks an explicit, freshly checked nothing-playing result separately so
+      remote 4.56 can close a completed empty transaction while ignoring a
+      transient unsolicited clear. Moves corrected poster cache keys to v4.
+
+  1.73 - 2026-09-11
+    - Fixes 192px Prime Video and larger Stremio posters appearing as only
+      their top-left 96px corner. JPEGDEC expects bit flags such as
+      `JPEG_SCALE_HALF`; passing the numeric scale level left those images at
+      full size and the 96x96 callback correctly clipped the rest.
+    - Versions the Prime and Stremio artwork cache identities so remotes fetch
+      a corrected full-frame image instead of reusing an earlier bad crop.
+    - Keeps an explicit now-playing transaction together across a dock reboot:
+      if the saved Chromecast has not been rediscovered yet, discovery runs
+      before the reply instead of returning an empty boot-time state that
+      makes the remote shut its radio down before metadata and art are ready.
+
+  1.72 - 2026-09-11
+    - Adds rich metadata for the native Prime Video app. The dock recognizes
+      `com.amazon.amazonvideo.livingroom`, reads its hidden current GTI through
+      the approved ADB media-session connection, and resolves title, year,
+      content type, duration and poster from Prime Video's public detail page.
+    - Caches a tiny read-only ADB helper on Google TV because Android's stock
+      media-session shell hides Prime's GTI Bundle. Prime artwork uses a small
+      square Amazon rendition, then follows the existing RGB565 ESP-NOW and
+      remote SD-cache path with a token-free `prime://` identity.
+    - Treats Android's Prime session as authoritative, preventing the stale
+      Apple TV Cast receiver from clearing or replacing active Prime playback.
+
+  1.71 - 2026-09-10
+    - Follows HTTPS redirects when downloading media artwork. Metahub's
+      Stremio poster endpoint redirects to its live image host, so valid movie
+      posters such as Mayday were previously rejected at HTTP 307 before any
+      JPEG bytes reached the decoder.
+    - Sends artwork identity before the now-playing reply, allowing remote
+      firmware 4.53 to treat the metadata packet as the end of that explicit
+      request and shut ESP-NOW down immediately afterward.
+
+  1.70 - 2026-09-10
+    - Fixes SmartTube playback jumping back to an old base time whenever the
+      remote wakes. Android's PlaybackState position is the position at its
+      `updated` elapsed-realtime value, and SmartTube may leave that base
+      untouched for minutes while playback continues. The dock now samples
+      Android uptime with the media session and advances a playing position by
+      the elapsed interval before sending it to the remote.
+
+  1.69 - 2026-09-10
+    - Uses Android's active media-session owner and playback state as the
+      authority before applying app-specific metadata. Stopped Apple TV data
+      now clears, and stale Apple receiver records can no longer replace an
+      active SmartTube/YouTube, Plex or Stremio session.
+    - Retains the latest valid SmartTube/YouTube record across brief stale Cast
+      responses and pushes only real title, transport, duration or art changes.
+    - Converts curly quotes, bullets, long dashes and related Unicode
+      punctuation to display-safe ASCII before sending metadata to the remote.
+    - Accepts compact Stremio poster JPEGs up to 64 KB; some valid series art
+      exceeds the previous 32 KB cap before it is decoded and centre-cropped.
+
+  1.68 - 2026-09-10
+    - Adds Stremio poster enrichment. Stremio already publishes title, episode
+      and timing through Cast but omits artwork; the dock reads its current
+      catalogue ID from the approved ADB connection and resolves the matching
+      public Metahub series poster.
+    - Downscales the compact 300x450 JPEG during decode and centre-crops it to
+      the existing 96x96 RGB565 artwork frame, then uses the same acknowledged
+      ESP-NOW transfer and remote SD cache as Apple TV and Plex.
+
+  1.67 - 2026-09-10
+    - Keeps the last confirmed Plex metadata over the intervening Cast polls
+      instead of letting Plex's blank native record replace it every few
+      seconds. This stops title, timers and artwork flickering on and off.
+    - Requires two consecutive successful empty Plex session responses before
+      clearing the widget. A real stop still clears, while the short session
+      gaps Plex creates during startup, seeking and item changes are ignored.
+
+  1.66 - 2026-09-10
+    - Clears Plex title, timers and artwork when the Plex server successfully
+      reports no active session for the selected Chromecast. Previously this
+      valid stopped response was treated like a failed poll, so the last movie
+      remained on the widget indefinitely.
+
+  1.65 - 2026-09-10
+    - Fills Plex's blank Cast metadata from the active Plex Media Server
+      session. The dock captures Plex's authenticated local server connection
+      from its approved ADB link, retains it in NVS across power outages, and
+      sends the current title, subtitle, playback position, duration and a
+      token-free poster identity to the remote.
+    - Downloads Plex posters only on the dock, requests a cover-sized rendition,
+      centre-crops it to 96x96 RGB565 and transfers it over ESP-NOW. The Plex
+      account token is never logged or included in a packet to the remote.
+    - Expands now-playing titles to 127 characters for scrolling remote labels.
+
+  1.64 - 2026-09-10
+    - Keeps draining Android's one-shot ADB shell after the TCP close becomes
+      visible. Google TV can queue the final Luna log WRTE and its FIN together;
+      treating connected()==false as an empty response discarded the content
+      ID, leaving the widget with only "Apple TV" and a position counter.
+    - Requests Apple's compact quality-60 square poster rendition and reports
+      the exact download, allocation or JPEG stage if conversion fails. This
+      keeps detailed movie art within the C3's available contiguous heap.
+
+  1.63 - 2026-09-10
+    - Filters AirReceiver's software Google Cast advertisements from discovery.
+      Google TV can publish both its real receiver on port 8009 and an
+      AirReceiver alias on the same IP; the aliases consumed the six-device
+      reply and made a real name selected in WebConfig disappear from later
+      scans.
+    - Makes Apple TV metadata prefer Google TV's persistent authenticated ADB
+      listener and filters Luna's log on Android before parsing it. This keeps
+      the response bounded and drains buffered ADB data after a one-shot shell
+      closes.
+    - Accepts Android's checksum-free ADB 1.0.41 packets, which were arriving
+      correctly but being rejected as corrupt before Luna could be read.
+    - Moves JPEGDEC's 17.5 KB workspace off the ESP32-C3 loop stack, preventing
+      the dock from resetting while it prepares poster art. Apple artwork now
+      uses the square centre-crop rendition, so the cached image has no black
+      bars and fills the remote's rounded artwork frame.
+
+  1.62 - 2026-09-10
+    - Recognises the Apple TV app by its exact Cast display name and fills the
+      metadata Apple omits from Cast. The dock uses its authorized, persistent
+      ADB identity to read Luna's current Apple content ID, resolves that ID
+      through Apple's public catalogue, and reports the real title,
+      description, duration and poster identity to the remote.
+    - Owns the complete poster path. It requests Apple's compact JPEG, decodes
+      it to a 96x96 RGB565 buffer, and sends it to the remote in acknowledged
+      ESP-NOW chunks with CRC protection. Wi-Fi credentials, remote pairing,
+      Chromecast target and the ADB identity all survive a dock power loss.
+
   1.61 - 2026-09-09
     - Reports the poster address for the current title. Only the address
       travels, never the image: the remote fetches it once, scales it and keeps
@@ -983,6 +1157,7 @@
 #include <NetworkClientSecure.h>
 #include <ESPmDNS.h>
 #include <ArduinoJson.h>
+#include "pio_src/apple_tv_metadata.h"
 #if DOCK_RF_CS_PIN >= 0
 // Asynchronous serial mode, not the packet engine: a gate or garage remote is
 // a raw OOK edge train with no framing the CC1101 could parse for us. GDO0
@@ -1007,7 +1182,7 @@ static inline bool serialHostAttached() {
 }
 
 
-#define OPENREMOTE_DOCK_VERSION_STRING "1.61"
+#define OPENREMOTE_DOCK_VERSION_STRING "1.78"
 
 // A literal in the built image, so a tool holding the .bin can tell what it is
 // without running it. The remote firmware carries the same idea under
@@ -1192,14 +1367,19 @@ static const uint32_t ESPNOW_NOWPLAYING_MAGIC = 0x4F524E50UL;  // "ORNP"
 static const uint32_t ESPNOW_MEDIA_TARGET_MAGIC = 0x4F524D54UL;  // "ORMT"
 static const uint32_t ESPNOW_NOWPLAYING_REQ_MAGIC = 0x4F524E52UL;  // "ORNR"
 static const uint32_t ESPNOW_ARTWORK_MAGIC = 0x4F524157UL;        // "ORAW"
+static const uint32_t ESPNOW_ARTWORK_REQUEST_MAGIC = 0x4F524158UL; // "ORAX"
+static const uint32_t ESPNOW_ARTWORK_BEGIN_MAGIC = 0x4F524142UL;   // "ORAB"
+static const uint32_t ESPNOW_ARTWORK_DATA_MAGIC = 0x4F524144UL;    // "ORAD"
+static const uint32_t ESPNOW_ARTWORK_END_MAGIC = 0x4F524145UL;     // "ORAE"
+static const uint32_t ESPNOW_ARTWORK_ACK_MAGIC = 0x4F52414BUL;     // "ORAK"
+static const uint16_t ESPNOW_ARTWORK_CHUNK_BYTES = 160;
+static const uint16_t MEDIA_ART_WIDTH = 96;
+static const uint16_t MEDIA_ART_HEIGHT = 96;
 
 /*
-  Dock -> remote: where the poster for the current title lives.
-
-  Only the address travels, never the image. The remote fetches it once, scales
-  it and keeps it on its own SD card, so the same show costs one download ever
-  rather than one per play. Sent in its own frame because a URL is long and
-  most updates - a position ticking on - do not change it.
+  Dock -> remote: the poster identity. The remote uses the address only as its
+  SD-cache key. Network access and JPEG decoding stay on the mains-powered
+  dock; RGB565 pixels travel separately below.
 */
 struct __attribute__((packed)) EspNowArtworkPacket {
   uint32_t magic;
@@ -1207,6 +1387,47 @@ struct __attribute__((packed)) EspNowArtworkPacket {
 };
 static_assert(sizeof(EspNowArtworkPacket) == 204,
               "artwork layout drifted from the remote");
+
+struct __attribute__((packed)) EspNowArtworkRequestPacket {
+  uint32_t magic;
+  char url[200];
+};
+
+struct __attribute__((packed)) EspNowArtworkBeginPacket {
+  uint32_t magic;
+  uint32_t transferId;
+  uint32_t totalBytes;
+  uint32_t crc32;
+  uint16_t width;
+  uint16_t height;
+  char url[200];
+};
+
+struct __attribute__((packed)) EspNowArtworkDataPacket {
+  uint32_t magic;
+  uint32_t transferId;
+  uint32_t seq;
+  uint16_t len;
+  uint8_t data[ESPNOW_ARTWORK_CHUNK_BYTES];
+};
+
+struct __attribute__((packed)) EspNowArtworkEndPacket {
+  uint32_t magic;
+  uint32_t transferId;
+  uint32_t crc32;
+};
+
+struct __attribute__((packed)) EspNowArtworkAckPacket {
+  uint32_t magic;
+  uint32_t transferId;
+  uint32_t nextSeq;
+  uint8_t status;
+};
+
+static_assert(sizeof(EspNowArtworkBeginPacket) == 220,
+              "artwork begin exceeds ESP-NOW payload");
+static_assert(sizeof(EspNowArtworkDataPacket) == 174,
+              "artwork data exceeds proven ESP-NOW payload");
 static const uint32_t ESPNOW_CAST_SCAN_MAGIC = 0x4F524353UL;   // "ORCS"
 
 /*
@@ -1279,11 +1500,11 @@ struct __attribute__((packed)) EspNowNowPlayingPacket {
   uint8_t playing;
   uint32_t position;
   uint32_t duration;
-  char title[64];
+  char title[128];
   char subtitle[48];
   char source[24];
 };
-static_assert(sizeof(EspNowNowPlayingPacket) == 150,
+static_assert(sizeof(EspNowNowPlayingPacket) == 214,
               "now playing layout drifted from the remote");
 // Homebridge relayed through this dock instead of the remote. Byte-identical
 // to the remote's definitions - the static_asserts below fail the build if
@@ -1797,6 +2018,17 @@ uint8_t otaFrame[250];
 volatile uint16_t otaFrameLen = 0;
 
 Preferences prefs;
+
+// Written by the ESP-NOW callback and consumed by the Apple artwork service.
+// These declarations must precede the callback; the larger pixel buffer stays
+// beside the Cast state below.
+volatile bool pendingArtworkRequest = false;
+EspNowArtworkRequestPacket pendingArtworkRequestPacket = {};
+volatile bool artworkAckWaiting = false;
+volatile bool artworkAckArrived = false;
+volatile uint32_t artworkAckTransferId = 0;
+volatile uint32_t artworkAckNextSeq = 0;
+volatile uint8_t artworkAckStatus = 0;
 
 void enterState(DockState next);
 String macToString(const uint8_t mac[6]);
@@ -2935,6 +3167,8 @@ void loadRemote() {
   haEnabled = prefs.getBool("haEn", false);
   hbUser = prefs.getString("hbUser", "");
   hbPass = prefs.getString("hbPass", "");
+  String savedCastTarget = prefs.getString("castTarget", "");
+  strlcpy(castTargetName, savedCastTarget.c_str(), sizeof(castTargetName));
   wifiConfigured = hbSsid.length() > 0;
   prefs.end();
   if (wifiConfigured) {
@@ -2975,6 +3209,29 @@ void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len)
   }
   uint32_t magic = 0;
   memcpy(&magic, data, sizeof(magic));
+
+  if (magic == ESPNOW_ARTWORK_ACK_MAGIC &&
+      len >= (int)sizeof(EspNowArtworkAckPacket) && remoteKnown &&
+      memcmp(info->src_addr, remoteMac, 6) == 0) {
+    EspNowArtworkAckPacket ack;
+    memcpy(&ack, data, sizeof(ack));
+    artworkAckTransferId = ack.transferId;
+    artworkAckNextSeq = ack.nextSeq;
+    artworkAckStatus = ack.status;
+    artworkAckArrived = true;
+    artworkAckWaiting = false;
+    return;
+  }
+
+  if (magic == ESPNOW_ARTWORK_REQUEST_MAGIC &&
+      len >= (int)sizeof(EspNowArtworkRequestPacket) && remoteKnown &&
+      memcmp(info->src_addr, remoteMac, 6) == 0) {
+    memcpy(&pendingArtworkRequestPacket, data,
+           sizeof(pendingArtworkRequestPacket));
+    pendingArtworkRequestPacket.url[sizeof(pendingArtworkRequestPacket.url) - 1] = '\0';
+    pendingArtworkRequest = true;
+    return;
+  }
 
   // Scoped to IR commands, which is the only thing it was ever about: the dock
   // has one emitter and cannot start a second burst while the first is still
@@ -3764,7 +4021,7 @@ struct CastNowPlaying {
   bool playing;
   uint32_t position;
   uint32_t duration;
-  char title[64];
+  char title[128];
   char subtitle[48];
   char source[24];
   char artUrl[200];
@@ -3775,6 +4032,18 @@ struct CastNowPlaying {
   uint32_t sessionId;
 };
 CastNowPlaying castState = {};
+AppleTvRichMetadata appleTvRich = {};
+uint32_t appleTvRichSessionId = 0;
+PlexRichMetadata plexRich = {};
+char plexArtworkFetchUrl[512] = "";
+StremioArtworkMetadata stremioArtwork = {};
+PrimeVideoRichMetadata primeVideoRich = {};
+AbcIviewRichMetadata abcIviewRich = {};
+CastNowPlaying smartTubeRich = {};
+CastNowPlaying stremioCastRich = {};
+char lastAndroidMediaPackage[64] = "";
+
+uint16_t dockArtworkRgb[MEDIA_ART_WIDTH * MEDIA_ART_HEIGHT];
 
 // --- protobuf, just enough of it ------------------------------------------
 
@@ -3904,6 +4173,17 @@ void castDiscover() {
       The next scan usually resolves them, so dropping them is enough.
     */
     if (address == IPAddress((uint32_t)0)) continue;
+    // AirReceiver registers a second _googlecast service on Google TV (often
+    // "Room[Cast]", port 8010) beside the real built-in receiver. It is an
+    // AirPlay compatibility endpoint, not the Chromecast whose receiver
+    // status contains the active Android app. Letting these aliases into the
+    // six-name packet can evict real TVs depending on mDNS answer order.
+    String model = MDNS.txt(i, "md");
+    String receiverModel = MDNS.txt(i, "rmodel");
+    if (model.equalsIgnoreCase("AirReceiver") ||
+        receiverModel.equalsIgnoreCase("AirReceiver")) {
+      continue;
+    }
     castDevices[castDeviceCount].ip = address;
     String friendly = MDNS.txt(i, "fn");
     if (!friendly.length()) friendly = MDNS.hostname(i);
@@ -4037,6 +4317,12 @@ bool castPollDevice(uint8_t index, CastNowPlaying &out) {
         // publishes none, so this is frequently empty and the widget keeps its
         // placeholder rather than showing the previous title's image.
         const char *art = metadata["images"][0]["url"] | "";
+        if (appName.equalsIgnoreCase("Plex")) {
+          // Plex's title fields are blank, but this full URL carries the local
+          // server address and account token. Learn it before artUrl's compact
+          // packet buffer truncates it; the token stays private to the dock.
+          appleTvMetadataClient.learnPlexConnection(art);
+        }
         strlcpy(out.artUrl, art, sizeof(out.artUrl));
       }
       strlcpy(out.source, appName.c_str(), sizeof(out.source));
@@ -4044,8 +4330,343 @@ bool castPollDevice(uint8_t index, CastNowPlaying &out) {
       break;
     }
   }
+  // Plex advertises a Cast media namespace but returns an empty media-status
+  // array because playback is local to its Android player. Preserve the app
+  // identity so the Plex server-session fallback below can fill the record.
+  if (!gotAnswer && appName.equalsIgnoreCase("Plex")) {
+    out = {};
+    out.valid = true;
+    strlcpy(out.source, "Plex", sizeof(out.source));
+    gotAnswer = true;
+  }
   client.stop();
   return gotAnswer;
+}
+
+bool castIsAppleTv(const CastNowPlaying &state) {
+  return state.valid && strcmp(state.source, "Apple TV") == 0;
+}
+
+void enrichAppleTv(uint8_t deviceIndex, CastNowPlaying &state) {
+  if (!castIsAppleTv(state) || deviceIndex >= castDeviceCount) {
+    appleTvRich = {};
+    appleTvRichSessionId = 0;
+    return;
+  }
+  if (state.sessionId != appleTvRichSessionId) {
+    appleTvRich = {};
+    appleTvRichSessionId = state.sessionId;
+  }
+  appleTvMetadataClient.poll(castDevices[deviceIndex].ip, appleTvRich);
+  if (!appleTvRich.valid) return;
+  strlcpy(state.title, appleTvRich.title, sizeof(state.title));
+  strlcpy(state.subtitle, appleTvRich.subtitle, sizeof(state.subtitle));
+  strlcpy(state.artUrl, appleTvRich.artworkUrl, sizeof(state.artUrl));
+  if (appleTvRich.durationSeconds) state.duration = appleTvRich.durationSeconds;
+}
+
+bool castIsPlex(const CastNowPlaying &state) {
+  return state.valid && strcasecmp(state.source, "Plex") == 0;
+}
+
+bool castIsStremio(const CastNowPlaying &state) {
+  return state.valid && strcasecmp(state.source, "Stremio") == 0;
+}
+
+bool castIsPrimeVideo(const CastNowPlaying &state) {
+  return state.valid && strcasecmp(state.source, "Prime Video") == 0;
+}
+
+bool castIsAbcIview(const CastNowPlaying &state) {
+  return state.valid && strcasecmp(state.source, "ABC iview") == 0;
+}
+
+bool castIsYoutube(const CastNowPlaying &state) {
+  return state.valid &&
+    (strcasecmp(state.source, "SmartTube") == 0 ||
+     strcasecmp(state.source, "YouTube") == 0 ||
+     strcasecmp(state.source, "YouTube TV") == 0);
+}
+
+const char *mediaSourceForPackage(const char *packageName) {
+  if (!packageName) return nullptr;
+  if (strcmp(packageName, "com.apple.atve.androidtv.appletv") == 0)
+    return "Apple TV";
+  if (strcmp(packageName, "com.plexapp.android") == 0)
+    return "Plex";
+  if (strcmp(packageName, "com.stremio.one") == 0)
+    return "Stremio";
+  if (strcmp(packageName, "org.smarttube.stable") == 0)
+    return "SmartTube";
+  if (strcmp(packageName, "com.google.android.youtube.tv") == 0)
+    return "YouTube";
+  if (strcmp(packageName, "com.amazon.amazonvideo.livingroom") == 0)
+    return "Prime Video";
+  if (strcmp(packageName, "au.net.abc.iview") == 0)
+    return "ABC iview";
+  return nullptr;
+}
+
+void clearRichMediaState(const char *source) {
+  if (!source || strcmp(source, "Apple TV") == 0) {
+    appleTvRich = {};
+    appleTvRichSessionId = 0;
+  }
+  if (!source || strcmp(source, "Plex") == 0) {
+    plexRich = {};
+    plexArtworkFetchUrl[0] = '\0';
+  }
+  if (!source || strcmp(source, "Stremio") == 0) {
+    stremioArtwork = {};
+    stremioCastRich = {};
+  }
+  if (!source || strcmp(source, "Prime Video") == 0) {
+    primeVideoRich = {};
+  }
+  if (!source || strcmp(source, "ABC iview") == 0) {
+    abcIviewRich = {};
+  }
+  if (!source || strcmp(source, "SmartTube") == 0 ||
+      strcmp(source, "YouTube") == 0) {
+    smartTubeRich = {};
+  }
+}
+
+void enrichPlex(uint8_t deviceIndex, CastNowPlaying &state) {
+  if (!castIsPlex(state) || deviceIndex >= castDeviceCount) {
+    plexRich = {};
+    plexArtworkFetchUrl[0] = '\0';
+    return;
+  }
+  bool queried = appleTvMetadataClient.pollPlex(castDevices[deviceIndex].ip,
+                                                plexRich);
+  // Between five-second Plex server polls, keep overlaying the last confirmed
+  // rich record. The native Cast record is blank and must never replace it.
+  if (!queried && !plexRich.valid) return;
+  if (!plexRich.valid) {
+    state.valid = false;
+    state.playing = false;
+    state.position = 0;
+    state.duration = 0;
+    state.title[0] = '\0';
+    state.subtitle[0] = '\0';
+    state.artUrl[0] = '\0';
+    plexArtworkFetchUrl[0] = '\0';
+    return;
+  }
+  bool androidPlaying = state.playing;
+  uint32_t androidPosition = state.position;
+  state.valid = true;
+  // A server-owner token can read /status/sessions, including its live player
+  // clock. Shared-library tokens cannot; their item lookup supplies metadata
+  // while Android's active media session remains the playback authority.
+  state.playing = plexRich.playbackFromSession ? plexRich.playing
+                                               : androidPlaying;
+  state.position = plexRich.playbackFromSession ? plexRich.positionSeconds
+                                                : androidPosition;
+  state.duration = plexRich.durationSeconds;
+  strlcpy(state.title, plexRich.title, sizeof(state.title));
+  strlcpy(state.subtitle, plexRich.subtitle, sizeof(state.subtitle));
+  strlcpy(state.artUrl, plexRich.artworkKey, sizeof(state.artUrl));
+  strlcpy(plexArtworkFetchUrl, plexRich.artworkFetchUrl,
+          sizeof(plexArtworkFetchUrl));
+}
+
+void enrichStremio(uint8_t deviceIndex, CastNowPlaying &state) {
+  if (!castIsStremio(state) || deviceIndex >= castDeviceCount) {
+    stremioArtwork = {};
+    return;
+  }
+  appleTvMetadataClient.pollStremio(castDevices[deviceIndex].ip,
+                                    stremioArtwork);
+  if (!stremioArtwork.valid) return;
+  strlcpy(state.artUrl, stremioArtwork.artworkKey, sizeof(state.artUrl));
+}
+
+void enrichPrimeVideo(uint8_t deviceIndex, CastNowPlaying &state) {
+  if (!castIsPrimeVideo(state) || deviceIndex >= castDeviceCount) {
+    primeVideoRich = {};
+    return;
+  }
+  appleTvMetadataClient.pollPrimeVideo(castDevices[deviceIndex].ip,
+                                       primeVideoRich);
+  if (!primeVideoRich.valid) return;
+  strlcpy(state.title, primeVideoRich.title, sizeof(state.title));
+  strlcpy(state.subtitle, primeVideoRich.subtitle, sizeof(state.subtitle));
+  strlcpy(state.artUrl, primeVideoRich.artworkKey, sizeof(state.artUrl));
+  if (primeVideoRich.durationSeconds)
+    state.duration = primeVideoRich.durationSeconds;
+}
+
+void enrichAbcIview(uint8_t deviceIndex, CastNowPlaying &state,
+                    bool queryOverlay) {
+  if (!castIsAbcIview(state) || deviceIndex >= castDeviceCount) {
+    abcIviewRich = {};
+    return;
+  }
+  if (queryOverlay)
+    appleTvMetadataClient.pollAbcIview(castDevices[deviceIndex].ip,
+                                       abcIviewRich);
+  if (!abcIviewRich.valid) return;
+  state.valid = true;
+  state.playing = abcIviewRich.playing;
+  state.position = abcIviewRich.positionSeconds;
+  state.duration = abcIviewRich.durationSeconds;
+  strlcpy(state.title, abcIviewRich.title, sizeof(state.title));
+  strlcpy(state.subtitle, abcIviewRich.subtitle, sizeof(state.subtitle));
+  strlcpy(state.artUrl, abcIviewRich.artworkKey, sizeof(state.artUrl));
+}
+
+void enrichMediaApp(uint8_t deviceIndex, CastNowPlaying &state,
+                    bool forceOwnerPoll = false) {
+  if (deviceIndex >= castDeviceCount) return;
+
+  // Keep a good native Cast record as a fallback for the short periods where
+  // Android has already switched apps but the Cast receiver still publishes
+  // the previous app. This is especially common between SmartTube videos.
+  if (castIsYoutube(state) && state.title[0]) smartTubeRich = state;
+  if (castIsStremio(state) && state.title[0]) stremioCastRich = state;
+
+  AndroidMediaSession owner = {};
+  bool haveOwner = appleTvMetadataClient.pollAndroidMediaSession(
+    castDevices[deviceIndex].ip, owner, forceOwnerPoll);
+  bool abcForeground = haveOwner && owner.valid &&
+    strcmp(owner.foregroundPackageName, "au.net.abc.iview") == 0;
+  if (abcForeground) {
+    if (strcmp(lastAndroidMediaPackage, "au.net.abc.iview") != 0) {
+      clearRichMediaState(nullptr);
+      strlcpy(lastAndroidMediaPackage, "au.net.abc.iview",
+              sizeof(lastAndroidMediaPackage));
+    }
+    state = {};
+    state.valid = true;
+    strlcpy(state.source, "ABC iview", sizeof(state.source));
+    enrichAbcIview(deviceIndex, state, forceOwnerPoll);
+    return;
+  }
+  if (haveOwner && owner.valid && !owner.packageName[0] &&
+      (lastAndroidMediaPackage[0] || castIsAppleTv(state) ||
+       castIsPlex(state) || castIsStremio(state) || castIsYoutube(state))) {
+    clearRichMediaState(nullptr);
+    lastAndroidMediaPackage[0] = '\0';
+    state = {};
+    return;
+  }
+  const char *ownerSource = haveOwner && owner.valid
+                              ? mediaSourceForPackage(owner.packageName)
+                              : nullptr;
+  if (ownerSource) {
+    bool ownerChanged = strcmp(lastAndroidMediaPackage,
+                               owner.packageName) != 0;
+    if (ownerChanged) {
+      // Data cached for an earlier visit to an app must not flash up while the
+      // newly-active item is still being resolved.
+      clearRichMediaState(nullptr);
+      strlcpy(lastAndroidMediaPackage, owner.packageName,
+              sizeof(lastAndroidMediaPackage));
+    }
+
+    if (!owner.active) {
+      // STOPPED/NONE from Android is authoritative even when Cast is still
+      // advertising the old receiver and title.
+      clearRichMediaState(ownerSource);
+      state = {};
+      return;
+    }
+
+    if (strcmp(ownerSource, "SmartTube") == 0 ||
+        strcmp(ownerSource, "YouTube") == 0) {
+      if (!castIsYoutube(state)) {
+        state = smartTubeRich.valid ? smartTubeRich : CastNowPlaying{};
+      }
+      state.valid = true;
+      state.playing = owner.playing;
+      if (owner.positionSeconds) state.position = owner.positionSeconds;
+      strlcpy(state.source, ownerSource, sizeof(state.source));
+      if (state.title[0]) smartTubeRich = state;
+      return;
+    }
+
+    if (strcmp(ownerSource, "Stremio") == 0 && !castIsStremio(state)) {
+      state = stremioCastRich.valid ? stremioCastRich : CastNowPlaying{};
+      state.valid = true;
+      state.playing = owner.playing;
+      if (owner.positionSeconds) state.position = owner.positionSeconds;
+      strlcpy(state.source, "Stremio", sizeof(state.source));
+    } else if (strcmp(ownerSource, "Apple TV") == 0 &&
+               !castIsAppleTv(state)) {
+      state = {};
+      state.valid = true;
+      state.playing = owner.playing;
+      state.position = owner.positionSeconds;
+      strlcpy(state.source, "Apple TV", sizeof(state.source));
+    } else if (strcmp(ownerSource, "Plex") == 0) {
+      if (!castIsPlex(state)) state = {};
+      state.valid = true;
+      state.playing = owner.playing;
+      state.position = owner.positionSeconds;
+      strlcpy(state.source, "Plex", sizeof(state.source));
+    } else if (strcmp(ownerSource, "Prime Video") == 0 &&
+               !castIsPrimeVideo(state)) {
+      state = {};
+      state.valid = true;
+      state.playing = owner.playing;
+      state.position = owner.positionSeconds;
+      strlcpy(state.source, "Prime Video", sizeof(state.source));
+    }
+  }
+
+  enrichAppleTv(deviceIndex, state);
+  enrichPlex(deviceIndex, state);
+  enrichStremio(deviceIndex, state);
+  enrichPrimeVideo(deviceIndex, state);
+}
+
+// The LCD fonts intentionally contain only the compact ASCII range. Normalise
+// punctuation emitted by Android apps before it enters an ESP-NOW packet so
+// curly quotes, bullets and long dashes do not render as square placeholders.
+void copyMediaTextAscii(const char *source, char *destination, size_t size) {
+  if (!destination || !size) return;
+  destination[0] = '\0';
+  if (!source) return;
+  size_t out = 0;
+  auto append = [&](const char *text) {
+    while (*text && out + 1 < size) destination[out++] = *text++;
+  };
+  const uint8_t *p = (const uint8_t *)source;
+  while (*p && out + 1 < size) {
+    if (*p < 0x80) {
+      destination[out++] = (*p >= 0x20 || *p == '\t') ? (char)*p : ' ';
+      p++;
+      continue;
+    }
+    if (p[0] == 0xC2 && p[1] == 0xA0) { append(" "); p += 2; continue; }
+    if (p[0] == 0xC2 && p[1] == 0xB7) { append(" - "); p += 2; continue; }
+    if (p[0] == 0xE2 && p[1] == 0x80) {
+      if (p[2] >= 0x98 && p[2] <= 0x9B) append("'");
+      else if (p[2] == 0x9C || p[2] == 0x9D) append("\"");
+      else if (p[2] >= 0x90 && p[2] <= 0x95) append("-");
+      else if (p[2] == 0xA2) append(" - ");
+      else if (p[2] == 0xA6) append("...");
+      else append(" ");
+      p += 3;
+      continue;
+    }
+    if (p[0] == 0xEF && p[1] == 0xBC && p[2] == 0x8C) {
+      append(","); p += 3; continue;
+    }
+    if (p[0] == 0xEF && p[1] == 0xBC && p[2] == 0x87) {
+      append("'"); p += 3; continue;
+    }
+    // Skip an unsupported UTF-8 code point. A plain question mark is more
+    // useful than the font's missing-glyph square and preserves word spacing.
+    append("?");
+    if ((*p & 0xE0) == 0xC0) p += 2;
+    else if ((*p & 0xF0) == 0xE0) p += 3;
+    else if ((*p & 0xF8) == 0xF0) p += 4;
+    else p++;
+  }
+  destination[out] = '\0';
 }
 
 // --- the service loop and the relay ---------------------------------------
@@ -4065,32 +4686,149 @@ bool castStateDiffers(const CastNowPlaying &a, const CastNowPlaying &b) {
 
 // Sent only when the address actually changes, which is once per title rather
 // than once per status.
-void castSendArtwork() {
+void castSendArtwork(bool force = false) {
   static char lastSent[200] = "";
   if (!remoteKnown) return;
-  if (strcmp(lastSent, castState.artUrl) == 0) return;
+  if (!force && strcmp(lastSent, castState.artUrl) == 0) return;
   strlcpy(lastSent, castState.artUrl, sizeof(lastSent));
   EspNowArtworkPacket packet = {};
   packet.magic = ESPNOW_ARTWORK_MAGIC;
   strlcpy(packet.url, castState.artUrl, sizeof(packet.url));
   esp_now_send(remoteMac, (const uint8_t *)&packet, sizeof(packet));
   Serial.printf("Cast: artwork %s\n",
-                castState.artUrl[0] ? castState.artUrl : "(none published)");
+                castState.artUrl[0] ? "identity updated" : "(none published)");
 }
 
-void castSendToRemote() {
+bool artworkSendAndWait(const uint8_t *bytes, size_t length,
+                        uint32_t transferId, uint32_t nextSeq,
+                        uint8_t status) {
+  // An artwork is 116 acknowledged chunks. One missed acknowledgement must
+  // not discard the whole image near the end, especially while the remote is
+  // drawing its expanded widget. Duplicate chunks are safe: the remote
+  // answers them with the next sequence it still needs.
+  for (uint8_t attempt = 0; attempt < 8; attempt++) {
+    artworkAckArrived = false;
+    artworkAckWaiting = true;
+    if (esp_now_send(remoteMac, bytes, length) != ESP_OK) {
+      artworkAckWaiting = false;
+      delay(3);
+      continue;
+    }
+    uint32_t deadline = millis() + 700;
+    while ((int32_t)(millis() - deadline) < 0) {
+      if (artworkAckArrived && artworkAckTransferId == transferId &&
+          artworkAckNextSeq == nextSeq && artworkAckStatus == status) {
+        artworkAckWaiting = false;
+        return true;
+      }
+      delay(1);
+    }
+    artworkAckWaiting = false;
+  }
+  return false;
+}
+
+void serviceArtworkTransfer() {
+  if (!pendingArtworkRequest) return;
+  pendingArtworkRequest = false;
+  if (!remoteKnown || (!castIsAppleTv(castState) && !castIsPlex(castState) &&
+                       !castIsStremio(castState) &&
+                       !castIsPrimeVideo(castState) &&
+                       !castIsAbcIview(castState)) ||
+      strcmp(pendingArtworkRequestPacket.url, castState.artUrl) != 0 ||
+      !castState.artUrl[0]) return;
+
+  const char *fetchUrl = castState.artUrl;
+  if (castIsPlex(castState)) fetchUrl = plexArtworkFetchUrl;
+  else if (castIsStremio(castState)) fetchUrl = stremioArtwork.artworkUrl;
+  else if (castIsPrimeVideo(castState)) fetchUrl = primeVideoRich.artworkUrl;
+  else if (castIsAbcIview(castState)) fetchUrl = abcIviewRich.artworkUrl;
+  if (!fetchUrl[0]) return;
+  Serial.printf("Media: preparing cached artwork %s\n", castState.artUrl);
+  if (!appleTvMetadataClient.decodeArtwork(fetchUrl, dockArtworkRgb,
+                                            MEDIA_ART_WIDTH,
+                                            MEDIA_ART_HEIGHT)) {
+    Serial.println("Media: artwork download or JPEG conversion failed");
+    return;
+  }
+
+  const uint32_t totalBytes = sizeof(dockArtworkRgb);
+  uint32_t crc = 0xffffffffUL;
+  crc = esp_rom_crc32_le(crc, (const uint8_t *)dockArtworkRgb, totalBytes);
+  crc ^= 0xffffffffUL;
+  uint32_t transferId = 2166136261UL;
+  for (const char *p = castState.artUrl; *p; p++) {
+    transferId ^= (uint8_t)*p;
+    transferId *= 16777619UL;
+  }
+
+  EspNowArtworkBeginPacket begin = {};
+  begin.magic = ESPNOW_ARTWORK_BEGIN_MAGIC;
+  begin.transferId = transferId;
+  begin.totalBytes = totalBytes;
+  begin.crc32 = crc;
+  begin.width = MEDIA_ART_WIDTH;
+  begin.height = MEDIA_ART_HEIGHT;
+  strlcpy(begin.url, castState.artUrl, sizeof(begin.url));
+  if (!artworkSendAndWait((const uint8_t *)&begin, sizeof(begin), transferId,
+                          0, 0)) {
+    Serial.println("Apple TV: remote did not accept artwork transfer");
+    return;
+  }
+
+  uint32_t offset = 0;
+  uint32_t seq = 0;
+  while (offset < totalBytes) {
+    EspNowArtworkDataPacket packet = {};
+    packet.magic = ESPNOW_ARTWORK_DATA_MAGIC;
+    packet.transferId = transferId;
+    packet.seq = seq;
+    packet.len = (uint16_t)min((uint32_t)ESPNOW_ARTWORK_CHUNK_BYTES,
+                               totalBytes - offset);
+    memcpy(packet.data, ((const uint8_t *)dockArtworkRgb) + offset, packet.len);
+    size_t packetBytes = offsetof(EspNowArtworkDataPacket, data) + packet.len;
+    if (!artworkSendAndWait((const uint8_t *)&packet, packetBytes, transferId,
+                            seq + 1, 0)) {
+      Serial.printf("Apple TV: artwork transfer stopped at chunk %lu\n",
+                    (unsigned long)seq);
+      return;
+    }
+    offset += packet.len;
+    seq++;
+  }
+
+  EspNowArtworkEndPacket end = {};
+  end.magic = ESPNOW_ARTWORK_END_MAGIC;
+  end.transferId = transferId;
+  end.crc32 = crc;
+  if (!artworkSendAndWait((const uint8_t *)&end, sizeof(end), transferId,
+                          seq, 1)) {
+    Serial.println("Apple TV: remote did not confirm the completed artwork");
+    return;
+  }
+  Serial.printf("Apple TV: sent %lu RGB565 bytes in %lu chunks\n",
+                (unsigned long)totalBytes, (unsigned long)seq);
+}
+
+void castSendToRemote(bool forceArtwork = false, bool explicitReply = false) {
   if (!remoteKnown) return;
+  // The remote treats the now-playing packet as completion of an explicit
+  // metadata request. Deliver the separate artwork identity first so it is
+  // already present before that completion lets the radio shut down.
+  castSendArtwork(forceArtwork);
   EspNowNowPlayingPacket packet = {};
   packet.magic = ESPNOW_NOWPLAYING_MAGIC;
-  packet.valid = castState.valid ? 1 : 0;
+  // Value 2 is an explicit, settled "nothing playing" reply. It keeps the
+  // byte layout unchanged while allowing the remote to distinguish that from
+  // an unsolicited transient clear and close its one-shot transaction.
+  packet.valid = castState.valid ? 1 : (explicitReply ? 2 : 0);
   packet.playing = castState.playing ? 1 : 0;
   packet.position = castState.position;
   packet.duration = castState.duration;
-  strlcpy(packet.title, castState.title, sizeof(packet.title));
-  strlcpy(packet.subtitle, castState.subtitle, sizeof(packet.subtitle));
-  strlcpy(packet.source, castState.source, sizeof(packet.source));
+  copyMediaTextAscii(castState.title, packet.title, sizeof(packet.title));
+  copyMediaTextAscii(castState.subtitle, packet.subtitle, sizeof(packet.subtitle));
+  copyMediaTextAscii(castState.source, packet.source, sizeof(packet.source));
   esp_now_send(remoteMac, (const uint8_t *)&packet, sizeof(packet));
-  castSendArtwork();
 }
 
 /*
@@ -4148,20 +4886,38 @@ void serviceCast(unsigned long now) {
     which fits inside the hold the remote's request has already armed.
   */
   if (castReplyRequested) {
-    castReplyRequested = false;
     if (castTargetName[0]) {
       int8_t index = castFindTarget();
+      // Immediately after a dock boot the saved target is known but the mDNS
+      // list is still empty. An empty response here made the remote conclude
+      // its one-shot transaction was finished and shut ESP-NOW down just
+      // before the normal discovery found Prime metadata. Discover inside the
+      // request so this one transaction remains contiguous from wake through
+      // metadata and, when needed, artwork.
+      if (index < 0) {
+        castDiscover();
+        castNextDiscoverMs = now + CAST_DISCOVER_MS;
+        index = castFindTarget();
+      }
       if (index >= 0) {
         CastNowPlaying fresh = castState;
         fresh.valid = false;
         if (!castPollDevice((uint8_t)index, fresh) || !fresh.valid) {
           fresh = CastNowPlaying{};
         }
+        // Bypass the two-second Android-owner cache for an explicit request.
+        // A cached boot-time NONE is exactly what used to close the remote's
+        // transaction a moment before Prime Video resolved.
+        enrichMediaApp((uint8_t)index, fresh, true);
         castState = fresh;
         castNextPollMs = now + CAST_POLL_ACTIVE_MS;
       }
     }
-    castSendToRemote();
+    castReplyRequested = false;
+    // An explicit request is also how a freshly rebooted remote recovers the
+    // poster identity. The dock's change suppressor may already remember this
+    // URL, so force the separate ORAW frame alongside the status response.
+    castSendToRemote(true, true);
   }
 
   /*
@@ -4191,6 +4947,11 @@ void serviceCast(unsigned long now) {
 
   if (castTargetChanged) {
     castTargetChanged = false;
+    prefs.begin("dock", false);
+    prefs.putString("castTarget", castTargetName);
+    prefs.end();
+    Serial.printf("Cast: target '%s' saved\n",
+                  castTargetName[0] ? castTargetName : "(none)");
     castNextDiscoverMs = now;      // Re-scan at once for the new name.
     castState = CastNowPlaying{};
     castSendToRemote();            // Clear the widget while the new one is found.
@@ -4221,6 +4982,7 @@ void serviceCast(unsigned long now) {
   fresh.valid = false;
   bool answered = castPollDevice((uint8_t)index, fresh);
   if (!answered || !fresh.valid) fresh = CastNowPlaying{};
+  enrichMediaApp((uint8_t)index, fresh);
   // One device, so the only question is how closely to watch it: quickly while
   // something is playing, and more gently when it is idle.
   castNextPollMs = now + (fresh.valid ? CAST_POLL_ACTIVE_MS : CAST_POLL_IDLE_MS);
@@ -5141,6 +5903,11 @@ void setup() {
   setCpuFrequencyMhz(160);
   Serial.printf("CPU: %u MHz (fixed)\n", (unsigned)getCpuFrequencyMhz());
 
+  // Parse the dock's approved ADB identity once at boot. The key lives in the
+  // firmware, so Android sees the same authorized dock after every power loss
+  // and ordinary firmware update.
+  appleTvMetadataClient.begin();
+
   pinMode(DOCK_BUTTON_PIN, INPUT_PULLUP);
 #if DOCK_MENU_BUTTON_PIN >= 0
   pinMode(DOCK_MENU_BUTTON_PIN, INPUT_PULLUP);
@@ -5428,6 +6195,70 @@ void serviceSerialConsole() {
   while (Serial.available()) {
     int key = Serial.read();
     if (key < 33) continue;   // Whitespace, newlines and stray control bytes.
+    if (key == 'p' || key == 'P') {
+      if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("Apple TV probe: dock is not on Wi-Fi");
+      } else {
+        if (!castDeviceCount) castDiscover();
+        int8_t index = castFindTarget();
+        if (index < 0) {
+          Serial.printf("Apple TV probe: no Chromecast matching '%s'\n",
+                        castTargetName[0] ? castTargetName : "(no saved target)");
+        } else {
+          AppleTvRichMetadata probe = {};
+          if (appleTvMetadataClient.poll(castDevices[index].ip, probe) && probe.valid) {
+            Serial.printf("Apple TV probe: %s — %s, %lus, art=%s\n",
+                          probe.subtitle, probe.title,
+                          (unsigned long)probe.durationSeconds,
+                          probe.artworkUrl);
+          } else {
+            Serial.println("Apple TV probe: no current content ID resolved");
+          }
+        }
+      }
+      continue;
+    }
+    if (key == 'a' || key == 'A') {
+      if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("ABC iview probe: dock is not on Wi-Fi");
+      } else {
+        if (!castDeviceCount) castDiscover();
+        int8_t index = castFindTarget();
+        if (index < 0) {
+          Serial.printf("ABC iview probe: no Chromecast matching '%s'\n",
+                        castTargetName[0] ? castTargetName : "(no saved target)");
+        } else {
+          AndroidMediaSession owner = {};
+          appleTvMetadataClient.pollAndroidMediaSession(
+            castDevices[index].ip, owner, true);
+          if (strcmp(owner.foregroundPackageName, "au.net.abc.iview") != 0) {
+            Serial.printf("ABC iview probe: foreground is %s\n",
+                          owner.foregroundPackageName[0]
+                            ? owner.foregroundPackageName : "unknown");
+          } else {
+            AbcIviewRichMetadata probe = {};
+            if (appleTvMetadataClient.pollAbcIview(castDevices[index].ip,
+                                                   probe) && probe.valid) {
+              Serial.printf("ABC iview probe: %s - %s (%lu/%lus), art=%s\n",
+                            probe.title, probe.subtitle,
+                            (unsigned long)probe.positionSeconds,
+                            (unsigned long)probe.durationSeconds,
+                            probe.artworkKey[0] ? "ready" : "unavailable");
+              if (probe.artworkUrl[0]) {
+                bool decoded = appleTvMetadataClient.decodeArtwork(
+                  probe.artworkUrl, dockArtworkRgb,
+                  MEDIA_ART_WIDTH, MEDIA_ART_HEIGHT);
+                Serial.printf("ABC iview probe: 96x96 artwork %s\n",
+                              decoded ? "decoded" : "failed");
+              }
+            } else {
+              Serial.println("ABC iview probe: playback overlay had no item");
+            }
+          }
+        }
+      }
+      continue;
+    }
 #if DOCK_IR_LED_PIN >= 0
     if (key == 'i' || key == 'I') { runIrEmitterTest(false, 5); continue; }
     if (key == 'm' || key == 'M') { runIrEmitterTest(true, 5); continue; }
@@ -5449,6 +6280,8 @@ void serviceSerialConsole() {
 #else
     Serial.println("  (the IR emitter is disabled in this build)");
 #endif
+    Serial.println("  p - probe Apple TV metadata on the saved Chromecast");
+    Serial.println("  a - probe ABC iview metadata on the saved Chromecast");
   }
 }
 
@@ -5460,6 +6293,7 @@ void loop() {
   serviceChannelMove();
   serviceChannelSave(now);
   serviceCast(now);
+  serviceArtworkTransfer();
   serviceHomebridgeConfig();
   serviceHomebridgeWifi(now);
   serviceHomebridge(now);
