@@ -161,7 +161,7 @@ A normal Git commit and push updates repository source only. It does **not** upd
    - Preserve the existing platform-specific naming convention for Studio assets.
 4. Upload the new assets to the existing `latest-builds` release first. Update its title and version table so every displayed version and filename is current. Update the README's direct download filenames and URLs in the same release commit.
 5. Query the release again and verify each uploaded asset's name, byte size, and downloaded SHA-256 against the verified local artifact. Only after that verification may the superseded asset for the same component be deleted. Do not delete unchanged current assets, such as Studio builds when Studio was not bumped.
-6. Commit the release documentation changes locally, push `main` to `origin`, confirm local `HEAD` equals `origin/main`, and confirm the working tree is clean. Finally reopen or query the public release URL and ensure the title, table, links, and asset list all show the new versions.
+6. Commit the release documentation changes locally and push `main` to `origin`. Move the mutable `latest-builds` Git tag to that exact new `main` commit and push the tag update so the release's generated source archives and “commits since this release” comparison are current. Confirm local `HEAD`, `origin/main`, and `refs/tags/latest-builds` resolve to the same commit and that the working tree is clean. Finally reopen or query the public release URL and ensure the title, table, links, and asset list all show the new versions.
 
 Never claim that GitHub downloads are updated merely because source was pushed. A release is complete only when the repository, GitHub Release assets, local artifacts, and NAS mirror have all been verified.
 
@@ -172,7 +172,7 @@ Keep this section updated as active work progresses so a later session can resum
 ### 2026-09-11 — GitHub `latest-builds` release corrected
 
 - A source push does not update GitHub Release downloads. The `latest-builds` release had remained on Remote 4.48, Dock 1.61, and WebConfig 2.75 even though newer source had been pushed.
-- The release title, version table, README links, and downloadable assets now publish Remote 4.62, Dock 1.78, WebConfig 2.81, and the unchanged Studio 2.79 builds. The superseded Remote 4.48, Dock 1.61, and WebConfig 2.75 release assets were removed only after the replacements were uploaded, downloaded again, and hash-verified.
+- The release title, version table, README links, downloadable assets, and mutable `latest-builds` tag now publish Remote 4.62, Dock 1.78, WebConfig 2.81, and the unchanged Studio 2.79 builds from the current `main`. The superseded Remote 4.48, Dock 1.61, and WebConfig 2.75 release assets were removed only after the replacements were uploaded, downloaded again, and hash-verified.
 - Downloaded GitHub assets match the verified local artifacts: Remote 4.62 SHA-256 `8ee006a30323badc90fd575b3512cb571ad4dfcb14c4e132df4736b0a0f808b0`, Dock 1.78 SHA-256 `f24f318583c66900cdbc1e9406420eb817c56374d2ab3d4cfdbc48254084392b`, and WebConfig 2.81 SHA-256 `30e5e721df74be45cc656abaa26213b3f35ba3804458ba5fc0ddc2930ad5cd19`.
 
 ### 2026-09-11 — ABC playback no longer exits in Dock 1.78
