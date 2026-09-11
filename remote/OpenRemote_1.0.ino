@@ -1,6 +1,127 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.62 - 2026-09-11
+    - Restores dock discovery when the normal Wi-Fi station is off and while
+      WebConfig's setup access point is active. Pairing now opens a standalone
+      ESP-NOW receive window on the radio's current channel; the dock's pairing
+      sweep finds that channel without requiring a saved Wi-Fi network.
+
+  4.61 - 2026-09-11
+    - Adds an optional per-Wallpaper rounded content panel behind every
+      widget foreground element. Its colour and transparency are saved in
+      the Wallpaper record and applied consistently to compact and expanded
+      Weather, Battery and Media widgets.
+
+  4.60 - 2026-09-11
+    - Accepts the full generated filename for expanded Widget Wallpaper
+      assets. The shared theme sanitizer previously clipped long wallpaper
+      IDs before `_expanded.rgb565`, then validated the 228x268 file as a
+      224x96 file and rejected the upload.
+    - Gives a full-screen widget using Follow Page Theme its own opaque
+      blue-grey gradient. The compact widget still follows the page theme,
+      while the expanded overlay no longer reveals and duplicates the page
+      and compact widget underneath it.
+
+  4.59 - 2026-09-11
+    - Adds SD-backed Widget Wallpapers for Weather, Battery and Media. Each
+      saved wallpaper has an exact 224x96 compact asset and a separate
+      228x268 expanded crop, so full-screen widgets do not stretch or clip a
+      landscape card. Widget wallpaper files now participate in native and
+      portable backup/restore and can be managed through WebConfig 2.79.
+
+  4.58 - 2026-09-11
+    - Keeps a visible media artwork transaction alive across a stalled chunk
+      and automatically requests the poster again without another wake or
+      button press. Dock keepalive pings are suppressed throughout metadata
+      and artwork work so their retry/channel-recovery path cannot interrupt
+      the acknowledged image stream.
+
+  4.57 - 2026-09-11
+    - Sends artwork transfer acknowledgements immediately from the ESP-NOW
+      receive callback. Bluetooth Voice Search negotiation or a busy LVGL loop
+      can no longer delay an ACK until the dock abandons a valid chunk; the
+      dock's duplicate-chunk retries remain the recovery path for RF loss.
+
+  4.56 - 2026-09-11
+    - Completes the bounded media transaction only for a valid metadata record
+      or dock 1.74's explicit freshly-checked nothing-playing result. A
+      transient unsolicited empty packet can no longer shut ESP-NOW down while
+      app metadata and corrected artwork are still being prepared.
+
+  4.55 - 2026-09-11
+    - Keeps a one-shot media wake transaction open for up to 45 seconds while
+      a rebooted dock rediscovers its saved Chromecast, resolves app metadata,
+      downloads artwork and begins the acknowledged transfer. This is a
+      bounded transaction wait, not the removed four-second media polling.
+    - Extends the artwork-begin deadline to the same window. Once metadata is
+      received and any poster is CRC-verified into the SD cache, the existing
+      operation-complete path turns ESP-NOW off immediately as before.
+
+  4.54 - 2026-09-10
+    - Adds an explicit saved Homebridge configuration API and a saved-broker
+      MQTT connection test for WebConfig's device wizard. Home Assistant,
+      Homebridge and MQTT discovery/setup can now reuse protected NVS
+      credentials without placing credential fields inside the wizard.
+    - Adds a per-widget background choice. Weather, Battery and Media can
+      follow the active page theme or draw an opaque blue-black card in both
+      compact and expanded views.
+    - Hides the missing-artwork glyph while a media poster is still being
+      transferred. Both media layouts use larger title and subtitle text in
+      the freed space, then restore the artwork layout when the image arrives.
+    - Makes dock-backed rich media mandatory and repairs automatic expansion
+      so a newly playing title opens the compact media widget once.
+
+  4.53 - 2026-09-10
+    - Removes the fixed two-second ESP-NOW hold and the media widget's passive
+      receive window. Ordinary acknowledged sends now release the radio on the
+      next loop; metadata, artwork, scans, relay calls and firmware transfers
+      keep it only for their explicit in-flight transaction. The dock receives
+      link-down before the radio stops, so its LED and the time-pill outline
+      return to idle together.
+    - A now-playing request stays open only until the dock's reply arrives.
+      Artwork similarly releases immediately after its final acknowledged
+      chunk and uses a bounded wait while the dock downloads and converts it.
+
+  4.52 - 2026-09-10
+    - Stops the media widget's five-second polling. It requests metadata once
+      when the screen/widget wakes and after a successful Chromecast BLE key,
+      then advances playback time locally. While the media widget is visible,
+      ESP-NOW stays in silent receive mode so the dock can push pause, stop,
+      app changes and new titles without periodic keepalive packets.
+      The already-persistent Chromecast target is likewise sent only when it
+      changes instead of being repeated every minute.
+    - Invalidates both compact and expanded media cards as soon as a dock
+      update arrives, keeping the compact card in step without opening it.
+
+  4.51 - 2026-09-10
+    - Shows a local YouTube logo whenever YouTube or SmartTube publishes no
+      artwork, instead of leaving the media frame as a generic placeholder.
+    - Scrolls media titles that are wider than their card and carries up to 127
+      title characters from the dock, so long video names are readable rather
+      than truncated or reduced to an ellipsis.
+
+  4.50 - 2026-09-10
+    - Refreshes the collapsed media card's title, subtitle and poster whenever
+      new now-playing data arrives. Previously its progress bar refreshed but
+      the text and artwork were fixed at card creation, so opening the expanded
+      view appeared to be the only way to populate it.
+    - Scales the dock's square 96x96 RGB565 poster to fill either media artwork
+      frame and clips it to the same rounded outline as the frame.
+
+  4.49 - 2026-09-10
+    - Apple TV rich metadata now comes from the dock. When Cast identifies the
+      exact Apple TV app, the dock reads Apple's current content identifier
+      over its approved ADB connection, resolves the public Apple TV catalogue
+      page, and sends the title, description, duration and poster identity to
+      the media widget. The remote never joins Wi-Fi to obtain artwork.
+    - A missing poster is requested from the dock over ESP-NOW. The dock
+      downloads and decodes the JPEG into a 96x96 RGB565 image, then transfers
+      it in acknowledged chunks with an end-to-end CRC. The remote writes the
+      completed image atomically to /media/art on its SD card, keyed by the
+      poster URL, so another episode using the same artwork loads locally even
+      after a power outage or weeks later.
+
   4.48 - 2026-09-09
     - Fixed renaming the remote through WebConfig reverting to OpenRemote.
       ArduinoJson's `value | nullptr` selects a nullptr_t fallback and returns
@@ -5560,7 +5681,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.48"
+#define OPENREMOTE_VERSION_STRING "4.62"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -6312,15 +6433,64 @@ static const uint32_t ESPNOW_NOWPLAYING_MAGIC = 0x4F524E50UL;  // "ORNP"
 static const uint32_t ESPNOW_MEDIA_TARGET_MAGIC = 0x4F524D54UL;  // "ORMT"
 static const uint32_t ESPNOW_NOWPLAYING_REQ_MAGIC = 0x4F524E52UL;  // "ORNR"
 static const uint32_t ESPNOW_ARTWORK_MAGIC = 0x4F524157UL;        // "ORAW"
+static const uint32_t ESPNOW_ARTWORK_REQUEST_MAGIC = 0x4F524158UL; // "ORAX"
+static const uint32_t ESPNOW_ARTWORK_BEGIN_MAGIC = 0x4F524142UL;   // "ORAB"
+static const uint32_t ESPNOW_ARTWORK_DATA_MAGIC = 0x4F524144UL;    // "ORAD"
+static const uint32_t ESPNOW_ARTWORK_END_MAGIC = 0x4F524145UL;     // "ORAE"
+static const uint32_t ESPNOW_ARTWORK_ACK_MAGIC = 0x4F52414BUL;     // "ORAK"
+static const uint16_t ESPNOW_ARTWORK_CHUNK_BYTES = 160;
+static const uint16_t ESPNOW_ARTWORK_DIMENSION = 96;
 
-// Dock -> remote: where the poster for the current title lives. Only the
-// address travels; see serviceMediaArtwork() for what happens to it.
+// Dock -> remote: the identity of the poster for the current title. The URL is
+// only a cache key; the remote must never fetch it over Wi-Fi. Poster bytes are
+// supplied separately by the dock over ESP-NOW.
 struct __attribute__((packed)) EspNowArtworkPacket {
   uint32_t magic;
   char url[200];
 };
 static_assert(sizeof(EspNowArtworkPacket) == 204,
               "artwork layout drifted from the dock");
+
+struct __attribute__((packed)) EspNowArtworkRequestPacket {
+  uint32_t magic;
+  char url[200];
+};
+
+struct __attribute__((packed)) EspNowArtworkBeginPacket {
+  uint32_t magic;
+  uint32_t transferId;
+  uint32_t totalBytes;
+  uint32_t crc32;
+  uint16_t width;
+  uint16_t height;
+  char url[200];
+};
+
+struct __attribute__((packed)) EspNowArtworkDataPacket {
+  uint32_t magic;
+  uint32_t transferId;
+  uint32_t seq;
+  uint16_t len;
+  uint8_t data[ESPNOW_ARTWORK_CHUNK_BYTES];
+};
+
+struct __attribute__((packed)) EspNowArtworkEndPacket {
+  uint32_t magic;
+  uint32_t transferId;
+  uint32_t crc32;
+};
+
+struct __attribute__((packed)) EspNowArtworkAckPacket {
+  uint32_t magic;
+  uint32_t transferId;
+  uint32_t nextSeq;
+  uint8_t status;
+};
+
+static_assert(sizeof(EspNowArtworkBeginPacket) == 220,
+              "artwork begin exceeds ESP-NOW payload");
+static_assert(sizeof(EspNowArtworkDataPacket) == 174,
+              "artwork data exceeds proven ESP-NOW payload");
 static const uint32_t ESPNOW_CAST_SCAN_MAGIC = 0x4F524353UL;   // "ORCS"
 
 // Remote -> dock: send what is playing, now. See serviceMediaRadio().
@@ -6352,6 +6522,7 @@ static_assert(sizeof(EspNowCastListPacket) == 197,
 char castDiscoveredNames[6][32] = {};
 uint8_t castDiscoveredCount = 0;
 volatile bool castListDirty = false;
+volatile bool castListRequestPending = false;
 
 /*
   Remote -> dock: the one Chromecast the media widget is about.
@@ -6384,11 +6555,11 @@ struct __attribute__((packed)) EspNowNowPlayingPacket {
   uint8_t playing;
   uint32_t position;
   uint32_t duration;
-  char title[64];
+  char title[128];
   char subtitle[48];
   char source[24];
 };
-static_assert(sizeof(EspNowNowPlayingPacket) == 150,
+static_assert(sizeof(EspNowNowPlayingPacket) == 214,
               "now playing layout drifted from the dock");
 // Homebridge relayed through the dock. The dock is mains powered and holds its
 // Wi-Fi association open, so it can issue the HTTP call immediately, where the
@@ -6529,6 +6700,9 @@ static const int WIDGET_TILE_WIDTH = 224;
 static const int WIDGET_TILE_HEIGHT = 96;
 
 struct WidgetSettings {
+  bool weatherSolidBackground;
+  char weatherWallpaper[96];
+  char weatherExpandedWallpaper[96];
   char weatherLocation[48];
   float weatherLatitude;
   float weatherLongitude;
@@ -6537,10 +6711,16 @@ struct WidgetSettings {
   bool weatherShowRange;
   uint8_t weatherIntervalHours;
 
+  bool batterySolidBackground;
+  char batteryWallpaper[96];
+  char batteryExpandedWallpaper[96];
   bool batteryShowPercent;
   bool batteryShowVoltage;
   uint8_t batteryWarnBelow;
 
+  bool mediaSolidBackground;
+  char mediaWallpaper[96];
+  char mediaExpandedWallpaper[96];
   bool mediaUseNamedDevice;
   char mediaDeviceId[48];
   /*
@@ -6558,10 +6738,18 @@ struct WidgetSettings {
 /* Defaults must match defaultWidgetSettings() in WebConfig, so a remote that
    has never been synced draws the same thing WebConfig previews. */
 WidgetSettings widgetSettings = {
-  "", 0.0f, 0.0f, false, false, true, 6,
-  true, false, 20,
-  false, "", true, true, true
+  false, "", "", "", 0.0f, 0.0f, false, false, true, 6,
+  false, "", "", true, false, 20,
+  false, "", "", false, "", "", true, true, true
 };
+
+struct WidgetContentPanelStyle {
+  bool enabled;
+  uint32_t colour;
+  uint8_t opacity;
+};
+
+WidgetContentPanelStyle widgetContentPanels[WIDGET_KIND_COUNT] = {};
 
 struct WeatherReading {
   bool valid;
@@ -6608,7 +6796,7 @@ time_t weatherLastSlotEpoch = 0;
 struct NowPlaying {
   bool valid;
   bool playing;
-  char title[64];
+  char title[128];
   char subtitle[48];
   char source[24];
   uint32_t position;
@@ -6944,20 +7132,12 @@ char dockReportedVersion[9] = {0};
 //
 // ESP-NOW needs none of that. It needs the radio powered and parked on the
 // right channel, which is a mode change and a channel set - no AP, no DHCP, no
-// router involved at all. So the radio is brought up on demand, held briefly in
-// case more commands follow, and dropped again.
+// router involved at all. The radio is brought up on demand and dropped as
+// soon as the operation that requested it finishes.
 //
 // The channel is the catch: a dock locks onto whichever channel it first heard
 // the remote on, so standalone mode has to use that same channel rather than
 // whatever the radio defaults to. It is remembered here and in NVS.
-// 7 seconds. Long enough that a burst of presses pays the bring-up once, short
-// enough that the green outline is not still claiming a live link long after
-// the last command. In a Bluetooth activity where only volume goes through the
-// dock, most presses touch ESP-NOW not at all, so a long hold left the pill
-// green almost permanently and it stopped meaning anything.
-// Two seconds, down from seven. The dock proved fast enough to wake that the
-// long hold was buying nothing but idle radio time.
-static const uint32_t ESPNOW_ONDEMAND_HOLD_MS = 2000;
 bool espNowStandalone = false;
 unsigned long lastEspNowPsAssertMs = 0;      // We brought the radio up ourselves.
 uint8_t espNowChannel = 0;          // 0 = not yet known.
@@ -6966,7 +7146,6 @@ uint8_t espNowChannel = 0;          // 0 = not yet known.
 static const uint8_t ESPNOW_CHANNEL_MIN = 1;
 static const uint8_t ESPNOW_CHANNEL_MAX = 13;
 bool espNowRecoverChannel(const uint8_t mac[6], const uint8_t *payload, size_t len);
-unsigned long espNowHoldUntilMs = 0;
 uint32_t espNowLastBringUpMs = 0;   // Measured, so the cost is known not guessed.
 char sdStatusText[64] = "Not checked";
 
@@ -7340,6 +7519,9 @@ bool customIconUploadOk = false;
 File themeUploadFile;
 String themeUploadPath;
 bool themeUploadOk = false;
+File widgetWallpaperUploadFile;
+String widgetWallpaperUploadPath;
+bool widgetWallpaperUploadOk = false;
 File runtimeConfigUploadFile;
 bool runtimeConfigUploadStarted = false;
 bool runtimeConfigUploadOk = false;
@@ -8073,10 +8255,9 @@ unsigned long nextBatteryPageRefreshMs = 0;
 unsigned long nextSetupApStatusRefreshMs = 0;
 unsigned long brightnessLastActivityMs = 0;
 unsigned long commandFeedbackUntilMs = 0;
-// Lit green while the ESP-NOW radio is up because a command went through the
-// dock. Unlike the red flash - which is a brief acknowledgement of a keypress -
-// this holds for as long as the link does, so the pill answers "did that go via
-// the dock, and is the dock link still warm" at a glance rather than for 80ms.
+// Lit blue only while an ESP-NOW transaction owns the radio. Unlike the red
+// flash, this follows the actual dock link lifetime so the pill and dock LED
+// return to idle together.
 bool espNowCommandFeedbackActive = false;
 unsigned long espNowPulseUntilMs = 0;
 bool commandFeedbackActive = false;
@@ -8181,6 +8362,8 @@ const char *sdFolders[] = {
   "/themes",
   "/themes/Default",
   "/themes/Custom",
+  "/widgets",
+  "/widgets/Wallpapers",
   "/icons",
   "/icons/Default",
   "/icons/Custom",
@@ -8274,22 +8457,46 @@ bool mediaWidgetOnScreen();
   The poster for whatever is playing, and where it is kept.
 
   Cached on the SD card and keyed by the address it came from, so a series
-  watched night after night is fetched once and then read locally forever. The
-  fetch itself never happens on the wake path - see serviceMediaArtwork() - so
-  waking stays as quick as it is now.
+  watched night after night is transferred once and then read locally forever.
+  The dock owns all network access and sends poster bytes over ESP-NOW; this
+  remote never joins Wi-Fi to retrieve artwork.
 */
 char mediaArtUrl[200] = "";
 char mediaArtFile[48] = "";
 volatile bool mediaArtUrlChanged = false;
-bool mediaArtFetchWanted = false;
-uint32_t mediaArtNextTryMs = 0;
-uint8_t mediaArtFailures = 0;
 lv_img_dsc_t mediaArtDescriptor = {};
 uint8_t *mediaArtPixels = nullptr;
+uint8_t *mediaArtIncoming = nullptr;
+volatile bool mediaArtRequestWanted = false;
+volatile bool mediaArtRequestAwaitingDock = false;
+volatile uint32_t mediaArtRequestDeadlineMs = 0;
+uint32_t mediaArtNextRequestMs = 0;
+volatile bool mediaArtTransferActive = false;
+volatile bool mediaArtTransferComplete = false;
+volatile uint32_t mediaArtTransferId = 0;
+volatile uint32_t mediaArtTransferBytes = 0;
+volatile uint32_t mediaArtTransferTotal = 0;
+volatile uint32_t mediaArtTransferCrc = 0;
+volatile uint32_t mediaArtTransferNextSeq = 0;
+volatile uint32_t mediaArtTransferLastMs = 0;
+volatile uint16_t mediaArtTransferWidth = 0;
+volatile uint16_t mediaArtTransferHeight = 0;
+char mediaArtTransferUrl[200] = "";
+volatile uint32_t mediaArtLastCompletedId = 0;
+volatile uint32_t mediaArtLastCompletedSeq = 0;
+volatile uint32_t mediaArtLastCompletedCrc = 0;
+volatile bool mediaArtAckPending = false;
+uint8_t mediaArtAckMac[6] = {};
+volatile uint32_t mediaArtAckTransferId = 0;
+volatile uint32_t mediaArtAckNextSeq = 0;
+volatile uint8_t mediaArtAckStatus = 0;
 volatile bool nowPlayingDirty = false;
 // Printed from loop() rather than the callback: Serial from the Wi-Fi task
 // competes with the same UART the loop uses and has garbled output before.
 volatile bool nowPlayingLogWanted = false;
+volatile bool nowPlayingReplyPending = false;
+volatile uint32_t nowPlayingReplyDeadlineMs = 0;
+volatile bool espNowProbePending = false;
 volatile bool commandFeedbackWanted = false;
 volatile bool espNowCommandFeedbackWanted = false;
 void sendDockSettings();
@@ -8307,6 +8514,7 @@ void flashEspNowCommandFeedback();
 void applyEspNowPulse(bool bright);
 void serviceEspNowCommandFeedback(unsigned long now);
 bool dockOtaBusy();
+bool espNowOperationBusy();
 bool espNowDockRadioRequired();
 void applyCommandFeedbackStyle(bool active);
 void serviceDockOta(unsigned long now);
@@ -10259,7 +10467,7 @@ bool dockOtaBusy() {
 }
 
 bool espNowDockRadioRequired() {
-  return dockOtaBusy();
+  return dockOtaBusy() || (espNowRadioActive && espNowOperationBusy());
 }
 
 void scheduleNetworkShutdown(uint32_t delayMs = NETWORK_IDLE_SHUTDOWN_MS) {
@@ -13496,10 +13704,9 @@ void appendIrDeviceFileSummaries(JsonArray target) {
 // Green while the ESP-NOW radio is actually powered, white once it is not.
 //
 // Tied to the radio rather than to "a dock is paired", so the pill says
-// something true at every moment: green from the instant pairing succeeds
-// (the radio is up to do it), green through the hold after a command went via
-// the dock, and back to white when the radio is released. A pairing that is
-// merely remembered, with the radio asleep, is not something to signal.
+// something true at every moment: blue while a dock transaction is active and
+// back to white as soon as its radio is released. A pairing that is merely
+// remembered, with the radio asleep, is not something to signal.
 // True when an activity or a device page is open - that is, when a button press
 // could actually produce a command. On the activity list it is false.
 bool remoteHasActiveTarget() {
@@ -14974,19 +15181,18 @@ bool transmitIrCommand(const DeviceCommand &command) {
       if (!beginVoiceSearchHold(&command)) return false;
       delay(80);
       endVoiceSearchHold(&command);
+      nowPlayingRefreshWanted = true;
       return true;
     }
     flashCommandFeedback();
     if (sendBleHidState(command, true)) {
       delay(20);
       sendBleHidState(command, false);
+      nowPlayingRefreshWanted = true;
       return true;
     }
     return false;
   }
-  // A press is one of the few things that changes what is playing, so the
-  // widget asks the dock for a fresh status right after it.
-  nowPlayingRefreshWanted = true;
   if (command.kind == DeviceCommand::ESPNOW) {
     // Blue, not red. This command leaves via the dock, and red is reserved for
     // this remote's own emitter - the outline is what says "the dock is
@@ -15181,11 +15387,52 @@ const char *widgetKindName(uint8_t kind) {
   every field keeps its compiled default rather than being zeroed - a remote
   that has not been re-synced should still draw sensible widgets.
 */
-void applyWidgetSettingsJson(JsonObjectConst widgets) {
+uint32_t widgetWallpaperHexColour(const char *value, uint32_t fallback) {
+  if (!value || value[0] != '#' || strlen(value) != 7) return fallback;
+  char *end = nullptr;
+  unsigned long parsed = strtoul(value + 1, &end, 16);
+  return end && *end == '\0' ? (uint32_t)(parsed & 0xFFFFFFUL) : fallback;
+}
+
+void resolveWidgetWallpaperPaths(const char *backgroundId,
+                                 JsonArrayConst wallpapers,
+                                 char *compactPath, size_t compactSize,
+                                 char *expandedPath, size_t expandedSize,
+                                 WidgetContentPanelStyle &panel) {
+  compactPath[0] = '\0';
+  expandedPath[0] = '\0';
+  panel = {false, 0x303844, 128};
+  if (!backgroundId || !backgroundId[0] || strcmp(backgroundId, "theme") == 0 ||
+      strcmp(backgroundId, "solid") == 0 || wallpapers.isNull()) return;
+  for (JsonObjectConst wallpaper : wallpapers) {
+    if (strcmp(wallpaper["id"] | "", backgroundId) != 0) continue;
+    const char *compact = wallpaper["runtimePath"] | "";
+    const char *expanded = wallpaper["expandedPath"] | "";
+    if (strncmp(compact, "/widgets/Wallpapers/", 20) == 0) {
+      strlcpy(compactPath, compact, compactSize);
+    }
+    if (strncmp(expanded, "/widgets/Wallpapers/", 20) == 0) {
+      strlcpy(expandedPath, expanded, expandedSize);
+    }
+    panel.enabled = wallpaper["contentBox"] | false;
+    panel.colour = widgetWallpaperHexColour(
+      wallpaper["contentBoxColour"] | "#303844", 0x303844);
+    int transparency = constrain((int)(wallpaper["contentBoxTransparency"] | 50), 0, 100);
+    panel.opacity = (uint8_t)(((100 - transparency) * 255 + 50) / 100);
+    return;
+  }
+}
+
+void applyWidgetSettingsJson(JsonObjectConst widgets, JsonArrayConst wallpapers) {
   if (widgets.isNull()) return;
 
   JsonObjectConst weather = widgets["weather"].as<JsonObjectConst>();
   if (!weather.isNull()) {
+    widgetSettings.weatherSolidBackground = false;
+    resolveWidgetWallpaperPaths(weather["background"] | "theme", wallpapers,
+      widgetSettings.weatherWallpaper, sizeof(widgetSettings.weatherWallpaper),
+      widgetSettings.weatherExpandedWallpaper, sizeof(widgetSettings.weatherExpandedWallpaper),
+      widgetContentPanels[WIDGET_WEATHER]);
     strlcpy(widgetSettings.weatherLocation, weather["location"] | "",
             sizeof(widgetSettings.weatherLocation));
     bool hasLatitude = weather["latitude"].is<float>();
@@ -15220,6 +15467,11 @@ void applyWidgetSettingsJson(JsonObjectConst widgets) {
 
   JsonObjectConst battery = widgets["battery"].as<JsonObjectConst>();
   if (!battery.isNull()) {
+    widgetSettings.batterySolidBackground = false;
+    resolveWidgetWallpaperPaths(battery["background"] | "theme", wallpapers,
+      widgetSettings.batteryWallpaper, sizeof(widgetSettings.batteryWallpaper),
+      widgetSettings.batteryExpandedWallpaper, sizeof(widgetSettings.batteryExpandedWallpaper),
+      widgetContentPanels[WIDGET_BATTERY]);
     widgetSettings.batteryShowPercent = battery["showPercent"] | true;
     widgetSettings.batteryShowVoltage = battery["showVoltage"] | false;
     widgetSettings.batteryWarnBelow =
@@ -15228,12 +15480,20 @@ void applyWidgetSettingsJson(JsonObjectConst widgets) {
 
   JsonObjectConst media = widgets["media"].as<JsonObjectConst>();
   if (!media.isNull()) {
+    widgetSettings.mediaSolidBackground = false;
+    resolveWidgetWallpaperPaths(media["background"] | "theme", wallpapers,
+      widgetSettings.mediaWallpaper, sizeof(widgetSettings.mediaWallpaper),
+      widgetSettings.mediaExpandedWallpaper, sizeof(widgetSettings.mediaExpandedWallpaper),
+      widgetContentPanels[WIDGET_MEDIA]);
     widgetSettings.mediaUseNamedDevice = strcmp(media["source"] | "auto", "device") == 0;
     strlcpy(widgetSettings.mediaDeviceId, media["deviceId"] | "",
             sizeof(widgetSettings.mediaDeviceId));
     strlcpy(widgetSettings.mediaCastName, media["castName"] | "",
             sizeof(widgetSettings.mediaCastName));
-    widgetSettings.mediaViaDock = media["viaDock"] | true;
+    // Metadata and poster retrieval are dock-only. Older runtime files may
+    // contain viaDock:false, but direct Wi-Fi media fetching on the battery
+    // remote is no longer a supported mode.
+    widgetSettings.mediaViaDock = true;
     widgetSettings.mediaAutoExpand = media["autoExpand"] | true;
     widgetSettings.mediaArtwork = media["artwork"] | true;
   }
@@ -15822,7 +16082,7 @@ void loadRuntimeModel(JsonDocument &doc) {
   }
 
   applySettingsJson(doc["settings"]);
-  applyWidgetSettingsJson(doc["widgets"]);
+  applyWidgetSettingsJson(doc["widgets"], doc["widgetWallpapers"].as<JsonArrayConst>());
   applyRuntimeThemeRowCalibration();
   rebuildPages();
   requestPageStripRebuild();
@@ -16564,6 +16824,10 @@ bool usbWritableSdPath(const String &path) {
   // rather than a missing permission. Same read-only factory content as the
   // icons above: the wallpaper the LCD renders, its preview, and themes.json.
   if (path.startsWith("/themes/Default/") &&
+      (path.endsWith(".rgb565") || path.endsWith(".png") ||
+       path.endsWith(".jpg") || path.endsWith(".jpeg") ||
+       path.endsWith(".json"))) return true;
+  if (path.startsWith("/widgets/Wallpapers/") &&
       (path.endsWith(".rgb565") || path.endsWith(".png") ||
        path.endsWith(".jpg") || path.endsWith(".jpeg") ||
        path.endsWith(".json"))) return true;
@@ -17739,6 +18003,9 @@ bool convertWebBackupToRuntime(JsonDocument &backup, String &error) {
   if (backup["themeAssets"].is<JsonArrayConst>()) {
     if (!restoreEmbeddedFiles(backup["themeAssets"].as<JsonArrayConst>(), error)) return false;
   }
+  if (backup["widgetWallpaperAssets"].is<JsonArrayConst>()) {
+    if (!restoreEmbeddedFiles(backup["widgetWallpaperAssets"].as<JsonArrayConst>(), error)) return false;
+  }
   // Restores /devices/*.ir (and its index.txt) for file-backed Studio/IRDB
   // devices, which have no representation in runtime.json at all.
   if (backup["deviceFiles"].is<JsonArrayConst>()) {
@@ -17765,6 +18032,23 @@ bool convertWebBackupToRuntime(JsonDocument &backup, String &error) {
   runtime["activities"].set(data["activities"]);
   runtime["macros"].set(data["macros"]);
   runtime["themes"].set(data["themes"]);
+  if (data["widgets"].is<JsonArrayConst>()) {
+    JsonObject runtimeWidgets = runtime["widgets"].to<JsonObject>();
+    JsonArray runtimeWallpapers = runtime["widgetWallpapers"].to<JsonArray>();
+    for (JsonObjectConst row : data["widgets"].as<JsonArrayConst>()) {
+      const char *kind = row["kind"] | "";
+      if (strcmp(kind, "wallpaper") == 0) {
+        JsonObject target = runtimeWallpapers.add<JsonObject>();
+        target.set(row);
+        target.remove("kind");
+      } else if (strcmp(kind, "weather") == 0 ||
+                 strcmp(kind, "battery") == 0 || strcmp(kind, "media") == 0) {
+        JsonObject target = runtimeWidgets[kind].to<JsonObject>();
+        target.set(row);
+        target.remove("kind");
+      }
+    }
+  }
 
   JsonArray devicesJson = runtime["devices"].as<JsonArray>();
   JsonArrayConst learned = data["learned"].as<JsonArrayConst>();
@@ -17803,7 +18087,8 @@ bool backupCategoryIsRestorable(const char *category) {
          strcmp(category, "activities") == 0 ||
          strcmp(category, "macros") == 0 ||
          strcmp(category, "icons") == 0 ||
-         strcmp(category, "themes") == 0;
+         strcmp(category, "themes") == 0 ||
+         strcmp(category, "widgets") == 0;
 }
 
 // Merges exported items into a runtime array by id: an id already present is
@@ -17933,6 +18218,32 @@ bool restoreCategoryBackup(JsonDocument &backup, String &error) {
     // writing them back into /icons/Custom is the whole job.
     if (!restoreEmbeddedFiles(items, error)) return false;
     merged = items.size();
+  } else if (category == "widgets") {
+    JsonObject settings = runtime["widgets"].to<JsonObject>();
+    JsonArray wallpapers = runtime["widgetWallpapers"].to<JsonArray>();
+    for (JsonObjectConst item : items) {
+      const char *kind = item["kind"] | "";
+      if (strcmp(kind, "wallpaper") == 0) {
+        const char *id = item["id"] | "";
+        JsonObject destination;
+        for (JsonObject candidate : wallpapers) {
+          if (id[0] && strcmp(candidate["id"] | "", id) == 0) {
+            destination = candidate;
+            break;
+          }
+        }
+        if (destination.isNull()) destination = wallpapers.add<JsonObject>();
+        destination.set(item);
+        destination.remove("kind");
+        merged++;
+      } else if (strcmp(kind, "weather") == 0 || strcmp(kind, "battery") == 0 ||
+                 strcmp(kind, "media") == 0) {
+        JsonObject destination = settings[kind].to<JsonObject>();
+        destination.set(item);
+        destination.remove("kind");
+        merged++;
+      }
+    }
   } else {
     if (!runtime[targetKey].is<JsonArray>()) runtime[targetKey].to<JsonArray>();
     merged = mergeRuntimeItemsById(runtime[targetKey].as<JsonArray>(), items);
@@ -18009,7 +18320,7 @@ bool createLcdFullBackup(String &createdName, String &error) {
 
   const char *sourceFolders[] = {
     "/config", "/devices", "/activities", "/macros",
-    "/themes/Default", "/themes/Custom", "/icons/Custom"
+    "/themes/Default", "/themes/Custom", "/widgets/Wallpapers", "/icons/Custom"
   };
   bool assetsOk = true;
   for (const char *source : sourceFolders) {
@@ -18059,6 +18370,19 @@ bool createLcdFullBackup(String &createdName, String &error) {
   data["activities"].set(runtime["activities"]);
   data["macros"].set(runtime["macros"]);
   data["themes"].set(runtime["themes"]);
+  JsonArray widgetRows = data["widgets"].to<JsonArray>();
+  JsonObjectConst runtimeWidgets = runtime["widgets"].as<JsonObjectConst>();
+  const char *widgetKinds[] = {"weather", "battery", "media"};
+  for (const char *kind : widgetKinds) {
+    JsonObject row = widgetRows.add<JsonObject>();
+    row.set(runtimeWidgets[kind]);
+    row["kind"] = kind;
+  }
+  for (JsonObjectConst wallpaper : runtime["widgetWallpapers"].as<JsonArrayConst>()) {
+    JsonObject row = widgetRows.add<JsonObject>();
+    row.set(wallpaper);
+    row["kind"] = "wallpaper";
+  }
   JsonArray learned = data["learned"].to<JsonArray>();
   for (JsonObjectConst device : runtime["devices"].as<JsonArrayConst>()) {
     String source = device["source"] | "";
@@ -18075,6 +18399,8 @@ bool createLcdFullBackup(String &createdName, String &error) {
   JsonArray themeAssets = backup["themeAssets"].to<JsonArray>();
   embedSdFilesAsBase64(themeAssets, "/themes/Default");
   embedSdFilesAsBase64(themeAssets, "/themes/Custom");
+  JsonArray widgetWallpaperAssets = backup["widgetWallpaperAssets"].to<JsonArray>();
+  embedSdFilesAsBase64(widgetWallpaperAssets, "/widgets/Wallpapers");
   // File-backed devices (OpenRemote Studio / IRDB imports) exist only as
   // /devices/*.ir files - appendIrDeviceFileSummaries() above puts their
   // *metadata* in data.devices so a restore can list them, but the summary
@@ -18124,7 +18450,7 @@ bool restoreNativeBackupAssets(const String &assetsPath, String &error) {
   }
   const char *targets[] = {
     "/config", "/devices", "/activities", "/macros",
-    "/themes/Default", "/themes/Custom", "/icons/Custom"
+    "/themes/Default", "/themes/Custom", "/widgets/Wallpapers", "/icons/Custom"
   };
   for (const char *target : targets) {
     String source = assetsPath + target;
@@ -19002,7 +19328,7 @@ void handleChunkUploadFinish() {
 bool performFactoryReset() {
   const char *userFolders[] = {
     "/config", "/devices", "/activities", "/macros",
-    "/icons/Custom", "/themes/Custom", "/logs", "/tmp"
+    "/icons/Custom", "/themes/Custom", "/widgets/Wallpapers", "/logs", "/tmp"
   };
   for (const char *folder : userFolders) deleteSdTree(folder);
   bool ok = true;
@@ -19464,6 +19790,7 @@ void appendEspNowDeviceListJson(JsonArray target) {
 void probeEspNowDocks() {
   if (!espNowEnabled || espNowDeviceCount == 0) return;
   if (!ensureEspNowLink()) return;
+  espNowProbePending = true;
   uint8_t ping[5];
   uint32_t pingMagic = ESPNOW_DOCK_PING_MAGIC;
   memcpy(ping, &pingMagic, sizeof(pingMagic));
@@ -19480,6 +19807,7 @@ void probeEspNowDocks() {
     delay(10);
     serviceUiDuringLongHttpTransfer();
   }
+  espNowProbePending = false;
 }
 
 // Accepts a dock .bin upload and stores it on the SD card. Validated on the way
@@ -19663,28 +19991,21 @@ void handleCastScanApi() {
     return;
   }
   castListDirty = false;
+  castListRequestPending = true;
   EspNowCastScanPacket packet = {};
   packet.magic = ESPNOW_CAST_SCAN_MAGIC;
   for (uint8_t i = 0; i < espNowDeviceCount; i++) {
     sendEspNowWithRetry(espNowDevices[i].mac, (const uint8_t *)&packet, sizeof(packet));
   }
-  /*
-    Wait for the reply, holding the radio open for the whole wait.
-
-    An mDNS query on the dock takes a second or two and its answer comes back
-    through the dock's loop, so this has to wait. The catch is that the ESP-NOW
-    radio is on demand and its hold is about two seconds: without refreshing it
-    the radio shut down mid-wait, the dock's reply landed on a receiver that
-    was no longer listening, and the scan returned an empty list while the dock
-    logged "reported 6 name(s) to the remote". ensureEspNowLink() re-arms the
-    hold each time round, which is exactly what it is for.
-  */
+  // The explicit pending flag keeps the radio only until the mDNS result
+  // returns. A Chromecast scan can take several seconds, so this cannot be a
+  // fire-and-forget send, but it also must not leave a timed radio hold behind.
   unsigned long until = millis() + 6000;
   while (!castListDirty && (long)(millis() - until) < 0) {
-    ensureEspNowLink();
     delay(20);
     serviceUiDuringLongHttpTransfer();
   }
+  castListRequestPending = false;
   JsonDocument doc;
   doc["ok"] = true;
   doc["scanned"] = castListDirty;
@@ -19763,8 +20084,7 @@ void handleEspNowScanStartApi() {
     return;
   }
   if (!startEspNowScan()) {
-    sendJson(409, "{\"ok\":false,\"error\":\"ESP-NOW is disabled, or Wi-Fi station "
-                  "isn't available right now (e.g. the setup AP is active)\"}");
+    sendJson(409, "{\"ok\":false,\"error\":\"The ESP-NOW pairing radio could not be started\"}");
     return;
   }
   char body[80];
@@ -20003,6 +20323,38 @@ String sanitizeThemeFileName(String name) {
   return output.length() > 4 ? output : (jpeg ? "theme.jpg" : (png ? "theme.png" : "theme.rgb565"));
 }
 
+/*
+  Widget assets include a generated ID plus `_expanded.rgb565`. The theme
+  filename limit is deliberately shorter and clipped that suffix from normal
+  36-character generated IDs, so the expanded image was mistaken for a
+  compact image and failed its exact-size check. Widget runtime paths have
+  room for 72 safe filename characters; keep the complete supported suffix.
+*/
+String sanitizeWidgetWallpaperFileName(String name) {
+  String lowerName = name;
+  lowerName.toLowerCase();
+  bool jpeg = lowerName.endsWith(".jpg") || lowerName.endsWith(".jpeg");
+  bool png = lowerName.endsWith(".png");
+  String output;
+  output.reserve(76);
+  for (size_t i = 0; i < name.length() && output.length() < 72; i++) {
+    char c = name[i];
+    if (isalnum((unsigned char)c) || c == '-' || c == '_') output += c;
+    else if (c == '.') output += c;
+  }
+  String lowerOutput = output;
+  lowerOutput.toLowerCase();
+  if (jpeg) {
+    if (!(lowerOutput.endsWith(".jpg") || lowerOutput.endsWith(".jpeg"))) output += ".jpg";
+  } else if (png) {
+    if (!lowerOutput.endsWith(".png")) output += ".png";
+  } else if (!lowerOutput.endsWith(".rgb565")) {
+    output += ".rgb565";
+  }
+  return output.length() > 4 ? output
+    : (jpeg ? "widget.jpg" : (png ? "widget.png" : "widget.rgb565"));
+}
+
 void handleThemeUploadData() {
   HTTPUpload &upload = webServer.upload();
   if (upload.status == UPLOAD_FILE_START) {
@@ -20042,6 +20394,75 @@ void handleThemeUploadData() {
     SD.remove("/tmp/theme.upload");
     themeUploadOk = false;
   }
+}
+
+void handleWidgetWallpaperUploadData() {
+  HTTPUpload &upload = webServer.upload();
+  if (upload.status == UPLOAD_FILE_START) {
+    widgetWallpaperUploadOk = requestAuthorized() && sdReady &&
+      createSdFolderIfMissing("/widgets") &&
+      createSdFolderIfMissing("/widgets/Wallpapers");
+    String requestedName = webServer.arg("name");
+    if (!requestedName.length()) requestedName = upload.filename;
+    widgetWallpaperUploadPath = String("/widgets/Wallpapers/") +
+      sanitizeWidgetWallpaperFileName(requestedName);
+    SD.remove("/tmp/widget_wallpaper.upload");
+    if (widgetWallpaperUploadOk) {
+      widgetWallpaperUploadFile = SD.open("/tmp/widget_wallpaper.upload", FILE_WRITE);
+    }
+    widgetWallpaperUploadOk = widgetWallpaperUploadOk && (bool)widgetWallpaperUploadFile;
+  } else if (upload.status == UPLOAD_FILE_WRITE && widgetWallpaperUploadOk) {
+    widgetWallpaperUploadOk =
+      widgetWallpaperUploadFile.write(upload.buf, upload.currentSize) == upload.currentSize;
+    serviceUiDuringLongHttpTransfer();
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (widgetWallpaperUploadFile) widgetWallpaperUploadFile.close();
+    String lowerPath = widgetWallpaperUploadPath;
+    lowerPath.toLowerCase();
+    bool validSize = upload.totalSize > 0;
+    if (lowerPath.endsWith(".rgb565")) {
+      const size_t compactBytes = (size_t)WIDGET_TILE_WIDTH * WIDGET_TILE_HEIGHT * 2;
+      const size_t expandedBytes = (size_t)228 * 268 * 2;
+      validSize = lowerPath.endsWith("_expanded.rgb565")
+        ? upload.totalSize == expandedBytes
+        : upload.totalSize == compactBytes;
+    }
+    widgetWallpaperUploadOk = widgetWallpaperUploadOk && validSize;
+    if (widgetWallpaperUploadOk) {
+      SD.remove(widgetWallpaperUploadPath);
+      widgetWallpaperUploadOk =
+        SD.rename("/tmp/widget_wallpaper.upload", widgetWallpaperUploadPath);
+    } else {
+      SD.remove("/tmp/widget_wallpaper.upload");
+    }
+  } else if (upload.status == UPLOAD_FILE_ABORTED) {
+    if (widgetWallpaperUploadFile) widgetWallpaperUploadFile.close();
+    SD.remove("/tmp/widget_wallpaper.upload");
+    widgetWallpaperUploadOk = false;
+  }
+}
+
+void handleWidgetWallpaperDelete() {
+  if (!requestAuthorized()) {
+    sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
+    return;
+  }
+  String id = webServer.arg("id");
+  String safe;
+  for (size_t i = 0; i < id.length() && safe.length() < 42; i++) {
+    char c = id[i];
+    if (isalnum((unsigned char)c) || c == '-' || c == '_') safe += c;
+  }
+  if (!safe.length()) {
+    sendJson(400, "{\"ok\":false,\"error\":\"Invalid wallpaper id\"}");
+    return;
+  }
+  String base = String("/widgets/Wallpapers/") + safe;
+  SD.remove(base + ".rgb565");
+  SD.remove(base + "_expanded.rgb565");
+  SD.remove(base + ".png");
+  SD.remove(base + "_source.png");
+  sendJson(200, "{\"ok\":true}");
 }
 
 void handleCustomIconDelete() {
@@ -20320,6 +20741,43 @@ void handleHomebridgeDiscover() {
                 (unsigned)readOnlySkipped, truncated ? ", LIST TRUNCATED" : "");
   saveHomebridgeCredentials(address, username, password);
   homebridgeToken = token;
+  String body;
+  serializeJson(response, body);
+  sendJson(200, body);
+}
+
+void handleHomebridgeConfigApi() {
+  if (!requestAuthorized()) {
+    sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
+    return;
+  }
+  JsonDocument request(&psramJsonAllocator);
+  if (deserializeJson(request, webServer.arg("plain"))) {
+    sendJson(400, "{\"ok\":false,\"error\":\"Invalid Homebridge request\"}");
+    return;
+  }
+  String address = normaliseHomebridgeAddress(
+    String((const char *)(request["address"] | homebridgeAddress.c_str())));
+  String username = String((const char *)(request["username"] | homebridgeUsername.c_str()));
+  String password = request["password"].is<const char *>()
+    ? String((const char *)(request["password"] | "")) : homebridgePassword;
+  address.trim();
+  username.trim();
+  if (!address.length() || !username.length()) {
+    sendJson(400, "{\"ok\":false,\"error\":\"Enter the Homebridge address and username\"}");
+    return;
+  }
+  saveHomebridgeCredentials(address, username, password);
+  homebridgeViaDock = request["viaDock"] | homebridgeViaDock;
+  preferences.begin(PREFERENCES_NAMESPACE, false);
+  preferences.putBool("hbViaDock", homebridgeViaDock);
+  preferences.end();
+  homebridgeToken = "";
+  if (homebridgeViaDock) homebridgeConfigPushWanted = true;
+
+  JsonDocument response;
+  response["ok"] = true;
+  response["configured"] = true;
   String body;
   serializeJson(response, body);
   sendJson(200, body);
@@ -20609,6 +21067,27 @@ void handleMqttStatusApi() {
   sendJson(200, body);
 }
 
+void handleMqttConnectApi() {
+  if (!requestAuthorized()) {
+    sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
+    return;
+  }
+  bool wasConnected = mqttClient.connected();
+  String error;
+  bool connected = mqttConnectDirect(error);
+  JsonDocument response;
+  response["ok"] = connected;
+  response["connected"] = connected;
+  if (!connected) response["error"] = error;
+  String body;
+  serializeJson(response, body);
+  sendJson(connected ? 200 : 502, body);
+  if (connected && !wasConnected) {
+    mqttClient.disconnect();
+    releaseMqttRadio();
+  }
+}
+
 /* Publishes a one-off topic/payload so the broker settings can be proved
    from WebConfig without first building a device and putting it on a page. */
 void handleMqttTestApi() {
@@ -20659,14 +21138,18 @@ void handleHomebridgeStatus() {
   // already treats an empty password as "use the saved one", but WebConfig had
   // no way to know that was on offer, so it asked for it again every time.
   response["passwordSaved"] = homebridgePassword.length() > 0;
+  response["viaDock"] = homebridgeViaDock;
   response["connected"] = false;
-  if (response["configured"].as<bool>() && WiFi.status() == WL_CONNECTED) {
+  if (response["configured"].as<bool>() && ensureStationConnected()) {
     String raw;
     String error;
     int status = 0;
     response["connected"] = homebridgeAuthorizedRequest(
       "GET", "/api/auth/check", "", raw, status, error);
     if (!response["connected"].as<bool>()) response["error"] = error;
+    scheduleNetworkShutdown();
+  } else if (response["configured"].as<bool>()) {
+    response["error"] = "Could not connect OpenRemote to its saved Wi-Fi network";
   }
   String body;
   serializeJson(response, body);
@@ -20818,7 +21301,9 @@ void configureWebServer() {
   webServer.on("/api/homeassistant/discover", HTTP_POST, handleHomeAssistantDiscover);
   webServer.on("/api/mqtt/config", HTTP_POST, handleMqttConfigApi);
   webServer.on("/api/mqtt/status", HTTP_GET, handleMqttStatusApi);
+  webServer.on("/api/mqtt/connect", HTTP_POST, handleMqttConnectApi);
   webServer.on("/api/mqtt/test", HTTP_POST, handleMqttTestApi);
+  webServer.on("/api/homebridge/config", HTTP_POST, handleHomebridgeConfigApi);
   webServer.on("/api/homebridge/discover", HTTP_POST, handleHomebridgeDiscover);
   webServer.on("/api/homebridge/status", HTTP_GET, handleHomebridgeStatus);
   webServer.on("/api/homebridge/control", HTTP_POST, handleHomebridgeControl);
@@ -20878,6 +21363,14 @@ void configureWebServer() {
                     ? String("{\"ok\":true,\"path\":\"") + themeUploadPath + "\"}"
                     : "{\"ok\":false,\"error\":\"Theme upload failed\"}");
   }, handleThemeUploadData);
+  webServer.on("/api/widget-wallpapers", HTTP_POST, []() {
+    if (!requestAuthorized()) webServer.send(403, "application/json", "{\"ok\":false}");
+    else sendJson(widgetWallpaperUploadOk ? 200 : 400,
+                  widgetWallpaperUploadOk
+                    ? String("{\"ok\":true,\"path\":\"") + widgetWallpaperUploadPath + "\"}"
+                    : "{\"ok\":false,\"error\":\"Widget Wallpaper upload failed\"}");
+  }, handleWidgetWallpaperUploadData);
+  webServer.on("/api/widget-wallpapers", HTTP_DELETE, handleWidgetWallpaperDelete);
   webServer.on("/api/irdb/search", HTTP_GET, handleIrdbSearch);
   webServer.on("/api/irdb/detail", HTTP_GET, handleIrdbDetail);
   webServer.on("/api/irdb", HTTP_GET, handleIrdbDownload);
@@ -20933,6 +21426,7 @@ void configureWebServer() {
   }, handleWebConfigUploadData);
   webServer.serveStatic("/icons/", SD, "/icons/", "max-age=300");
   webServer.serveStatic("/themes/", SD, "/themes/", "max-age=300");
+  webServer.serveStatic("/widgets/", SD, "/widgets/", "max-age=300");
   // WebConfig's own "Backup All Categories" builds its JSON entirely in the
   // browser, so it can only embed what it can actually fetch. Icons and
   // themes were already reachable this way; /devices was not, which is why a
@@ -21289,14 +21783,130 @@ void espNowRegisterAllPeers() {
 // Armed while espNowScanActive (pairing) or rfLearnActive (RF433 capture) -
 // outside those two explicit, user-initiated windows incoming ESP-NOW
 // frames are ignored entirely, so this never touches command traffic.
+void sendArtworkAckFromCallback(const uint8_t mac[6], uint32_t transferId,
+                                uint32_t nextSeq, uint8_t status) {
+  EspNowArtworkAckPacket ack = {};
+  ack.magic = ESPNOW_ARTWORK_ACK_MAGIC;
+  ack.transferId = transferId;
+  ack.nextSeq = nextSeq;
+  ack.status = status;
+  // Non-blocking and safe on the Wi-Fi task. The dock waits before sending the
+  // next chunk and resends the same chunk if this packet is lost, so no retry
+  // loop or logging belongs in the callback.
+  if (esp_now_send(mac, (const uint8_t *)&ack, sizeof(ack)) != ESP_OK) {
+    // A full Wi-Fi TX queue is temporary. Preserve the cumulative ACK for the
+    // main loop; the dock's duplicate packet will also give this callback a
+    // fresh chance without losing or duplicating image bytes.
+    memcpy(mediaArtAckMac, mac, sizeof(mediaArtAckMac));
+    mediaArtAckTransferId = transferId;
+    mediaArtAckNextSeq = nextSeq;
+    mediaArtAckStatus = status;
+    mediaArtAckPending = true;
+  }
+}
+
 void onEspNowDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
   if (!info || !info->src_addr || !data) return;
+
+  bool fromPairedDock = findEspNowDeviceIndexByMac(info->src_addr) >= 0;
+  uint32_t incomingMagic = 0;
+  if ((size_t)len >= sizeof(incomingMagic)) {
+    memcpy(&incomingMagic, data, sizeof(incomingMagic));
+  }
+
+  // Assemble the transfer in memory here; SD and LVGL remain on loop(). The
+  // dock waits for each acknowledgement, so duplicates and reordering are
+  // handled by replying with the next sequence number still required.
+  if (fromPairedDock && incomingMagic == ESPNOW_ARTWORK_BEGIN_MAGIC &&
+      (size_t)len >= sizeof(EspNowArtworkBeginPacket)) {
+    mediaArtRequestAwaitingDock = false;
+    EspNowArtworkBeginPacket begin;
+    memcpy(&begin, data, sizeof(begin));
+    begin.url[sizeof(begin.url) - 1] = '\0';
+    bool accepted = mediaArtIncoming &&
+                    begin.width == ESPNOW_ARTWORK_DIMENSION &&
+                    begin.height == ESPNOW_ARTWORK_DIMENSION &&
+                    begin.totalBytes == (uint32_t)begin.width * begin.height * 2U &&
+                    strcmp(begin.url, mediaArtUrl) == 0;
+    if (accepted) {
+      mediaArtTransferId = begin.transferId;
+      mediaArtTransferBytes = 0;
+      mediaArtTransferTotal = begin.totalBytes;
+      mediaArtTransferCrc = begin.crc32;
+      mediaArtTransferNextSeq = 0;
+      mediaArtTransferWidth = begin.width;
+      mediaArtTransferHeight = begin.height;
+      mediaArtTransferLastMs = millis();
+      strlcpy(mediaArtTransferUrl, begin.url, sizeof(mediaArtTransferUrl));
+      mediaArtTransferComplete = false;
+      mediaArtTransferActive = true;
+      mediaArtRequestWanted = false;
+    }
+    sendArtworkAckFromCallback(info->src_addr, begin.transferId, 0,
+                               accepted ? 0 : 2);
+    return;
+  }
+
+  if (fromPairedDock && incomingMagic == ESPNOW_ARTWORK_DATA_MAGIC &&
+      (size_t)len >= offsetof(EspNowArtworkDataPacket, data)) {
+    EspNowArtworkDataPacket packet = {};
+    size_t copied = min((size_t)len, sizeof(packet));
+    memcpy(&packet, data, copied);
+    bool valid = mediaArtTransferActive && mediaArtIncoming &&
+                 packet.transferId == mediaArtTransferId &&
+                 packet.len <= ESPNOW_ARTWORK_CHUNK_BYTES &&
+                 (size_t)len >= offsetof(EspNowArtworkDataPacket, data) + packet.len;
+    if (valid) mediaArtTransferLastMs = millis();
+    if (valid && packet.seq == mediaArtTransferNextSeq &&
+        mediaArtTransferBytes + packet.len <= mediaArtTransferTotal) {
+      memcpy(mediaArtIncoming + mediaArtTransferBytes, packet.data, packet.len);
+      mediaArtTransferBytes += packet.len;
+      mediaArtTransferNextSeq++;
+    }
+    sendArtworkAckFromCallback(info->src_addr, packet.transferId,
+                               mediaArtTransferNextSeq, valid ? 0 : 2);
+    return;
+  }
+
+  if (fromPairedDock && incomingMagic == ESPNOW_ARTWORK_END_MAGIC &&
+      (size_t)len >= sizeof(EspNowArtworkEndPacket)) {
+    EspNowArtworkEndPacket end;
+    memcpy(&end, data, sizeof(end));
+    bool complete = mediaArtTransferActive && mediaArtIncoming &&
+                    end.transferId == mediaArtTransferId &&
+                    mediaArtTransferBytes == mediaArtTransferTotal &&
+                    end.crc32 == mediaArtTransferCrc;
+    if (complete) {
+      uint32_t crc = 0xffffffffUL;
+      crc = esp_rom_crc32_le(crc, mediaArtIncoming, mediaArtTransferTotal);
+      crc ^= 0xffffffffUL;
+      complete = crc == mediaArtTransferCrc;
+    }
+    bool duplicateCompletion = !mediaArtTransferActive &&
+                               end.transferId == mediaArtLastCompletedId &&
+                               end.crc32 == mediaArtLastCompletedCrc;
+    if (complete) {
+      mediaArtTransferActive = false;
+      mediaArtTransferComplete = true;
+      mediaArtLastCompletedId = end.transferId;
+      mediaArtLastCompletedSeq = mediaArtTransferNextSeq;
+      mediaArtLastCompletedCrc = end.crc32;
+    } else if (!duplicateCompletion) {
+      mediaArtTransferActive = false;
+      mediaArtRequestWanted = true;
+    }
+    sendArtworkAckFromCallback(
+      info->src_addr, end.transferId,
+      duplicateCompletion ? mediaArtLastCompletedSeq : mediaArtTransferNextSeq,
+      (complete || duplicateCompletion) ? 1 : 2);
+    return;
+  }
 
   // A firmware ack from the dock we are currently updating. Checked before the
   // scan and learn windows because a transfer can be running while neither is
   // open, and only ever accepted from the dock this transfer is addressed to.
   if ((size_t)len >= sizeof(EspNowArtworkPacket) &&
-      findEspNowDeviceIndexByMac(info->src_addr) >= 0) {
+      fromPairedDock) {
     uint32_t magic = 0;
     memcpy(&magic, data, sizeof(magic));
     if (magic == ESPNOW_ARTWORK_MAGIC) {
@@ -21324,6 +21934,7 @@ void onEspNowDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int 
         strlcpy(castDiscoveredNames[i], packet.names[i], sizeof(castDiscoveredNames[i]));
       }
       castListDirty = true;
+      castListRequestPending = false;
       return;
     }
   }
@@ -21346,7 +21957,8 @@ void onEspNowDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int 
       packet.title[sizeof(packet.title) - 1] = '\0';
       packet.subtitle[sizeof(packet.subtitle) - 1] = '\0';
       packet.source[sizeof(packet.source) - 1] = '\0';
-      nowPlaying.valid = packet.valid != 0;
+      bool explicitSettledEmpty = packet.valid == 2;
+      nowPlaying.valid = packet.valid == 1;
       nowPlaying.playing = packet.playing != 0;
       nowPlaying.position = packet.position;
       nowPlaying.duration = packet.duration;
@@ -21356,6 +21968,11 @@ void onEspNowDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int 
       strlcpy(nowPlaying.source, packet.source, sizeof(nowPlaying.source));
       nowPlayingDirty = true;   // Repainted from loop(): LVGL is not this task's.
       nowPlayingLogWanted = true;
+      // A valid record completes metadata. Value 2 is the dock's explicit
+      // confirmation that its fresh target/app scan found nothing playing.
+      // A transient unsolicited zero cannot prematurely close a wake request.
+      if (nowPlaying.valid || explicitSettledEmpty)
+        nowPlayingReplyPending = false;
       return;
     }
   }
@@ -21574,7 +22191,6 @@ void onEspNowDataSent(const wifi_tx_info_t *info, esp_now_send_status_t status) 
 // Brings ESP-NOW up without associating to anything, and reports how long it
 // took. Returns false only if the radio itself refuses.
 bool ensureEspNowLink() {
-  espNowHoldUntilMs = millis() + ESPNOW_ONDEMAND_HOLD_MS;
   if (espNowRadioActive) return true;
   if (!espNowEnabled || espNowDeviceCount == 0) return false;
 
@@ -21668,10 +22284,9 @@ void startEspNow() {
   // permanent: a station defaults to WIFI_PS_MIN_MODEM and duty-cycles its
   // radio, and ESP-NOW has no AP buffering anything that arrives during a nap.
   // The remote IS battery powered, so this is not left on - it is turned off
-  // only while the ESP-NOW radio is up, which under the on-demand hold is
-  // about seven seconds at a time, and restored in stopEspNow(). That is a
-  // negligible amount of awake time against a real gain in how reliably
-  // pairing announcements and dock replies are heard.
+  // only while an explicit ESP-NOW operation owns the radio, and restored in
+  // stopEspNow(). This keeps pairing announcements and dock replies reliable
+  // without leaving a timed warm-link period behind.
   esp_wifi_set_ps(WIFI_PS_NONE);
   applyEspNowTxPower();
   espNowRadioActive = true;
@@ -21746,7 +22361,7 @@ void startEspNow() {
 // it becomes false in stopEspNow(), the same moment the link-down packet has
 // been sent, so both ends stop showing the link at the same instant rather
 // than one of them guessing.
-static const uint32_t DOCK_LINK_ACK_GRACE_MS = 5000;   // Comfortably over the 2s hold.
+static const uint32_t DOCK_LINK_ACK_GRACE_MS = 5000;
 
 bool dockConnected() {
   if (!espNowEnabled || espNowDeviceCount == 0 || !espNowRadioActive) return false;
@@ -21761,7 +22376,8 @@ void sendDockSettings() {
   packet.magic = ESPNOW_DOCK_SETTINGS_MAGIC;
   packet.rfEnabled = dockRfEnabled ? 1 : 0;
   packet.ledOnTransmit = dockLedOnTransmit ? 1 : 0;
-  esp_now_send(espNowDevices[0].mac, (const uint8_t *)&packet, sizeof(packet));
+  sendEspNowWithRetry(espNowDevices[0].mac,
+                      (const uint8_t *)&packet, sizeof(packet));
   Serial.printf("Dock settings sent: RF=%s LED=%s\n",
                 dockRfEnabled ? "on" : "off", dockLedOnTransmit ? "on" : "off");
 }
@@ -21815,12 +22431,12 @@ void serviceEspNowLinkLog(unsigned long now) {
     lastActive = espNowRadioActive;
     nextMs = now + 10000UL;
     Serial.printf("ESP-NOW link: active=%s standalone=%s channel=%u dockOnline=%s "
-                  "holdMsLeft=%ld enabled=%s paired=%u\n",
+                  "busy=%s enabled=%s paired=%u\n",
                   espNowRadioActive ? "yes" : "no",
                   espNowStandalone ? "yes" : "no",
                   (unsigned)espNowChannel,
                   dockLinkOnline ? "yes" : "no",
-                  (long)(espNowHoldUntilMs - now),
+                  espNowOperationBusy() ? "yes" : "no",
                   espNowEnabled ? "yes" : "no",
                   (unsigned)espNowDeviceCount);
   }
@@ -21839,6 +22455,14 @@ void serviceDockLink(unsigned long now) {
   // its LED out and the pill has to say the same thing.
   if (!espNowRadioActive) return;
   if (dockOtaBusy()) return;  // A running transfer is its own proof.
+  // Metadata replies and acknowledged poster chunks already prove the link.
+  // A keepalive's send retry can invoke channel recovery after one collision;
+  // doing that in the middle of a poster moves the remote away from the dock
+  // and is exactly what made transfers stop at seemingly random chunks.
+  if (nowPlayingReplyPending || mediaArtRequestAwaitingDock ||
+      mediaArtTransferActive || mediaArtTransferComplete ||
+      mediaArtAckPending ||
+      (mediaArtRequestWanted && mediaWidgetOnScreen())) return;
   if ((int32_t)(now - dockNextPingMs) < 0) return;
   // Every 3 seconds, and retried like any other send. The dock puts its LED
   // out after 9 seconds of hearing nothing, so at the old fire-and-forget
@@ -21935,8 +22559,19 @@ void stopEspNow() {
 // Puts the radio away, telling the dock first so its LED goes out at the same
 // moment rather than some seconds later on a timeout.
 //
-// Refuses while a transfer, scan or learn is running - those own the radio and
-// losing it mid-way would abandon real work.
+// Every reason to keep the link is an actual in-flight transaction. There is
+// no warm-link timer: when this returns false the radio can go down now.
+bool espNowOperationBusy() {
+  return espNowSendWaiting || espNowScanActive || rfLearnActive ||
+         dockOtaBusy() || dockPairAckRetriesLeft ||
+         homebridgeDockPending || mqttDockPending || haDockPending ||
+         espNowProbePending || castListRequestPending ||
+         nowPlayingReplyPending || mediaArtUrlChanged ||
+         mediaArtRequestAwaitingDock || mediaArtTransferActive ||
+         mediaArtTransferComplete || mediaArtAckPending ||
+         (mediaArtRequestWanted && mediaWidgetOnScreen());
+}
+
 void releaseEspNowLink(const char *reason) {
   // espNowRadioActive is what actually costs memory and battery - the ESP-NOW
   // protocol stack's own peer table and buffers - whether this session brought
@@ -21950,12 +22585,7 @@ void releaseEspNowLink(const char *reason) {
   // indefinitely once a WebConfig visit had brought ESP-NOW up, and why a
   // firmware upload during that same visit never got the memory back either.
   if (!espNowRadioActive) return;
-  // A Homebridge command in flight is waiting on the dock's reply, which
-  // arrives over this radio. Dropping it mid-wait would lose the verdict and
-  // report a failure for a command that actually succeeded. It happens to be
-  // safe today because the sender blocks loop(), but relying on that is the
-  // kind of accident that breaks the moment the wait becomes non-blocking.
-  if (espNowScanActive || rfLearnActive || dockOtaBusy() || homebridgeDockPending) return;
+  if (espNowOperationBusy()) return;
   if (espNowDeviceCount > 0) {
     // Retried, not fired blindly. This one packet is what puts the dock's LED
     // out at the same instant the pill goes white; if it is lost the dock
@@ -21967,17 +22597,16 @@ void releaseEspNowLink(const char *reason) {
   }
   stopEspNow();
   espNowStandalone = false;
-  espNowHoldUntilMs = 0;
-  if (!networkStackActive && WiFi.getMode() != WIFI_OFF) WiFi.mode(WIFI_OFF);
+  // A setup access point also has networkStackActive=false. Do not mistake
+  // that for an otherwise-idle radio and tear WebConfig down when a pairing
+  // scan ends.
+  if (!networkStackActive && !setupApActive && WiFi.getMode() != WIFI_OFF) {
+    WiFi.mode(WIFI_OFF);
+  }
   Serial.printf("ESP-NOW: link released (%s)\n", reason);
 }
 
 void serviceEspNow(unsigned long now) {
-  // WebConfig's dock controls need the link, and this is the one place that
-  // runs whether or not the radio is currently up - serviceDockLink(), where
-  // this refresh used to live, returns early while the radio is down and so
-  // could never bring it back for the QR page.
-
   // Power save re-asserted while the radio is up, not just once at start-up.
   // esp_wifi_set_ps(WIFI_PS_NONE) is applied in startEspNow(), but the station
   // re-associating puts the Arduino default WIFI_PS_MIN_MODEM back - and a
@@ -21990,39 +22619,26 @@ void serviceEspNow(unsigned long now) {
     lastEspNowPsAssertMs = now;
     esp_wifi_set_ps(WIFI_PS_NONE);
   }
-  bool holding = (int32_t)(now - espNowHoldUntilMs) < 0;
-  bool shouldBeActive = espNowEnabled && networkStackActive && !setupApActive &&
-                        WiFi.getMode() != WIFI_OFF;
-  // "holding" is what makes this on-demand rather than always-on. Without it,
-  // 3.80's release-on-hold-expiry fought this auto-start: with the Wi-Fi
-  // station up, shouldBeActive is true purely because Wi-Fi is connected, so
-  // every release below was undone by a startEspNow() on the very next loop
-  // tick - an esp_now_init/deinit cycle every few microseconds for as long as
-  // Wi-Fi stayed connected. Requiring the hold means the radio comes up when
-  // something actually asked for it (ensureEspNowLink sets the hold before
-  // starting) and stays down otherwise, which is the on-demand rule the
-  // whole design rests on.
-  if (shouldBeActive && !espNowRadioActive && holding) {
-    startEspNow();
-  } else if (!shouldBeActive && espNowRadioActive && !espNowStandalone) {
+  if (nowPlayingReplyPending &&
+      (int32_t)(now - nowPlayingReplyDeadlineMs) >= 0) {
+    nowPlayingReplyPending = false;
+    Serial.println("Media: dock metadata reply timed out");
+  }
+  if (mediaArtRequestAwaitingDock &&
+      (int32_t)(now - mediaArtRequestDeadlineMs) >= 0) {
+    mediaArtRequestAwaitingDock = false;
+    mediaArtNextRequestMs = now + 5000UL;
+    Serial.println("Artwork: dock did not begin the transfer");
+  }
+
+  bool stationUnavailable = !espNowStandalone &&
+    (!networkStackActive || setupApActive || WiFi.getMode() == WIFI_OFF);
+  if (espNowRadioActive && (!espNowEnabled || stationUnavailable)) {
     stopEspNow();
   }
 
-  // Gated on espNowRadioActive, not espNowStandalone. Whenever ESP-NOW rides
-  // an already-up Wi-Fi station - any time the station happens to be
-  // connected for some other reason, which is common and has nothing to do
-  // with the dock - espNowStandalone is never set, so gating on it meant the
-  // 7 second hold could never fire at all in that case: the link stayed up
-  // indefinitely with no timeout, and the only thing that ever tore it down
-  // was display sleep forcing a release through. That is exactly "only turns
-  // off when the screen does" - the hold was never actually being tried.
-  // releaseEspNowLink() is itself already safe to call here regardless of
-  // how the link came up: it only touches Wi-Fi's own mode when NOT riding
-  // the station, so this cannot disturb a station the remote needs for
-  // something else.
-  if (espNowRadioActive && !holding && !espNowScanActive && !rfLearnActive &&
-      !dockOtaBusy() && !homebridgeDockPending) {
-    releaseEspNowLink("hold expired");
+  if (espNowRadioActive && !espNowOperationBusy()) {
+    releaseEspNowLink("operation complete");
   }
   if (espNowScanActive && now - espNowScanStartedMs >= ESPNOW_SCAN_TIMEOUT_MS) {
     espNowScanActive = false;
@@ -22092,11 +22708,78 @@ bool startEspNowScan() {
     Serial.println("ESP-NOW: cannot scan, feature disabled in Settings");
     return false;
   }
-  if (!networkStackActive || setupApActive) {
-    Serial.println("ESP-NOW: cannot scan while Wi-Fi station is unavailable");
-    return false;
+  // Bring the radio up if it isn't already. The dock walks channels 1-13
+  // during its pairing window, so the remote only needs to be listening on
+  // any channel - no Wi-Fi association is required. This is what lets a
+  // fresh or disconnected remote pair a dock from the LCD.
+  if (!espNowRadioActive) {
+    if (setupApActive) {
+      /*
+        Keep the captive WebConfig AP alive and add the station interface that
+        this firmware's ESP-NOW peers use. The AP pins one channel and the dock
+        deliberately sweeps every channel, so there is no need to disconnect,
+        retune or wait for a normal Wi-Fi association.
+      */
+      wifi_mode_t mode = WiFi.getMode();
+      if (mode == WIFI_AP && !WiFi.mode(WIFI_AP_STA)) {
+        Serial.println("ESP-NOW: could not add STA alongside the setup AP");
+        return false;
+      }
+      if (mode == WIFI_AP) delay(1);
+      uint8_t currentChannel = 0;
+      wifi_second_chan_t second;
+      if (esp_wifi_get_channel(&currentChannel, &second) != ESP_OK ||
+          currentChannel < ESPNOW_CHANNEL_MIN ||
+          currentChannel > ESPNOW_CHANNEL_MAX) {
+        Serial.println("ESP-NOW: setup AP channel is unavailable");
+        return false;
+      }
+      // This is the channel on which the dock hears the pairing reply and the
+      // one a later on-demand standalone link must restore.
+      if (espNowChannel != currentChannel) {
+        espNowChannel = currentChannel;
+        preferences.begin(PREFERENCES_NAMESPACE, false);
+        preferences.putUChar("enChan", espNowChannel);
+        preferences.end();
+      }
+      espNowStandalone = true;
+      startEspNow();
+    } else if (networkStackActive) {
+      // Ride the station that is already up.
+      startEspNow();
+    } else {
+      // Standalone: no WiFi.begin(), so none of the association cost. The
+      // dock walks channels 1-13, so any channel works - use the remembered
+      // one if we have it, otherwise channel 1.
+      uint8_t scanChannel = espNowChannel ? espNowChannel : ESPNOW_CHANNEL_MIN;
+      WiFi.persistent(false);
+      bool modeChanged = WiFi.getMode() != WIFI_STA;
+      if (modeChanged) WiFi.mode(WIFI_STA);
+      WiFi.disconnect(false, false);
+      // A mode transition from OFF is not always immediately ready to accept a
+      // channel set - delay(1) gives it one scheduler tick, cheap against the
+      // alternative of silently landing on the wrong channel. Only when the
+      // mode actually changed; already being in STA needs nothing extra.
+      if (modeChanged) delay(1);
+      esp_err_t channelResult = esp_wifi_set_channel(scanChannel, WIFI_SECOND_CHAN_NONE);
+      if (channelResult != ESP_OK) {
+        Serial.printf("ESP-NOW: could not set channel %u (rc=%d) - not bringing "
+                      "the link up on the wrong one\n",
+                      (unsigned)scanChannel, (int)channelResult);
+        return false;
+      }
+      // Remember the channel so a later standalone bring-up (e.g. sending a
+      // command after pairing) knows where the dock is.
+      if (!espNowChannel) {
+        espNowChannel = scanChannel;
+        preferences.begin(PREFERENCES_NAMESPACE, false);
+        preferences.putUChar("enChan", espNowChannel);
+        preferences.end();
+      }
+      espNowStandalone = true;
+      startEspNow();
+    }
   }
-  if (!espNowRadioActive) startEspNow();
   if (!espNowRadioActive) return false;
   espNowCandidateCount = 0;
   espNowScanActive = true;
@@ -28678,6 +29361,11 @@ struct WidgetInstance {
   lv_obj_t *card;
   lv_obj_t *primary;    // percentage, temperature or title
   lv_obj_t *secondary;  // meta line, condition or source
+  lv_obj_t *mediaArtBox;// rounded frame containing poster/source artwork
+  lv_obj_t *mediaArt;   // live poster image inside a media card
+  lv_obj_t *mediaPlaceholder;
+  lv_obj_t *mediaYoutubeLogo;
+  lv_obj_t *mediaTrack;// playback progress track
   lv_obj_t *fill;       // progress fill or battery fill
   lv_obj_t *left;       // elapsed
   lv_obj_t *right;      // remaining
@@ -28687,8 +29375,11 @@ struct WidgetInstance {
   int16_t glyphCode;    // what that icon was drawn for
   int16_t glyphSize;
   int fillTrackWidth;
+  int16_t faceWidth;
+  int16_t faceHeight;
   uint8_t kind;
   bool expanded;
+  bool mediaVisualLayout;
 };
 
 static const uint8_t MAX_LIVE_WIDGETS = 6;
@@ -28699,12 +29390,99 @@ WidgetInstance widgetExpandedInstance = {};
 lv_obj_t *widgetExpandedOverlay = nullptr;
 uint8_t widgetExpandedKind = 0;
 bool widgetExpandedClosing = false;
+char mediaLastAutoExpandedTitle[128] = "";
 lv_area_t widgetExpandFrom = {0, 0, 0, 0};
 lv_area_t widgetExpandTo = {0, 0, 0, 0};
 uint32_t widgetLastServiceMs = 0;
 
+struct WidgetWallpaperCacheEntry {
+  char path[96];
+  uint8_t *pixels;
+  lv_img_dsc_t descriptor;
+};
+
+// A page can show all three widget types, then the user can expand each one
+// without rebuilding the page. Keep all three compact and all three expanded
+// assets available so the second and third full-screen views do not fall back
+// to the page theme after the first expanded image consumes the last slot.
+static const uint8_t WIDGET_WALLPAPER_CACHE_COUNT = 6;
+WidgetWallpaperCacheEntry widgetWallpaperCache[WIDGET_WALLPAPER_CACHE_COUNT] = {};
+
+void clearWidgetWallpaperCache() {
+  lv_img_cache_invalidate_src(nullptr);
+  for (uint8_t i = 0; i < WIDGET_WALLPAPER_CACHE_COUNT; i++) {
+    if (widgetWallpaperCache[i].pixels) free(widgetWallpaperCache[i].pixels);
+    widgetWallpaperCache[i] = {};
+  }
+}
+
+const char *widgetWallpaperPath(uint8_t kind, bool expanded) {
+  if (kind == WIDGET_WEATHER) {
+    return expanded ? widgetSettings.weatherExpandedWallpaper
+                    : widgetSettings.weatherWallpaper;
+  }
+  if (kind == WIDGET_BATTERY) {
+    return expanded ? widgetSettings.batteryExpandedWallpaper
+                    : widgetSettings.batteryWallpaper;
+  }
+  return expanded ? widgetSettings.mediaExpandedWallpaper
+                  : widgetSettings.mediaWallpaper;
+}
+
+const void *widgetWallpaperSource(const char *path, uint16_t width, uint16_t height) {
+  if (!path || !path[0] || !sdReady || !SD.exists(path)) return nullptr;
+  for (uint8_t i = 0; i < WIDGET_WALLPAPER_CACHE_COUNT; i++) {
+    if (widgetWallpaperCache[i].pixels &&
+        strcmp(widgetWallpaperCache[i].path, path) == 0) {
+      return &widgetWallpaperCache[i].descriptor;
+    }
+  }
+  uint8_t slot = WIDGET_WALLPAPER_CACHE_COUNT;
+  for (uint8_t i = 0; i < WIDGET_WALLPAPER_CACHE_COUNT; i++) {
+    if (!widgetWallpaperCache[i].pixels) { slot = i; break; }
+  }
+  if (slot >= WIDGET_WALLPAPER_CACHE_COUNT) return nullptr;
+  const size_t expected = (size_t)width * height * sizeof(uint16_t);
+  File file = SD.open(path, FILE_READ);
+  if (!file || file.size() != expected) {
+    if (file) file.close();
+    return nullptr;
+  }
+  uint8_t *pixels = static_cast<uint8_t *>(psramFound() ? ps_malloc(expected) : malloc(expected));
+  if (!pixels || file.read(pixels, expected) != expected) {
+    if (pixels) free(pixels);
+    file.close();
+    return nullptr;
+  }
+  file.close();
+  WidgetWallpaperCacheEntry &entry = widgetWallpaperCache[slot];
+  strlcpy(entry.path, path, sizeof(entry.path));
+  entry.pixels = pixels;
+  entry.descriptor.header.always_zero = 0;
+  entry.descriptor.header.w = width;
+  entry.descriptor.header.h = height;
+  entry.descriptor.header.cf = LV_IMG_CF_TRUE_COLOR;
+  entry.descriptor.data_size = expected;
+  entry.descriptor.data = pixels;
+  return &entry.descriptor;
+}
+
 lv_color_t widgetMutedColour() {
   return lvRgb(150, 165, 182);
+}
+
+bool widgetMediaIsYoutube() {
+  return nowPlaying.valid &&
+    (strcasestr(nowPlaying.source, "youtube") ||
+     strcasestr(nowPlaying.source, "smarttube"));
+}
+
+void setWidgetLabelText(lv_obj_t *label, const char *text) {
+  if (!label || !lv_obj_is_valid(label)) return;
+  const char *current = lv_label_get_text(label);
+  if (!current || strcmp(current, text ? text : "") != 0) {
+    lv_label_set_text(label, text ? text : "");
+  }
 }
 
 lv_obj_t *makeWidgetLabel(lv_obj_t *parent, const char *text, int x, int y,
@@ -28800,6 +29578,75 @@ Device *widgetMediaDevice() {
 }
 
 /* ---------------------------------------------------------------- media */
+void applyWidgetMediaLayout(WidgetInstance &instance, bool showVisual) {
+  if (!instance.card || !lv_obj_is_valid(instance.card)) return;
+
+  const bool expanded = instance.expanded;
+  const int width = instance.faceWidth;
+  const int height = instance.faceHeight;
+  const int pad = expanded ? 14 : 8;
+  const int artSize = expanded ? 126 : 66;
+  const int artX = expanded ? (width - artSize) / 2 : pad;
+  const int artY = expanded ? pad : (height - artSize) / 2;
+
+  if (instance.mediaArtBox && lv_obj_is_valid(instance.mediaArtBox)) {
+    lv_obj_set_pos(instance.mediaArtBox, artX, artY);
+    lv_obj_set_size(instance.mediaArtBox, artSize, artSize);
+    if (showVisual) lv_obj_clear_flag(instance.mediaArtBox, LV_OBJ_FLAG_HIDDEN);
+    else lv_obj_add_flag(instance.mediaArtBox, LV_OBJ_FLAG_HIDDEN);
+  }
+
+  int textX = showVisual && !expanded ? pad + artSize + 10 : pad;
+  int textWidth = width - textX - pad;
+  int textY = showVisual
+    ? (expanded ? pad + artSize + 12 : artY + 2)
+    : (expanded ? 42 : 12);
+  lv_text_align_t align = expanded ? LV_TEXT_ALIGN_CENTER : LV_TEXT_ALIGN_LEFT;
+  const lv_font_t *primaryFont = showVisual
+    ? (expanded ? &lv_font_montserrat_20 : &lv_font_montserrat_16)
+    : (expanded ? &lv_font_montserrat_24 : &lv_font_montserrat_20);
+  const lv_font_t *secondaryFont = showVisual
+    ? &lv_font_montserrat_12
+    : (expanded ? &lv_font_montserrat_16 : &lv_font_montserrat_14);
+
+  if (instance.primary && lv_obj_is_valid(instance.primary)) {
+    lv_obj_set_pos(instance.primary, textX, textY);
+    lv_obj_set_width(instance.primary, textWidth);
+    lv_obj_set_height(instance.primary, lv_font_get_line_height(primaryFont));
+    lv_obj_set_style_text_font(instance.primary, primaryFont, 0);
+    lv_obj_set_style_text_align(instance.primary, align, 0);
+  }
+  int secondaryY = textY + (showVisual ? (expanded ? 28 : 21)
+                                      : (expanded ? 36 : 25));
+  if (instance.secondary && lv_obj_is_valid(instance.secondary)) {
+    lv_obj_set_pos(instance.secondary, textX, secondaryY);
+    lv_obj_set_width(instance.secondary, textWidth);
+    lv_obj_set_height(instance.secondary, lv_font_get_line_height(secondaryFont));
+    lv_obj_set_style_text_font(instance.secondary, secondaryFont, 0);
+    lv_obj_set_style_text_align(instance.secondary, align, 0);
+  }
+
+  int barY = showVisual
+    ? textY + (expanded ? 58 : 41)
+    : (expanded ? 128 : 67);
+  int trackWidth = textWidth;
+  if (instance.mediaTrack && lv_obj_is_valid(instance.mediaTrack)) {
+    lv_obj_set_pos(instance.mediaTrack, textX, barY);
+    lv_obj_set_width(instance.mediaTrack, trackWidth);
+  }
+  instance.fillTrackWidth = trackWidth;
+  int timesY = barY + (expanded ? 12 : 9);
+  if (instance.left && lv_obj_is_valid(instance.left)) {
+    lv_obj_set_pos(instance.left, textX, timesY);
+    lv_obj_set_width(instance.left, trackWidth / 2);
+  }
+  if (instance.right && lv_obj_is_valid(instance.right)) {
+    lv_obj_set_pos(instance.right, textX + trackWidth / 2, timesY);
+    lv_obj_set_width(instance.right, trackWidth - trackWidth / 2);
+  }
+  instance.mediaVisualLayout = showVisual;
+}
+
 void buildWidgetMediaFace(WidgetInstance &instance, lv_obj_t *parent,
                           int width, int height, bool expanded) {
   bool haveMedia = nowPlaying.valid;
@@ -28810,6 +29657,7 @@ void buildWidgetMediaFace(WidgetInstance &instance, lv_obj_t *parent,
   int artY = expanded ? pad : (height - artSize) / 2;
 
   lv_obj_t *art = lv_obj_create(parent);
+  instance.mediaArtBox = art;
   lv_obj_remove_style_all(art);
   lv_obj_set_pos(art, artX, artY);
   lv_obj_set_size(art, artSize, artSize);
@@ -28819,21 +29667,49 @@ void buildWidgetMediaFace(WidgetInstance &instance, lv_obj_t *parent,
   lv_obj_set_style_border_color(art, lv_color_white(), 0);
   lv_obj_set_style_border_opa(art, LV_OPA_20, 0);
   lv_obj_set_style_border_width(art, 1, 0);
+  lv_obj_set_style_clip_corner(art, true, LV_PART_MAIN);
   lv_obj_clear_flag(art, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_clear_flag(art, LV_OBJ_FLAG_SCROLLABLE);
 
   const void *artSource = mediaArtSource();
-  if (widgetSettings.mediaArtwork && haveMedia && artSource) {
-    lv_obj_t *poster = lv_img_create(art);
-    lv_img_set_src(poster, artSource);
-    lv_obj_center(poster);
-    lv_obj_clear_flag(poster, LV_OBJ_FLAG_CLICKABLE);
+  instance.mediaArt = lv_img_create(art);
+  lv_img_set_zoom(instance.mediaArt,
+                  (uint16_t)((uint32_t)artSize * 256UL / ESPNOW_ARTWORK_DIMENSION));
+  lv_obj_center(instance.mediaArt);
+  lv_obj_clear_flag(instance.mediaArt, LV_OBJ_FLAG_CLICKABLE);
+  // A slow poster transfer is not an error and should not be represented by a
+  // missing-image glyph. Until real artwork is available the complete frame is
+  // hidden and the title/subtitle are enlarged into the freed space.
+  instance.mediaPlaceholder = nullptr;
+  // YouTube and SmartTube expose rich text through Cast but commonly omit an
+  // image. Draw their familiar mark locally so the fallback costs no Wi-Fi,
+  // ESP-NOW transfer or SD space and stays sharp at either widget size.
+  instance.mediaYoutubeLogo = lv_obj_create(art);
+  lv_obj_remove_style_all(instance.mediaYoutubeLogo);
+  lv_obj_set_size(instance.mediaYoutubeLogo,
+                  expanded ? 84 : 48, expanded ? 56 : 32);
+  lv_obj_set_style_radius(instance.mediaYoutubeLogo, expanded ? 14 : 8, 0);
+  lv_obj_set_style_bg_color(instance.mediaYoutubeLogo, lvRgb(255, 0, 0), 0);
+  lv_obj_set_style_bg_opa(instance.mediaYoutubeLogo, LV_OPA_COVER, 0);
+  lv_obj_clear_flag(instance.mediaYoutubeLogo, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_clear_flag(instance.mediaYoutubeLogo, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_center(instance.mediaYoutubeLogo);
+  lv_obj_t *youtubePlay = makeLabel(
+    instance.mediaYoutubeLogo, LV_SYMBOL_PLAY, 0, 0,
+    expanded ? &lv_font_montserrat_24 : &lv_font_montserrat_16,
+    lv_color_white());
+  lv_obj_center(youtubePlay);
+  bool showArt = widgetSettings.mediaArtwork && haveMedia && artSource;
+  bool showYoutube = widgetSettings.mediaArtwork && haveMedia && !artSource &&
+                     widgetMediaIsYoutube();
+  if (showArt) {
+    lv_img_set_src(instance.mediaArt, artSource);
+    lv_obj_clear_flag(instance.mediaArt, LV_OBJ_FLAG_HIDDEN);
   } else {
-    lv_obj_t *placeholder = makeLabel(art, LV_SYMBOL_IMAGE, 0, 0,
-                                      expanded ? &lv_font_montserrat_24 : &lv_font_montserrat_16,
-                                      widgetMutedColour());
-    lv_obj_center(placeholder);
+    lv_obj_add_flag(instance.mediaArt, LV_OBJ_FLAG_HIDDEN);
   }
+  if (showYoutube) lv_obj_clear_flag(instance.mediaYoutubeLogo, LV_OBJ_FLAG_HIDDEN);
+  else lv_obj_add_flag(instance.mediaYoutubeLogo, LV_OBJ_FLAG_HIDDEN);
 
   int textX = expanded ? pad : pad + artSize + 10;
   int textWidth = expanded ? width - pad * 2 : width - textX - pad;
@@ -28844,6 +29720,8 @@ void buildWidgetMediaFace(WidgetInstance &instance, lv_obj_t *parent,
     haveMedia && nowPlaying.title[0] ? nowPlaying.title : "Nothing playing",
     textX, textY, expanded ? &lv_font_montserrat_20 : &lv_font_montserrat_16,
     textPrimary(), textWidth, align);
+  lv_label_set_long_mode(instance.primary, LV_LABEL_LONG_SCROLL_CIRCULAR);
+  lv_obj_set_style_anim_speed(instance.primary, 22, 0);
 
   Device *player = widgetMediaDevice();
   char idle[64];
@@ -28861,6 +29739,7 @@ void buildWidgetMediaFace(WidgetInstance &instance, lv_obj_t *parent,
   int barY = textY + (expanded ? 58 : 41);
   int trackWidth = textWidth;
   lv_obj_t *track = lv_obj_create(parent);
+  instance.mediaTrack = track;
   lv_obj_remove_style_all(track);
   lv_obj_set_pos(track, textX, barY);
   lv_obj_set_size(track, trackWidth, expanded ? 6 : 4);
@@ -28886,6 +29765,9 @@ void buildWidgetMediaFace(WidgetInstance &instance, lv_obj_t *parent,
   instance.right = makeWidgetLabel(parent, "0:00", textX + trackWidth / 2, timesY,
     &lv_font_montserrat_10, widgetMutedColour(), trackWidth - trackWidth / 2,
     LV_TEXT_ALIGN_RIGHT);
+  instance.faceWidth = width;
+  instance.faceHeight = height;
+  applyWidgetMediaLayout(instance, showArt || showYoutube);
 }
 
 /* ---------------------------------------------------------------- *
@@ -29241,6 +30123,11 @@ void buildWidgetFace(WidgetInstance &instance, lv_obj_t *parent, uint8_t kind,
   instance.expanded = expanded;
   instance.primary = nullptr;
   instance.secondary = nullptr;
+  instance.mediaArtBox = nullptr;
+  instance.mediaArt = nullptr;
+  instance.mediaPlaceholder = nullptr;
+  instance.mediaYoutubeLogo = nullptr;
+  instance.mediaTrack = nullptr;
   instance.fill = nullptr;
   instance.left = nullptr;
   instance.right = nullptr;
@@ -29250,6 +30137,8 @@ void buildWidgetFace(WidgetInstance &instance, lv_obj_t *parent, uint8_t kind,
   instance.glyphCode = -32768;
   instance.glyphSize = 0;
   instance.fillTrackWidth = 0;
+  instance.faceWidth = width;
+  instance.faceHeight = height;
   if (kind == WIDGET_WEATHER) buildWidgetWeatherFace(instance, parent, width, height, expanded);
   else if (kind == WIDGET_BATTERY) buildWidgetBatteryFace(instance, parent, width, height, expanded);
   else buildWidgetMediaFace(instance, parent, width, height, expanded);
@@ -29295,6 +30184,45 @@ void refreshWidgetInstance(WidgetInstance &instance) {
   }
 
   if (instance.kind == WIDGET_MEDIA) {
+    bool haveMedia = nowPlaying.valid;
+    if (instance.primary && lv_obj_is_valid(instance.primary)) {
+      setWidgetLabelText(instance.primary,
+        haveMedia && nowPlaying.title[0] ? nowPlaying.title : "Nothing playing");
+    }
+    if (instance.secondary && lv_obj_is_valid(instance.secondary)) {
+      Device *player = widgetMediaDevice();
+      char idle[64];
+      if (player) snprintf(idle, sizeof(idle), "Waiting for %s", player->name);
+      else snprintf(idle, sizeof(idle), "No media device on this page");
+      const char *secondary = idle;
+      if (haveMedia && nowPlaying.subtitle[0]) secondary = nowPlaying.subtitle;
+      else if (haveMedia && nowPlaying.source[0]) secondary = nowPlaying.source;
+      setWidgetLabelText(instance.secondary, secondary);
+    }
+    const void *artSource = mediaArtSource();
+    bool showArt = widgetSettings.mediaArtwork && haveMedia && artSource;
+    bool showYoutube = widgetSettings.mediaArtwork && haveMedia && !artSource &&
+                       widgetMediaIsYoutube();
+    if (instance.mediaArt && lv_obj_is_valid(instance.mediaArt)) {
+      if (showArt) {
+        lv_img_set_src(instance.mediaArt, artSource);
+        lv_obj_clear_flag(instance.mediaArt, LV_OBJ_FLAG_HIDDEN);
+      } else {
+        lv_obj_add_flag(instance.mediaArt, LV_OBJ_FLAG_HIDDEN);
+      }
+    }
+    if (instance.mediaPlaceholder && lv_obj_is_valid(instance.mediaPlaceholder)) {
+      if (showArt || showYoutube) lv_obj_add_flag(instance.mediaPlaceholder, LV_OBJ_FLAG_HIDDEN);
+      else lv_obj_clear_flag(instance.mediaPlaceholder, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (instance.mediaYoutubeLogo && lv_obj_is_valid(instance.mediaYoutubeLogo)) {
+      if (showYoutube) lv_obj_clear_flag(instance.mediaYoutubeLogo, LV_OBJ_FLAG_HIDDEN);
+      else lv_obj_add_flag(instance.mediaYoutubeLogo, LV_OBJ_FLAG_HIDDEN);
+    }
+    bool showVisual = showArt || showYoutube;
+    if (instance.mediaVisualLayout != showVisual) {
+      applyWidgetMediaLayout(instance, showVisual);
+    }
     uint32_t position = widgetMediaPosition();
     uint32_t duration = nowPlaying.duration;
     if (instance.fill && lv_obj_is_valid(instance.fill)) {
@@ -29311,6 +30239,7 @@ void refreshWidgetInstance(WidgetInstance &instance) {
       formatWidgetClock(text, sizeof(text), remaining, true);
       lv_label_set_text(instance.right, nowPlaying.valid && duration ? text : "0:00");
     }
+    lv_obj_invalidate(instance.card);
     return;
   }
 
@@ -29405,6 +30334,57 @@ void widgetOverlayEvent(lv_event_t *event) {
   closeWidgetFullScreen();
 }
 
+void styleWidgetContainer(lv_obj_t *card, uint8_t kind, bool expanded) {
+  if (!card) return;
+  const char *wallpaperPath = widgetWallpaperPath(kind, expanded);
+  uint16_t wallpaperWidth = expanded ? 228 : WIDGET_TILE_WIDTH;
+  uint16_t wallpaperHeight = expanded ? 268 : WIDGET_TILE_HEIGHT;
+  const void *wallpaperSource = widgetWallpaperSource(
+    wallpaperPath, wallpaperWidth, wallpaperHeight);
+  bool opaqueExpandedTheme = expanded && !wallpaperSource;
+  lv_color_t colour = opaqueExpandedTheme ? lvRgb(24, 43, 62) : activeRuntimeThemeStyle
+    ? lv_color_hex(activeRuntimeThemeStyle->glassColour)
+    : lvRgb(30, 42, 58);
+  lv_opa_t opacity = opaqueExpandedTheme ? LV_OPA_COVER : activeRuntimeThemeStyle
+    ? (lv_opa_t)activeRuntimeThemeStyle->glassOpacity
+    : (lv_opa_t)58;
+  lv_obj_set_style_radius(card, expanded ? 14 : 12, 0);
+  lv_obj_set_style_bg_color(card, wallpaperSource ? lv_color_black() : colour, 0);
+  lv_obj_set_style_bg_opa(card, wallpaperSource ? LV_OPA_COVER : opacity, 0);
+  lv_obj_set_style_bg_grad_color(card, lvRgb(8, 18, 31), 0);
+  lv_obj_set_style_bg_grad_dir(card,
+    opaqueExpandedTheme ? LV_GRAD_DIR_VER : LV_GRAD_DIR_NONE, 0);
+  lv_obj_set_style_border_color(card, lv_color_white(), 0);
+  lv_obj_set_style_border_opa(card, wallpaperSource ? LV_OPA_TRANSP : LV_OPA_20, 0);
+  lv_obj_set_style_border_width(card, wallpaperSource ? 0 : 1, 0);
+  lv_obj_set_style_pad_all(card, 0, 0);
+  lv_obj_set_style_clip_corner(card, true, 0);
+  if (wallpaperSource) {
+    lv_obj_t *background = lv_img_create(card);
+    lv_img_set_src(background, wallpaperSource);
+    lv_obj_set_pos(background, 0, 0);
+    lv_obj_set_size(background, wallpaperWidth, wallpaperHeight);
+    lv_obj_clear_flag(background, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(background, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_move_background(background);
+  }
+  WidgetContentPanelStyle &panelStyle = widgetContentPanels[kind];
+  if (wallpaperPath && wallpaperPath[0] && panelStyle.enabled) {
+    int inset = expanded ? 8 : 5;
+    lv_obj_t *panel = lv_obj_create(card);
+    lv_obj_remove_style_all(panel);
+    lv_obj_set_pos(panel, inset, inset);
+    lv_obj_set_size(panel, wallpaperWidth - inset * 2,
+                    wallpaperHeight - inset * 2);
+    lv_obj_set_style_radius(panel, expanded ? 18 : 11, 0);
+    lv_obj_set_style_bg_color(panel, lv_color_hex(panelStyle.colour), 0);
+    lv_obj_set_style_bg_opa(panel, (lv_opa_t)panelStyle.opacity, 0);
+    lv_obj_set_style_border_opa(panel, LV_OPA_TRANSP, 0);
+    lv_obj_clear_flag(panel, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+  }
+}
+
 /*
   Grows a widget from where it sits on the page to the whole screen.
 
@@ -29438,14 +30418,7 @@ void openWidgetFullScreen(lv_obj_t *sourceTile, uint8_t kind) {
   lv_obj_set_pos(widgetExpandedOverlay, source.x1, source.y1);
   lv_obj_set_size(widgetExpandedOverlay, lv_area_get_width(&source),
                   lv_area_get_height(&source));
-  lv_obj_set_style_radius(widgetExpandedOverlay, 14, 0);
-  lv_obj_set_style_bg_color(widgetExpandedOverlay, lvRgb(10, 18, 30), 0);
-  lv_obj_set_style_bg_opa(widgetExpandedOverlay, LV_OPA_COVER, 0);
-  lv_obj_set_style_border_color(widgetExpandedOverlay, lv_color_white(), 0);
-  lv_obj_set_style_border_opa(widgetExpandedOverlay, LV_OPA_20, 0);
-  lv_obj_set_style_border_width(widgetExpandedOverlay, 1, 0);
-  lv_obj_set_style_pad_all(widgetExpandedOverlay, 0, 0);
-  lv_obj_set_style_clip_corner(widgetExpandedOverlay, true, 0);
+  styleWidgetContainer(widgetExpandedOverlay, kind, true);
   lv_obj_clear_flag(widgetExpandedOverlay, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_flag(widgetExpandedOverlay, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_add_event_cb(widgetExpandedOverlay, widgetOverlayEvent, LV_EVENT_CLICKED, nullptr);
@@ -29497,18 +30470,7 @@ void makeWidgetTile(uint8_t slot, uint8_t kind, int originY) {
   lv_obj_set_pos(card, 8, (originY >= 0 ? originY : themeGridStartY()) + row * 52);
   lv_obj_set_size(card, WIDGET_TILE_WIDTH, WIDGET_TILE_HEIGHT);
   registerSplitDiagnosticAnchor(card);
-  lv_obj_set_style_radius(card, 12, 0);
-  lv_color_t cardColour = activeRuntimeThemeStyle
-    ? lv_color_hex(activeRuntimeThemeStyle->glassColour) : lvRgb(30, 42, 58);
-  lv_opa_t cardOpacity = activeRuntimeThemeStyle
-    ? (lv_opa_t)activeRuntimeThemeStyle->glassOpacity : (lv_opa_t)58;
-  lv_obj_set_style_bg_color(card, cardColour, 0);
-  lv_obj_set_style_bg_opa(card, cardOpacity, 0);
-  lv_obj_set_style_border_color(card, lv_color_white(), 0);
-  lv_obj_set_style_border_opa(card, LV_OPA_20, 0);
-  lv_obj_set_style_border_width(card, 1, 0);
-  lv_obj_set_style_pad_all(card, 0, 0);
-  lv_obj_set_style_clip_corner(card, true, 0);
+  styleWidgetContainer(card, kind, false);
   lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_add_flag(card, LV_OBJ_FLAG_GESTURE_BUBBLE);
@@ -29959,84 +30921,83 @@ const void *mediaArtSource() {
 }
 
 /*
-  Downloads the poster, scales it and writes it to the card.
-
-  Only ever called from serviceMediaArtwork(), which keeps it off the wake path.
-  LovyanGFX decodes both JPEG and PNG into an off-screen sprite, which is also
-  where the scaling happens, so what lands on the card is already the size the
-  widget draws.
-*/
-bool mediaArtFetch(const char *url, const char *path) {
-  if (!sdReady) return false;
-  if (!ensureStationConnected(12000)) return false;
-
-  NetworkClientSecure secure;
-  secure.setInsecure();          // Poster hosts vary; the remote carries no root store.
-  HTTPClient http;
-  http.setConnectTimeout(5000);
-  http.setTimeout(9000);
-  bool https = strncmp(url, "https://", 8) == 0;
-  bool begun = https ? http.begin(secure, url) : http.begin(url);
-  if (!begun) return false;
-  int status = http.GET();
-  if (status != 200) { http.end(); Serial.printf("Artwork: HTTP %d\n", status); return false; }
-  int length = http.getSize();
-  if (length <= 0 || length > 512 * 1024) {
-    http.end();
-    Serial.printf("Artwork: refusing a %d byte image\n", length);
-    return false;
-  }
-  uint8_t *raw = (uint8_t *)(psramFound() ? ps_malloc(length) : malloc(length));
-  if (!raw) { http.end(); return false; }
-  int got = http.getStream().readBytes(raw, length);
-  http.end();
-  if (got != length) { free(raw); return false; }
-
-  LGFX_Sprite sprite(&tft);
-  sprite.setColorDepth(16);
-  if (!sprite.createSprite(MEDIA_ART_SIZE, MEDIA_ART_SIZE)) { free(raw); return false; }
-  sprite.fillSprite(0);
-  bool drawn = sprite.drawJpg(raw, (size_t)length, 0, 0, MEDIA_ART_SIZE, MEDIA_ART_SIZE,
-                              0, 0, ::lgfx::v1::datum_t::middle_center) ||
-               sprite.drawPng(raw, (size_t)length, 0, 0, MEDIA_ART_SIZE, MEDIA_ART_SIZE,
-                              0, 0, ::lgfx::v1::datum_t::middle_center);
-  free(raw);
-  if (!drawn) { sprite.deleteSprite(); Serial.println("Artwork: could not decode the image"); return false; }
-
-  SD.mkdir(MEDIA_ART_DIR);
-  String temp = String(path) + ".part";
-  SD.remove(temp);
-  File file = SD.open(temp, FILE_WRITE);
-  if (!file) { sprite.deleteSprite(); return false; }
-  uint16_t dimension = (uint16_t)MEDIA_ART_SIZE;
-  file.write((const uint8_t *)&dimension, 2);
-  file.write((const uint8_t *)&dimension, 2);
-  size_t written = file.write((const uint8_t *)sprite.getBuffer(),
-                              (size_t)MEDIA_ART_SIZE * MEDIA_ART_SIZE * 2);
-  file.close();
-  sprite.deleteSprite();
-  // Written to a temporary name and renamed, so a fetch interrupted by a flat
-  // battery cannot leave a half-written file that loads as a corrupt poster
-  // forever afterwards.
-  if (written != (size_t)MEDIA_ART_SIZE * MEDIA_ART_SIZE * 2) { SD.remove(temp); return false; }
-  SD.remove(path);
-  return SD.rename(temp, path);
-}
-
-/*
-  Decides when the poster is allowed to cost anything.
-
-  A cache hit is free and happens immediately, including on the wake path -
-  it is one file read. A miss needs Wi-Fi and a decode, so it waits until the
-  display is properly awake and the widget is actually on screen, and backs off
-  after repeated failures rather than retrying a dead address forever.
+  Loads a poster that the dock has already delivered to the SD cache. A cache
+  miss deliberately does no network work: the dock owns Wi-Fi and will send
+  the image over ESP-NOW.
 */
 void serviceMediaArtwork(uint32_t now) {
+  if (mediaArtAckPending && espNowRadioActive) {
+    EspNowArtworkAckPacket ack = {};
+    ack.magic = ESPNOW_ARTWORK_ACK_MAGIC;
+    ack.transferId = mediaArtAckTransferId;
+    ack.nextSeq = mediaArtAckNextSeq;
+    ack.status = mediaArtAckStatus;
+    mediaArtAckPending = false;
+    sendEspNowWithRetry(mediaArtAckMac, (const uint8_t *)&ack, sizeof(ack));
+  }
+
+  if (mediaArtTransferActive &&
+      (uint32_t)(now - mediaArtTransferLastMs) > 10000UL) {
+    mediaArtTransferActive = false;
+    mediaArtRequestWanted = true;
+    mediaArtRequestAwaitingDock = false;
+    mediaArtNextRequestMs = now + 500UL;
+    Serial.println("Artwork: dock transfer timed out; requesting it again");
+  }
+
+  // Commit through a temporary file. A power cut can leave an ignored .part
+  // file, but cannot replace a good cached poster with a partial transfer.
+  if (mediaArtTransferComplete) {
+    mediaArtTransferComplete = false;
+    bool saved = false;
+    char finalPath[48] = "";
+    char partPath[56] = "";
+    mediaArtFileForUrl(mediaArtTransferUrl, finalPath, sizeof(finalPath));
+    snprintf(partPath, sizeof(partPath), "%s.part", finalPath);
+    if (sdReady && mediaArtIncoming) {
+      if (!SD.exists("/media")) SD.mkdir("/media");
+      if (!SD.exists(MEDIA_ART_DIR)) SD.mkdir(MEDIA_ART_DIR);
+      SD.remove(partPath);
+      File file = SD.open(partPath, FILE_WRITE);
+      if (file) {
+        uint16_t width = mediaArtTransferWidth;
+        uint16_t height = mediaArtTransferHeight;
+        size_t total = mediaArtTransferTotal;
+        saved = file.write((const uint8_t *)&width, 2) == 2 &&
+                file.write((const uint8_t *)&height, 2) == 2 &&
+                file.write(mediaArtIncoming, total) == total;
+        file.flush();
+        file.close();
+        if (saved) {
+          SD.remove(finalPath);
+          saved = SD.rename(partPath, finalPath);
+        }
+        if (!saved) SD.remove(partPath);
+      }
+    }
+    free(mediaArtIncoming);
+    mediaArtIncoming = nullptr;
+    mediaArtRequestAwaitingDock = false;
+    if (saved) {
+      Serial.printf("Artwork: cached %s from the dock\n", finalPath);
+      if (strcmp(mediaArtTransferUrl, mediaArtUrl) == 0 &&
+          mediaArtLoadFromCard(finalPath)) {
+        strlcpy(mediaArtFile, finalPath, sizeof(mediaArtFile));
+        nowPlayingDirty = true;
+      }
+    } else {
+      Serial.println("Artwork: could not save the dock transfer to SD");
+      mediaArtRequestWanted = true;
+    }
+  }
+
   if (mediaArtUrlChanged) {
     mediaArtUrlChanged = false;
-    mediaArtFailures = 0;
-    mediaArtNextTryMs = 0;
-    mediaArtFetchWanted = false;
+    mediaArtRequestWanted = false;
+    mediaArtRequestAwaitingDock = false;
+    mediaArtTransferActive = false;
+    mediaArtTransferComplete = false;
+    if (mediaArtIncoming) { free(mediaArtIncoming); mediaArtIncoming = nullptr; }
     if (!mediaArtUrl[0]) {
       mediaArtRelease();
       mediaArtFile[0] = '\0';
@@ -30049,31 +31010,45 @@ void serviceMediaArtwork(uint32_t now) {
       nowPlayingDirty = true;
     } else {
       mediaArtRelease();
-      mediaArtFetchWanted = true;
+      mediaArtRequestWanted = true;
+      Serial.printf("Artwork: %s is not cached; requesting it from the dock\n", mediaArtFile);
     }
   }
 
-  if (!mediaArtFetchWanted || !widgetSettings.mediaArtwork) return;
-  if (displaySleeping || !mediaWidgetOnScreen()) return;
-  if (mediaArtNextTryMs && (int32_t)(now - mediaArtNextTryMs) < 0) return;
+  if (!widgetSettings.mediaArtwork || !mediaArtRequestWanted ||
+      mediaArtRequestAwaitingDock || mediaArtTransferActive || !mediaArtUrl[0] ||
+      !mediaWidgetOnScreen() ||
+      (mediaArtNextRequestMs &&
+       (int32_t)(now - mediaArtNextRequestMs) < 0)) return;
 
-  mediaArtFetchWanted = false;
-  Serial.printf("Artwork: fetching %s\n", mediaArtUrl);
-  if (mediaArtFetch(mediaArtUrl, mediaArtFile) && mediaArtLoadFromCard(mediaArtFile)) {
-    mediaArtFailures = 0;
-    nowPlayingDirty = true;
-    Serial.printf("Artwork: cached as %s\n", mediaArtFile);
+  const size_t capacity = (size_t)ESPNOW_ARTWORK_DIMENSION *
+                          ESPNOW_ARTWORK_DIMENSION * 2U;
+  if (!mediaArtIncoming) {
+    mediaArtIncoming = (uint8_t *)(psramFound() ? ps_malloc(capacity) : malloc(capacity));
+  }
+  if (!mediaArtIncoming) {
+    mediaArtNextRequestMs = now + 30000UL;
+    Serial.println("Artwork: not enough memory for a dock transfer");
     return;
   }
-  // Backs off rather than hammering: some posters are simply unreachable from
-  // this network, and a widget without an image is a much smaller problem than
-  // a remote that keeps waking its radio to be refused.
-  if (++mediaArtFailures < 3) {
-    mediaArtFetchWanted = true;
-    mediaArtNextTryMs = now + 60000UL * mediaArtFailures;
-  } else {
-    Serial.println("Artwork: giving up on this poster");
+  if (!ensureEspNowLink()) {
+    mediaArtNextRequestMs = now + 10000UL;
+    return;
   }
+  EspNowArtworkRequestPacket request = {};
+  request.magic = ESPNOW_ARTWORK_REQUEST_MAGIC;
+  strlcpy(request.url, mediaArtUrl, sizeof(request.url));
+  bool sent = false;
+  for (uint8_t i = 0; i < espNowDeviceCount; i++) {
+    sent |= sendEspNowWithRetry(espNowDevices[i].mac,
+                                (const uint8_t *)&request, sizeof(request));
+  }
+  mediaArtRequestAwaitingDock = sent;
+  // The dock may need to fetch and decode a new poster before its first BEGIN
+  // packet. Keep this same one-shot transaction alive; there is no periodic
+  // metadata poll and the radio still closes immediately after completion.
+  mediaArtRequestDeadlineMs = now + 45000UL;
+  mediaArtNextRequestMs = now + (sent ? 20000UL : 5000UL);
 }
 
 bool mediaWidgetOnScreen() {
@@ -30085,6 +31060,30 @@ bool mediaWidgetOnScreen() {
   return false;
 }
 
+void autoExpandPlayingMedia() {
+  if (!nowPlaying.valid) {
+    // A later replay of the same title is a new playback session.
+    mediaLastAutoExpandedTitle[0] = '\0';
+    return;
+  }
+  if (!widgetSettings.mediaAutoExpand || !nowPlaying.playing ||
+      !nowPlaying.title[0] || widgetExpandedOverlay || displaySleeping ||
+      strcmp(mediaLastAutoExpandedTitle, nowPlaying.title) == 0) return;
+
+  for (uint8_t i = 0; i < widgetInstanceCount; i++) {
+    WidgetInstance &instance = widgetInstances[i];
+    if (instance.kind != WIDGET_MEDIA || !instance.card ||
+        !lv_obj_is_valid(instance.card)) continue;
+    // Remember only after an actual expansion. If metadata arrived while the
+    // widget was not on the current page, opening that page can still expand
+    // the title after its wake request returns.
+    strlcpy(mediaLastAutoExpandedTitle, nowPlaying.title,
+            sizeof(mediaLastAutoExpandedTitle));
+    openWidgetFullScreen(instance.card, WIDGET_MEDIA);
+    return;
+  }
+}
+
 // Set by the command path so a pause or a skip refreshes the widget rather
 // than leaving it showing the state from before the press.
 bool nowPlayingRefreshWanted = false;
@@ -30094,14 +31093,21 @@ void requestNowPlaying() {
   if (!ensureEspNowLink()) return;
   EspNowNowPlayingRequestPacket packet = {};
   packet.magic = ESPNOW_NOWPLAYING_REQ_MAGIC;
+  bool sent = false;
+  nowPlayingReplyPending = true;
+  // A rebooted dock can know the saved target before mDNS has rediscovered it.
+  // Give that single request enough time to perform discovery and app-specific
+  // catalogue lookup without making the user press another button.
+  nowPlayingReplyDeadlineMs = millis() + 45000UL;
   for (uint8_t i = 0; i < espNowDeviceCount; i++) {
-    sendEspNowWithRetry(espNowDevices[i].mac, (const uint8_t *)&packet, sizeof(packet));
+    sent |= sendEspNowWithRetry(espNowDevices[i].mac,
+                                (const uint8_t *)&packet, sizeof(packet));
   }
+  if (!sent) nowPlayingReplyPending = false;
 }
 
 void serviceMediaRadio(uint32_t now) {
   static bool wasOnScreen = false;
-  static uint32_t nextPollMs = 0;
 
   bool onScreen = mediaWidgetOnScreen();
   if (!onScreen) {
@@ -30115,37 +31121,14 @@ void serviceMediaRadio(uint32_t now) {
   bool justAppeared = !wasOnScreen;
   wasOnScreen = true;
 
-  /*
-    Five seconds while the widget is on screen, not thirty.
-
-    Thirty was chosen to be frugal and was simply too slow to be believed: stop
-    something and the widget went on showing it for up to half a minute, which
-    reads as broken rather than thrifty. A request is one short link bring-up -
-    around twelve milliseconds - so five seconds is roughly a quarter of one
-    percent of radio-on time, and only while a person is actually looking at
-    the widget. The position still advances locally between requests; this
-    interval only decides how quickly a change made somewhere else shows up.
-  */
-  static const uint32_t MEDIA_POLL_MS = 5000;
-  bool due = nextPollMs == 0 || (int32_t)(now - nextPollMs) >= 0;
-  if (!justAppeared && !nowPlayingRefreshWanted && !due) return;
+  if (!justAppeared && !nowPlayingRefreshWanted) return;
   nowPlayingRefreshWanted = false;
-  nextPollMs = now + MEDIA_POLL_MS;
   requestNowPlaying();
 }
 
 void serviceMediaTarget(uint32_t now) {
   static char lastSent[32] = "";
   static uint32_t nextRetryMs = 0;
-  static uint32_t resendMs = 0;
-  /*
-    Repeated every minute rather than only on change. The dock keeps the target
-    in RAM, so it loses it on a reboot or a firmware update and then has
-    nothing to poll - silently, because from the remote's side nothing has
-    changed and there is nothing to re-send. A minute of staleness after a dock
-    restart is not worth a person having to work out why the widget went blank.
-  */
-  if (resendMs && (int32_t)(now - resendMs) >= 0) { lastSent[0] = '\0'; resendMs = 0; }
 
   char wanted[32] = "";
   // An explicitly configured Cast name wins over everything, because it is the
@@ -30176,7 +31159,6 @@ void serviceMediaTarget(uint32_t now) {
   if (!sent) { nextRetryMs = now + 5000; return; }
   strlcpy(lastSent, wanted, sizeof(lastSent));
   nextRetryMs = 0;
-  resendMs = now + 60000;
   Serial.printf("Media: watching '%s'\n", wanted[0] ? wanted : "(nothing)");
 }
 
@@ -30202,6 +31184,7 @@ void serviceWidgets(uint32_t now) {
     if (widgetExpandedOverlay && !widgetExpandedClosing) {
       refreshWidgetInstance(widgetExpandedInstance);
     }
+    autoExpandPlayingMedia();
   }
   if (now - widgetLastServiceMs < 1000UL) return;
   widgetLastServiceMs = now;
@@ -30513,6 +31496,7 @@ void renderCurrentPage() {
   dismissWidgetFullScreen();
   widgetInstanceCount = 0;
   memset(widgetInstances, 0, sizeof(widgetInstances));
+  clearWidgetWallpaperCache();
   liveTileBindingCount = 0;
   memset(liveTileBindings, 0, sizeof(liveTileBindings));
   memset(batteryMetricNameLabels, 0, sizeof(batteryMetricNameLabels));
@@ -30866,33 +31850,13 @@ void toggleEspNowDevicesModal(lv_event_t *e) {
   }
   showEspNowSearchOverlay();
 
-  // Wi-Fi down: bring it up and search when it is ready, rather than refusing.
-  // The remote shuts the network stack down when idle, so refusing here meant
-  // the LCD could almost never pair a dock - which is exactly what happened,
-  // and why pairing only ever worked from WebConfig, where Wi-Fi is by
-  // definition already running.
-  if (!networkStackActive || setupApActive) {
-    if (!wifiOn || !hasSelectedWifiProfile()) {
-      showEspNowSearchBlocked("ESP-NOW shares the Wi-Fi radio, so Wi-Fi must be on with a network selected before a dock can be found.");
-      return;
-    }
-    espNowSearchBlocked = false;
-    espNowSearchAwaitingWifi = true;
-    espNowSearchWifiDeadlineMs = millis() + 15000UL;
-    networkShutdownAtMs = 0;
-    startNetworkStack();
-    lv_label_set_text(espNowSearchGlyph, LV_SYMBOL_WIFI);
-    lv_obj_set_style_text_color(espNowSearchGlyph, lvRgb(45, 143, 255), 0);
-    lv_obj_set_style_border_color(espNowSearchPulse, lvRgb(45, 143, 255), 0);
-    lv_label_set_text(espNowSearchTitle, "STARTING WI-FI");
-    lv_label_set_text(espNowSearchHint,
-                      "ESP-NOW shares the Wi-Fi radio. The search starts as soon as it is up.\nTap to cancel");
-    return;
-  }
-
-  if (!espNowRadioActive) startEspNow();
+  // The dock walks channels 1-13 during its pairing window, so the remote
+  // only needs to be listening on any channel - no Wi-Fi association is
+  // required. startEspNowScan() now brings the radio up standalone when the
+  // network stack is down, which is what lets a fresh or disconnected remote
+  // pair a dock from the LCD.
   if (!startEspNowScan()) {
-    showEspNowSearchBlocked("The search could not be started. Check Wi-Fi and ESP-NOW are on.");
+    showEspNowSearchBlocked("The search could not be started. Check ESP-NOW is on.");
     return;
   }
   showEspNowSearchScanning();
@@ -31552,6 +32516,9 @@ void wakeDisplay() {
   // reporting false and the link the user is about to need would not come
   // back. No-op unless Bluetooth Sleep is on and a session was released.
   bleActivitySessionReleased = false;
+  // Consumed only if a media widget is visible. This produces one fresh
+  // snapshot at wake and never starts a timed polling loop.
+  nowPlayingRefreshWanted = true;
   // Restore full application speed before touching the LCD bus or beginning
   // an IR command from the physical key that caused this wake.
   leaveBleConnectedIdle();
@@ -32083,6 +33050,7 @@ void loop() {
   serviceDockOta(now);
   serviceDockPairAck(now);
   serviceDockLink(now);
+  serviceMediaArtwork(now);
   serviceEspNowLinkLog(now);
   serviceDockSettingsSync();
   if (homebridgeConfigPushWanted) {
@@ -32128,7 +33096,6 @@ void loop() {
   if (!displaySleeping) serviceWidgets(now);
   serviceMediaTarget(now);
   serviceMediaRadio(now);
-  serviceMediaArtwork(now);
   serviceWeatherWidget(now);
   serviceMqtt(now);
   serviceHomeAssistantLive(now);

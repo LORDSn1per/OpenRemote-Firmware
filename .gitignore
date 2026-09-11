@@ -45,3 +45,7 @@ archive/reference-projects/Official OMOTE Firmware References/OMOTE-Firmware-off
 # Written handoffs. Kept on disk and published as artifacts rather than
 # versioned here - they describe the work, they are not part of it.
 Handoffs/
+
+# Device-specific ADB authentication identity. This private key remains only
+# on Phillip's local dock build machine and must never be published.
+dock/firmware/pio_src/openremote_dock_adb_identity.h
