@@ -148,16 +148,39 @@ Build only from the local source tree. After every completed version, keep the v
 
 Before reporting a release complete, verify the embedded firmware version marker in each BIN and use SHA-256 to confirm each local/NAS copy is byte-identical to its build output or versioned HTML source. Do not copy versioned WebConfig releases into SD-card template paths unless Phillip explicitly asks for that deployment.
 
+### GitHub `latest-builds` release
+
+A normal Git commit and push updates repository source only. It does **not** update the downloadable files on the GitHub Releases page. Every completed Remote, Dock, WebConfig, or Studio version bump must also update the existing `latest-builds` release at `https://github.com/LORDSn1per/OpenRemote-Firmware/releases/tag/latest-builds` before the release may be reported complete.
+
+1. Build from the local source tree and verify the embedded firmware version marker.
+2. Create the prescribed versioned local and NAS artifacts without overwriting any older version, then use SHA-256 and byte comparison to prove that the build output, local artifact, and NAS artifact match. For WebConfig, compare the local versioned HTML directly with its NAS copy.
+3. Give GitHub assets these exact public names:
+   - `OpenRemote-Remote-Firmware-<version>.bin`
+   - `OpenRemote-Dock-Firmware-<version>.bin`
+   - `OpenRemote-WebConfig-<version>.html`
+   - Preserve the existing platform-specific naming convention for Studio assets.
+4. Upload the new assets to the existing `latest-builds` release first. Update its title and version table so every displayed version and filename is current. Update the README's direct download filenames and URLs in the same release commit.
+5. Query the release again and verify each uploaded asset's name, byte size, and downloaded SHA-256 against the verified local artifact. Only after that verification may the superseded asset for the same component be deleted. Do not delete unchanged current assets, such as Studio builds when Studio was not bumped.
+6. Commit the release documentation changes locally, push `main` to `origin`, confirm local `HEAD` equals `origin/main`, and confirm the working tree is clean. Finally reopen or query the public release URL and ensure the title, table, links, and asset list all show the new versions.
+
+Never claim that GitHub downloads are updated merely because source was pushed. A release is complete only when the repository, GitHub Release assets, local artifacts, and NAS mirror have all been verified.
+
 ## Current implementation history
 
 Keep this section updated as active work progresses so a later session can resume without reconstructing decisions from chat history.
+
+### 2026-09-11 — GitHub `latest-builds` release corrected
+
+- A source push does not update GitHub Release downloads. The `latest-builds` release had remained on Remote 4.48, Dock 1.61, and WebConfig 2.75 even though newer source had been pushed.
+- The release title, version table, README links, and downloadable assets now publish Remote 4.62, Dock 1.78, WebConfig 2.81, and the unchanged Studio 2.79 builds. The superseded Remote 4.48, Dock 1.61, and WebConfig 2.75 release assets were removed only after the replacements were uploaded, downloaded again, and hash-verified.
+- Downloaded GitHub assets match the verified local artifacts: Remote 4.62 SHA-256 `8ee006a30323badc90fd575b3512cb571ad4dfcb14c4e132df4736b0a0f808b0`, Dock 1.78 SHA-256 `f24f318583c66900cdbc1e9406420eb817c56374d2ab3d4cfdbc48254084392b`, and WebConfig 2.81 SHA-256 `30e5e721df74be45cc656abaa26213b3f35ba3804458ba5fc0ddc2930ad5cd19`.
 
 ### 2026-09-11 — ABC playback no longer exits in Dock 1.78
 
 - ABC iview treats Back on its playback overlay as leave-player, so Dock 1.77 could still return a running show to its detail page after successfully reading metadata.
 - Dock 1.78 removes Back from the ABC metadata path entirely. It reveals controls with DPAD Down only after the key-free preflight confirms a full-screen video, reads the accessible metadata, and lets ABC's progress overlay fade automatically.
 - Live regression test under Jane: resumed `GG: Spawn Squad`, captured `S3 Episode 34 Caleb VS Super Smash Bros CPUs!`, position 241 seconds of 891 seconds, and decoded its 96x96 artwork. After the overlay faded, ABC remained in `MainActivity` with protected full-screen video still playing and no Resume/detail controls present.
-- Dock 1.78 builds at 1,475,201 bytes total image size (72.5% flash, 22.7% RAM) and was flashed to Dock Rev6 MAC `40:4c:ca:f9:ef:54`; esptool verified every image. The versioned local/NAS release copies and SHA-256 are recorded after packaging.
+- Dock 1.78 builds at 1,475,201 bytes total image size (72.5% flash, 22.7% RAM) and was flashed to Dock Rev6 MAC `40:4c:ca:f9:ef:54`; esptool verified every image. Byte-identical release copies are in local `releases/dock-bin/OpenRemote_Dock_1.78.bin` and NAS `DOCK/FIRMWARE/BIN/OpenRemote_Dock_1.78.bin`, with SHA-256 `f24f318583c66900cdbc1e9406420eb817c56374d2ab3d4cfdbc48254084392b`.
 
 ### 2026-09-11 — ABC profile-screen navigation regression fixed in Dock 1.77
 
