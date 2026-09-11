@@ -28,7 +28,7 @@ The working rich-media implementation is split between the dock and remote. Pres
 - The dock sends title, subtitle, source, playback state, position, duration, and a token-free artwork cache key to the remote over ESP-NOW.
 - The dock downloads artwork, decodes and centre-crops it to a 96x96 RGB565 image, then sends the 18,432 pixel bytes to the remote in acknowledged ESP-NOW chunks with an end-to-end CRC.
 - The remote caches completed RGB565 images under `/media/art` on its SD card using the artwork key. Replaying the same item should load its poster from the remote's SD cache without another download.
-- Keep the dock and remote `EspNowNowPlayingPacket` layouts byte-identical. Titles are 128-byte buffers and the packed packet is 214 bytes as of remote 4.63 and dock 1.78.
+- Keep the dock and remote `EspNowNowPlayingPacket` layouts byte-identical. Titles are 128-byte buffers and the packed packet is 214 bytes as of remote 4.64 and dock 1.79.
 - Do not put account tokens, authenticated artwork URLs, Wi-Fi credentials, or other secrets in ESP-NOW packets, serial logs, source code, release notes, or cache filenames.
 - Before applying any app-specific fallback, the dock queries Android's active
   `media_session` owner over the approved ADB connection. Treat that package
@@ -170,6 +170,16 @@ Never claim that GitHub downloads are updated merely because source was pushed. 
 ## Current implementation history
 
 Keep this section updated as active work progresses so a later session can resume without reconstructing decisions from chat history.
+
+### 2026-09-11 — Held dock IR cadence and collision-free dual IR
+
+- A simultaneous Remote/Dock serial capture reproduced the held-volume pause. The remote delivered 210 ms repeats, but a blocking dock Chromecast pass left its single pending-command slot occupied and discarded four subsequent frames before returning to the IR service.
+- Dock 1.79 services pending IR before network work, defers blocking Cast operations while an IR stream is active, and releases the callback staging slot before the RMT transmission so the next held frame can queue safely.
+- Remote 4.64 keeps ESP-NOW active throughout a held dock-routed command, eliminating a radio shutdown/restart on every repeat. Its dock-transmit time-pill outline is a solid saturated blue for at least 320 ms, with held repeats extending one continuous indication.
+- Exact phase-aligned simultaneous IR from two independent microcontrollers is not possible over ESP-NOW and overlapping 38 kHz emitters can corrupt the received envelope. Remote-and-dock mode now sends two clean, non-overlapping frames in deterministic order: remote first, dock second.
+- Remote 4.64 builds at 2,674,331 bytes total image size (78.3% flash, 37.3% RAM) and Dock 1.79 builds at 1,475,335 bytes (72.5% flash, 22.7% RAM). Both were flashed over USB and esptool verified every written image.
+- Remote 4.64 SHA-256 is `21a3c93184b61c3641f2fe74739e08c74884ff71b7c914672fd1c834c415772e`; Dock 1.79 SHA-256 is `da38e49558b5fdd5cfd7e62d3aff94245bf7f4612f586f99928b04835447af36`. Each build, local release copy, and NAS copy is byte-identical.
+- GitHub publishing remains pending unless Phillip explicitly asks for it. The source commits and release artifacts are local only.
 
 ### 2026-09-11 — Command feedback and Widget Wallpaper lifetime fixed in Remote 4.63
 
