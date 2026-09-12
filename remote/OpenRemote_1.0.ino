@@ -1,6 +1,32 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.81 - 2026-09-12
+    - Fixes the real cause of a large upload crashing the remote, which the
+      previous two attempts both missed. On every chunk that did not verify, the
+      recovery path re-read the ENTIRE staged file to recompute its checksum -
+      on the HTTP task, in 512 byte reads, without ever yielding. The time that
+      held core 0 grew with the file, so at roughly 7.8MB it exceeded the five
+      second task watchdog and the remote aborted with IDLE0 starved. The crash
+      point barely moved between 4.78 and 4.80 despite unrelated fixes, and that
+      is what identified it: the threshold tracks file SIZE, not chunk count or
+      elapsed time.
+    - Recovery is now bounded to a single chunk. The confirmed checksum and byte
+      count are snapshotted when each chunk begins, so a chunk that only partly
+      lands is repaired by re-reading just the span from there to what the card
+      actually holds - at most one chunk, however large the file has grown.
+    - fileCrc32() yields every 64KB and reads in 4KB bites rather than 512B, so
+      even a whole-file pass cannot starve the idle task. That function is
+      reachable from several places and any of them could have hit this.
+    - Reverts 4.79's "hold the file open across chunks". It avoids FILE_APPEND
+      walking the FAT chain, but on this SD implementation an open append handle
+      reports neither a usable size() (4.79: short on every chunk, so every
+      chunk looked like a card falling behind) nor a usable position() (4.80:
+      returned -1, logged as "4294967295 on card", so every chunk ran the
+      expensive recovery and the transfer crawled at 104KB/s before the watchdog
+      killed it anyway). The per-chunk open is the only state in which size()
+      tells the truth, and the verification rests entirely on that.
+
   4.80 - 2026-09-12
     - Fixes 4.79's own regression, which failed every chunk with "SD card fell
       behind on that chunk" within a few hundred KB. Two halves, both caused by
@@ -6040,7 +6066,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.80"
+#define OPENREMOTE_VERSION_STRING "4.81"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -8026,6 +8052,11 @@ String chunkUploadTempPath;
 File chunkUploadFile;
 size_t chunkUploadBytes = 0;
 uint32_t chunkUploadCrc = 0;
+// The confirmed state as it stood before the chunk now being received. A chunk
+// that only partly lands is repaired from here, so recovery re-reads at most
+// one chunk instead of the whole file - see the mismatch branch.
+uint32_t chunkUploadCrcAtChunkStart = 0;
+size_t chunkUploadBytesAtChunkStart = 0;
 bool chunkUploadChunkOk = false;
 String chunkUploadError;
 static const uint8_t MAX_LCD_BACKUPS = 16;
@@ -17528,22 +17559,58 @@ uint32_t crc32Update(uint32_t crc, const uint8_t *data, size_t length);
 
 // CRC32 and length of a file as it exists on the card, so what was written can
 // be compared with what was meant to be written.
-bool fileCrc32(const String &path, uint32_t &crcOut, size_t &bytesOut) {
+/*
+  Checksums part of a file, yielding as it goes.
+
+  The unyielded version of this is what actually crashed a 200MB upload. It ran
+  on the HTTP task whenever a chunk mismatched, read the WHOLE file in 512 byte
+  bites, and never gave the scheduler a turn - so the time it held core 0 grew
+  with the file. At roughly 7.8MB it finally exceeded the five second task
+  watchdog and the remote aborted with IDLE0 starved. The crash point did not
+  move when an unrelated O(n^2) file-open was fixed, which is what identified
+  this as the real cause: the threshold tracks file SIZE, not chunk count.
+
+  4KB reads rather than 512B, because eight times fewer SD transactions for the
+  same bytes, and a vTaskDelay every 64KB so the idle task always gets a turn no
+  matter how large the range is.
+*/
+bool fileCrc32Range(const String &path, size_t from, size_t to,
+                    uint32_t &crcInOut, size_t &bytesOut) {
   File file = SD.open(path, FILE_READ);
   if (!file) return false;
-  uint32_t crc = 0;
-  size_t total = 0;
-  uint8_t buffer[512];
-  while (true) {
-    int got = file.read(buffer, sizeof(buffer));
+  if (from && !file.seek((uint32_t)from)) { file.close(); return false; }
+  static const size_t READ_BYTES = 4096;
+  static const size_t YIELD_EVERY = 64 * 1024;
+  uint8_t *buffer = (uint8_t *)malloc(READ_BYTES);
+  if (!buffer) { file.close(); return false; }
+  size_t total = from;
+  size_t sinceYield = 0;
+  while (total < to) {
+    size_t want = to - total;
+    if (want > READ_BYTES) want = READ_BYTES;
+    int got = file.read(buffer, want);
     if (got <= 0) break;
-    crc = crc32Update(crc, buffer, (size_t)got);
+    crcInOut = crc32Update(crcInOut, buffer, (size_t)got);
     total += (size_t)got;
+    sinceYield += (size_t)got;
+    if (sinceYield >= YIELD_EVERY) {
+      sinceYield = 0;
+      vTaskDelay(1);
+    }
   }
+  free(buffer);
   file.close();
-  crcOut = crc;
   bytesOut = total;
   return true;
+}
+
+bool fileCrc32(const String &path, uint32_t &crcOut, size_t &bytesOut) {
+  File probe = SD.open(path, FILE_READ);
+  if (!probe) return false;
+  size_t size = (size_t)probe.size();
+  probe.close();
+  crcOut = 0;
+  return fileCrc32Range(path, 0, size, crcOut, bytesOut);
 }
 
 bool uploadedWebConfigLooksValid(const String &path) {
@@ -20222,28 +20289,30 @@ void handleChunkUploadData() {
       // corrupt the file - the client re-reads /status and resumes.
       chunkUploadChunkOk = false;
       chunkUploadError = "Chunk offset mismatch";
-    } else if (!chunkUploadFile) {
+      chunkUploadCrcAtChunkStart = chunkUploadCrc;
+      chunkUploadBytesAtChunkStart = chunkUploadBytes;
+    } else {
       /*
-        Opened once for the whole transfer, not once per chunk.
+        Opened per chunk, deliberately, after trying the alternative twice.
 
-        This used to run on every chunk, and FILE_APPEND seeks to the end of the
-        file - which on FAT means walking the cluster chain from the start. With
-        a fixed chunk size that is O(n) per chunk and O(n^2) over a transfer, so
-        the open got steadily slower as the file grew. It is invisible on a
-        2MB WebConfig and fatal on a 200MB database: at roughly 7.8MB a single
-        open finally blocked longer than the five second task watchdog, the HTTP
-        worker never yielded to IDLE0, and the remote aborted and rebooted -
-        "task_wdt: IDLE0 (CPU 0)", with CPU 0 running openremote_http and the
-        heap still perfectly healthy at 86KB. It was never a memory problem.
+        Holding one handle open across the whole transfer looks obviously
+        better - it avoids FILE_APPEND walking the FAT cluster chain on every
+        chunk - but on this SD implementation an open append handle reports
+        neither a usable size() (4.79: read short every chunk, so every chunk
+        looked like a card falling behind) nor a usable position() (4.80:
+        returned -1, logged as "4294967295 on card", so EVERY chunk triggered
+        the expensive recovery path and the upload crawled at 104KB/s before
+        the watchdog killed it).
 
-        Holding the handle open keeps every append at the position the last
-        write left, which costs nothing regardless of how large the file is.
+        The per-chunk open is the only state in which size() tells the truth,
+        and the truth is what the whole verification rests on. The open cost is
+        real but small; what actually crashed these transfers was never this,
+        it was the unyielded whole-file CRC in the recovery path, which is now
+        both yielded and bounded to a single chunk.
       */
       chunkUploadFile = SD.open(chunkUploadTempPath, FILE_APPEND);
       chunkUploadChunkOk = (bool)chunkUploadFile;
       if (!chunkUploadChunkOk) chunkUploadError = "Could not open upload file";
-      else Serial.printf("Chunked upload: file opened once for %s, heapFree=%u\n",
-                         chunkUploadTarget.c_str(), (unsigned)ESP.getFreeHeap());
     }
   } else if (upload.status == UPLOAD_FILE_WRITE && chunkUploadChunkOk) {
     if (chunkUploadFile.write(upload.buf, upload.currentSize) != upload.currentSize) {
@@ -20288,26 +20357,49 @@ void handleChunkUploadData() {
         recovery read returned nothing useful, so a transfer that should have
         resumed failed outright at the first mismatch.
       */
-      size_t onCard = (size_t)chunkUploadFile.position();
-      // Left open deliberately - see the open above. closeChunkUploadSession()
-      // and the finish handler are what close it.
+      size_t onCard = chunkUploadFile.size();
+      // Closed here, which is also what makes size() above meaningful and what
+      // lets the recovery path below open the same file by name.
+      chunkUploadFile.close();
       if (onCard != chunkUploadBytes) {
-        // Re-reading needs sole ownership of the file; the next chunk reopens.
-        chunkUploadFile.close();
         Serial.printf("Chunked upload: SD fell behind - %u bytes written but %u on "
                       "card, rewinding %d\n",
                       (unsigned)chunkUploadBytes, (unsigned)onCard,
                       (int)((long)chunkUploadBytes - (long)onCard));
-        // The CRC was accumulated over bytes that did not all land, so it no
-        // longer describes the file. Recomputing it from the card keeps the
-        // running total honest for the resumed remainder.
-        uint32_t cardCrc = 0;
-        size_t cardBytes = 0;
-        if (fileCrc32(chunkUploadTempPath, cardCrc, cardBytes)) {
-          chunkUploadCrc = cardCrc;
-          chunkUploadBytes = cardBytes;
+        /*
+          Repaired from the start of THIS chunk, not from byte zero.
+
+          The CRC was accumulated over bytes that did not all land, so it no
+          longer describes the file - but everything before this chunk is still
+          known good, and its checksum was snapshotted when the chunk began. So
+          only the span from there to what the card actually holds needs
+          re-reading, which is at most one chunk however large the file has
+          grown.
+
+          Re-reading the whole file here is what crashed a 200MB upload: it ran
+          on the HTTP task, took longer as the file grew, and at about 7.8MB
+          exceeded the task watchdog. Bounding it to one chunk removes the
+          size dependence entirely; fileCrc32Range() also yields, so even a
+          pathological range cannot starve the idle task.
+        */
+        uint32_t repairedCrc = chunkUploadCrcAtChunkStart;
+        size_t repairedBytes = chunkUploadBytesAtChunkStart;
+        if (onCard >= chunkUploadBytesAtChunkStart &&
+            fileCrc32Range(chunkUploadTempPath, chunkUploadBytesAtChunkStart,
+                           onCard, repairedCrc, repairedBytes)) {
+          chunkUploadCrc = repairedCrc;
+          chunkUploadBytes = repairedBytes;
         } else {
-          chunkUploadBytes = onCard;
+          // The card holds less than this chunk started with, which should not
+          // happen - fall back to the honest whole-file read, which now yields.
+          uint32_t cardCrc = 0;
+          size_t cardBytes = 0;
+          if (fileCrc32(chunkUploadTempPath, cardCrc, cardBytes)) {
+            chunkUploadCrc = cardCrc;
+            chunkUploadBytes = cardBytes;
+          } else {
+            chunkUploadBytes = onCard;
+          }
         }
         chunkUploadChunkOk = false;
         chunkUploadError = "SD card fell behind on that chunk";
