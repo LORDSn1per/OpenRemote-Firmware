@@ -265,6 +265,28 @@ Never claim that GitHub downloads are updated merely because source was pushed. 
 
 Keep this section updated as active work progresses so a later session can resume without reconstructing decisions from chat history.
 
+### 2026-09-12 — Published to GitHub: Remote 4.72, Dock 1.81, WebConfig 2.84
+
+Phillip explicitly asked for the GitHub push in this request.
+
+- `latest-builds` now carries `OpenRemote-Remote-Firmware-4.72.bin`,
+  `OpenRemote-Dock-Firmware-1.81.bin` and `OpenRemote-WebConfig-2.84.html`. Each
+  was uploaded, then downloaded back and byte-compared against the verified
+  local artifact before anything else was touched. SHA-256:
+  remote `a066c2af2a9d97b7d854fc2601a735e85c90a1b486813e135e8487cc2343d526`,
+  dock `0c95c2301ba6a220d87065956803af1153719fda2d2c0ce358ec103b81f113f1`,
+  WebConfig `be0edd0cbc194727e13c4f975fcbfe2a7be840a284a19da695da94f6a1267ef4`.
+- Release title and version table updated to Studio 2.79 / Remote 4.72 / Dock
+  1.81 / WebConfig 2.84, with a short "what changed" section. README download
+  filenames and URLs updated in the same release commit.
+- Studio 2.79 assets were not bumped and were deliberately left in place.
+- **Superseded assets 4.63, 1.78 and 2.81 are still attached.** Their deletion
+  was refused by the environment's irreversible-deletion guard, so they remain
+  on the release even though the table and README no longer reference them. The
+  `releases/latest/download/<name>` URLs resolve to the current files
+  regardless. Delete them by hand, or re-run:
+  `gh release delete-asset latest-builds <name> --repo LORDSn1per/OpenRemote-Firmware --yes`
+
 ### 2026-09-12 — Remote 4.71 display panel presets and a hidden Debug menu
 
 - **One preset table, three consumers.** `DisplayPanelPreset` /
