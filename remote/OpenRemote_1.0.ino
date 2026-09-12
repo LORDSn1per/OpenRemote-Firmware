@@ -1,6 +1,33 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.82 - 2026-09-12
+    - Stops a large upload throwing away good chunks and re-sending them, which
+      is what turned a steady 200KB/s into thirty second stalls. The per-chunk
+      check read the staged file's size from the OPEN handle, and this SD layer
+      commits in 4KB units - so the tail of every chunk was still in the write
+      buffer and the file always looked a few KB short. Measured live during a
+      198MB transfer: the reported size was 4096-byte aligned every single time
+      (31379456, 33665024, 34271232 - all exact multiples) with shortfalls of
+      3816, 3488 and 3720 bytes. Nothing was ever being lost; the number was
+      simply read too early, and believing it discarded a perfectly good 192KB
+      chunk each time and made the client send it again.
+    - The size is now read after closing the file, which flushes the buffer and
+      updates the directory entry, from a fresh read-only handle. The check
+      itself is unchanged and still catches a card that genuinely falls behind -
+      it just no longer fires on one that has not.
+    - Checks the IR database on arrival over USB as well, which had no arrival
+      check at all while every other category did. Sixteen bytes against
+      SQLite's fixed header, deliberately not a whole-file checksum: reading
+      200MB here would hold the USB task long enough to trip the task watchdog,
+      which is the fault that cost three revisions on the HTTP side. Studio's
+      transfer protocol acknowledges every window, so truncation is caught on
+      the wire rather than by re-reading the card.
+    - Studio's USB path needs no change for any of this. It holds one file open
+      for the whole transfer, is byte-budgeted so it returns to loop() and
+      yields naturally, never reads size() mid-transfer, and computes no
+      whole-file checksum - none of the three faults above can occur on it.
+
   4.81 - 2026-09-12
     - Fixes the real cause of a large upload crashing the remote, which the
       previous two attempts both missed. On every chunk that did not verify, the
@@ -6066,7 +6093,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.81"
+#define OPENREMOTE_VERSION_STRING "4.82"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -17729,6 +17756,31 @@ void finishUsbFileUpload(Stream &port, UsbSerialSession &session) {
     failUsbUpload(port, session, "USB payload is not a valid OpenRemote WebConfig");
     return;
   }
+  /*
+    The IR database, which arrived with no arrival check at all.
+
+    Every other category here is verified, and the HTTP upload path checks this
+    one - but the USB route did not, so a mis-picked file could be renamed over
+    a working database and only be discovered when the search stopped finding
+    anything. Sixteen bytes is the whole test: a SQLite file begins with a fixed
+    seventeen byte string, and a database that does not is not one.
+
+    Deliberately not a whole-file checksum. This file is over 200MB, and reading
+    all of it here would hold the USB task long enough to trip the task watchdog
+    - which is exactly the fault that cost three firmware revisions on the HTTP
+    side. The transfer protocol already acknowledges every window, so truncation
+    is caught on the wire rather than by re-reading the card.
+  */
+  if (finalPath == IRDB_PATH) {
+    File probe = SD.open(tempPath, FILE_READ);
+    char header[16] = {0};
+    if (probe) { probe.read((uint8_t *)header, sizeof(header)); probe.close(); }
+    if (received < 65536UL || memcmp(header, "SQLite format 3", 15) != 0) {
+      failUsbUpload(port, session,
+        "USB payload is not an OpenRemote.irdb database");
+      return;
+    }
+  }
   // Backups were the one upload category with no arrival check at all. A file
   // that landed truncated or corrupt was renamed into /backups as if it were
   // sound, and only failed much later at restore - by which point the good
@@ -20357,10 +20409,30 @@ void handleChunkUploadData() {
         recovery read returned nothing useful, so a transfer that should have
         resumed failed outright at the first mismatch.
       */
-      size_t onCard = chunkUploadFile.size();
-      // Closed here, which is also what makes size() above meaningful and what
-      // lets the recovery path below open the same file by name.
+      /*
+        Measured after closing, not before.
+
+        size() on an OPEN handle reports only the blocks this SD layer has
+        fully committed, and it commits in 4KB units - so the tail of every
+        chunk sat in the write buffer and the file always looked a few KB short.
+        Measured live during a 198MB transfer: the reported size was 4096-byte
+        aligned EVERY time (31379456, 33665024, 34271232 - all exact multiples)
+        with shortfalls of 3816, 3488 and 3720 bytes. Nothing was being lost;
+        the number was simply being read too early.
+
+        The cost of believing it was high: each false alarm discarded a
+        perfectly good 192KB chunk and made the client re-send it, which is
+        what turned a steady 200KB/s into long stalls. Closing first flushes
+        the buffer and updates the directory entry, so a fresh read-only handle
+        reports what the card genuinely holds.
+      */
       chunkUploadFile.close();
+      size_t onCard = chunkUploadBytes;
+      File sizeProbe = SD.open(chunkUploadTempPath, FILE_READ);
+      if (sizeProbe) {
+        onCard = (size_t)sizeProbe.size();
+        sizeProbe.close();
+      }
       if (onCard != chunkUploadBytes) {
         Serial.printf("Chunked upload: SD fell behind - %u bytes written but %u on "
                       "card, rewinding %d\n",
