@@ -1,6 +1,37 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.90 - 2026-09-13
+    - Makes the upload actually overlap receiving and writing. 4.88 put the SD
+      writer on core 0 next to the HTTP worker at a higher priority, assuming an
+      SD write blocks on hardware and hands the CPU back. It does not:
+      esp_driver_sdspi uses spi_device_polling_transmit() throughout, including
+      the loop that waits out a busy card, so a write BUSY-WAITS. It therefore
+      pinned core 0 for every 64KB block, the HTTP task could not read the
+      socket, and the TCP receive window - 5760 bytes, fixed in the prebuilt
+      lwIP - stayed shut. Measured on a 114MB transfer: 2.2ms of real network
+      round trip behaving like 15.4ms. The writer now runs on core 1, at the
+      same priority as the Arduino loop so a busy-waiting task cannot freeze
+      LVGL for the whole transfer.
+    - A card that pauses for its own housekeeping no longer costs a chunk. Four
+      EIO stalls landed in the first 66MB of a 114MB upload; each one rolled
+      back a 192KB chunk and re-sent it, about a second, for a fault that clears
+      in twenty milliseconds. The writer now seeks back to the confirmed offset
+      and retries before giving up, with the full chunk recovery still behind it.
+    - The finished upload is verified in slices, and the page can show it. The
+      read-back check - which is what catches a card that stored the file badly,
+      and is worth keeping - ran inside the single /api/upload/finish request.
+      On a 120MB database that was 112 seconds of complete silence AFTER the
+      progress bar reached 100%, measured as handleClient() took 112000ms. There
+      is now POST /api/upload/verify, which checks 2MB at a time and reports how
+      far it has got, so the bar fills a second time instead of the page looking
+      hung. finish skips the re-read when this firmware's own verify state shows
+      the whole file was already covered and matched - never on the client's say
+      so. Older clients that go straight to finish behave exactly as before.
+    - That read-back is also about three times faster: it read the file 4KB at a
+      time, which for 120MB is thirty thousand trips through FATFS. It now uses
+      a 64KB PSRAM buffer, falling back to the old size without PSRAM.
+
   4.89 - 2026-09-13
     - Stops a body posted to the wrong upload route from crashing the remote.
       WebServer calls a route's single upload callback for a multipart body and
@@ -6208,7 +6239,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.89"
+#define OPENREMOTE_VERSION_STRING "4.90"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -8122,6 +8153,8 @@ volatile bool chunkWriteRunning = false;
 // request - so it records what went wrong and the HTTP task reports it.
 volatile bool chunkWriteFailed = false;
 volatile int chunkWriteErrno = 0;
+volatile size_t chunkWriteFailedRequested = 0;
+volatile size_t chunkWriteFailedAccepted = 0;
 const char *chunkWriteFailedOp = "write";
 // The buffer the HTTP side is currently filling, and how much is in it.
 uint8_t *chunkFillBuffer = nullptr;
@@ -8262,6 +8295,27 @@ uint32_t chunkUploadCrc = 0;
 // that only partly lands is repaired from here, so recovery re-reads at most
 // one chunk instead of the whole file - see the mismatch branch.
 uint32_t chunkUploadCrcAtChunkStart = 0;
+/*
+  Incremental read-back verification.
+
+  Checking a finished upload means reading the whole file off the card again
+  and checksumming it, because the running CRC only proves the bytes arrived -
+  not that the card stored them. On a 120MB database that took 112 seconds,
+  all of it after the progress bar had reached 100% and none of it visible to
+  anyone: one HTTP request went quiet for nearly two minutes and then said
+  "installed".
+
+  So it is done a slice at a time instead, one short request each, and the
+  client draws a real progress bar from the answers. The file handle stays open
+  across the slices deliberately - reopening and seeking to the next offset
+  would walk the FAT cluster chain from the start every time, which is the same
+  O(n^2) trap that made uploads themselves crawl before 4.86.
+*/
+String chunkVerifyTarget;
+File chunkVerifyFile;
+size_t chunkVerifyOffset = 0;
+size_t chunkVerifyTotal = 0;
+uint32_t chunkVerifyCrc = 0;
 size_t chunkUploadBytesAtChunkStart = 0;
 bool chunkUploadChunkOk = false;
 String chunkUploadError;
@@ -17832,15 +17886,23 @@ bool fileCrc32Range(const String &path, size_t from, size_t to,
   File file = SD.open(path, FILE_READ);
   if (!file) return false;
   if (from && !file.seek((uint32_t)from)) { file.close(); return false; }
-  static const size_t READ_BYTES = 4096;
+  // 64KB a time, from PSRAM. This used to read 4KB, which for a 120MB database
+  // is thirty thousand trips through FATFS and took 112 seconds - a quarter of
+  // the entire transfer, spent after the progress bar had already reached 100%.
+  // The falllback keeps a board without PSRAM working at the old size.
+  size_t readBytes = 64 * 1024;
   static const size_t YIELD_EVERY = 64 * 1024;
-  uint8_t *buffer = (uint8_t *)malloc(READ_BYTES);
+  uint8_t *buffer = (uint8_t *)ps_malloc(readBytes);
+  if (!buffer) {
+    readBytes = 4096;
+    buffer = (uint8_t *)malloc(readBytes);
+  }
   if (!buffer) { file.close(); return false; }
   size_t total = from;
   size_t sinceYield = 0;
   while (total < to) {
     size_t want = to - total;
-    if (want > READ_BYTES) want = READ_BYTES;
+    if (want > readBytes) want = readBytes;
     int got = file.read(buffer, want);
     if (got <= 0) break;
     crcInOut = crc32Update(crcInOut, buffer, (size_t)got);
@@ -20492,16 +20554,32 @@ bool startChunkWriter() {
     uint8_t *slot = chunkWriteBuffers[i];
     xQueueSend(chunkWriteFreeQueue, &slot, 0);
   }
-  // Core 0, alongside the HTTP worker, and one priority step above it. Core 1
-  // belongs to LVGL and the keypad, and a task that blocks for ~100ms at a time
-  // would visibly stall them. Sharing core 0 costs nothing because both tasks
-  // spend nearly all their time blocked on hardware - one on the socket, one on
-  // the SPI transfer - so the CPU is free for the other exactly when it is
-  // needed. The higher priority only means a filled buffer starts reaching the
-  // card the moment it is handed over.
+  /*
+    Core 1, at the same priority as the Arduino loop. Both halves of that
+    matter and the first was learned the expensive way.
+
+    This ran on core 0 next to the HTTP worker at one priority above it, on the
+    assumption that an SD write blocks on hardware and hands the CPU back. It
+    does not: esp_driver_sdspi uses spi_device_polling_transmit() throughout,
+    including the loop that waits for the card to stop being busy, so a write
+    BUSY-WAITS. At a higher priority on the same core it therefore pinned core
+    0 for the duration of every 64KB block, the HTTP task could not call
+    readBytes(), and the TCP receive window - 5760 bytes, a compile-time
+    constant in the prebuilt lwIP - stayed shut until it was let go. Measured
+    on a 114MB transfer: 2.2ms of real network round trip behaving like 15.4ms,
+    which is precisely 5760 bytes per stalled window.
+
+    Core 1 leaves core 0 to the HTTP task alone, which is what makes the
+    overlap real rather than nominal. Equal priority rather than higher because
+    a busy-waiting task ABOVE the Arduino loop would take core 1 outright and
+    freeze LVGL for the whole upload; at the same priority the scheduler slices
+    between them every tick and the progress bar keeps moving. The card is not
+    the limit here - it absorbs far more than the network delivers - so giving
+    it half a core costs nothing.
+  */
   chunkWriteRunning = true;
   BaseType_t created = xTaskCreatePinnedToCore(chunkWriteWorker, "or_sdwrite",
-                                               4096, nullptr, 2, &chunkWriteTask, 0);
+                                               4096, nullptr, 1, &chunkWriteTask, 1);
   if (created != pdPASS) {
     chunkWriteTask = nullptr;
     chunkWriteRunning = false;
@@ -20521,6 +20599,7 @@ void chunkWriteWorker(void *) {
     // only put bytes past the offset the client will resume from.
     if (!chunkWriteFailed && chunkUploadFd >= 0) {
       size_t accepted = 0;
+      uint8_t stalls = 0;
       while (accepted < block.length) {
         errno = 0;
         ssize_t written = ::write(chunkUploadFd, block.data + accepted,
@@ -20531,10 +20610,37 @@ void chunkWriteWorker(void *) {
           continue;
         }
         if (written <= 0) {
+          /*
+            An SD card that pauses to do its own internal housekeeping answers
+            EIO rather than waiting, and is ready again within milliseconds.
+            Four of these landed in the first 66MB of a 114MB transfer, and
+            each one used to cost a rolled-back chunk, a reopen and a 192KB
+            re-send - about a second - for a fault that clears in twenty.
+
+            The offset after a failed write is not guaranteed, so the retry
+            seeks back to the byte count that is actually confirmed before
+            trying again. A card that refuses this many times in a row is a
+            real failure and still fails the chunk, with the whole recovery
+            path behind it unchanged.
+          */
+          if (++stalls <= 10 &&
+              ::lseek(chunkUploadFd, (off_t)chunkUploadBytes, SEEK_SET) ==
+                (off_t)chunkUploadBytes) {
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+          }
           chunkWriteErrno = error ? error : EIO;
           chunkWriteFailedOp = "write";
+          chunkWriteFailedRequested = block.length;
+          chunkWriteFailedAccepted = accepted;
           chunkWriteFailed = true;
           break;
+        }
+        if (stalls) {
+          Serial.printf("Chunked upload: card stalled %u time(s) at %u, "
+                        "recovered without losing the chunk\n",
+                        (unsigned)stalls, (unsigned)chunkUploadBytes);
+          stalls = 0;
         }
         // Only bytes the card has actually taken are counted, so a short or
         // failed write leaves chunkUploadBytes telling the truth. The HTTP
@@ -20641,8 +20747,17 @@ void setChunkUploadRadioBoost(bool on) {
   }
 }
 
+void resetChunkUploadVerify() {
+  if (chunkVerifyFile) chunkVerifyFile.close();
+  chunkVerifyTarget = "";
+  chunkVerifyOffset = 0;
+  chunkVerifyTotal = 0;
+  chunkVerifyCrc = 0;
+}
+
 void closeChunkUploadSession() {
   setChunkUploadRadioBoost(false);
+  resetChunkUploadVerify();
   // Before the descriptor goes: the writer task holds it too.
   stopChunkWriter();
   if (chunkUploadFd >= 0) ::close(chunkUploadFd);
@@ -20791,7 +20906,7 @@ void handleChunkUploadBegin() {
   // for the route would mean sending a whole chunk to firmware that might not
   // have it, and an unknown URI makes the web server try to buffer the entire
   // body in heap before answering 404.
-  sendJson(200, "{\"ok\":true,\"bytes\":0,\"raw\":true}");
+  sendJson(200, "{\"ok\":true,\"bytes\":0,\"raw\":true,\"verify\":true}");
 }
 
 void handleChunkUploadStatus() {
@@ -20864,7 +20979,8 @@ void beginChunkUploadRequest(const String &target, size_t offset, bool authorize
 // Reports a failure the writer task hit, in the request that caused it.
 bool chunkWriterHealthy() {
   if (!chunkWriteFailed) return true;
-  failChunkUploadIo(chunkWriteFailedOp, chunkWriteErrno);
+  failChunkUploadIo(chunkWriteFailedOp, chunkWriteErrno,
+                    chunkWriteFailedRequested, chunkWriteFailedAccepted);
   return false;
 }
 
@@ -21009,6 +21125,103 @@ void handleChunkUploadData() {
   else handleChunkUploadOctetStream();
 }
 
+/*
+  Verifies the next slice of a finished upload and reports how far it has got.
+
+  Small enough that each request answers in well under a second even on a slow
+  card, so the client's bar moves continuously; large enough that the
+  per-request overhead is irrelevant next to the reading.
+*/
+static const size_t CHUNK_VERIFY_SLICE_BYTES = 2UL * 1024UL * 1024UL;
+
+void handleChunkUploadVerify() {
+  if (!requestAuthorized()) {
+    sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
+    return;
+  }
+  String target = webServer.arg("target");
+  if (!target.length() || target != chunkUploadTarget || !chunkUploadTempPath.length()) {
+    sendJson(400, "{\"ok\":false,\"error\":\"No upload session for this target\"}");
+    return;
+  }
+  chunkUploadLastActivityMs = millis();
+
+  if (chunkVerifyTarget != target) {
+    resetChunkUploadVerify();
+    // The writer must be finished and the descriptor closed before the file is
+    // read back, or the tail of it would not be on the card yet.
+    if (chunkUploadFd >= 0) {
+      drainChunkWriter();
+      if (::fsync(chunkUploadFd) != 0) {
+        sendJson(500, "{\"ok\":false,\"error\":\"Could not flush the upload to the card\"}");
+        return;
+      }
+      ::close(chunkUploadFd);
+      chunkUploadFd = -1;
+    }
+    stopChunkWriter();
+    chunkVerifyFile = SD.open(chunkUploadTempPath, FILE_READ);
+    if (!chunkVerifyFile) {
+      sendJson(500, "{\"ok\":false,\"error\":\"Could not read the uploaded file back to verify it\"}");
+      return;
+    }
+    chunkVerifyTarget = target;
+    chunkVerifyTotal = chunkUploadBytes;
+    Serial.printf("Chunked upload: verifying %u bytes of %s\n",
+                  (unsigned)chunkVerifyTotal, target.c_str());
+  }
+
+  size_t want = chunkVerifyTotal - chunkVerifyOffset;
+  if (want > CHUNK_VERIFY_SLICE_BYTES) want = CHUNK_VERIFY_SLICE_BYTES;
+  if (want) {
+    uint8_t *buffer = (uint8_t *)ps_malloc(65536);
+    size_t bufferBytes = 65536;
+    if (!buffer) { buffer = (uint8_t *)malloc(4096); bufferBytes = 4096; }
+    if (!buffer) {
+      sendJson(500, "{\"ok\":false,\"error\":\"Not enough memory to verify the upload\"}");
+      return;
+    }
+    size_t done = 0;
+    while (done < want) {
+      size_t ask = want - done;
+      if (ask > bufferBytes) ask = bufferBytes;
+      int got = chunkVerifyFile.read(buffer, ask);
+      if (got <= 0) break;
+      chunkVerifyCrc = crc32Update(chunkVerifyCrc, buffer, (size_t)got);
+      done += (size_t)got;
+      serviceUiDuringLongHttpTransfer();
+    }
+    free(buffer);
+    chunkVerifyOffset += done;
+    if (done < want) {
+      // The file is shorter than the byte count the transfer acknowledged,
+      // which means the card did not keep what it said it had.
+      resetChunkUploadVerify();
+      sendJson(200, String("{\"ok\":false,\"error\":\"The SD card did not store the file "
+                           "correctly (read ") + String((unsigned)(chunkVerifyOffset)) +
+                          " of " + String((unsigned)chunkVerifyTotal) + " bytes)\"}");
+      return;
+    }
+  }
+
+  bool done = chunkVerifyOffset >= chunkVerifyTotal;
+  bool match = true;
+  if (done) {
+    chunkVerifyFile.close();
+    match = chunkVerifyCrc == chunkUploadCrc;
+    Serial.printf("Chunked upload: verified %u bytes of %s, checksum %s\n",
+                  (unsigned)chunkVerifyTotal, target.c_str(), match ? "ok" : "WRONG");
+    if (!match) resetChunkUploadVerify();
+  }
+  sendJson(200, String("{\"ok\":") + (done && !match ? "false" : "true") +
+                ",\"checked\":" + String((unsigned)chunkVerifyOffset) +
+                ",\"total\":" + String((unsigned)chunkVerifyTotal) +
+                ",\"done\":" + (done ? "true" : "false") +
+                (done && !match
+                   ? ",\"error\":\"Upload corrupted on the card (checksum mismatch)\""
+                   : "") + "}");
+}
+
 void handleChunkUploadFinish() {
   if (!requestAuthorized()) {
     sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
@@ -21063,7 +21276,18 @@ void handleChunkUploadFinish() {
     // WebConfig installs, reports success, and then renders as garbage or not
     // at all. Re-reading is a few hundred milliseconds against a 1.6MB file and
     // turns a silent corruption into a refusal.
-    if (ok) {
+    //
+    // A client that walked /api/upload/verify to the end has already done
+    // exactly this read, slice by slice, with a progress bar in front of the
+    // user. Doing it again here would double a two minute wait for no new
+    // information. The decision rests on this firmware's own verify state, not
+    // on anything the client claims: the target must match, the whole file must
+    // have been covered, and the checksum it arrived at must agree.
+    bool alreadyVerified = chunkVerifyTarget == target &&
+                           chunkVerifyTotal == received &&
+                           chunkVerifyOffset >= chunkVerifyTotal &&
+                           chunkVerifyCrc == chunkUploadCrc;
+    if (ok && !alreadyVerified) {
       uint32_t storedCrc = 0;
       size_t storedBytes = 0;
       if (!fileCrc32(path, storedCrc, storedBytes)) {
@@ -21075,6 +21299,8 @@ void handleChunkUploadFinish() {
                 String((unsigned)storedBytes) + " of " + String((unsigned)received) +
                 " bytes, checksum " + (storedCrc == chunkUploadCrc ? "ok" : "wrong") + ")";
       }
+    } else if (ok) {
+      Serial.println("Chunked upload: read-back already verified slice by slice");
     }
   }
 
@@ -23431,6 +23657,7 @@ void configureWebServer() {
                     : String("{\"ok\":false,\"error\":\"") + chunkUploadError +
                       "\",\"bytes\":" + String((unsigned)chunkUploadBytes) + "}");
   }, handleChunkUploadData);
+  webServer.on("/api/upload/verify", HTTP_POST, handleChunkUploadVerify);
   webServer.on("/api/sd/format", HTTP_POST, handleSdRebuild);
   webServer.on("/api/factory-reset", HTTP_POST, handleFactoryReset);
   webServer.on("/api/backups", HTTP_GET, handleBackupList);
