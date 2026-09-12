@@ -1,6 +1,26 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.83 - 2026-09-12
+    - Makes a large upload run at the card's real speed instead of crawling
+      between long pauses. A chunk the card only partly took was answered with
+      400, which sent the client down its error path: a 700ms back-off, a
+      /status round trip, and then a re-send of the WHOLE 192KB chunk to recover
+      the few KB that had not landed. This card commits in 4KB units and keeps
+      the remainder buffered, so it fires on most chunks of a 198MB transfer -
+      which is the entire explanation for "200KB/s for a while, then a pause,
+      then it restarts".
+    - A short write is not a failure; it is where the file now ends. The
+      response already carried the true byte count and the client already
+      resumes from it on success, so it now answers success with the honest
+      number. The next chunk starts where the card really ended and the few KB
+      that did not land are re-sent as part of it. Waste drops from a whole
+      chunk to a few kilobytes.
+    - Genuine corruption is still refused: if the card holds less than the chunk
+      started with, something went backwards and resuming would preserve the
+      damage. The per-chunk log now only speaks up when the shortfall exceeds
+      one 4KB block, which would mean something other than ordinary buffering.
+
   4.82 - 2026-09-12
     - Stops a large upload throwing away good chunks and re-sending them, which
       is what turned a steady 200KB/s into thirty second stalls. The per-chunk
@@ -6093,7 +6113,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.82"
+#define OPENREMOTE_VERSION_STRING "4.83"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -20434,10 +20454,16 @@ void handleChunkUploadData() {
         sizeProbe.close();
       }
       if (onCard != chunkUploadBytes) {
-        Serial.printf("Chunked upload: SD fell behind - %u bytes written but %u on "
-                      "card, rewinding %d\n",
-                      (unsigned)chunkUploadBytes, (unsigned)onCard,
-                      (int)((long)chunkUploadBytes - (long)onCard));
+        // Routine on a card that buffers 4KB blocks, so logged only when the
+        // shortfall is larger than that - which would mean something other
+        // than ordinary buffering.
+        if ((long)chunkUploadBytes - (long)onCard > 4096) {
+          Serial.printf("Chunked upload: card took %u of %u bytes, resuming from "
+                        "%u (short by %d)\n",
+                        (unsigned)onCard, (unsigned)chunkUploadBytes,
+                        (unsigned)onCard,
+                        (int)((long)chunkUploadBytes - (long)onCard));
+        }
         /*
           Repaired from the start of THIS chunk, not from byte zero.
 
@@ -20473,8 +20499,33 @@ void handleChunkUploadData() {
             chunkUploadBytes = onCard;
           }
         }
-        chunkUploadChunkOk = false;
-        chunkUploadError = "SD card fell behind on that chunk";
+        /*
+          A short write is not a failure. It is where the file now ends.
+
+          This used to answer 400, which sent the client down its error path: a
+          700ms back-off, a /status round trip, and then a re-send of the WHOLE
+          192KB chunk to recover the few KB the card had not taken. The card
+          commits in 4KB units and keeps the remainder buffered, so this fires
+          on most chunks of a large transfer - which is exactly why a 198MB
+          upload crawled along with long pauses between bursts.
+
+          The response already carries the true byte count, and the client
+          already resumes from it on success. So report success with the honest
+          number: the next chunk simply starts where the card really ended, and
+          the few KB that did not land are re-sent as part of it. Waste drops
+          from a whole chunk to a few kilobytes, and the pause disappears
+          entirely.
+
+          Genuine corruption is still a failure. If the card holds LESS than
+          this chunk started with, something went backwards and resuming would
+          preserve the damage.
+        */
+        if (onCard > chunkUploadBytesAtChunkStart) {
+          chunkUploadChunkOk = true;
+        } else {
+          chunkUploadChunkOk = false;
+          chunkUploadError = "SD card lost data already written";
+        }
       }
     }
   } else if (upload.status == UPLOAD_FILE_ABORTED) {
