@@ -1,6 +1,20 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.92 - 2026-09-13
+    - Air conditioners transmit again. An AC has no "mode dry" code: it resends
+      its whole state - mode, temperature, fan, louvre, timer - in one long
+      burst. The Hisense DG11J1 is 343 raw timings, 696 bytes, and ESP-NOW is
+      limited to 250 bytes per packet, so on "Dock only" the relay refused it,
+      nothing was tried locally, and WebConfig said "this command cannot be
+      transmitted by the installed firmware" - pointing at the wrong thing
+      entirely, since the emitter on this remote can send it perfectly well.
+      A frame the dock cannot carry now goes out locally, the same reasoning as
+      the existing "Dock only with no dock paired" fallback. The saved route is
+      untouched. This affects every air conditioner in the database, not one.
+    - Fragmenting long frames across several ESP-NOW packets is the real fix and
+      needs the dock's receiver to reassemble them; it is not in this version.
+
   4.91 - 2026-09-13
     - Makes searching the onboard IR database finish. readIrdbIndexLine() called
       file.read() once per BYTE. The search section of a 14,551 device database
@@ -6254,7 +6268,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.91"
+#define OPENREMOTE_VERSION_STRING "4.92"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -16342,6 +16356,38 @@ bool transmitIrCommand(const DeviceCommand &command) {
     // handing the identical command to the dock, guaranteeing no collision.
     wentLocal = useLocal && transmitLocalIrCommand(command);
     wentViaDock = useDock && relayIrToDock(command);
+  }
+  /*
+    The dock could not carry it, so send it from here rather than not at all.
+
+    An air conditioner does not have a "mode dry" code: it retransmits its
+    entire state - mode, temperature, fan, louvre, timer - in one long burst.
+    The Hisense DG11J1 is 343 raw timings, 696 bytes, and ESP-NOW's hard limit
+    is 250 bytes per packet, so every air conditioner in the database is
+    unsendable over the dock link. On "Dock only" that meant nothing was
+    transmitted and WebConfig reported "this command cannot be transmitted by
+    the installed firmware", which pointed at entirely the wrong thing: the
+    firmware can transmit it perfectly well, just not through a 250 byte radio
+    packet.
+
+    The route is a preference about which emitter to prefer, not an instruction
+    to stay silent when that one cannot do the job - the same reasoning as the
+    "Dock only with no dock paired" fallback above. The saved route is left
+    alone. Fragmenting long frames across several ESP-NOW packets is the real
+    fix and needs the dock's receiver to reassemble them; until then this makes
+    the commands work instead of failing.
+  */
+  if (!wentLocal && !wentViaDock && !useLocal) {
+    wentLocal = transmitLocalIrCommand(command);
+    if (wentLocal) {
+      static unsigned long lastOversizeWarningMs = 0;
+      unsigned long nowMs = millis();
+      if (!lastOversizeWarningMs || (nowMs - lastOversizeWarningMs) > 10000UL) {
+        lastOversizeWarningMs = nowMs;
+        Serial.println("IR: frame too large for the dock link - sent from this "
+                       "remote's emitter instead");
+      }
+    }
   }
   if (wentViaDock) flashEspNowCommandFeedback();
   return wentLocal || wentViaDock;
