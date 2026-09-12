@@ -1,6 +1,58 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.73 - 2026-09-12
+    - Makes writing runtime.json atomic, which is a data-loss fix and the most
+      important thing in this release. saveRuntimeConfigDocument() used to
+      SD.remove() the live configuration and only then begin writing its
+      replacement into the same path, so everything between those two points was
+      a window in which the remote's entire configuration - every device,
+      activity, macro, page and setting - existed nowhere at all. A reset, a
+      power cut, a full card or a serialisation that ran out of memory anywhere
+      in that window left a zero-byte runtime.json and took the lot. That is not
+      theoretical: a bench remote went from "runtime.json is 81833 bytes" one
+      boot to "runtime.json is 0 bytes / Runtime config read failed" the next,
+      losing ten devices and four activities, and the window is live during
+      ordinary use because this runs on every settings change. It now writes
+      /tmp/runtime-config.json and renames it into place, which is what
+      createLcdFullBackup() a few hundred lines below has always done - the old
+      file stays complete until a whole valid new one exists.
+    - Fixes backups not restoring settings. Every backup has always CARRIED
+      them - createLcdFullBackup() embeds the whole of runtime.json as
+      runtimeConfig - but nothing ever read that block back. restoreLcdFullBackup()
+      starts from the runtime.json already on the card and overwrites devices,
+      activities, macros, themes and widgets, so settings{} simply kept whatever
+      the remote already had. Brightness, sleep timers, clock, Wi-Fi, MQTT, Home
+      Assistant, the whole display configuration: present in the file, none of
+      it restored. A native same-card restore hid this completely, because
+      restoreNativeBackupAssets() copies the entire /config folder back and that
+      includes runtime.json - so only the portable path was affected, which is
+      the case backups exist for. Settings are now merged back key by key, and a
+      backup with no settings block says so on the serial log rather than
+      failing silently.
+    - Nine settings were never in any backup at all, because they lived only in
+      NVS and nothing backs NVS up: menu style, display module, LCD driver, LCD
+      bus clock, buffering, drive strength ("Pressure"), backlight PWM
+      frequency, the new Debug Menu switch and ESP-NOW transmit power. All nine
+      now mirror into settings{} in runtime.json, so both the LCD backup and
+      WebConfig's carry them. Each is range checked on the way back in - a
+      restore is exactly the path that can hand this code a value no UI would
+      produce, and an unrecognised LCD bus clock costs a readable screen, so an
+      invalid one is ignored rather than installed.
+    - saveSettings() now also persists those of the nine it did not write
+      before. Without that a restored value survived only until the next boot,
+      when loadSettings() read the old NVS value back over it.
+    - applySettingsJson() notices when the settings object it was handed is
+      missing any of the nine and schedules a rewrite of the complete set.
+      WebConfig has no UI for them, so a sync POSTs a settings object without
+      them; the in-memory values survive that, but the runtime.json WebConfig
+      just wrote does not contain them - and that file is what both backups
+      carry.
+    - Widget wallpapers were already backed up and restored on both paths, in
+      the same base64 form as theme wallpapers (backup.widgetWallpaperAssets
+      beside backup.themeAssets, plus the /widgets/Wallpapers folder in the
+      native asset copy). Verified rather than changed.
+
   4.72 - 2026-09-12
     - Renames the Settings > Display dropdown added in 4.71 from "LCD Panel" to
       "LCD", in both menu styles. Label only - the options, the preset table and
@@ -5847,7 +5899,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.72"
+#define OPENREMOTE_VERSION_STRING "4.73"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -6462,6 +6514,20 @@ uint32_t backlightPwmHz = BACKLIGHT_PWM_HZ;
 // than only toggled between the extremes.
 static const uint32_t BACKLIGHT_PWM_OPTIONS[] = {640UL, 1000UL, 5000UL, 25000UL};
 static const uint8_t BACKLIGHT_PWM_OPTION_COUNT = 4;
+
+// The same five values the LCD Clock dropdown offers. A restore reads this
+// from a JSON file that may have been hand-edited or written by an older
+// firmware, and an arbitrary bus clock is not a cosmetic mistake - it is a
+// panel that does not come up. Anything unrecognised is ignored in favour of
+// whatever is already stored.
+bool lcdBusFrequencyValid(uint32_t hz) {
+  static const uint32_t options[] = {40000000UL, 27000000UL, 20000000UL,
+                                     16000000UL, 10000000UL};
+  for (uint32_t option : options) {
+    if (option == hz) return true;
+  }
+  return false;
+}
 
 bool backlightPwmFrequencyValid(uint32_t hz) {
   for (uint8_t i = 0; i < BACKLIGHT_PWM_OPTION_COUNT; i++) {
@@ -10739,6 +10805,18 @@ void saveSettings() {
   preferences.putString("city", clockCityName);
   preferences.putShort("utcOffset", clockUtcOffsetMinutes);
   preferences.putString("remoteName", remoteName);
+  // Written here as well as from their own dropdowns. applySettingsJson()
+  // restores these from runtime.json and is followed by a saveSettings() call;
+  // if that call did not carry them to NVS, the very next boot would read the
+  // old NVS value back over the restored one, because loadSettings() runs long
+  // before the SD copy is consulted.
+  preferences.putUChar("menuStyle", menuStyle);
+  preferences.putUChar("dispMod", displayModuleChoice);
+  preferences.putUChar("dispDrv", displayDriverChoice);
+  preferences.putULong("lcdFreqHz", lcdFreqHz);
+  preferences.putUChar("lcdBufMode", lcdBufferMode);
+  preferences.putUChar("lcdDriveStr", lcdDriveStrength);
+  preferences.putULong("blPwmHz", backlightPwmHz);
   preferences.end();
 }
 
@@ -13428,6 +13506,53 @@ void applySettingsJson(JsonVariantConst settings) {
   activityTextSize = constrain((int)(settings["activityTextSize"] | activityTextSize), 10, 24);
   buttonBoxesEnabled = settings["buttonBoxesEnabled"] | buttonBoxesEnabled;
   activityBoxesEnabled = settings["activityBoxesEnabled"] | activityBoxesEnabled;
+  // See persistSettingsToRuntimeConfig() for why these are here. Each is range
+  // checked rather than trusted: this JSON can come from a hand-edited backup
+  // or an older firmware, and a bad display value costs a readable screen.
+  /*
+    WebConfig has no UI for the nine settings below, so currentRemoteSettings()
+    does not include them and a sync POSTs a settings object without them. The
+    "| current" default means the in-memory values survive that intact - but the
+    runtime.json WebConfig just wrote does NOT contain them any more, and that
+    file is what both backups carry. A backup taken between a WebConfig sync and
+    the next time one of these happened to be saved would silently be missing
+    them again, which is the whole fault this change exists to fix.
+
+    So notice when they are absent and write the complete set back. Deferred
+    through scheduleRuntimeSettingsSave() because this runs on the HTTP worker
+    during a sync and the SD write belongs to the main loop.
+  */
+  bool settingsIncomplete = false;
+  static const char *ownedSettingKeys[] = {
+    "menuStyle", "displayModule", "displayDriver", "lcdBusHz", "lcdBufferMode",
+    "lcdDriveStrength", "backlightPwmHz", "debugMenuVisible", "espNowTxPower"
+  };
+  for (const char *key : ownedSettingKeys) {
+    if (settings[key].isNull()) { settingsIncomplete = true; break; }
+  }
+  menuStyle = constrain((int)(settings["menuStyle"] | menuStyle), 0, 1);
+  displayModuleChoice = constrain(
+    (int)(settings["displayModule"] | displayModuleChoice),
+    (int)DISPLAY_MODULE_ADAFRUIT, (int)DISPLAY_MODULE_ST7789);
+  displayDriverChoice = constrain(
+    (int)(settings["displayDriver"] | displayDriverChoice), 0, 1);
+  uint32_t restoredBusHz = settings["lcdBusHz"] | lcdFreqHz;
+  if (lcdBusFrequencyValid(restoredBusHz)) lcdFreqHz = restoredBusHz;
+  lcdBufferMode = constrain((int)(settings["lcdBufferMode"] | lcdBufferMode), 0, 1);
+  lcdDriveStrength = constrain(
+    (int)(settings["lcdDriveStrength"] | lcdDriveStrength), 0, 3);
+  uint32_t restoredPwmHz = settings["backlightPwmHz"] | backlightPwmHz;
+  if (backlightPwmFrequencyValid(restoredPwmHz)) backlightPwmHz = restoredPwmHz;
+  debugMenuVisible = settings["debugMenuVisible"] | debugMenuVisible;
+  espNowTxPower = constrain((int)(settings["espNowTxPower"] | espNowTxPower), 0, 2);
+  // Only when a real settings object was actually handed over. Rewriting on the
+  // strength of an absent or empty one would push a defaults-only block onto a
+  // card whose real configuration may only be temporarily unreadable, turning a
+  // recoverable bad read into a permanent loss.
+  if (settingsIncomplete && settings.is<JsonObjectConst>() &&
+      settings.as<JsonObjectConst>().size() > 0) {
+    scheduleRuntimeSettingsSave();
+  }
   raiseToWake = true;
   saveSettings();
   applyBrightness();
@@ -16434,13 +16559,37 @@ bool loadRuntimeConfig() {
   return true;
 }
 
+/*
+  Writes the whole configuration to a temporary file and renames it into place.
+
+  This used to SD.remove() the live runtime.json and then start writing the
+  replacement into the same path. Everything between those two points was a
+  window in which the remote's entire configuration - every device, activity,
+  macro, page and setting - existed nowhere at all. A reset, a power cut, a full
+  card or a serialisation that ran out of memory anywhere in that window left a
+  zero-byte runtime.json and took the lot. Observed exactly that on a bench
+  remote: 81833 bytes one boot, "runtime.json is 0 bytes / Runtime config read
+  failed" the next, with ten devices and four activities gone.
+
+  The window is not small, either. The document is tens of kilobytes and goes
+  out through the SD card a block at a time, and this runs on every settings
+  change - so it is live during ordinary use, not just during an upgrade.
+
+  createLcdFullBackup() a few hundred lines below already does this correctly,
+  writing /tmp/lcd-full-backup.json and renaming. Same approach here: the old
+  file stays untouched and complete until a whole valid new one exists, and a
+  failure at any point leaves the original in place. A rename within one
+  filesystem is the closest thing to atomic that FAT offers.
+*/
 bool saveRuntimeConfigDocument(JsonDocument &doc, String &error) {
   if (!sdReady) {
     error = "SD card unavailable";
     return false;
   }
-  SD.remove(RUNTIME_CONFIG_PATH);
-  File file = SD.open(RUNTIME_CONFIG_PATH, FILE_WRITE);
+  const char *temporaryPath = "/tmp/runtime-config.json";
+  if (!SD.exists("/tmp")) SD.mkdir("/tmp");
+  SD.remove(temporaryPath);
+  File file = SD.open(temporaryPath, FILE_WRITE);
   if (!file) {
     error = "Could not open runtime config for writing";
     return false;
@@ -16448,7 +16597,16 @@ bool saveRuntimeConfigDocument(JsonDocument &doc, String &error) {
   size_t written = serializeJson(doc, file);
   file.close();
   if (!written) {
+    SD.remove(temporaryPath);
     error = "Could not write runtime config";
+    return false;
+  }
+  // Only now is the live file touched, and only once a complete replacement is
+  // known to be on the card.
+  SD.remove(RUNTIME_CONFIG_PATH);
+  if (!SD.rename(temporaryPath, RUNTIME_CONFIG_PATH)) {
+    SD.remove(temporaryPath);
+    error = "Could not finalise runtime config";
     return false;
   }
   return true;
@@ -16524,6 +16682,31 @@ bool persistSettingsToRuntimeConfig() {
   settings["buttonBoxesEnabled"] = buttonBoxesEnabled;
   settings["activityBoxesEnabled"] = activityBoxesEnabled;
   settings["remoteName"] = remoteName;
+  /*
+    Display, menu and radio settings that used to live only in NVS.
+
+    NVS is not backed up by anything - neither the LCD's own backup nor
+    WebConfig's can see it - so every one of these was silently absent from a
+    "full" backup and came back as a default after a restore. They are all
+    ordinary user choices and belong in the backup like any other. Mirrored here
+    so they travel in runtime.json, which the LCD backup embeds wholesale as
+    runtimeConfig and WebConfig reads through /api/config.
+
+    The five display values only take effect at boot, so restoring them onto a
+    running remote is correct but not visible until it restarts. Restoring a
+    backup taken from a remote with a DIFFERENT panel fitted can therefore leave
+    this one with an unreadable screen - which is exactly what the Red+Blue
+    rescue combo exists to undo, and why it is safe to back these up at all.
+  */
+  settings["menuStyle"] = menuStyle;
+  settings["displayModule"] = displayModuleChoice;
+  settings["displayDriver"] = displayDriverChoice;
+  settings["lcdBusHz"] = lcdFreqHz;
+  settings["lcdBufferMode"] = lcdBufferMode;
+  settings["lcdDriveStrength"] = lcdDriveStrength;
+  settings["backlightPwmHz"] = backlightPwmHz;
+  settings["debugMenuVisible"] = debugMenuVisible;
+  settings["espNowTxPower"] = espNowTxPower;
 
   String error;
   bool saved = saveRuntimeConfigDocument(doc, error);
@@ -18338,6 +18521,47 @@ bool convertWebBackupToRuntime(JsonDocument &backup, String &error) {
   runtime["schemaVersion"] = 1;
   runtime["webConfigVersion"] = backup["appVersion"] | installedWebConfigVersion();
   runtime["savedAt"] = backup["exportedAt"] | "";
+  /*
+    Settings.
+
+    Every backup has always CARRIED these - createLcdFullBackup() embeds the
+    whole of runtime.json as runtimeConfig - but nothing ever read them back.
+    This function starts from the runtime.json already on the card and
+    overwrites devices, activities, macros, themes and widgets, so settings{}
+    simply kept whatever this remote already had. Brightness, sleep timers,
+    clock, Wi-Fi, MQTT, Home Assistant, the whole display configuration: all
+    present in the file, none of it restored.
+
+    A native same-card restore hid the fault completely, because
+    restoreNativeBackupAssets() copies the entire /config folder back and that
+    includes runtime.json. Only the portable path was affected - a backup
+    carried to a different remote or onto a fresh card, which is the case
+    backups exist for in the first place.
+
+    Merged key by key rather than assigning the whole object, so a backup
+    written by an older firmware that predates a setting leaves this remote's
+    current value alone instead of erasing it.
+  */
+  JsonObjectConst backupSettings =
+    backup["runtimeConfig"]["settings"].as<JsonObjectConst>();
+  if (!backupSettings.isNull()) {
+    JsonObject restoredSettings = runtime["settings"].as<JsonObject>();
+    if (restoredSettings.isNull()) restoredSettings = runtime["settings"].to<JsonObject>();
+    uint16_t restoredCount = 0;
+    for (JsonPairConst entry : backupSettings) {
+      restoredSettings[entry.key()] = entry.value();
+      restoredCount++;
+    }
+    Serial.printf("Restore: %u setting(s) restored from the backup\n",
+                  (unsigned)restoredCount);
+  } else {
+    // Says so rather than leaving it ambiguous. A backup from a firmware older
+    // than this change has no runtimeConfig block, and the settings genuinely
+    // cannot be recovered from it - which the user should hear about now, not
+    // discover later.
+    Serial.println("Restore: this backup carries no settings block - "
+                   "device data restored, settings left as they are");
+  }
   runtime["devices"].set(data["devices"]);
   runtime["activities"].set(data["activities"]);
   runtime["macros"].set(data["macros"]);
