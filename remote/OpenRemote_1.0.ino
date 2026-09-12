@@ -1,6 +1,39 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.88 - 2026-09-13
+    - Lifts the WebConfig upload off 170KB/s. Four things were in the way and
+      all four are fixed; none of them was the SD card, which has never been
+      the limit.
+    - Wi-Fi power save was on for the whole transfer. The upload path itself
+      turned it on: it calls releaseEspNowLink() to drop the dock link first,
+      that ends in stopEspNow(), and stopEspNow() restores WIFI_PS_MIN_MODEM -
+      which duty-cycles the radio, so the remote was asleep for part of every
+      beacon interval while trying to receive 130MB. Power save is now off for
+      the duration and restored exactly as it was afterwards, ESP-NOW's own
+      claim on it included.
+    - The server handed over the body 1436 bytes at a time - one TCP segment -
+      which is about 95,000 separate SD writes for a 130MB file, each smaller
+      than a sector, so the card had to read every sector back before it could
+      modify it. HTTP_UPLOAD_BUFLEN and HTTP_RAW_BUFLEN are #ifndef-guarded in
+      WebServer.h precisely so a sketch can raise them; both are now 8KB, and
+      the sketch coalesces those into 64KB before the card sees anything.
+    - Chunks may now be posted as a raw application/octet-stream body on
+      /api/upload/raw instead of as a multipart part. A multipart body makes the
+      server scan every byte looking for the boundary before the sketch is given
+      any of it - 130 million comparisons to locate a marker whose position the
+      Content-Length already told us. /api/upload/begin advertises the route so
+      an older WebConfig keeps using multipart and still works.
+    - Receiving and writing now overlap. They used to take turns on one task,
+      each idle while the other worked, which halved the ceiling on its own.
+      A dedicated writer task owns the descriptor and takes 64KB buffers through
+      a pair of queues, so the socket is read while the previous buffer is still
+      going to the card. Two PSRAM buffers, fixed at 128KB whatever the file
+      size. Per-chunk atomicity is unchanged: the writer counts only bytes the
+      card actually took, and every chunk drains and fsyncs before it is
+      acknowledged, so a failure still rolls offset and CRC back together.
+    - Not done, deliberately: 4-bit SDMMC. This board wires the card over SPI.
+
   4.87 - 2026-09-13
     - Keeps the chunked WebConfig session awake through upload and verification.
       Uses a sequential, unbuffered SD descriptor with checked writes/fsync;
@@ -6163,7 +6196,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.87"
+#define OPENREMOTE_VERSION_STRING "4.88"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -8035,6 +8068,52 @@ bool networkStackActive = false;
 bool setupApActive = false;
 volatile bool webConfigTransferActive = false;
 volatile bool chunkUploadSessionActive = false;
+// Whether this transfer turned Wi-Fi power save off, so it can be put back
+// exactly as it was rather than left off for the rest of the session.
+bool chunkUploadRadioBoosted = false;
+
+/*
+  Double-buffered SD writer.
+
+  Receiving and writing used to take turns on one task: the web server handed
+  over a network buffer, that buffer was written to the card, and only then was
+  the next one read from the socket. The card and the radio were therefore idle
+  in alternation, each waiting for the other, and 130MB of that came out at
+  170KB/s.
+
+  Two large buffers let them overlap. The HTTP task fills one while this task
+  writes the other, and they swap through a pair of queues - "ready" carries a
+  full buffer to the writer, "free" carries an empty one back. There are exactly
+  two buffers and they are always in one place or the other, so memory is fixed
+  at 128KB of PSRAM no matter how large the file is.
+
+  The writer is the ONLY thing that touches the staging file while a transfer is
+  running, so nothing is shared beyond the buffers and the two queues, and no
+  lock is needed: the HTTP task reads chunkUploadBytes and chunkUploadCrc only
+  after drainChunkWriter() has confirmed the writer is idle.
+*/
+static const size_t CHUNK_WRITE_BUFFER_BYTES = 64UL * 1024UL;
+static const uint8_t CHUNK_WRITE_BUFFER_COUNT = 2;
+
+struct ChunkWriteBlock {
+  uint8_t *data;
+  size_t length;
+};
+
+uint8_t *chunkWriteBuffers[CHUNK_WRITE_BUFFER_COUNT] = {nullptr, nullptr};
+QueueHandle_t chunkWriteReadyQueue = nullptr;
+QueueHandle_t chunkWriteFreeQueue = nullptr;
+TaskHandle_t chunkWriteTask = nullptr;
+volatile bool chunkWriteRunning = false;
+// Set by the writer task, read by the HTTP task after a drain. The writer
+// cannot build the error String itself - failChunkUploadIo() belongs to the
+// request - so it records what went wrong and the HTTP task reports it.
+volatile bool chunkWriteFailed = false;
+volatile int chunkWriteErrno = 0;
+const char *chunkWriteFailedOp = "write";
+// The buffer the HTTP side is currently filling, and how much is in it.
+uint8_t *chunkFillBuffer = nullptr;
+size_t chunkFillUsed = 0;
 bool webConfigTransferBusy() {
   return webConfigTransferActive || chunkUploadSessionActive;
 }
@@ -20355,7 +20434,205 @@ String chunkUploadTempPathFor(const String &target) {
   return String();
 }
 
+/*
+  Holds the Wi-Fi radio awake for the duration of a transfer.
+
+  A station defaults to WIFI_PS_MIN_MODEM, which duty-cycles the radio between
+  beacons - fine for a remote that sends an occasional command, and ruinous for
+  sustained throughput. The upload path was switching it ON for itself: /begin
+  calls releaseEspNowLink() to hand the dock's memory back, that calls
+  stopEspNow(), and stopEspNow() ends with esp_wifi_set_ps(WIFI_PS_MIN_MODEM)
+  as "the battery-friendly default the rest of the firmware expects". So every
+  large upload ran its entire length with the radio asleep between beacons.
+
+  Restored on close rather than left off, because the default is right for
+  everything else the remote does.
+*/
+void chunkWriteWorker(void *);
+
+bool startChunkWriter() {
+  if (chunkWriteTask) return true;
+  chunkWriteFailed = false;
+  chunkWriteErrno = 0;
+  chunkWriteFailedOp = "write";
+  chunkFillBuffer = nullptr;
+  chunkFillUsed = 0;
+  for (uint8_t i = 0; i < CHUNK_WRITE_BUFFER_COUNT; i++) {
+    if (!chunkWriteBuffers[i]) {
+      // PSRAM by preference - 128KB is most of the free internal heap, and the
+      // board has 8MB of PSRAM sitting idle. The fallback is for a board built
+      // without it, where the upload is slower but still works.
+      chunkWriteBuffers[i] = (uint8_t *)ps_malloc(CHUNK_WRITE_BUFFER_BYTES);
+      if (!chunkWriteBuffers[i]) chunkWriteBuffers[i] = (uint8_t *)malloc(CHUNK_WRITE_BUFFER_BYTES);
+      if (!chunkWriteBuffers[i]) {
+        Serial.printf("Chunked upload: no room for a %uKB write buffer "
+                      "(heap=%u psram=%u)\n",
+                      (unsigned)(CHUNK_WRITE_BUFFER_BYTES / 1024),
+                      (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
+        return false;
+      }
+    }
+  }
+  chunkWriteReadyQueue = xQueueCreate(CHUNK_WRITE_BUFFER_COUNT, sizeof(ChunkWriteBlock));
+  chunkWriteFreeQueue = xQueueCreate(CHUNK_WRITE_BUFFER_COUNT, sizeof(uint8_t *));
+  if (!chunkWriteReadyQueue || !chunkWriteFreeQueue) return false;
+  for (uint8_t i = 0; i < CHUNK_WRITE_BUFFER_COUNT; i++) {
+    uint8_t *slot = chunkWriteBuffers[i];
+    xQueueSend(chunkWriteFreeQueue, &slot, 0);
+  }
+  // Core 0, alongside the HTTP worker, and one priority step above it. Core 1
+  // belongs to LVGL and the keypad, and a task that blocks for ~100ms at a time
+  // would visibly stall them. Sharing core 0 costs nothing because both tasks
+  // spend nearly all their time blocked on hardware - one on the socket, one on
+  // the SPI transfer - so the CPU is free for the other exactly when it is
+  // needed. The higher priority only means a filled buffer starts reaching the
+  // card the moment it is handed over.
+  chunkWriteRunning = true;
+  BaseType_t created = xTaskCreatePinnedToCore(chunkWriteWorker, "or_sdwrite",
+                                               4096, nullptr, 2, &chunkWriteTask, 0);
+  if (created != pdPASS) {
+    chunkWriteTask = nullptr;
+    chunkWriteRunning = false;
+    return false;
+  }
+  return true;
+}
+
+void chunkWriteWorker(void *) {
+  for (;;) {
+    ChunkWriteBlock block;
+    if (xQueueReceive(chunkWriteReadyQueue, &block, portMAX_DELAY) != pdTRUE) continue;
+    // A null block is the shutdown signal from stopChunkWriter().
+    if (!block.data) break;
+    // After a failure the remaining blocks are swallowed rather than written:
+    // the chunk is being rolled back anyway, and appending more of it would
+    // only put bytes past the offset the client will resume from.
+    if (!chunkWriteFailed && chunkUploadFd >= 0) {
+      size_t accepted = 0;
+      while (accepted < block.length) {
+        errno = 0;
+        ssize_t written = ::write(chunkUploadFd, block.data + accepted,
+                                  block.length - accepted);
+        int error = errno;
+        if (written < 0 && error == EINTR) {
+          vTaskDelay(1);
+          continue;
+        }
+        if (written <= 0) {
+          chunkWriteErrno = error ? error : EIO;
+          chunkWriteFailedOp = "write";
+          chunkWriteFailed = true;
+          break;
+        }
+        // Only bytes the card has actually taken are counted, so a short or
+        // failed write leaves chunkUploadBytes telling the truth. The HTTP
+        // task reads these two only after drainChunkWriter(), which is why
+        // no lock is needed around them.
+        chunkUploadCrc = crc32Update(chunkUploadCrc, block.data + accepted,
+                                     (size_t)written);
+        accepted += (size_t)written;
+        chunkUploadBytes += (size_t)written;
+      }
+    }
+    // Hand the buffer back even after a failure: the HTTP task drains by
+    // waiting for every buffer to return, and would otherwise wait forever.
+    xQueueSend(chunkWriteFreeQueue, &block.data, portMAX_DELAY);
+    // One yield per 64KB block, which is all the idle task on this core needs
+    // to stay fed. Yielding any more often is pure overhead at this size.
+    vTaskDelay(1);
+  }
+  chunkWriteRunning = false;
+  vTaskDelete(nullptr);
+}
+
+// Hands the buffer being filled to the writer and takes an empty one back.
+bool submitChunkFillBuffer() {
+  if (!chunkFillBuffer || !chunkFillUsed) return true;
+  ChunkWriteBlock block = {chunkFillBuffer, chunkFillUsed};
+  if (xQueueSend(chunkWriteReadyQueue, &block, pdMS_TO_TICKS(20000)) != pdTRUE) return false;
+  chunkFillBuffer = nullptr;
+  chunkFillUsed = 0;
+  return true;
+}
+
+bool takeChunkFillBuffer() {
+  if (chunkFillBuffer) return true;
+  uint8_t *slot = nullptr;
+  if (xQueueReceive(chunkWriteFreeQueue, &slot, pdMS_TO_TICKS(20000)) != pdTRUE) return false;
+  chunkFillBuffer = slot;
+  chunkFillUsed = 0;
+  return true;
+}
+
+// Blocks until every submitted buffer has reached the card.
+bool drainChunkWriter() {
+  if (!chunkWriteTask) return true;
+  if (!submitChunkFillBuffer()) return false;
+  // Both buffers back in the free queue means the writer has nothing left.
+  uint8_t *slots[CHUNK_WRITE_BUFFER_COUNT];
+  uint8_t held = 0;
+  while (held < CHUNK_WRITE_BUFFER_COUNT) {
+    if (xQueueReceive(chunkWriteFreeQueue, &slots[held], pdMS_TO_TICKS(20000)) != pdTRUE) {
+      for (uint8_t i = 0; i < held; i++) xQueueSend(chunkWriteFreeQueue, &slots[i], 0);
+      return false;
+    }
+    held++;
+  }
+  for (uint8_t i = 0; i < held; i++) xQueueSend(chunkWriteFreeQueue, &slots[i], 0);
+  return !chunkWriteFailed;
+}
+
+void stopChunkWriter() {
+  if (!chunkWriteTask) return;
+  // Drain first. The buffers are freed at the end of this function, and the
+  // writer is holding one of them until it has finished with it - waiting only
+  // for the poison block would race that, because the poison can sit behind a
+  // block still being written.
+  drainChunkWriter();
+  ChunkWriteBlock poison = {nullptr, 0};
+  xQueueSend(chunkWriteReadyQueue, &poison, pdMS_TO_TICKS(2000));
+  // The task deletes itself once it sees the poison block.
+  for (uint16_t waited = 0; waited < 300 && chunkWriteRunning; waited++) delay(10);
+  if (chunkWriteRunning) {
+    // Never reached in practice, but freeing buffers out from under a live
+    // task would corrupt the card rather than just fail the upload.
+    Serial.println("Chunked upload: SD writer did not stop; leaking its buffers");
+    chunkWriteTask = nullptr;
+    chunkWriteReadyQueue = nullptr;
+    chunkWriteFreeQueue = nullptr;
+    for (uint8_t i = 0; i < CHUNK_WRITE_BUFFER_COUNT; i++) chunkWriteBuffers[i] = nullptr;
+    chunkFillBuffer = nullptr;
+    chunkFillUsed = 0;
+    return;
+  }
+  chunkWriteTask = nullptr;
+  if (chunkWriteReadyQueue) { vQueueDelete(chunkWriteReadyQueue); chunkWriteReadyQueue = nullptr; }
+  if (chunkWriteFreeQueue) { vQueueDelete(chunkWriteFreeQueue); chunkWriteFreeQueue = nullptr; }
+  for (uint8_t i = 0; i < CHUNK_WRITE_BUFFER_COUNT; i++) {
+    if (chunkWriteBuffers[i]) { free(chunkWriteBuffers[i]); chunkWriteBuffers[i] = nullptr; }
+  }
+  chunkFillBuffer = nullptr;
+  chunkFillUsed = 0;
+}
+
+void setChunkUploadRadioBoost(bool on) {
+  if (on == chunkUploadRadioBoosted) return;
+  chunkUploadRadioBoosted = on;
+  if (on) {
+    WiFi.setSleep(false);
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    Serial.println("Chunked upload: Wi-Fi power save off for the transfer");
+  } else {
+    // Only back to the default if ESP-NOW is not itself holding it awake.
+    if (!espNowRadioActive) esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+    Serial.println("Chunked upload: Wi-Fi power save restored");
+  }
+}
+
 void closeChunkUploadSession() {
+  setChunkUploadRadioBoost(false);
+  // Before the descriptor goes: the writer task holds it too.
+  stopChunkWriter();
   if (chunkUploadFd >= 0) ::close(chunkUploadFd);
   chunkUploadFd = -1;
   chunkUploadWriting = false;
@@ -20384,6 +20661,8 @@ void failChunkUploadIo(const char *operation, int error, size_t requested = 0,
 
 void rollbackChunkUpload() {
   if (!chunkUploadWriting) return;
+  // Nothing may still be in flight towards a file about to be truncated.
+  drainChunkWriter();
   if (chunkUploadFd >= 0) ::close(chunkUploadFd);
   chunkUploadFd = -1;
   // Only complete, successfully synced chunks are acknowledged. An aborted
@@ -20457,6 +20736,9 @@ void handleChunkUploadBegin() {
   // starts; the dock reconnects on demand the next time it is actually needed,
   // which is the whole point of on-demand ESP-NOW.
   releaseEspNowLink("chunked upload starting");
+  // After releaseEspNowLink(), never before: that call ends in stopEspNow(),
+  // which sets WIFI_PS_MIN_MODEM and would otherwise undo this immediately.
+  setChunkUploadRadioBoost(true);
   SD.remove(path);
   chunkUploadTarget = target;
   chunkUploadTempPath = path;
@@ -20492,7 +20774,12 @@ void handleChunkUploadBegin() {
   }
   Serial.printf("Chunked upload: begin target=%s heapFree=%u psramFree=%u\n",
                 target.c_str(), (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
-  sendJson(200, "{\"ok\":true,\"bytes\":0}");
+  // "raw" tells the client it may post chunks as bare octet-streams on
+  // /api/upload/raw. It has to be advertised rather than discovered: probing
+  // for the route would mean sending a whole chunk to firmware that might not
+  // have it, and an unknown URI makes the web server try to buffer the entire
+  // body in heap before answering 404.
+  sendJson(200, "{\"ok\":true,\"bytes\":0,\"raw\":true}");
 }
 
 void handleChunkUploadStatus() {
@@ -20506,89 +20793,187 @@ void handleChunkUploadStatus() {
   sendJson(200, String("{\"ok\":true,\"bytes\":") + String((unsigned)bytes) + "}");
 }
 
+/*
+  One chunk, four steps, two transports.
+
+  A chunk arrives either as a multipart form part on /api/upload/chunk or as a
+  bare body on /api/upload/raw. Only the framing differs, so everything below
+  the framing lives here and both routes drive the same four calls: begin,
+  feed, finish, abort.
+*/
+void beginChunkUploadRequest(const String &target, size_t offset, bool authorized) {
+  // A chunk whose connection simply died never reaches the abort callback, so
+  // every chunk starts by settling whatever the last one left behind.
+  drainChunkWriter();
+  chunkFillUsed = 0;
+  chunkWriteFailed = false;
+  chunkWriteErrno = 0;
+  rollbackChunkUpload();
+  if (authorized && sdReady && target.length() && target != chunkUploadTarget &&
+      offset == 0) {
+    String path = chunkUploadTempPathFor(target);
+    if (path.length()) {
+      closeChunkUploadSession();
+      chunkUploadSessionActive = true;
+      SD.remove(path);
+      chunkUploadTarget = target;
+      chunkUploadTempPath = path;
+    }
+  }
+  chunkUploadWriting = false;
+  chunkUploadChunkOk = authorized && sdReady &&
+                       target.length() && target == chunkUploadTarget;
+  chunkUploadError = "";
+  if (!chunkUploadChunkOk) {
+    chunkUploadError = !authorized ? "Not authorized for this upload"
+                     : !sdReady ? "SD card unavailable"
+                     : !target.length() ? "Upload chunk carried no target"
+                     : "No upload session for this target";
+  } else if (offset != chunkUploadBytes) {
+    chunkUploadChunkOk = false;
+    chunkUploadError = "Chunk offset mismatch";
+  } else {
+    chunkUploadBytesAtChunkStart = chunkUploadBytes;
+    chunkUploadCrcAtChunkStart = chunkUploadCrc;
+    chunkUploadWriting = true;
+    chunkUploadChunkOk = openChunkUploadFile() && startChunkWriter();
+    if (chunkUploadChunkOk) chunkUploadChunkOk = takeChunkFillBuffer();
+    if (!chunkUploadChunkOk && !chunkUploadError.length()) {
+      chunkUploadError = "Could not start the SD writer";
+    }
+  }
+  if (!chunkUploadChunkOk) {
+    Serial.printf("Chunked upload: refused offset=%u confirmed=%u: %s\n",
+                  (unsigned)offset, (unsigned)chunkUploadBytes,
+                  chunkUploadError.c_str());
+  }
+}
+
+// Reports a failure the writer task hit, in the request that caused it.
+bool chunkWriterHealthy() {
+  if (!chunkWriteFailed) return true;
+  failChunkUploadIo(chunkWriteFailedOp, chunkWriteErrno);
+  return false;
+}
+
+/*
+  Copies one network buffer into the buffer being filled and, whenever that
+  fills, hands it to the writer task and picks up an empty one.
+
+  The copy is the entire cost on this side. Nothing here touches the card, so
+  the socket is read again immediately while the previous 64KB is still being
+  written - which is the whole point of the second buffer.
+*/
+void feedChunkUpload(const uint8_t *data, size_t length) {
+  if (!chunkUploadChunkOk) return;
+  if (!chunkWriterHealthy()) return;
+  size_t consumed = 0;
+  while (consumed < length) {
+    if (!takeChunkFillBuffer()) {
+      failChunkUploadIo("write", ETIMEDOUT, length, consumed);
+      return;
+    }
+    size_t room = CHUNK_WRITE_BUFFER_BYTES - chunkFillUsed;
+    size_t take = length - consumed;
+    if (take > room) take = room;
+    memcpy(chunkFillBuffer + chunkFillUsed, data + consumed, take);
+    chunkFillUsed += take;
+    consumed += take;
+    if (chunkFillUsed == CHUNK_WRITE_BUFFER_BYTES) {
+      if (!submitChunkFillBuffer()) {
+        failChunkUploadIo("write", ETIMEDOUT, length, consumed);
+        return;
+      }
+      // One yield per full buffer. The old code yielded once per network
+      // buffer, which at 1436 bytes a time was a millisecond of dead air
+      // every 1.4KB - a tax of its own on a 130MB transfer.
+      serviceUiDuringLongHttpTransfer();
+      if (!chunkWriterHealthy()) return;
+    }
+  }
+}
+
+void finishChunkUploadRequest() {
+  if (chunkUploadChunkOk) {
+    // Everything still buffered has to reach the card before the chunk can be
+    // acknowledged, or a reported offset would run ahead of the file.
+    bool drained = drainChunkWriter();
+    if (!chunkWriterHealthy()) { /* reported */ }
+    else if (!drained) failChunkUploadIo("write", ETIMEDOUT);
+  }
+  if (chunkUploadChunkOk && chunkUploadFd >= 0) {
+    errno = 0;
+    if (::fsync(chunkUploadFd) != 0) failChunkUploadIo("sync", errno);
+  }
+  if (!chunkUploadChunkOk) rollbackChunkUpload();
+  else {
+    chunkUploadWriting = false;
+    // Progress once per MiB is useful during a long serial capture without
+    // logging each network buffer or slowing the transfer.
+    if (chunkUploadBytes / (1024UL * 1024UL) !=
+        chunkUploadBytesAtChunkStart / (1024UL * 1024UL)) {
+      Serial.printf("Chunked upload: synced %u bytes heap=%u\n",
+                    (unsigned)chunkUploadBytes, (unsigned)ESP.getFreeHeap());
+    }
+  }
+}
+
+void abortChunkUploadRequest() {
+  // Whatever is in flight must land before the rollback truncates, or the
+  // writer would still be appending to a file that has just been rewound.
+  drainChunkWriter();
+  chunkFillUsed = 0;
+  chunkWriteFailed = false;
+  rollbackChunkUpload();
+  chunkUploadChunkOk = false;
+  chunkUploadError = "Chunk upload interrupted; retrying from the last complete chunk";
+}
+
 void handleChunkUploadData() {
   HTTPUpload &upload = webServer.upload();
   chunkUploadLastActivityMs = millis();
   if (upload.status == UPLOAD_FILE_START) {
-    rollbackChunkUpload();
-    String target = webServer.arg("target");
-    size_t offset = (size_t)strtoul(webServer.arg("offset").c_str(), nullptr, 10);
-    bool authorized = requestAuthorized();
-    if (authorized && sdReady && target.length() && target != chunkUploadTarget &&
-        offset == 0) {
-      String path = chunkUploadTempPathFor(target);
-      if (path.length()) {
-        closeChunkUploadSession();
-        chunkUploadSessionActive = true;
-        SD.remove(path);
-        chunkUploadTarget = target;
-        chunkUploadTempPath = path;
-      }
-    }
-    chunkUploadWriting = false;
-    chunkUploadChunkOk = authorized && sdReady &&
-                         target.length() && target == chunkUploadTarget;
-    chunkUploadError = "";
-    if (!chunkUploadChunkOk) {
-      chunkUploadError = !authorized ? "Not authorized for this upload"
-                       : !sdReady ? "SD card unavailable"
-                       : !target.length() ? "Upload chunk carried no target"
-                       : "No upload session for this target";
-    } else if (offset != chunkUploadBytes) {
-      chunkUploadChunkOk = false;
-      chunkUploadError = "Chunk offset mismatch";
-    } else {
-      chunkUploadBytesAtChunkStart = chunkUploadBytes;
-      chunkUploadCrcAtChunkStart = chunkUploadCrc;
-      chunkUploadWriting = true;
-      chunkUploadChunkOk = openChunkUploadFile();
-    }
-    if (!chunkUploadChunkOk) {
-      Serial.printf("Chunked upload: refused offset=%u confirmed=%u: %s\n",
-                    (unsigned)offset, (unsigned)chunkUploadBytes,
-                    chunkUploadError.c_str());
-    }
-  } else if (upload.status == UPLOAD_FILE_WRITE && chunkUploadChunkOk) {
-    size_t accepted = 0;
-    while (accepted < upload.currentSize) {
-      errno = 0;
-      ssize_t written = ::write(chunkUploadFd, upload.buf + accepted,
-                                 upload.currentSize - accepted);
-      int error = errno;
-      if (written < 0 && error == EINTR) {
-        serviceUiDuringLongHttpTransfer();
-        continue;
-      }
-      if (written <= 0) {
-        failChunkUploadIo("write", error, upload.currentSize, accepted);
-        break;
-      }
-      chunkUploadCrc = crc32Update(chunkUploadCrc, upload.buf + accepted,
-                                    (size_t)written);
-      accepted += (size_t)written;
-      chunkUploadBytes += (size_t)written;
-    }
-    serviceUiDuringLongHttpTransfer();
+    beginChunkUploadRequest(webServer.arg("target"),
+                            (size_t)strtoul(webServer.arg("offset").c_str(), nullptr, 10),
+                            requestAuthorized());
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    feedChunkUpload(upload.buf, upload.currentSize);
   } else if (upload.status == UPLOAD_FILE_END) {
-    if (chunkUploadChunkOk && chunkUploadFd >= 0) {
-      errno = 0;
-      if (::fsync(chunkUploadFd) != 0) failChunkUploadIo("sync", errno);
-    }
-    if (!chunkUploadChunkOk) rollbackChunkUpload();
-    else {
-      chunkUploadWriting = false;
-      // Progress once per MiB is useful during a long serial capture without
-      // logging each network buffer or slowing the transfer.
-      if (chunkUploadBytes / (1024UL * 1024UL) !=
-          chunkUploadBytesAtChunkStart / (1024UL * 1024UL)) {
-        Serial.printf("Chunked upload: synced %u bytes heap=%u\n",
-                      (unsigned)chunkUploadBytes, (unsigned)ESP.getFreeHeap());
-      }
-    }
+    finishChunkUploadRequest();
   } else if (upload.status == UPLOAD_FILE_ABORTED) {
-    rollbackChunkUpload();
-    chunkUploadChunkOk = false;
-    chunkUploadError = "Chunk upload interrupted; retrying from the last complete chunk";
+    abortChunkUploadRequest();
+  }
+}
+
+/*
+  The same chunk with none of the multipart wrapping.
+
+  A multipart part costs a boundary header per chunk and, far worse, makes the
+  web server scan every single byte of the body looking for that boundary
+  before the sketch ever sees it. For a 130MB database that is 130 million
+  comparisons that exist only to find a marker the client already told us the
+  length of. A raw application/octet-stream body is handed straight through.
+
+  There is one trap. WebServer only calls _parseArguments() on the multipart
+  and plain-body paths - never on the raw path (Parsing.cpp) - so
+  webServer.arg() is empty here even though the query string is right there in
+  the URL. Target and offset therefore travel as headers, which ARE collected.
+  The same applies to the response handler for this route, which is why it
+  reads its size and CRC from headers too.
+*/
+void handleChunkUploadRaw() {
+  HTTPRaw &raw = webServer.raw();
+  chunkUploadLastActivityMs = millis();
+  if (raw.status == RAW_START) {
+    beginChunkUploadRequest(webServer.header("X-OR-Target"),
+                            (size_t)strtoul(webServer.header("X-OR-Offset").c_str(), nullptr, 10),
+                            requestAuthorized());
+  } else if (raw.status == RAW_WRITE) {
+    feedChunkUpload(raw.buf, raw.currentSize);
+  } else if (raw.status == RAW_END) {
+    finishChunkUploadRequest();
+  } else if (raw.status == RAW_ABORTED) {
+    abortChunkUploadRequest();
   }
 }
 
@@ -22876,8 +23261,11 @@ void serveCaptivePortal() {
 
 void configureWebServer() {
   if (webServerConfigured) return;
-  const char *headers[] = {"X-OpenRemote-Token"};
-  webServer.collectHeaders(headers, 1);
+  // The raw upload path never parses the query string (see
+  // handleChunkUploadRaw), so its target and offset arrive as headers and have
+  // to be collected explicitly.
+  const char *headers[] = {"X-OpenRemote-Token", "X-OR-Target", "X-OR-Offset"};
+  webServer.collectHeaders(headers, 3);
   webServer.on("/", HTTP_GET, serveWebConfig);
   webServer.on("/index.html", HTTP_GET, serveWebConfig);
   webServer.on("/hotspot-detect.html", HTTP_GET, serveCaptivePortal);
@@ -22998,6 +23386,16 @@ void configureWebServer() {
                     : String("{\"ok\":false,\"error\":\"") + chunkUploadError +
                       "\",\"bytes\":" + String((unsigned)chunkUploadBytes) + "}");
   }, handleChunkUploadData);
+  // Same session, same chunking, same acknowledgement - only the framing is
+  // cheaper. Clients that do not know about it keep using /api/upload/chunk.
+  webServer.on("/api/upload/raw", HTTP_POST, []() {
+    if (!requestAuthorized()) webServer.send(403, "application/json", "{\"ok\":false}");
+    else sendJson(chunkUploadChunkOk ? 200 : 400,
+                  chunkUploadChunkOk
+                    ? String("{\"ok\":true,\"bytes\":") + String((unsigned)chunkUploadBytes) + "}"
+                    : String("{\"ok\":false,\"error\":\"") + chunkUploadError +
+                      "\",\"bytes\":" + String((unsigned)chunkUploadBytes) + "}");
+  }, handleChunkUploadRaw);
   webServer.on("/api/sd/format", HTTP_POST, handleSdRebuild);
   webServer.on("/api/factory-reset", HTTP_POST, handleFactoryReset);
   webServer.on("/api/backups", HTTP_GET, handleBackupList);
