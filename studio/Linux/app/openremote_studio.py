@@ -657,9 +657,9 @@ def create_db(records, db_path, metadata):
     cur.executemany("INSERT INTO remotes VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",rows); con.commit(); con.close()
 IRDB_INDEX_MAGIC=b"ORIDX1\x00\x00"
 IRDB_INDEX_FOOTER_SIZE=64
-IRDB_INDEX_FORMAT_VERSION=1
+IRDB_INDEX_FORMAT_VERSION=2
 
-def append_embedded_index(db_path, records):
+def append_embedded_index(db_path, records, metadata=None):
     """Append a searchable index to the end of the SQLite .irdb file.
 
     One file instead of three. The remote used to need OpenRemote.irdb,
@@ -727,12 +727,21 @@ def append_embedded_index(db_path, records):
 
     search_bytes=b"\n".join(search_lines)+(b"\n" if search_lines else b"")
     detail_bytes=b"".join(detail_blobs)
+    # A third small section carrying what the remote shows about the database
+    # itself - how many devices and when it was built. Without it the remote can
+    # only learn that from a Database Manifest.json copied alongside, and the
+    # whole point of this change is that one file is enough.
+    meta=dict(metadata or {})
+    meta.setdefault("device_count",len(records))
+    meta_bytes=json.dumps(meta,ensure_ascii=False,separators=(",",":")).encode("utf-8")
 
     with db_path.open("ab") as f:
         search_start=f.tell()
         f.write(search_bytes)
         detail_start=f.tell()
         f.write(detail_bytes)
+        meta_start=f.tell()
+        f.write(meta_bytes)
         footer=bytearray(IRDB_INDEX_FOOTER_SIZE)
         footer[0:8]=IRDB_INDEX_MAGIC
         struct.pack_into("<QQQQII",footer,8,
@@ -740,9 +749,12 @@ def append_embedded_index(db_path, records):
                          detail_start,len(detail_bytes),
                          len(records),IRDB_INDEX_FORMAT_VERSION)
         struct.pack_into("<I",footer,48,zlib.crc32(search_bytes) & 0xFFFFFFFF)
+        # The last twelve bytes of the footer, which version 1 left reserved.
+        struct.pack_into("<QI",footer,52,meta_start,len(meta_bytes))
         f.write(bytes(footer))
     return {"search_offset":search_start,"search_bytes":len(search_bytes),
             "detail_offset":detail_start,"detail_bytes":len(detail_bytes),
+            "meta_offset":meta_start,"meta_bytes":len(meta_bytes),
             "device_count":len(records),"format_version":IRDB_INDEX_FORMAT_VERSION}
 
 def create_search_indexes(records, search_path, details_dir):
@@ -1118,7 +1130,7 @@ def build_database(save_parent, selected):
     index_path=release/"search.jsonl"; details_dir=release/"details"; create_search_indexes(records,index_path,details_dir)
     # Appended last, so the SQLite file above is complete and closed first.
     log("Embedding the searchable index into OpenRemote.irdb...")
-    embedded=append_embedded_index(db_path,records)
+    embedded=append_embedded_index(db_path,records,metadata)
     log(f"Embedded index: {embedded['search_bytes']/1024/1024:.2f} MB searchable, "
         f"{embedded['detail_bytes']/1024/1024:.1f} MB of device detail, "
         f"{embedded['device_count']} devices")
@@ -1528,6 +1540,80 @@ def serial_upload_payload(port_obj,fd,header,payload,progress=None):
         if not match or int(match.group(1))!=sent:
             raise RuntimeError("Remote upload acknowledgement was missing or out of sequence.")
     raise RuntimeError("USB upload contained no data.")
+
+IRDB_USB_STATE={"running":False,"done":False,"error":"","sent":0,"total":0,"status":"Ready."}
+
+def serial_upload_stream(port_obj,fd,header,source_path,total,progress=None):
+    """Same acknowledged window protocol as serial_upload_payload, reading from
+    disk instead of from memory.
+
+    The infrared database is over 200MB. Loading it into a bytes object to hand
+    to the existing helper would mean holding the whole thing in RAM on top of
+    whatever the browser view is using, for over an hour, to send a file that is
+    already sitting on disk.
+    """
+    serial_write(port_obj,header)
+    ready=serial_readline(port_obj,fd,timeout=20)
+    if ready.startswith("{"):
+        raise RuntimeError(json.loads(ready).get("error","Remote rejected the upload."))
+    match=re.fullmatch(r"READY (\d+)",ready)
+    if not match: raise RuntimeError("Unexpected remote upload response: "+ready[:80])
+    window=int(match.group(1))
+    if window<32 or window>4096: raise RuntimeError("Remote supplied an invalid upload window.")
+    sent=0
+    with open(source_path,"rb") as f:
+        while sent<total:
+            chunk=f.read(min(window,total-sent))
+            if not chunk: raise RuntimeError("The database file ended sooner than expected.")
+            serial_write(port_obj,chunk)
+            sent+=len(chunk)
+            response=serial_readline(port_obj,fd,timeout=30)
+            if progress: progress(sent,total)
+            if sent==total:
+                result=json.loads(response)
+                if not result.get("ok"): raise RuntimeError(result.get("error","Remote rejected the upload."))
+                return result
+            m=re.fullmatch(r"ACK (\d+)",response)
+            if not m or int(m.group(1))!=sent:
+                raise RuntimeError("Remote upload acknowledgement was missing or out of sequence.")
+    raise RuntimeError("USB upload contained no data.")
+
+def send_irdb_over_usb(port):
+    """Copies the loaded OpenRemote.irdb to the remote's SD card over USB.
+
+    Slow by nature - the link runs at 460800 baud, so a 200MB database takes
+    well over an hour. It exists for a remote that is not on Wi-Fi; WebConfig
+    over the network, or simply writing the card in a reader, are both far
+    quicker and the UI says so.
+    """
+    if not ACTIVE_DB.exists():
+        IRDB_USB_STATE.update({"running":False,"done":False,"error":"No OpenRemote.irdb loaded yet.","status":"No database loaded."})
+        return
+    total=ACTIVE_DB.stat().st_size
+    IRDB_USB_STATE.update({"running":True,"done":False,"error":"","sent":0,"total":total,
+                           "status":"Connecting to the remote..."})
+    def report(sent,size):
+        IRDB_USB_STATE["sent"]=sent
+        IRDB_USB_STATE["total"]=size
+        IRDB_USB_STATE["status"]="Sending the IR database over USB..."
+    port_obj=None
+    try:
+        with USB_LOCK:
+            p=normalize_usb_port(port)
+            port_obj,fd=open_serial_port(p)
+            hello=usb_handshake(port_obj,fd,timeout=30)
+            require_usb_firmware(hello,"1.24")
+            header=("ORUSB WRITE %s %d\n"%("/irdb/OpenRemote.irdb",total)).encode("ascii")
+            serial_upload_stream(port_obj,fd,header,str(ACTIVE_DB),total,report)
+        IRDB_USB_STATE.update({"running":False,"done":True,"sent":total,"total":total,
+                               "status":"Installed as /irdb/OpenRemote.irdb. WebConfig can now search it."})
+    except Exception as e:
+        IRDB_USB_STATE.update({"running":False,"done":False,"error":str(e),
+                               "status":"Transfer failed: "+str(e)})
+    finally:
+        try:
+            if port_obj: port_obj.close()
+        except Exception: pass
 
 def _usb_import_device(port,id):
     ir_file=ir_file_from_db(id)
@@ -2165,6 +2251,7 @@ class Handler(BaseHTTPRequestHandler):
                                     "firmwareInstalled":False})
         if self.path.startswith("/app/ping"): self.send_data(json.dumps({"ok":True,"version":APP_VERSION}),"application/json")
         elif self.path.startswith("/usb/webconfig-state"): self.send_data(json.dumps(WEBCONFIG_STATE),"application/json")
+        elif self.path.startswith("/usb/irdb-state"): self.send_data(json.dumps(IRDB_USB_STATE),"application/json")
         elif self.path.startswith("/status"): self.send_data(json.dumps(STATE),"application/json")
         elif self.path.startswith("/setup/status"): self.send_data(json.dumps(FACTORY_STATE),"application/json")
         elif self.path.startswith("/setup/info"):
@@ -2462,6 +2549,19 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_data(json.dumps({"ok":False,"error":"That WebConfig file looks truncated (no closing </html>)."}),"application/json",400); return
             threading.Thread(target=install_webconfig_over_usb,args=(port,payload),daemon=True).start()
             self.send_data(json.dumps({"ok":True,"bytes":len(payload)}),"application/json")
+        elif self.path.startswith("/usb/send-irdb"):
+            length=int(self.headers.get("Content-Length","0") or 0); body=self.rfile.read(length).decode("utf-8") if length else "{}"
+            try: request=json.loads(body)
+            except Exception: request={}
+            port=(request.get("port") or "").strip()
+            if not port:
+                self.send_data(json.dumps({"error":"Choose the remote's USB serial port first."}),"application/json"); return
+            if not ACTIVE_DB.exists():
+                self.send_data(json.dumps({"error":"No OpenRemote.irdb loaded yet."}),"application/json"); return
+            if IRDB_USB_STATE.get("running"):
+                self.send_data(json.dumps({"error":"A database transfer is already running."}),"application/json"); return
+            threading.Thread(target=send_irdb_over_usb,args=(port,),daemon=True).start()
+            self.send_data(json.dumps({"ok":True,"bytes":ACTIVE_DB.stat().st_size}),"application/json")
         elif self.path.startswith("/usb/import-device"):
             length=int(self.headers.get("Content-Length","0") or 0); body=self.rfile.read(length).decode("utf-8") if length else "{}"
             try: request=json.loads(body)

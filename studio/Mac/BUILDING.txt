@@ -82,6 +82,24 @@ If a merged ("factory") .bin is chosen in Recovery, its first 0x10000 bytes -
 bootloader and partition table - are stripped and only the application is
 written, so either kind of file gives a settings-preserving install.
 
+Copying a FINISHED .app - never with cp -RL
+-------------------------------------------
+The "cp -RL" advice above applies to the vendor tree going INTO a build. Do not
+use it to copy a finished bundle anywhere. PyInstaller symlinks ~160 files in
+Contents/Resources to the real binaries in Contents/Frameworks, and -L
+dereferences every one of them into a full copy: an 87MB bundle becomes 270MB
+with zero symlinks left. Observed on 2.80.
+
+Copy a finished bundle with ditto, which preserves symlinks:
+
+    ditto -c -k --sequesterRsrc --keepParent "<app>" "<name>.zip"
+    ditto -x -k "<name>.zip" "<destination folder>"
+
+Sanity check after copying - the numbers should match the build output:
+
+    du -sh "<app>"                        # ~87MB, not ~270MB
+    find "<app>" -type l | wc -l          # ~160, not 0
+
 Distributing to the NAS
 -----------------------
 Zip it with ditto. The NAS is SMB and cannot store extended attributes, so

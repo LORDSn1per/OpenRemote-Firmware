@@ -386,6 +386,22 @@ input:focus,textarea:focus{border-color:rgba(47,140,255,.8); box-shadow:0 0 0 3p
               <button class="primary" onclick="uploadDb()">Load OpenRemote.irdb</button>
             </div>
             <div id="dbInfo" class="detailKV">No database loaded yet.</div>
+          <div class="usbPanel" id="irdbUsbPanel">
+            <b>Copy this database to the remote's SD card over USB</b>
+            <div class="detailKV">Writes <b>/irdb/OpenRemote.irdb</b> so the remote can search every device on its own, with no computer involved afterwards.</div>
+            <div class="detailKV" id="irdbUsbWarn" style="color:#ffc37d;margin-top:6px">
+              <b>This is slow.</b> USB serial runs at 460800 baud, so a database this size takes
+              <span id="irdbUsbEta">over an hour</span>. Installing it from WebConfig over Wi-Fi is much quicker,
+              and writing the card directly in an SD card reader is quicker still. Use this only when the
+              remote is not on your network.
+            </div>
+            <div class="usbRow">
+              <select id="irdbUsbPort"><option>Scanning…</option></select>
+              <button class="secondary" onclick="loadUsbPorts()">Refresh</button>
+              <button class="primary" id="irdbUsbSendBtn" onclick="sendIrdbToUsb()">Send to Remote</button>
+            </div>
+            <div class="usbStatus" id="irdbUsbStatus">Ready.</div>
+          </div>
       <div id="browserStatusCard" class="card dbStatusCard">
         <div id="browserStatusLine"><span class="statusDot redStatus"></span>No database loaded</div>
         <div id="browserDbName" class="detailKV">OpenRemote.irdb</div>
@@ -746,6 +762,7 @@ async function loadInfo(){
   sideLoaded.innerHTML='<span class="statusDot"></span>Database Loaded';
   sideDbName.textContent='OpenRemote.irdb ('+(info.size_mb||0).toFixed(1)+' MB)';
   sideDbDate.textContent='Created: '+(info.build_date_short||'—');
+  setIrdbUsbEta(info.size_mb);
   if(typeof browserStatusLine!=='undefined' && browserStatusLine){
     browserStatusLine.innerHTML='<span class="statusDot"></span>Database Loaded';
     browserDbName.textContent='OpenRemote.irdb ('+(info.size_mb||0).toFixed(1)+' MB)';
@@ -796,6 +813,7 @@ let timer=null;function searchDb(){clearTimeout(timer);timer=setTimeout(async()=
       sideLoaded.innerHTML='<span class="statusDot"></span>Database Loaded';
       sideDbName.textContent='OpenRemote.irdb ('+(info.size_mb||0).toFixed(1)+' MB)';
       sideDbDate.textContent='Created: '+(info.build_date_short||'—');
+  setIrdbUsbEta(info.size_mb);
       if(typeof browserStatusLine!=='undefined' && browserStatusLine){
         browserStatusLine.innerHTML='<span class="statusDot"></span>Database Loaded';
         browserDbName.textContent='OpenRemote.irdb ('+(info.size_mb||0).toFixed(1)+' MB)';
@@ -818,13 +836,69 @@ async function details(id){
 }
 
 async function loadUsbPorts(){
-  let select=document.getElementById('usbPortSelect');
-  if(!select) return;
-  select.innerHTML='<option>Scanning…</option>';
+  // Both selects. The device-details one only exists once a device has been
+  // picked, and returning early on its absence left the database panel's own
+  // selector stuck on "Scanning...".
+  let selects=[document.getElementById('usbPortSelect'),document.getElementById('irdbUsbPort')].filter(Boolean);
+  if(!selects.length) return;
+  selects.forEach(s=>{s.innerHTML='<option>Scanning…</option>';});
   let data=await fetch('/usb-ports?ts='+Date.now()).then(r=>r.json()).catch(()=>({ports:[]}));
   let ports=data.ports||[];
-  select.innerHTML=ports.length?ports.map(p=>`<option value="${esc(p)}">${esc(p)}</option>`).join(''):'<option value="">No USB serial ports found</option>';
+  let html=ports.length?ports.map(p=>`<option value="${esc(p)}">${esc(p)}</option>`).join(''):'<option value="">No USB serial ports found</option>';
+  selects.forEach(s=>{s.innerHTML=html;});
 }
+
+// 460800 baud is 8N1, so ten bits a byte: 46,080 bytes a second before any
+// per-chunk acknowledgement. Stated in hours once it passes one, because
+// pretending to know it to the minute would be false precision.
+function setIrdbUsbEta(sizeMb){
+  let eta=document.getElementById('irdbUsbEta');
+  if(!eta) return;
+  let minutes=Math.ceil((Number(sizeMb||0)*1048576/46080)/60);
+  if(!minutes){ eta.textContent='over an hour'; return; }
+  eta.textContent=minutes>=60
+    ? ('about '+(Math.round(minutes/60*10)/10)+' hours')
+    : ('about '+minutes+' minutes');
+}
+function irdbFormatBytes(n){
+  n=Number(n)||0;
+  return n>=1048576 ? (n/1048576).toFixed(1)+" MB" : (n/1024).toFixed(0)+" KB";
+}
+
+var irdbUsbPoll=null;
+async function sendIrdbToUsb(){
+  let select=document.getElementById('irdbUsbPort');
+  let status=document.getElementById('irdbUsbStatus');
+  let button=document.getElementById('irdbUsbSendBtn');
+  let port=select&&select.value;
+  if(!port){ if(status){status.className='usbStatus err';status.textContent='Choose the remote\'s USB serial port first.';} return; }
+  if(!confirm("Send the whole IR database to the remote over USB?\n\nThis takes well over an hour at USB serial speed. Installing it from WebConfig over Wi-Fi, or writing the SD card in a card reader, are both much faster.\n\nLeave Studio open and do not unplug the remote.")) return;
+  if(button) button.disabled=true;
+  if(status){status.className='usbStatus';status.textContent='Starting transfer…';}
+  let data=await fetch('/usb/send-irdb',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({port})}).then(r=>r.json()).catch(e=>({error:e.message}));
+  if(data.error){
+    if(status){status.className='usbStatus err';status.textContent=data.error;}
+    if(button) button.disabled=false;
+    return;
+  }
+  if(irdbUsbPoll) clearInterval(irdbUsbPoll);
+  irdbUsbPoll=setInterval(async function(){
+    let s=await fetch('/usb/irdb-state').then(r=>r.json()).catch(()=>null);
+    if(!s) return;
+    let pct=s.total?Math.floor(s.sent*100/s.total):0;
+    if(s.running){
+      if(status){status.className='usbStatus';status.textContent=s.status+' '+irdbFormatBytes(s.sent)+' / '+irdbFormatBytes(s.total)+' ('+pct+'%)';}
+    }else{
+      clearInterval(irdbUsbPoll); irdbUsbPoll=null;
+      if(button) button.disabled=false;
+      if(status){
+        status.className=s.error?'usbStatus err':'usbStatus ok';
+        status.textContent=s.error?('Transfer failed: '+s.error):s.status;
+      }
+    }
+  },1000);
+}
+
 async function sendSelectedToUsb(){
   let select=document.getElementById('usbPortSelect');
   let status=document.getElementById('usbStatus');

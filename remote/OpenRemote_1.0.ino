@@ -1,6 +1,29 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.78 - 2026-09-12
+    - The IR database can now be installed and removed without touching the SD
+      card. "irdb" joins the chunked upload targets, staged under /tmp and moved
+      into /irdb only once the byte count and checksum agree, so a transfer that
+      dies part way leaves the previous database intact rather than a stump that
+      reports itself as installed. A new DELETE /api/irdb removes it and the
+      older separate index files and nothing else.
+    - The database is now also writable over USB at exactly one path, so Studio
+      can install it on a remote that is not on Wi-Fi.
+    - Reads the device count and build date from inside OpenRemote.irdb rather
+      than only from a Database Manifest.json copied beside it. The point of
+      embedding the index is that one file is enough, and someone who copied
+      only the database saw "Unknown build" and no device count on a database
+      that was perfectly complete. Footer format 2 carries that description in
+      the twelve bytes format 1 reserved; format 1 files still load.
+    - /irdb, /tmp and /backups can never enter a backup. They were already
+      absent from every backup list, but the exclusion is now enforced inside
+      copySdTree() and embedSdFilesAsBase64() - the two functions that actually
+      walk the card - so no future caller can reintroduce the database by naming
+      the wrong folder. It is over 200MB of redistributable asset that Studio
+      rebuilds on demand: in a backup it would produce a file no phone could
+      download and no restore could finish.
+
   4.77 - 2026-09-12
     - Reads the IRDB search index from inside OpenRemote.irdb, so WebConfig can
       search all 14,551 devices and import one with no computer involved. The
@@ -5979,7 +6002,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.77"
+#define OPENREMOTE_VERSION_STRING "4.78"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -6256,6 +6279,25 @@ static const char *IRDB_SEARCH_INDEX_PATH = "/irdb/search.jsonl";
 static const char *IRDB_DETAIL_DIR = "/irdb/details";
 static const char *IRDB_MANIFEST_PATH = "/irdb/manifest.json";
 static const char *IRDB_ALT_MANIFEST_PATH = "/irdb/Database Manifest.json";
+
+struct IrdbEmbeddedIndex {
+  bool present = false;
+  uint64_t searchOffset = 0;
+  uint64_t searchLength = 0;
+  uint64_t detailOffset = 0;
+  uint64_t detailLength = 0;
+  uint32_t deviceCount = 0;
+  uint32_t formatVersion = 0;
+  // Version 2 adds a small JSON blob describing the database itself - device
+  // count and build date - in the twelve footer bytes version 1 reserved.
+  uint64_t metaOffset = 0;
+  uint32_t metaLength = 0;
+};
+
+static const size_t IRDB_INDEX_FOOTER_SIZE = 64;
+// Defined down with the IRDB handlers, but loadIrdbMetadata() far above needs
+// it to read the database's own description.
+bool readIrdbEmbeddedIndex(IrdbEmbeddedIndex &out);
 static const char *OPENREMOTE_TZ = "AEST-10AEDT,M10.1.0,M4.1.0/3";
 static const char *BLE_HID_NAME = "OpenRemote HID";
 static const char *ATVV_SERVICE_UUID = "AB5E0001-5A21-4F05-BC7D-AF01F617B664";
@@ -8874,6 +8916,8 @@ bool dockOtaPrepare(uint8_t deviceIndex, String &error);
 // Reported by /api/config, which is built well above the IRDB handlers.
 bool irdbSearchAvailable();
 bool irdbDetailAvailable();
+void handleIrdbDelete();
+void deleteSdTree(const String &path);
 void applyDisplayPanelPreset(const DisplayPanelPreset &preset);
 void serviceDisplayRescueCombo(unsigned long now);
 // Both Display page renderers build the LCD Panel row, and both sit above the
@@ -11099,6 +11143,45 @@ void loadIrdbMetadata() {
           sizeof(irdbBuildDate));
   irdbDeviceCount = 0;
   if (!sdReady) return;
+
+  /*
+    Prefer the copy inside OpenRemote.irdb.
+
+    Studio writes a Database Manifest.json beside the database, but the whole
+    point of embedding the index is that one file is enough - and someone who
+    copies only OpenRemote.irdb would otherwise see "Unknown build" and no
+    device count, on a database that is perfectly complete. Read it from the
+    file itself and fall back to a manifest only when this database predates
+    the embedded form.
+  */
+  IrdbEmbeddedIndex embedded;
+  if (readIrdbEmbeddedIndex(embedded)) {
+    if (embedded.deviceCount) irdbDeviceCount = embedded.deviceCount;
+    if (embedded.metaLength && embedded.metaLength < 4096) {
+      File dbFile = SD.open(IRDB_PATH, FILE_READ);
+      if (dbFile && dbFile.seek((uint32_t)embedded.metaOffset)) {
+        String blob;
+        blob.reserve(embedded.metaLength + 1);
+        for (uint32_t i = 0; i < embedded.metaLength; i++) {
+          int c = dbFile.read();
+          if (c < 0) break;
+          blob += (char)c;
+        }
+        JsonDocument metaDoc;
+        if (!deserializeJson(metaDoc, blob)) {
+          const char *when = metaDoc["created_date"] | metaDoc["scrape_date_local"]
+                           | metaDoc["database_version"] | "";
+          if (when[0]) strlcpy(irdbBuildDate, when, sizeof(irdbBuildDate));
+          uint32_t count = metaDoc["device_count"] | 0;
+          if (count) irdbDeviceCount = count;
+        }
+      }
+      if (dbFile) dbFile.close();
+    }
+    Serial.printf("IRDB metadata: %s, %lu devices (embedded)\n",
+                  irdbBuildDate, (unsigned long)irdbDeviceCount);
+    if (irdbDeviceCount) return;
+  }
 
   const char *manifestPath = SD.exists(IRDB_MANIFEST_PATH)
     ? IRDB_MANIFEST_PATH
@@ -17478,6 +17561,12 @@ bool usbWritableSdPath(const String &path) {
   if (path == RUNTIME_CONFIG_PATH || path == WEB_CONFIG_PATH ||
       path == "/config/version.json") return true;
   if (path.startsWith("/firmware/") && path.endsWith(".bin")) return true;
+  // The infrared database, so OpenRemote Studio can install it over USB on a
+  // remote that is not on Wi-Fi. Exactly one path, not a prefix: this is the
+  // largest file the card ever holds and there is no reason to allow anything
+  // else under /irdb, which the remote otherwise treats as read-only content
+  // it did not write.
+  if (path == IRDB_PATH) return true;
   if (path.startsWith("/icons/Default/") &&
       (path.endsWith(".png") || path.endsWith(".jpg") ||
        path.endsWith(".jpeg") || path.endsWith(".html"))) return true;
@@ -18244,18 +18333,6 @@ bool lineMatchesSearchTerms(const String &line, const String terms[], uint8_t te
   detail record within the detail section, so importing is one scan of the small
   section and then a single seek - never a walk of the whole database.
 */
-struct IrdbEmbeddedIndex {
-  bool present = false;
-  uint64_t searchOffset = 0;
-  uint64_t searchLength = 0;
-  uint64_t detailOffset = 0;
-  uint64_t detailLength = 0;
-  uint32_t deviceCount = 0;
-  uint32_t formatVersion = 0;
-};
-
-static const size_t IRDB_INDEX_FOOTER_SIZE = 64;
-
 bool readIrdbEmbeddedIndex(IrdbEmbeddedIndex &out) {
   if (!sdReady || !SD.exists(IRDB_PATH)) return false;
   File file = SD.open(IRDB_PATH, FILE_READ);
@@ -18275,13 +18352,23 @@ bool readIrdbEmbeddedIndex(IrdbEmbeddedIndex &out) {
   memcpy(&out.detailLength, footer + 32, 8);
   memcpy(&out.deviceCount, footer + 40, 4);
   memcpy(&out.formatVersion, footer + 44, 4);
+  if (out.formatVersion >= 2) {
+    memcpy(&out.metaOffset, footer + 52, 8);
+    memcpy(&out.metaLength, footer + 60, 4);
+  }
   // Every section must lie inside the file and before the footer. A truncated
   // or half-copied database would otherwise send the reader seeking into
   // nothing, and an index that cannot be trusted is worse than no index.
   uint64_t limit = size - IRDB_INDEX_FOOTER_SIZE;
-  if (out.formatVersion != 1) return false;
+  if (out.formatVersion < 1 || out.formatVersion > 2) return false;
   if (out.searchOffset > limit || out.searchLength > limit - out.searchOffset) return false;
   if (out.detailOffset > limit || out.detailLength > limit - out.detailOffset) return false;
+  if (out.metaLength && (out.metaOffset > limit || out.metaLength > limit - out.metaOffset)) {
+    // A bad metadata pointer costs only the description, so drop it and keep
+    // the index rather than refusing a database that is otherwise fine.
+    out.metaOffset = 0;
+    out.metaLength = 0;
+  }
   out.present = out.searchLength > 0;
   return out.present;
 }
@@ -18310,6 +18397,45 @@ bool readIrdbIndexLine(File &file, uint64_t stopAt, String &line) {
     if (c != '\r' && line.length() < 2048) line += (char)c;
   }
   return line.length() > 0;
+}
+
+/*
+  Removes the infrared database from the SD card.
+
+  It is the one thing on the card that is both enormous and entirely
+  replaceable - Studio rebuilds it on demand - so being able to reclaim the
+  space without pulling the card out is worth an endpoint. Deliberately narrow:
+  it removes the database and the older separate index files and touches
+  nothing else, so a mistaken press costs a re-copy, never a configuration.
+*/
+void handleIrdbDelete() {
+  if (!requestAuthorized()) {
+    sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
+    return;
+  }
+  if (!sdReady) {
+    sendJson(503, "{\"ok\":false,\"error\":\"SD card unavailable\"}");
+    return;
+  }
+  uint64_t freed = 0;
+  File probe = SD.open(IRDB_PATH, FILE_READ);
+  if (probe) { freed = (uint64_t)probe.size(); probe.close(); }
+  bool removed = SD.exists(IRDB_PATH) && SD.remove(IRDB_PATH);
+  // The older separate-file form, if this card still carries it.
+  if (SD.exists(IRDB_SEARCH_INDEX_PATH)) SD.remove(IRDB_SEARCH_INDEX_PATH);
+  if (SD.exists(IRDB_DETAIL_DIR)) deleteSdTree(IRDB_DETAIL_DIR);
+  if (SD.exists(IRDB_MANIFEST_PATH)) SD.remove(IRDB_MANIFEST_PATH);
+  if (SD.exists(IRDB_ALT_MANIFEST_PATH)) SD.remove(IRDB_ALT_MANIFEST_PATH);
+  loadIrdbMetadata();
+  JsonDocument doc;
+  doc["ok"] = removed;
+  doc["freedBytes"] = (double)freed;
+  if (!removed) doc["error"] = "No IR database was installed";
+  String body;
+  serializeJson(doc, body);
+  sendJson(removed ? 200 : 404, body);
+  Serial.printf("IRDB delete: %s, %.1f MB freed\n",
+                removed ? "removed" : "nothing to remove", freed / 1048576.0);
 }
 
 void handleIrdbSearch() {
@@ -18583,7 +18709,34 @@ bool copySdFile(const String &sourcePath, const String &destinationPath) {
   return ok;
 }
 
+/*
+  Paths that must never enter a backup, whatever asks.
+
+  /irdb holds the infrared database, which is over 200MB. It is not user
+  configuration - it is a redistributable asset rebuilt by OpenRemote Studio at
+  any time - and putting it in a backup would produce a file no phone could
+  download, no SD card could spare room for, and no restore could finish. One
+  accidental "/irdb" in a folder list would do it.
+
+  So this is enforced in the two functions that actually walk the card rather
+  than in the lists that call them. A future caller cannot reintroduce it by
+  naming the wrong folder, because the copy and the encoder both refuse.
+*/
+bool isBackupExcludedPath(const String &path) {
+  if (path == "/irdb" || path.startsWith("/irdb/")) return true;
+  // Scratch space, and the staged copies backups themselves live in - copying
+  // either into a backup would nest a backup inside a backup.
+  if (path == "/tmp" || path.startsWith("/tmp/")) return true;
+  if (path == "/backups" || path.startsWith("/backups/")) return true;
+  return false;
+}
+
 bool copySdTree(const String &sourcePath, const String &destinationPath) {
+  if (isBackupExcludedPath(sourcePath)) {
+    Serial.printf("Backup: refusing to copy %s - excluded from backups\n",
+                  sourcePath.c_str());
+    return true;   // Not an error: the caller asked for something deliberately skipped.
+  }
   File source = SD.open(sourcePath);
   if (!source) return false;
   if (!source.isDirectory()) {
@@ -18667,6 +18820,11 @@ void normaliseRuntimeItemIcons(JsonArray items) {
 // is fully self-contained. Recurses like copySdTree()/countSdFiles(), since
 // icons/themes can have subfolders.
 void embedSdFilesAsBase64(JsonArray target, const String &directory) {
+  if (isBackupExcludedPath(directory)) {
+    Serial.printf("Backup: refusing to embed %s - excluded from backups\n",
+                  directory.c_str());
+    return;
+  }
   File root = SD.open(directory);
   if (!root || !root.isDirectory()) {
     if (root) root.close();
@@ -19893,6 +20051,15 @@ String chunkUploadTempPathFor(const String &target) {
     if (sdReady && !SD.exists("/dock")) SD.mkdir("/dock");
     return String(DOCK_FIRMWARE_PATH);
   }
+  // The infrared database, which is the largest thing this remote ever
+  // receives - over 200MB with its embedded index. Staged under /tmp and moved
+  // into place only once the size and checksum agree, so a transfer that dies
+  // part way leaves the previous database intact rather than a stump that
+  // reports itself as installed.
+  if (target == "irdb") {
+    if (sdReady && !SD.exists("/irdb")) SD.mkdir("/irdb");
+    return String("/tmp/OpenRemote.upload.irdb");
+  }
   return String();
 }
 
@@ -20176,6 +20343,27 @@ void handleChunkUploadFinish() {
   } else if (ok && target == "firmware") {
     ok = received >= 65536UL && uploadedFirmwareLooksValid(path);
     if (!ok) error = "Not a valid ESP32 firmware binary";
+  } else if (ok && target == "irdb") {
+    // A SQLite database begins with a fixed seventeen byte string. Checking it
+    // costs one read and stops a mis-picked file from replacing a working
+    // database with something the search will never parse.
+    File probe = SD.open(path, FILE_READ);
+    char header[16] = {0};
+    if (probe) { probe.read((uint8_t *)header, sizeof(header)); probe.close(); }
+    ok = received >= 65536UL && memcmp(header, "SQLite format 3", 15) == 0;
+    if (!ok) {
+      error = "That is not an OpenRemote.irdb database - build one in OpenRemote Studio";
+    } else {
+      SD.remove(IRDB_PATH);
+      ok = SD.rename(path, IRDB_PATH);
+      if (!ok) error = "Could not move the database into /irdb";
+      else {
+        loadIrdbMetadata();
+        Serial.printf("IRDB installed: %u bytes, %s, %lu devices\n",
+                      (unsigned)received, irdbBuildDate,
+                      (unsigned long)irdbDeviceCount);
+      }
+    }
   } else if (ok && target == "dock") {
     // Checked here, before it can ever be transmitted. Remote firmware is an
     // ESP32-S3 image with a different marker, so it fails both tests and cannot
@@ -22433,6 +22621,7 @@ void configureWebServer() {
   webServer.on("/api/irdb/search", HTTP_GET, handleIrdbSearch);
   webServer.on("/api/irdb/detail", HTTP_GET, handleIrdbDetail);
   webServer.on("/api/irdb", HTTP_GET, handleIrdbDownload);
+  webServer.on("/api/irdb", HTTP_DELETE, handleIrdbDelete);
   webServer.on("/api/irdb", HTTP_POST, []() {
     if (!requestAuthorized()) webServer.send(403, "application/json", "{\"ok\":false}");
     else sendJson(irdbUploadOk ? 200 : 400,
