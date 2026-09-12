@@ -87,6 +87,30 @@ Runs on the remote: a colour touchscreen, physical buttons, infrared, Bluetooth
 for Android TV and Chromecast — including voice search through the built-in
 microphone — plus Wi-Fi for Home Assistant, MQTT and Homebridge.
 
+#### Button shortcuts
+
+Two button combinations work from anywhere, whatever page the remote is showing
+and whatever the buttons are bound to. Both also fire the buttons' own normal
+commands, so use keys whose commands are harmless to send.
+
+| Hold | Does |
+|---|---|
+| **Stop + Forward** together | Jumps straight into Settings and takes touch out of the way, so the D-pad and OK navigate the menus. Press Back from the Settings home to leave again. |
+| **Red + Blue** for 7 seconds | Restores the safe Adafruit display settings and reboots immediately, with no confirmation. |
+
+The Red + Blue reset exists for a screen you cannot read — the wrong panel
+driver, inverted colours, a bus clock the fitted panel will not take. A
+confirmation dialog on an unreadable screen would be no help, so there isn't
+one; holding two specific keys for seven seconds is the confirmation. It restores
+the Adafruit module, colour inversion off, the Arduino_GFX driver, a 20 MHz LCD
+clock, double buffering and default pressure — the combination that works on
+every supported panel. Nothing else is touched: your activities, devices, Wi-Fi
+and pairings are all left alone.
+
+If the screen is readable, **Settings > Display > LCD** is the better route. It
+sets a whole matched configuration for Adafruit, BuyDisplay-ILI9341 or
+BuyDisplay-ST7789V and asks before restarting, and cancelling changes nothing.
+
 [Read more →](remote/README.md)
 
 ### Dock firmware — reach the rooms the remote cannot
