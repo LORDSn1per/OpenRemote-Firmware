@@ -1,6 +1,21 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.91 - 2026-09-13
+    - Makes searching the onboard IR database finish. readIrdbIndexLine() called
+      file.read() once per BYTE. The search section of a 14,551 device database
+      is 2.87MB, so every search made three million separate trips through the
+      filesystem and never appeared to return - which is exactly how it was
+      reported: "search never finishes and shows nothing". Both the search and
+      the per-device lookup scan that same section, so adding a device was
+      equally affected. It is read in 64KB blocks now, with the lines cut in
+      memory: the same scan in forty-five reads instead of three million.
+    - The device lookup no longer leaks 64KB of PSRAM per call. The scan buffer
+      belongs to the reader, and the embedded-index path was closing the file
+      handle without releasing it.
+    - Search now reports what it did on serial - entries scanned, time taken,
+      matches found - because nothing about this was visible from the outside.
+
   4.90 - 2026-09-13
     - Makes the upload actually overlap receiving and writing. 4.88 put the SD
       writer on core 0 next to the HTTP worker at a higher priority, assuming an
@@ -6239,7 +6254,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.90"
+#define OPENREMOTE_VERSION_STRING "4.91"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -18833,16 +18848,77 @@ bool irdbDetailAvailable() {
 // Reads one newline-terminated line from an open file without running past a
 // section boundary. The embedded sections are followed immediately by more
 // data, so readStringUntil('\n') alone would happily read into the next one.
-bool readIrdbIndexLine(File &file, uint64_t stopAt, String &line) {
-  line = "";
-  while ((uint64_t)file.position() < stopAt) {
-    int c = file.read();
-    if (c < 0) break;
-    if (c == '\n') return true;
-    if (c != '\r' && line.length() < 2048) line += (char)c;
+/*
+  Reads the embedded index one line at a time, in blocks.
+
+  This used to call file.read() for every single byte. The search section of a
+  14,551 device database is 2.87MB, so one search meant three million separate
+  trips through the filesystem - and a search that looked like it never
+  finished at all, which is exactly how it was reported. Both the search and
+  the per-device lookup scan this same section, so both were affected.
+
+  Reading it in 64KB blocks and cutting the lines in memory is the identical
+  scan in forty-five reads instead of three million. The buffer is one byte
+  longer than it is ever filled, so a line can be terminated in place and
+  handed to String without copying it a character at a time.
+*/
+struct IrdbIndexScanner {
+  File file;
+  uint8_t *buffer = nullptr;
+  size_t capacity = 0;
+  size_t filled = 0;
+  size_t cursor = 0;
+  uint64_t remaining = 0;
+
+  bool begin(const String &path, uint64_t from, uint64_t length) {
+    file = SD.open(path, FILE_READ);
+    if (!file) return false;
+    if (from && !file.seek((uint32_t)from)) { file.close(); return false; }
+    capacity = 64 * 1024;
+    buffer = (uint8_t *)ps_malloc(capacity + 1);
+    if (!buffer) {
+      capacity = 4096;
+      buffer = (uint8_t *)malloc(capacity + 1);
+    }
+    if (!buffer) { file.close(); return false; }
+    remaining = length;
+    return true;
   }
-  return line.length() > 0;
-}
+
+  void end() {
+    if (buffer) { free(buffer); buffer = nullptr; }
+    if (file) file.close();
+  }
+
+  bool nextLine(String &line) {
+    line = "";
+    for (;;) {
+      if (cursor >= filled) {
+        if (!remaining) return line.length() > 0;
+        size_t want = capacity;
+        if ((uint64_t)want > remaining) want = (size_t)remaining;
+        int got = file.read(buffer, want);
+        if (got <= 0) return line.length() > 0;
+        filled = (size_t)got;
+        cursor = 0;
+        remaining -= (uint64_t)got;
+      }
+      size_t start = cursor;
+      while (cursor < filled && buffer[cursor] != '\n') cursor++;
+      size_t run = cursor - start;
+      if (run && line.length() < 2048) {
+        if (line.length() + run > 2048) run = 2048 - line.length();
+        // Terminate in place. buffer[cursor] is either the newline about to be
+        // skipped or the spare byte past the fill, so nothing is lost.
+        uint8_t saved = buffer[start + run];
+        buffer[start + run] = 0;
+        line += (const char *)(buffer + start);
+        buffer[start + run] = saved;
+      }
+      if (cursor < filled) { cursor++; return true; }
+    }
+  }
+};
 
 /*
   Removes the infrared database from the SD card.
@@ -18913,37 +18989,41 @@ void handleIrdbSearch() {
     start = space + 1;
   }
 
-  File file = SD.open(useEmbedded ? IRDB_PATH : IRDB_SEARCH_INDEX_PATH, FILE_READ);
-  if (!file) {
-    sendJson(500, "{\"ok\":false,\"error\":\"Could not open the IRDB search index\"}");
-    return;
-  }
   // Bounded to the search section when reading the embedded copy; the detail
   // section follows it immediately with no separator of its own.
-  uint64_t scanStop = (uint64_t)file.size();
-  if (useEmbedded) {
-    if (!file.seek((uint32_t)embedded.searchOffset)) {
-      file.close();
-      sendJson(500, "{\"ok\":false,\"error\":\"Could not seek to the embedded IRDB index\"}");
+  IrdbIndexScanner scanner;
+  String indexPath = useEmbedded ? String(IRDB_PATH) : String(IRDB_SEARCH_INDEX_PATH);
+  uint64_t from = useEmbedded ? embedded.searchOffset : 0;
+  uint64_t span = embedded.searchLength;
+  if (!useEmbedded) {
+    File probe = SD.open(indexPath, FILE_READ);
+    if (!probe) {
+      sendJson(500, "{\"ok\":false,\"error\":\"Could not open the IRDB search index\"}");
       return;
     }
-    scanStop = embedded.searchOffset + embedded.searchLength;
+    span = (uint64_t)probe.size();
+    probe.close();
+  }
+  if (!scanner.begin(indexPath, from, span)) {
+    scanner.end();
+    sendJson(500, "{\"ok\":false,\"error\":\"Could not open the IRDB search index\"}");
+    return;
   }
 
   const uint8_t maxResults = 25;
   uint16_t total = 0;
   uint8_t shown = 0;
   uint32_t lines = 0;
-  unsigned long lastYieldMs = millis();
+  unsigned long startedMs = millis();
+  unsigned long lastYieldMs = startedMs;
 
   webServer.sendHeader("Cache-Control", "no-store");
   webServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
   webServer.send(200, "application/json", "");
   webServer.sendContent("{\"ok\":true,\"results\":[");
 
-  while ((uint64_t)file.position() < scanStop) {
-    String line;
-    if (!readIrdbIndexLine(file, scanStop, line)) break;
+  String line;
+  while (scanner.nextLine(line)) {
     line.trim();
     lines++;
     if (line.length() && lineMatchesSearchTerms(line, terms, termCount)) {
@@ -18960,7 +19040,10 @@ void handleIrdbSearch() {
       delay(1);
     }
   }
-  file.close();
+  scanner.end();
+  Serial.printf("IRDB search: \"%s\" scanned %lu entries in %lu ms, %u match(es)\n",
+                query.c_str(), (unsigned long)lines,
+                (unsigned long)(millis() - startedMs), (unsigned)total);
 
   webServer.sendContent("],\"shown\":");
   webServer.sendContent(String(shown));
@@ -19003,24 +19086,23 @@ void handleIrdbDetail() {
     }
   }
   if (useEmbedded) {
-    File file = SD.open(IRDB_PATH, FILE_READ);
-    if (!file || !file.seek((uint32_t)embedded.searchOffset)) {
-      if (file) file.close();
+    IrdbIndexScanner scanner;
+    if (!scanner.begin(IRDB_PATH, embedded.searchOffset, embedded.searchLength)) {
+      scanner.end();
       sendJson(500, "{\"ok\":false,\"error\":\"Could not read the embedded IRDB index\"}");
       return;
     }
+    File &file = scanner.file;
     // The id is matched against the line's own "id" field rather than anywhere
     // in the line, so a device whose model text happens to contain another
     // device's id cannot be served by mistake.
     String needle = String("\"id\":\"") + id + "\"";
-    uint64_t stopAt = embedded.searchOffset + embedded.searchLength;
     uint64_t offset = 0;
     uint64_t length = 0;
     bool found = false;
     unsigned long lastYieldMs = millis();
-    while ((uint64_t)file.position() < stopAt) {
-      String line;
-      if (!readIrdbIndexLine(file, stopAt, line)) break;
+    String line;
+    while (scanner.nextLine(line)) {
       if (line.indexOf(needle) >= 0) {
         int at = line.lastIndexOf("\"o\":");
         int lengthAt = line.lastIndexOf("\"l\":");
@@ -19035,12 +19117,12 @@ void handleIrdbDetail() {
       if (now - lastYieldMs >= 10UL) { lastYieldMs = now; delay(1); }
     }
     if (!found) {
-      file.close();
+      scanner.end();
       sendJson(404, "{\"ok\":false,\"error\":\"Device not found in the embedded IRDB index\"}");
       return;
     }
     if (!file.seek((uint32_t)(embedded.detailOffset + offset))) {
-      file.close();
+      scanner.end();
       sendJson(500, "{\"ok\":false,\"error\":\"Could not seek to the device record\"}");
       return;
     }
@@ -19057,7 +19139,10 @@ void handleIrdbDetail() {
       remaining -= (uint64_t)got;
       delay(0);
     }
-    file.close();
+    // scanner.end(), not file.close(): `file` is a reference into the scanner,
+    // so closing it alone would leak the scanner's 64KB buffer on every single
+    // device lookup.
+    scanner.end();
     Serial.printf("IRDB detail \"%s\": %lu bytes from the embedded index\n",
                   id.c_str(), (unsigned long)length);
     return;
