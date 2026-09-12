@@ -1,6 +1,28 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.79 - 2026-09-12
+    - Fixes the remote crashing and rebooting part way through a large upload.
+      Caught live: at about 7.8MB of a 198MB IR database the task watchdog
+      aborted with "IDLE0 (CPU 0)" starved and CPU 0 running openremote_http.
+      The heap was 86KB free at the time and never fell - it was never a memory
+      problem, which is what the symptom looked like.
+    - The cause was one line. handleChunkUploadData() opened the staging file
+      with SD.open(path, FILE_APPEND) on EVERY chunk, and FILE_APPEND seeks to
+      the end of the file, which on FAT means walking the cluster chain from the
+      start. That is O(n) per chunk and O(n^2) over a transfer, so the open grew
+      steadily slower as the file grew - invisible on a 2MB WebConfig, fatal on
+      a 200MB database. Eventually a single open blocked longer than the five
+      second task watchdog, the HTTP worker could not yield to IDLE0 in time,
+      and the remote aborted.
+    - The handle is now opened once for the whole transfer and closed by the
+      session, the finish handler or an abort. Every append continues from where
+      the last write left off, which costs the same whatever the file size.
+      Per-chunk verification is unchanged: each chunk is still flushed, the
+      file's real size compared against what was sent, and the byte count
+      corrected so a card that falls behind costs one retried chunk rather than
+      the whole transfer.
+
   4.78 - 2026-09-12
     - The IR database can now be installed and removed without touching the SD
       card. "irdb" joins the chunked upload targets, staged under /tmp and moved
@@ -6002,7 +6024,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.78"
+#define OPENREMOTE_VERSION_STRING "4.79"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -20184,10 +20206,28 @@ void handleChunkUploadData() {
       // corrupt the file - the client re-reads /status and resumes.
       chunkUploadChunkOk = false;
       chunkUploadError = "Chunk offset mismatch";
-    } else {
+    } else if (!chunkUploadFile) {
+      /*
+        Opened once for the whole transfer, not once per chunk.
+
+        This used to run on every chunk, and FILE_APPEND seeks to the end of the
+        file - which on FAT means walking the cluster chain from the start. With
+        a fixed chunk size that is O(n) per chunk and O(n^2) over a transfer, so
+        the open got steadily slower as the file grew. It is invisible on a
+        2MB WebConfig and fatal on a 200MB database: at roughly 7.8MB a single
+        open finally blocked longer than the five second task watchdog, the HTTP
+        worker never yielded to IDLE0, and the remote aborted and rebooted -
+        "task_wdt: IDLE0 (CPU 0)", with CPU 0 running openremote_http and the
+        heap still perfectly healthy at 86KB. It was never a memory problem.
+
+        Holding the handle open keeps every append at the position the last
+        write left, which costs nothing regardless of how large the file is.
+      */
       chunkUploadFile = SD.open(chunkUploadTempPath, FILE_APPEND);
       chunkUploadChunkOk = (bool)chunkUploadFile;
       if (!chunkUploadChunkOk) chunkUploadError = "Could not open upload file";
+      else Serial.printf("Chunked upload: file opened once for %s, heapFree=%u\n",
+                         chunkUploadTarget.c_str(), (unsigned)ESP.getFreeHeap());
     }
   } else if (upload.status == UPLOAD_FILE_WRITE && chunkUploadChunkOk) {
     if (chunkUploadFile.write(upload.buf, upload.currentSize) != upload.currentSize) {
@@ -20217,7 +20257,8 @@ void handleChunkUploadData() {
       // update.
       chunkUploadFile.flush();
       size_t onCard = chunkUploadFile.size();
-      chunkUploadFile.close();
+      // Left open deliberately - see the open above. closeChunkUploadSession()
+      // and the finish handler are what close it.
       if (onCard != chunkUploadBytes) {
         Serial.printf("Chunked upload: SD fell behind - %u bytes written but %u on "
                       "card, rewinding %d\n",
