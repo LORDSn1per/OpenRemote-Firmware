@@ -1,6 +1,20 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.70 - 2026-09-12
+    - Raises DOCK_OTA_SLOW_TIMEOUT_MS from 6 to 15 seconds. The dual capture
+      that verified 4.69 measured the dock's esp_ota_begin() partition erase at
+      5.72 seconds against a 6000ms budget - roughly 280ms of margin on a run
+      that passed. Going over that edge does not cost one clean retry: the retry
+      lands while the dock is still erasing, the dock reads it as a fresh begin,
+      aborts and erases the whole 0x1E0000 slot again, and the next timeout
+      falls inside that second erase. The old 3.2 second budget had already
+      produced exactly this cascade once.
+    - Costs nothing on a healthy transfer. The ceiling only bounds how long the
+      remote is willing to wait; the acceptance ack ends the wait the moment it
+      arrives, and the dock repeats that ack every second until data flows, so a
+      dock that is genuinely absent still fails - at 15s x 5 instead of 6s x 5.
+
   4.69 - 2026-09-12
     - Fixes the actual reason dock firmware updates failed, caught on a dual
       serial capture rather than by inspection. dockOtaPrepare() brings the
@@ -5791,7 +5805,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.69"
+#define OPENREMOTE_VERSION_STRING "4.70"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -7843,7 +7857,21 @@ static const uint8_t DOCK_OTA_MAX_RETRIES = 8;
 // come and timed out too - both ends blaming the other, which is exactly what
 // the two logs showed. The end frame is the same shape of problem: the dock
 // verifies the whole image before answering.
-static const uint32_t DOCK_OTA_SLOW_TIMEOUT_MS = 6000;
+//
+// 15 seconds, not 6. A dual capture of a successful transfer measured the
+// begin-phase erase at 5.72 seconds against the old 6000ms budget - about 280ms
+// of headroom on a run that happened to pass. The failure mode past that edge
+// is not a clean retry: the retry arrives while the dock is still erasing, the
+// dock takes it as a fresh begin, calls esp_ota_abort() and erases the whole
+// 0x1E0000 slot AGAIN, and the remote's next timeout lands in that second erase
+// the same way. Each attempt makes the next one likelier to fail.
+//
+// Nothing is lost by waiting longer. This is a ceiling, not a delay: the
+// acceptance ack ends the wait the instant it arrives, and the dock repeats
+// that ack every second until data starts flowing, so a genuinely dead dock
+// still fails in 15s x 5 rather than hanging. The end frame gets the same
+// budget for the same reason - it verifies the whole image before answering.
+static const uint32_t DOCK_OTA_SLOW_TIMEOUT_MS = 15000;
 static const uint8_t DOCK_OTA_SLOW_MAX_RETRIES = 5;
 
 enum DockOtaState : uint8_t {

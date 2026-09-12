@@ -185,12 +185,18 @@ a dual serial capture of both boards on one clock, and they are load bearing.
   idle and deep sleep are held off.** Do not "fix" this by pinning the backlight
   on.
 
-- **Timing margin on the begin phase is tight and must be respected.**
-  `esp_ota_begin()` erases the dock's whole 0x1E0000 spare slot before it can
-  acknowledge, measured at **5.72 s** against `DOCK_OTA_SLOW_TIMEOUT_MS = 6000`
-  - about 280 ms of headroom. A retry there makes the dock `esp_ota_abort()` and
-  erase again, which cascades. Do not lower that timeout, and do not add work to
-  the dock's `loop()` ahead of `serviceOta()`.
+- **Never tighten `DOCK_OTA_SLOW_TIMEOUT_MS`.** `esp_ota_begin()` erases the
+  dock's whole 0x1E0000 spare slot before it can acknowledge, measured at
+  **5.72 s** on a healthy run. At the old 6000 ms that left about 280 ms of
+  headroom; 4.70 raised it to **15000 ms**. Going over the edge does not cost
+  one clean retry - the retry arrives while the dock is still erasing, the dock
+  reads it as a fresh begin, calls `esp_ota_abort()` and erases the whole slot
+  again, and the next timeout lands inside that second erase. The original
+  3.2 second budget produced exactly this cascade. A longer ceiling costs a
+  healthy transfer nothing: the acceptance ack ends the wait as soon as it
+  arrives and the dock repeats that ack every second, so an absent dock still
+  fails promptly enough. Also do not add work to the dock's `loop()` ahead of
+  `serviceOta()`.
 
 - **Diagnose this path with `LOGS/capture-both.command` (or an equivalent dual
   capture) before theorising.** Both failures looked identical from the remote
@@ -259,6 +265,35 @@ Never claim that GitHub downloads are updated merely because source was pushed. 
 
 Keep this section updated as active work progresses so a later session can resume without reconstructing decisions from chat history.
 
+### 2026-09-12 — Remote 4.70 begin-phase headroom and WebConfig 2.84 naming
+
+- Remote 4.70 raises `DOCK_OTA_SLOW_TIMEOUT_MS` from 6000 to 15000 ms. The dual
+  capture that verified 4.69 measured the dock's `esp_ota_begin()` partition
+  erase at 5.72 s against a 6000 ms budget - roughly 280 ms of margin on a run
+  that passed. The failure past that edge cascades rather than retrying cleanly:
+  the retry lands mid-erase, the dock treats it as a fresh begin, aborts and
+  erases the whole slot again, and the next timeout falls inside that second
+  erase. Costs a healthy transfer nothing, because the ack ends the wait as soon
+  as it arrives.
+- WebConfig 2.84 renames the Settings section heading `ESP-NOW` to
+  `OpenRemote Dock`, and updates the two in-app instructions that referred to
+  that section by name ("Pair an ESP-NOW dock first (Settings > ...)") so they
+  still point at something that exists. The `ESP-NOW` toggle inside the section
+  keeps its name: it enables the protocol, and its hint explains what ESP-NOW
+  is. Diff against 2.83 is exactly five lines and the file grew by exactly the
+  24 bytes those edits account for; JavaScript syntax validated.
+- Remote 4.70 builds at 2,680,523 bytes, was flashed over USB at `0x10000` with
+  esptool hash verification, and its boot banner confirms 4.70 is running.
+  SHA-256 `81610ee9974f0d3f89a94c675216d630322d8032550613d7da0b63ff98a36ab3`.
+  WebConfig 2.84 SHA-256
+  `be0edd0cbc194727e13c4f975fcbfe2a7be840a284a19da695da94f6a1267ef4`. Local and
+  NAS copies verified byte-identical.
+- WebConfig 2.84 has **not** been installed onto the remote's SD card as
+  `/www/index.html`; the renamed heading will not appear until it is.
+- Dock firmware is unchanged. Dock 1.81 remains current.
+- GitHub publishing remains pending because Phillip did not ask for a GitHub
+  push in this request.
+
 ### 2026-09-12 — Remote 4.69 makes dock firmware updates work
 
 - Dock firmware updates could never complete. The cause was found on a dual
@@ -282,11 +317,7 @@ Keep this section updated as active work progresses so a later session can resum
   `Dock update: complete, the dock is restarting` followed by the dock's own
   `OPENREMOTE_DOCK_VERSION=1.81` boot banner, re-pairing on channel 8 and
   rejoining Wi-Fi.
-- **Known tight margin:** the dock's `esp_ota_begin()` erase measured 5.72 s
-  against `DOCK_OTA_SLOW_TIMEOUT_MS = 6000`, leaving about 280 ms. A slower
-  erase would trigger a retry, which makes the dock abort and erase again. Not
-  changed in 4.69 because it was not part of the reported fault; raising that
-  timeout is the obvious next hardening step.
+- The begin-phase timing margin found here was hardened in 4.70.
 - Remote 4.69 builds at 2,680,688 bytes, was flashed over USB at `0x10000` with
   esptool hash verification, and its boot banner confirms 4.69 is running. Local
   and NAS copies are byte-identical with SHA-256
