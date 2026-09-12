@@ -1,6 +1,21 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.93 - 2026-09-13
+    - Makes 4.92's air conditioner fallback actually work. It called
+      transmitLocalIrCommand() and got a silent false every time, so the frame
+      still went nowhere and not even the warning was printed. The cause is the
+      trap documented one function away on espNowEncoding: a dock-routed
+      command has already had `kind` overwritten with ESPNOW, so testing `kind`
+      against RAW and PARSED matches neither and refuses. It resolves the
+      original decode through espNowEncoding now, exactly as buildEspNowPayload
+      does. RF433 still refuses, deliberately - an infrared LED cannot stand in
+      for a 433MHz transmitter, and pretending otherwise would hide an unpaired
+      dock.
+    - "Both" mode benefits too: a dock-routed command reaching the local
+      emitter was refused for the same reason, so that mode was only ever
+      sending via the dock.
+
   4.92 - 2026-09-13
     - Air conditioners transmit again. An AC has no "mode dry" code: it resends
       its whole state - mode, temperature, fan, louvre, timer - in one long
@@ -6268,7 +6283,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.92"
+#define OPENREMOTE_VERSION_STRING "4.93"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -16229,13 +16244,37 @@ void endVoiceSearchHold(const DeviceCommand *command) {
 }
 
 bool transmitLocalIrCommand(const DeviceCommand &command) {
-  if (command.kind == DeviceCommand::RAW && command.rawTimings && command.rawCount) {
+  /*
+    Resolve the decode before dispatching on it.
+
+    ESP-NOW is a routing overlay: a dock-routed command was decoded into RAW
+    timings or PARSED protocol fields like any other, and then had `kind`
+    overwritten with ESPNOW. Testing `kind` against RAW and PARSED therefore
+    matches neither and refuses to send - the exact trap already documented on
+    espNowEncoding and in buildEspNowPayload(), and the reason 4.92's "send it
+    locally when the dock cannot carry it" fallback silently did nothing: it
+    called this function, got false, and never transmitted or logged.
+
+    RF433 is the one case that must still refuse. There is nothing for the
+    infrared emitter to stand in for, and firing 433MHz edge timings out of an
+    IR LED cannot work - it would only hide the real problem, which is that the
+    dock needs pairing.
+  */
+  if (command.kind == DeviceCommand::ESPNOW &&
+      command.espNowTransport == ESPNOW_TRANSPORT_RF433) {
+    return false;
+  }
+  bool wantsRaw = command.kind == DeviceCommand::RAW ||
+                  (command.kind == DeviceCommand::ESPNOW && command.espNowEncoding == 1);
+  bool wantsParsed = command.kind == DeviceCommand::PARSED ||
+                     (command.kind == DeviceCommand::ESPNOW && command.espNowEncoding == 0);
+  if (wantsRaw && command.rawTimings && command.rawCount) {
     flashCommandFeedback();
     IrSender.sendRaw(command.rawTimings, command.rawCount,
                      command.frequencyKhz ? command.frequencyKhz : 38);
     return true;
   }
-  if (command.kind != DeviceCommand::PARSED) return false;
+  if (!wantsParsed || !command.protocol[0]) return false;
   if (strcmp(command.protocol, "NEC") == 0) {
     flashCommandFeedback();
     IrSender.sendNEC((uint16_t)command.address, (uint16_t)command.command, 0);
