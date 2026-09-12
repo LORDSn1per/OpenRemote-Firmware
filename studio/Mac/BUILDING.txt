@@ -102,7 +102,12 @@ Sanity check after copying - the numbers should match the build output:
 
 Distributing to the NAS
 -----------------------
-Zip it with ditto. The NAS is SMB and cannot store extended attributes, so
-copying a .app there directly logs xattr errors and risks a broken bundle:
+The NAS gets the .app bundle ONLY. Do not leave a .zip beside it - the zip is a
+transport, not a deliverable.
 
-    ditto -c -k --sequesterRsrc --keepParent "<app>" "<name>.zip"
+The NAS is SMB and cannot store extended attributes, so copying a .app there
+directly logs xattr errors and risks a broken bundle. Zip it into a temp
+directory, expand it at the destination, then discard the zip:
+
+    ditto -c -k --sequesterRsrc --keepParent "<app>" /tmp/transport.zip
+    ditto -x -k /tmp/transport.zip "<NAS>/SOFTWARE/OpenRemote Studio/Mac/"

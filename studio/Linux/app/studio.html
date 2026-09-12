@@ -159,7 +159,13 @@ input:focus,textarea:focus{border-color:rgba(47,140,255,.8); box-shadow:0 0 0 3p
 .countLine{font-size:18px;font-weight:800;color:var(--blue);margin:12px 0}
 .detailTitle{font-size:22px;font-weight:800;color:var(--blue)}.detailKV{color:var(--muted);font-size:14px;margin:8px 0}
 .usbPanel{margin-top:16px;border:1px solid var(--line);border-radius:14px;background:rgba(47,140,255,.08);padding:14px}
-.usbRow{display:grid;grid-template-columns:1fr auto auto;gap:10px;align-items:center;margin-top:10px}
+.usbRow{display:grid;grid-template-columns:1fr auto auto auto;gap:10px;align-items:center;margin-top:10px}
+/* A hidden grid item still occupies its column unless it is display:none, */
+/* which is what the hidden attribute gives us. */
+.usbRow [hidden]{display:none}
+/* The USB panel's own progress bar: same look as the builder's, just */
+/* shorter, since it sits under a row of controls rather than a page. */
+.usbProgress{height:10px;margin-top:12px}
 .usbRow select{background:rgba(0,0,0,.28);color:var(--text);border:1px solid var(--line);border-radius:9px;padding:12px;min-width:0}
 .secondary{background:rgba(255,255,255,.08);color:white;border:1px solid var(--line);border-radius:9px;padding:12px 14px;cursor:pointer}
 .usbStatus{color:var(--muted);font-size:13px;margin-top:10px;line-height:1.35}
@@ -372,7 +378,7 @@ input:focus,textarea:focus{border-color:rgba(47,140,255,.8); box-shadow:0 0 0 3p
           </div>
               <div class="setupProgress">
                 <div id="builderStatus" class="setupStatus">Ready.</div>
-                <div class="progress"><div id="builderBar" class="bar"></div></div>
+                <div class="progress usbProgress"><div id="builderBar" class="bar"></div></div>
                 <pre id="builderLog" class="setupLog"></pre>
               </div>
         </section>
@@ -399,7 +405,9 @@ input:focus,textarea:focus{border-color:rgba(47,140,255,.8); box-shadow:0 0 0 3p
               <select id="irdbUsbPort"><option>Scanning…</option></select>
               <button class="secondary" onclick="loadUsbPorts()">Refresh</button>
               <button class="primary" id="irdbUsbSendBtn" onclick="sendIrdbToUsb()">Send to Remote</button>
+              <button class="secondary" id="irdbUsbCancelBtn" onclick="cancelIrdbUsb()" hidden>Cancel</button>
             </div>
+            <div class="progress usbProgress"><div class="bar" id="irdbUsbBar"></div></div>
             <div class="usbStatus" id="irdbUsbStatus">Ready.</div>
           </div>
       <div id="browserStatusCard" class="card dbStatusCard">
@@ -866,6 +874,46 @@ function irdbFormatBytes(n){
 }
 
 var irdbUsbPoll=null;
+var irdbUsbSamples=[];
+
+/*
+  Transfer rate and time remaining, measured rather than assumed.
+
+  Smoothed over a trailing window instead of averaged from the start, because a
+  USB serial transfer is not a steady stream - the remote acknowledges every
+  window and pauses while the SD card commits, so an average taken from the
+  beginning keeps reporting the first few seconds' speed long after the real
+  rate has settled. Speed appears as soon as there are two samples; the estimate
+  waits until there is enough history to be worth believing.
+*/
+function irdbUsbRateText(sent,total){
+  var now=Date.now();
+  irdbUsbSamples.push({at:now,bytes:sent});
+  while(irdbUsbSamples.length>2 && now-irdbUsbSamples[0].at>30000) irdbUsbSamples.shift();
+  var first=irdbUsbSamples[0];
+  var elapsed=(now-first.at)/1000;
+  var moved=sent-first.bytes;
+  if(elapsed<1 || moved<=0) return '';
+  var rate=moved/elapsed;
+  var speed=rate>=1048576 ? (rate/1048576).toFixed(2)+' MB/s' : Math.round(rate/1024)+' KB/s';
+  if(elapsed<5) return ' · '+speed;
+  var remaining=(total-sent)/rate;
+  if(!isFinite(remaining) || remaining<0) return ' · '+speed;
+  var left;
+  if(remaining<60) left=Math.max(1,Math.round(remaining))+'s';
+  else if(remaining<3600){ var m=Math.round(remaining/60); left=m+' min'+(m===1?'':'s'); }
+  else { var h=Math.floor(remaining/3600); left=h+'h '+Math.round((remaining-h*3600)/60)+'m'; }
+  return ' · '+speed+' · about '+left+' left';
+}
+
+async function cancelIrdbUsb(){
+  let button=document.getElementById('irdbUsbCancelBtn');
+  let status=document.getElementById('irdbUsbStatus');
+  if(button){ button.disabled=true; button.textContent='Cancelling…'; }
+  if(status){ status.className='usbStatus'; status.textContent='Cancelling after the current block…'; }
+  await fetch('/usb/cancel-irdb',{method:'POST'}).catch(function(){});
+}
+
 async function sendIrdbToUsb(){
   let select=document.getElementById('irdbUsbPort');
   let status=document.getElementById('irdbUsbStatus');
@@ -874,25 +922,40 @@ async function sendIrdbToUsb(){
   if(!port){ if(status){status.className='usbStatus err';status.textContent='Choose the remote\'s USB serial port first.';} return; }
   if(!confirm("Send the whole IR database to the remote over USB?\n\nThis takes well over an hour at USB serial speed. Installing it from WebConfig over Wi-Fi, or writing the SD card in a card reader, are both much faster.\n\nLeave Studio open and do not unplug the remote.")) return;
   if(button) button.disabled=true;
+  let cancelBtn=document.getElementById('irdbUsbCancelBtn');
+  let bar=document.getElementById('irdbUsbBar');
+  if(cancelBtn){ cancelBtn.hidden=false; cancelBtn.disabled=false; cancelBtn.textContent='Cancel'; }
+  if(bar) bar.style.width='0%';
   if(status){status.className='usbStatus';status.textContent='Starting transfer…';}
   let data=await fetch('/usb/send-irdb',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({port})}).then(r=>r.json()).catch(e=>({error:e.message}));
   if(data.error){
     if(status){status.className='usbStatus err';status.textContent=data.error;}
     if(button) button.disabled=false;
+    if(cancelBtn) cancelBtn.hidden=true;
     return;
   }
   if(irdbUsbPoll) clearInterval(irdbUsbPoll);
+  irdbUsbSamples=[];
   irdbUsbPoll=setInterval(async function(){
     let s=await fetch('/usb/irdb-state').then(r=>r.json()).catch(()=>null);
     if(!s) return;
     let pct=s.total?Math.floor(s.sent*100/s.total):0;
     if(s.running){
-      if(status){status.className='usbStatus';status.textContent=s.status+' '+irdbFormatBytes(s.sent)+' / '+irdbFormatBytes(s.total)+' ('+pct+'%)';}
+      let rate=irdbUsbRateText(s.sent,s.total);
+      if(bar) bar.style.width=pct+'%';
+      if(status){status.className='usbStatus';status.textContent=s.status+' '+irdbFormatBytes(s.sent)+' / '+irdbFormatBytes(s.total)+' ('+pct+'%)'+rate;}
     }else{
+      irdbUsbSamples=[];
       clearInterval(irdbUsbPoll); irdbUsbPoll=null;
       if(button) button.disabled=false;
+      if(cancelBtn){ cancelBtn.hidden=true; cancelBtn.disabled=false; cancelBtn.textContent='Cancel'; }
+      // Left where it stopped on a cancel or failure, so the bar agrees with
+      // the byte count beside it rather than snapping to an unearned 100%.
+      if(bar && s.done) bar.style.width='100%';
       if(status){
-        status.className=s.error?'usbStatus err':'usbStatus ok';
+        // A cancellation is neither success nor failure: nothing was installed
+        // and nothing was damaged, so it is reported plainly rather than in red.
+        status.className=s.error?'usbStatus err':(s.cancelled?'usbStatus':'usbStatus ok');
         status.textContent=s.error?('Transfer failed: '+s.error):s.status;
       }
     }

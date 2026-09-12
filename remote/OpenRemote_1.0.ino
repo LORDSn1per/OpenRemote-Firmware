@@ -1,6 +1,15 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.85 - 2026-09-12
+    - Clears staging files an interrupted upload left in /tmp. Every large
+      transfer writes there and is only moved into place once it has arrived
+      whole, which is what stops a failed one destroying the file it was
+      replacing - but an abandoned transfer left its bytes behind and nothing
+      ever removed them, because the session that owned them died with the
+      reboot. A cancelled database upload was found sitting there at 19.9MB.
+      Cleared at boot, files only, that directory only.
+
   4.84 - 2026-09-12
     - Lets the IR database arrive over USB at all. Every USB file transfer was
       capped at 4MB, so Studio's "Send to Remote" refused a 114MB database
@@ -6125,7 +6134,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.84"
+#define OPENREMOTE_VERSION_STRING "4.85"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -11270,6 +11279,48 @@ void serviceNetworkPower(unsigned long now) {
       !weatherOwnsRadio && !haDirectOwnsRadio) {
     if (bluetoothActivitySessionRequired()) parkNetworkStackForBle();
     else stopNetworkStack();
+  }
+}
+
+/*
+  Removes staging files an interrupted transfer left behind.
+
+  Every large upload writes to /tmp and is only moved into place once it has
+  arrived whole, which is what keeps a failed transfer from destroying the file
+  it was replacing. The cost is that an abandoned one leaves its staged bytes on
+  the card - a cancelled database upload was found sitting there at 19.9MB, and
+  nothing would ever have removed it, because the session that owned it died
+  with the reboot.
+
+  Cleared at boot rather than on the next upload: the next upload might be a
+  different target, and until then the space is simply gone. Only this
+  directory, and only files, so nothing a user put on the card is at risk.
+*/
+void clearStaleUploadStaging() {
+  if (!sdReady || !SD.exists("/tmp")) return;
+  File directory = SD.open("/tmp");
+  if (!directory || !directory.isDirectory()) {
+    if (directory) directory.close();
+    return;
+  }
+  uint32_t removed = 0;
+  uint64_t freed = 0;
+  while (true) {
+    File entry = directory.openNextFile();
+    if (!entry) break;
+    String childPath = entry.path();
+    bool regular = !entry.isDirectory();
+    uint64_t size = regular ? (uint64_t)entry.size() : 0;
+    entry.close();
+    if (regular && SD.remove(childPath)) {
+      removed++;
+      freed += size;
+    }
+  }
+  directory.close();
+  if (removed) {
+    Serial.printf("Startup: cleared %lu stale staging file(s) from /tmp, %.1f MB freed\n",
+                  (unsigned long)removed, freed / 1048576.0);
   }
 }
 
@@ -34859,6 +34910,7 @@ void setup() {
   uint32_t webConfigCheckStartMs = millis();
   recoverWebConfigIfIncomplete();
   uint32_t irdbLoadStartMs = millis();
+  clearStaleUploadStaging();
   loadIrdbMetadata();
   uint32_t runtimeConfigStartMs = millis();
   bool runtimeConfigLoaded = loadRuntimeConfig();

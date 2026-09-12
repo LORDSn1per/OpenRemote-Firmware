@@ -4,7 +4,7 @@ import contextlib, datetime as dt, glob, hashlib, io, json, os, re, select, shut
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-APP_VERSION="2.81"
+APP_VERSION="2.83"
 SERIAL_BAUD=460800
 # 2.68 adds Linux as a third supported platform. Until now every non-Windows
 # branch in this file assumed macOS outright - AppleScript dialogs, diskutil,
@@ -1608,9 +1608,36 @@ def serial_upload_payload(port_obj,fd,header,payload,progress=None):
             raise RuntimeError("Remote upload acknowledgement was missing or out of sequence.")
     raise RuntimeError("USB upload contained no data.")
 
-IRDB_USB_STATE={"running":False,"done":False,"error":"","sent":0,"total":0,"status":"Ready."}
+IRDB_USB_STATE={"running":False,"done":False,"error":"","sent":0,"total":0,
+                "status":"Ready.","cancel":False,"cancelled":False}
 
-def serial_upload_stream(port_obj,fd,header,source_path,total,progress=None):
+class TransferCancelled(Exception):
+    """Raised when the user stops a USB transfer. Not an error - see below."""
+    pass
+
+IRDB_USB_THREAD=None
+
+def irdb_usb_busy():
+    """True only while a transfer is genuinely still running.
+
+    IRDB_USB_STATE["running"] alone is not enough. If the worker dies in a way
+    that never reaches its own except clause - the process being torn down mid
+    transfer, a serial layer raising something that escapes, a hard kill - the
+    flag stays set for the life of the process and every later attempt is
+    refused with "a database transfer is already running". Nothing the user can
+    do from the UI clears that, which is exactly the shape of "it worked once
+    and never again". Asking the thread whether it is actually alive cannot get
+    stuck in the same way.
+    """
+    global IRDB_USB_THREAD
+    if not IRDB_USB_STATE.get("running"): return False
+    if IRDB_USB_THREAD is not None and IRDB_USB_THREAD.is_alive(): return True
+    IRDB_USB_STATE.update({"running":False,
+                           "status":"The previous transfer ended unexpectedly. Ready to try again."})
+    IRDB_USB_THREAD=None
+    return False
+
+def serial_upload_stream(port_obj,fd,header,source_path,total,progress=None,should_cancel=None):
     """Same acknowledged window protocol as serial_upload_payload, reading from
     disk instead of from memory.
 
@@ -1630,6 +1657,12 @@ def serial_upload_stream(port_obj,fd,header,source_path,total,progress=None):
     sent=0
     with open(source_path,"rb") as f:
         while sent<total:
+            # Checked between acknowledged windows, never mid-window: the remote
+            # is waiting for a known number of bytes and cutting the link part
+            # way through one would leave it counting bytes that never arrive
+            # until its own idle timeout expired.
+            if should_cancel and should_cancel():
+                raise TransferCancelled()
             chunk=f.read(min(window,total-sent))
             if not chunk: raise RuntimeError("The database file ended sooner than expected.")
             serial_write(port_obj,chunk)
@@ -1658,7 +1691,8 @@ def send_irdb_over_usb(port):
         return
     total=ACTIVE_DB.stat().st_size
     IRDB_USB_STATE.update({"running":True,"done":False,"error":"","sent":0,"total":total,
-                           "status":"Connecting to the remote..."})
+                           "status":"Connecting to the remote...",
+                           "cancel":False,"cancelled":False})
     def report(sent,size):
         IRDB_USB_STATE["sent"]=sent
         IRDB_USB_STATE["total"]=size
@@ -1671,9 +1705,17 @@ def send_irdb_over_usb(port):
             hello=usb_handshake(port_obj,fd,timeout=30)
             require_usb_firmware(hello,"1.24")
             header=("ORUSB WRITE %s %d\n"%("/irdb/OpenRemote.irdb",total)).encode("ascii")
-            serial_upload_stream(port_obj,fd,header,str(ACTIVE_DB),total,report)
+            serial_upload_stream(port_obj,fd,header,str(ACTIVE_DB),total,report,
+                                 lambda: IRDB_USB_STATE.get("cancel"))
         IRDB_USB_STATE.update({"running":False,"done":True,"sent":total,"total":total,
                                "status":"Installed as /irdb/OpenRemote.irdb. WebConfig can now search it."})
+    except TransferCancelled:
+        # Nothing was installed. The remote stages every USB upload under /tmp
+        # and only renames it into place once the whole payload has arrived, so
+        # an abandoned transfer leaves the database already on the card
+        # untouched; the remote discards the partial file on its own timeout.
+        IRDB_USB_STATE.update({"running":False,"done":False,"error":"","cancelled":True,
+                               "status":"Transfer cancelled. The database on the SD card is untouched."})
     except Exception as e:
         IRDB_USB_STATE.update({"running":False,"done":False,"error":str(e),
                                "status":"Transfer failed: "+str(e)})
@@ -2616,6 +2658,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_data(json.dumps({"ok":False,"error":"That WebConfig file looks truncated (no closing </html>)."}),"application/json",400); return
             threading.Thread(target=install_webconfig_over_usb,args=(port,payload),daemon=True).start()
             self.send_data(json.dumps({"ok":True,"bytes":len(payload)}),"application/json")
+        elif self.path.startswith("/usb/cancel-irdb"):
+            IRDB_USB_STATE["cancel"]=True
+            self.send_data(json.dumps({"ok":True}),"application/json")
         elif self.path.startswith("/usb/send-irdb"):
             length=int(self.headers.get("Content-Length","0") or 0); body=self.rfile.read(length).decode("utf-8") if length else "{}"
             try: request=json.loads(body)
@@ -2625,9 +2670,11 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_data(json.dumps({"error":"Choose the remote's USB serial port first."}),"application/json"); return
             if not ACTIVE_DB.exists():
                 self.send_data(json.dumps({"error":"No OpenRemote.irdb loaded yet."}),"application/json"); return
-            if IRDB_USB_STATE.get("running"):
+            if irdb_usb_busy():
                 self.send_data(json.dumps({"error":"A database transfer is already running."}),"application/json"); return
-            threading.Thread(target=send_irdb_over_usb,args=(port,),daemon=True).start()
+            global IRDB_USB_THREAD
+            IRDB_USB_THREAD=threading.Thread(target=send_irdb_over_usb,args=(port,),daemon=True)
+            IRDB_USB_THREAD.start()
             self.send_data(json.dumps({"ok":True,"bytes":ACTIVE_DB.stat().st_size}),"application/json")
         elif self.path.startswith("/usb/import-device"):
             length=int(self.headers.get("Content-Length","0") or 0); body=self.rfile.read(length).decode("utf-8") if length else "{}"
