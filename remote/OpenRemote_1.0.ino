@@ -1,6 +1,22 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.80 - 2026-09-12
+    - Fixes 4.79's own regression, which failed every chunk with "SD card fell
+      behind on that chunk" within a few hundred KB. Two halves, both caused by
+      holding the file open:
+      * The per-chunk check compared chunkUploadBytes against file.size(), and
+        on this SD implementation size() reports what the directory entry holds
+        rather than what an open append handle has written since - so it read
+        short on every chunk and every chunk looked like a card falling behind.
+        It now compares position(), the write offset of the handle itself,
+        which is exactly the number being checked.
+      * The recovery path calls fileCrc32(), which opens the same file by path.
+        Two handles on one file is not something FatFs supports, so the re-read
+        returned nothing useful and a transfer that should have resumed failed
+        outright at the first mismatch. The handle is now closed before that
+        re-read and reopened by the next chunk.
+
   4.79 - 2026-09-12
     - Fixes the remote crashing and rebooting part way through a large upload.
       Caught live: at about 7.8MB of a 198MB IR database the task watchdog
@@ -6024,7 +6040,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.79"
+#define OPENREMOTE_VERSION_STRING "4.80"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -20256,10 +20272,28 @@ void handleChunkUploadData() {
       // file. A slow card now costs a retried chunk rather than a failed
       // update.
       chunkUploadFile.flush();
-      size_t onCard = chunkUploadFile.size();
+      /*
+        position(), not size().
+
+        The handle is now held open across the whole transfer, and on this SD
+        implementation size() reports what the directory entry said rather than
+        what an open append handle has written since - so it reads short by
+        whatever is still in flight and every single chunk looked like a card
+        that had fallen behind. position() is the write offset of the handle
+        itself, which is exactly the number being checked.
+
+        The file is only closed and re-read on the error path below, because
+        fileCrc32() opens the same path and two handles on one file is not
+        something FatFs supports. That was the second half of the same bug: the
+        recovery read returned nothing useful, so a transfer that should have
+        resumed failed outright at the first mismatch.
+      */
+      size_t onCard = (size_t)chunkUploadFile.position();
       // Left open deliberately - see the open above. closeChunkUploadSession()
       // and the finish handler are what close it.
       if (onCard != chunkUploadBytes) {
+        // Re-reading needs sole ownership of the file; the next chunk reopens.
+        chunkUploadFile.close();
         Serial.printf("Chunked upload: SD fell behind - %u bytes written but %u on "
                       "card, rewinding %d\n",
                       (unsigned)chunkUploadBytes, (unsigned)onCard,
