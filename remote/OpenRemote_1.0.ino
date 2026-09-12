@@ -1,6 +1,27 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.86 - 2026-09-12
+    - Removes the growing pauses from a WebConfig upload. The staging file was
+      opened per chunk with FILE_APPEND, which on FAT seeks to the end by
+      walking the cluster chain from the start - O(n) per chunk and O(n^2) over
+      a transfer. Measured on a 114MB upload: handleClient() climbed 2835ms,
+      4449ms, 5023ms, 10333ms, 11330ms as the file grew, which is exactly the
+      "copies for a while, then pauses, then restarts" report. It is opened once
+      per transfer now.
+    - What identified it was the comparison, not the log: the same card and the
+      same file sent over USB - a path that never reopens the file - ran
+      perfectly steadily at 31KB/s. That ruled out the card and left the open.
+    - The per-chunk size check is gone rather than wrong. Holding the handle
+      open costs it, because on this SD layer neither size() nor position()
+      reports anything usable on an open append handle: size() returns only
+      fully committed 4KB blocks (4.79, 4.82) and position() returns -1 (4.80).
+      Both were tried; both turned every chunk into a false "card fell behind".
+      What remains is not nothing - write() is still checked on every buffer, so
+      a card that refuses data fails immediately and precisely, and /finish
+      still re-reads the whole file and compares its CRC against the client's,
+      which is the only check that ever proved the file was actually right.
+
   4.85 - 2026-09-12
     - Clears staging files an interrupted upload left in /tmp. Every large
       transfer writes there and is only moved into place once it has arrived
@@ -6134,7 +6155,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.85"
+#define OPENREMOTE_VERSION_STRING "4.86"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -20438,28 +20459,26 @@ void handleChunkUploadData() {
       chunkUploadError = "Chunk offset mismatch";
       chunkUploadCrcAtChunkStart = chunkUploadCrc;
       chunkUploadBytesAtChunkStart = chunkUploadBytes;
-    } else {
+    } else if (!chunkUploadFile) {
       /*
-        Opened per chunk, deliberately, after trying the alternative twice.
+        Opened once for the whole transfer.
 
-        Holding one handle open across the whole transfer looks obviously
-        better - it avoids FILE_APPEND walking the FAT cluster chain on every
-        chunk - but on this SD implementation an open append handle reports
-        neither a usable size() (4.79: read short every chunk, so every chunk
-        looked like a card falling behind) nor a usable position() (4.80:
-        returned -1, logged as "4294967295 on card", so EVERY chunk triggered
-        the expensive recovery path and the upload crawled at 104KB/s before
-        the watchdog killed it).
+        FILE_APPEND seeks to the end of the file, and on FAT that means walking
+        the cluster chain from the start - O(n) per chunk and O(n^2) over a
+        transfer. Doing it per chunk was measured on a 114MB upload as
+        handleClient() climbing 2835ms, 4449ms, 5023ms, 10333ms, 11330ms as the
+        file grew, which is precisely the "copies for a while, then pauses"
+        behaviour. The same card and the same file over USB, which never
+        reopens, ran perfectly steadily at 31KB/s - that comparison is what
+        identified the open rather than the card.
 
-        The per-chunk open is the only state in which size() tells the truth,
-        and the truth is what the whole verification rests on. The open cost is
-        real but small; what actually crashed these transfers was never this,
-        it was the unyielded whole-file CRC in the recovery path, which is now
-        both yielded and bounded to a single chunk.
+        Closed by closeChunkUploadSession(), the finish handler, or an abort.
       */
       chunkUploadFile = SD.open(chunkUploadTempPath, FILE_APPEND);
       chunkUploadChunkOk = (bool)chunkUploadFile;
       if (!chunkUploadChunkOk) chunkUploadError = "Could not open upload file";
+      else Serial.printf("Chunked upload: staging file opened once for %s\n",
+                         chunkUploadTarget.c_str());
     }
   } else if (upload.status == UPLOAD_FILE_WRITE && chunkUploadChunkOk) {
     if (chunkUploadFile.write(upload.buf, upload.currentSize) != upload.currentSize) {
@@ -20487,121 +20506,34 @@ void handleChunkUploadData() {
       // resume logic re-sends exactly the missing span instead of the whole
       // file. A slow card now costs a retried chunk rather than a failed
       // update.
+      /*
+        Flushed, and deliberately left open.
+
+        This is the third attempt at this end-of-chunk step, so the reasoning is
+        worth stating plainly.
+
+        The file used to be opened per chunk with FILE_APPEND, which on FAT
+        seeks to the end by walking the cluster chain from the start - O(n) per
+        chunk, O(n^2) over a transfer. Measured on a 114MB upload: handleClient()
+        went 2835ms, 4449ms, 5023ms, 10333ms, 11330ms as the file grew, and that
+        climb IS the "it copies for a while then pauses" report. Over USB, which
+        never reopens, the same card and the same file ran perfectly steadily.
+
+        Holding the handle open fixes that, but it costs the per-chunk size
+        check: on this SD layer neither size() nor position() reports anything
+        usable on an open append handle - size() returns only fully committed
+        4KB blocks and position() returns -1. Both were tried, and both turned
+        every chunk into a false "card fell behind".
+
+        So the check is gone rather than wrong. What replaces it is not nothing:
+        write() is still checked on every buffer, so a card that refuses data
+        fails immediately and precisely; and /finish still re-reads the whole
+        file and compares its CRC against the client's, which is the only check
+        that ever proved the file was actually right. What is lost is the
+        ability to repair a partial chunk in flight - a rarer fault than the
+        stalls this removes, and one the final checksum still catches.
+      */
       chunkUploadFile.flush();
-      /*
-        position(), not size().
-
-        The handle is now held open across the whole transfer, and on this SD
-        implementation size() reports what the directory entry said rather than
-        what an open append handle has written since - so it reads short by
-        whatever is still in flight and every single chunk looked like a card
-        that had fallen behind. position() is the write offset of the handle
-        itself, which is exactly the number being checked.
-
-        The file is only closed and re-read on the error path below, because
-        fileCrc32() opens the same path and two handles on one file is not
-        something FatFs supports. That was the second half of the same bug: the
-        recovery read returned nothing useful, so a transfer that should have
-        resumed failed outright at the first mismatch.
-      */
-      /*
-        Measured after closing, not before.
-
-        size() on an OPEN handle reports only the blocks this SD layer has
-        fully committed, and it commits in 4KB units - so the tail of every
-        chunk sat in the write buffer and the file always looked a few KB short.
-        Measured live during a 198MB transfer: the reported size was 4096-byte
-        aligned EVERY time (31379456, 33665024, 34271232 - all exact multiples)
-        with shortfalls of 3816, 3488 and 3720 bytes. Nothing was being lost;
-        the number was simply being read too early.
-
-        The cost of believing it was high: each false alarm discarded a
-        perfectly good 192KB chunk and made the client re-send it, which is
-        what turned a steady 200KB/s into long stalls. Closing first flushes
-        the buffer and updates the directory entry, so a fresh read-only handle
-        reports what the card genuinely holds.
-      */
-      chunkUploadFile.close();
-      size_t onCard = chunkUploadBytes;
-      File sizeProbe = SD.open(chunkUploadTempPath, FILE_READ);
-      if (sizeProbe) {
-        onCard = (size_t)sizeProbe.size();
-        sizeProbe.close();
-      }
-      if (onCard != chunkUploadBytes) {
-        // Routine on a card that buffers 4KB blocks, so logged only when the
-        // shortfall is larger than that - which would mean something other
-        // than ordinary buffering.
-        if ((long)chunkUploadBytes - (long)onCard > 4096) {
-          Serial.printf("Chunked upload: card took %u of %u bytes, resuming from "
-                        "%u (short by %d)\n",
-                        (unsigned)onCard, (unsigned)chunkUploadBytes,
-                        (unsigned)onCard,
-                        (int)((long)chunkUploadBytes - (long)onCard));
-        }
-        /*
-          Repaired from the start of THIS chunk, not from byte zero.
-
-          The CRC was accumulated over bytes that did not all land, so it no
-          longer describes the file - but everything before this chunk is still
-          known good, and its checksum was snapshotted when the chunk began. So
-          only the span from there to what the card actually holds needs
-          re-reading, which is at most one chunk however large the file has
-          grown.
-
-          Re-reading the whole file here is what crashed a 200MB upload: it ran
-          on the HTTP task, took longer as the file grew, and at about 7.8MB
-          exceeded the task watchdog. Bounding it to one chunk removes the
-          size dependence entirely; fileCrc32Range() also yields, so even a
-          pathological range cannot starve the idle task.
-        */
-        uint32_t repairedCrc = chunkUploadCrcAtChunkStart;
-        size_t repairedBytes = chunkUploadBytesAtChunkStart;
-        if (onCard >= chunkUploadBytesAtChunkStart &&
-            fileCrc32Range(chunkUploadTempPath, chunkUploadBytesAtChunkStart,
-                           onCard, repairedCrc, repairedBytes)) {
-          chunkUploadCrc = repairedCrc;
-          chunkUploadBytes = repairedBytes;
-        } else {
-          // The card holds less than this chunk started with, which should not
-          // happen - fall back to the honest whole-file read, which now yields.
-          uint32_t cardCrc = 0;
-          size_t cardBytes = 0;
-          if (fileCrc32(chunkUploadTempPath, cardCrc, cardBytes)) {
-            chunkUploadCrc = cardCrc;
-            chunkUploadBytes = cardBytes;
-          } else {
-            chunkUploadBytes = onCard;
-          }
-        }
-        /*
-          A short write is not a failure. It is where the file now ends.
-
-          This used to answer 400, which sent the client down its error path: a
-          700ms back-off, a /status round trip, and then a re-send of the WHOLE
-          192KB chunk to recover the few KB the card had not taken. The card
-          commits in 4KB units and keeps the remainder buffered, so this fires
-          on most chunks of a large transfer - which is exactly why a 198MB
-          upload crawled along with long pauses between bursts.
-
-          The response already carries the true byte count, and the client
-          already resumes from it on success. So report success with the honest
-          number: the next chunk simply starts where the card really ended, and
-          the few KB that did not land are re-sent as part of it. Waste drops
-          from a whole chunk to a few kilobytes, and the pause disappears
-          entirely.
-
-          Genuine corruption is still a failure. If the card holds LESS than
-          this chunk started with, something went backwards and resuming would
-          preserve the damage.
-        */
-        if (onCard > chunkUploadBytesAtChunkStart) {
-          chunkUploadChunkOk = true;
-        } else {
-          chunkUploadChunkOk = false;
-          chunkUploadError = "SD card lost data already written";
-        }
-      }
     }
   } else if (upload.status == UPLOAD_FILE_ABORTED) {
     if (chunkUploadFile) chunkUploadFile.close();
