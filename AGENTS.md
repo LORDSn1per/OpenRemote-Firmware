@@ -269,7 +269,7 @@ Keep this section updated as active work progresses so a later session can resum
 
 - **One preset table, three consumers.** `DisplayPanelPreset` /
   `LCD_PANEL_PRESETS[]` in the remote firmware is the single definition of a
-  complete display configuration. The LCD Panel dropdown, the Red+Blue rescue
+  complete display configuration. The Display page's LCD dropdown, the Red+Blue
   combo and the factory defaults all read it. Do not re-spell those six values
   anywhere else - that is how a fixed panel clock ends up living in one path and
   not the others.
@@ -295,12 +295,12 @@ Keep this section updated as active work progresses so a later session can resum
   "Debug Menu" on Settings > About under SD Card. Debug holds bring-up controls
   that can leave a remote with an unreadable screen. Because of that, panel
   selection has to stay reachable elsewhere - that is what the Display page's
-  LCD Panel dropdown is for. If Debug ever gains another control an ordinary
+  LCD dropdown is for. If Debug ever gains another control an ordinary
   user needs, it needs a home outside Debug too.
-- **The LCD Panel prompt writes nothing until Reboot is pressed.** This is the
+- **The LCD prompt writes nothing until Reboot is pressed.** This is the
   opposite of the Debug page's dropdowns, which save to Preferences immediately
   and only then ask about rebooting, so Cancel there still leaves the value
-  stored. Cancel on LCD Panel must change nothing. It also rebuilds the page
+  stored. Cancel on LCD must change nothing. It also rebuilds the page
   rather than holding the dropdown object across the modal: settings screens are
   recreated from scratch on every visit, so a stored widget pointer can name
   something LVGL has already freed.
@@ -313,8 +313,13 @@ Keep this section updated as active work progresses so a later session can resum
   `d3e5d2637501b0a2c0c10c13e17c20dbc0a75ee3053da693295b8739d701272e`. Local and
   NAS copies verified byte-identical.
 - **Not yet verified on hardware:** the Red+Blue seven-second combo, the About
-  switch, the hidden Debug row and the LCD Panel prompt are compile-and-flash
-  only. They need someone holding the buttons and reading the screen.
+  switch, the hidden Debug row and the LCD prompt are compile-and-flash only.
+  They need someone holding the buttons and reading the screen.
+- Remote 4.72 renames that dropdown's label from "LCD Panel" to "LCD" in both
+  menu styles. Label only. Builds at 2,682,587 bytes, flashed and boot-banner
+  confirmed, SHA-256
+  `a066c2af2a9d97b7d854fc2601a735e85c90a1b486813e135e8487cc2343d526`, local and
+  NAS copies byte-identical.
 - GitHub publishing remains pending because Phillip did not ask for a GitHub
   push in this request.
 

@@ -1,6 +1,11 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.72 - 2026-09-12
+    - Renames the Settings > Display dropdown added in 4.71 from "LCD Panel" to
+      "LCD", in both menu styles. Label only - the options, the preset table and
+      the confirm-or-cancel behaviour are unchanged.
+
   4.71 - 2026-09-12
     - Red + Blue held together for seven seconds restores a known-good display
       configuration (Adafruit, invert off, Arduino_GFX, 20MHz, double buffered,
@@ -25,7 +30,7 @@
       Menu" switch on Settings > About, directly under SD Card. Debug holds
       hardware bring-up controls that can leave a remote with an unreadable
       screen, so it should not be somewhere you arrive by browsing.
-    - New "LCD Panel" dropdown at the bottom of Settings > Display, under Colour
+    - New "LCD" dropdown at the bottom of Settings > Display, under Colour
       Depth: Adafruit, BuyDisplay-ILI9341, BuyDisplay-ST7789V. Choosing one
       prompts with Reboot or Cancel, and Cancel genuinely changes nothing - the
       choice is held pending and never written, unlike the Debug page's own
@@ -5842,7 +5847,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.71"
+#define OPENREMOTE_VERSION_STRING "4.72"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -27742,7 +27747,7 @@ void renderDisplayPageOmote() {
   // Sets the whole panel configuration in one go, so the six individual
   // controls on Settings > Debug are not the only way to change a panel - which
   // matters now that Debug is hidden by default.
-  lv_obj_t *panelDropdown = makeOmoteDropdownRow(optionsCard, "LCD Panel",
+  lv_obj_t *panelDropdown = makeOmoteDropdownRow(optionsCard, "LCD",
                                                  2 * rowH + 2, rowH, 150);
   lv_dropdown_set_options(panelDropdown,
                           "Adafruit\nBuyDisplay-ILI9341\nBuyDisplay-ST7789V");
@@ -27792,7 +27797,7 @@ void renderDisplayPage() {
   lv_obj_clear_flag(panelPanel, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_clear_flag(panelPanel, LV_OBJ_FLAG_CLICKABLE);
   stylePanel(panelPanel, lvRgb(34, 35, 39), lvRgb(54, 56, 62));
-  makeLabel(panelPanel, "LCD Panel", 8, 14, &lv_font_montserrat_14, textPrimary());
+  makeLabel(panelPanel, "LCD", 8, 14, &lv_font_montserrat_14, textPrimary());
   lv_obj_t *panelDropdown = lv_dropdown_create(panelPanel);
   lv_obj_set_pos(panelDropdown, 224 - 150 - 8, 6);
   lv_obj_set_size(panelDropdown, 150, 32);
