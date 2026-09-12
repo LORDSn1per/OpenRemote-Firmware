@@ -126,6 +126,94 @@ The ABC iview Android TV app creates no active Android media session and does no
 5. Derive ABC's public show slug from the program title and query `https://api.iview.abc.net.au/v3/show/<slug>`. Prefer its portrait image, then request a compact centre-cropped 192x192 baseline JPEG through `wsrv.nl` so the no-PSRAM dock can decode it safely.
 6. Send only the token-free `abc://v1/<slug>` identity to the remote. Decode the private fetch URL on the dock to the existing 96x96 RGB565 buffer and use the acknowledged ESP-NOW/CRC transfer and remote SD cache. Episodes of the same show reuse the series artwork.
 
+## Dock firmware transfers (ESP-NOW OTA)
+
+Pushing a dock image over ESP-NOW has broken twice, both times because something
+else decided the radio was idle and took it away. These rules are the result of
+a dual serial capture of both boards on one clock, and they are load bearing.
+
+- **An ESP-NOW transaction must be declared busy BEFORE the link is raised, not
+  after the slow work that follows it.** `dockOtaPrepare()` brings the link up
+  and then checksums a 1.4MB image off the SD card, which was measured at
+  **1131 ms** (`WebConfig server: handleClient() took 1131ms`). `loop()` runs on
+  the other core throughout. Because `dockOtaState` was still `DOCK_OTA_IDLE`
+  for that whole window, `serviceEspNow()`'s "nothing is in flight, put the radio
+  away" rule released the link that had just been raised for the transfer:
+
+  ```
+  ESP-NOW: link up in 1 ms (on the station, channel 8)
+  ESP-NOW: stopped
+  ESP-NOW: link released (operation complete)
+  Dock update: 1477824 bytes, CRC 0x3E0F8E31 -> OpenRemote Dock
+  E (220689) ESPNOW: esp now not init!
+  ```
+
+  `dockOtaPreparing` is raised for the whole of `dockOtaPrepare()` and folded
+  into `dockOtaBusy()` to close this. Any future operation that raises the link
+  and then does slow work before arming its own state must do the same. Setting
+  the busy flag "once we know it succeeded" is the bug.
+
+- **`dockOtaBusy()` must stay the single answer to "is a transfer in flight",
+  and every teardown path must consult it.** It is deliberately false for
+  `DOCK_OTA_DONE` and `DOCK_OTA_FAILED`, which are terminal, and true for
+  preparation plus `BEGIN`/`DATA`/`END`. Do not reintroduce `!= DOCK_OTA_IDLE`
+  tests, and do not add a new sleep, shutdown or radio-release path without
+  adding `dockOtaBusy()` to it.
+
+- **`stopNetworkStack()` calls `stopEspNow()` directly and therefore bypasses
+  `releaseEspNowLink()`'s `espNowOperationBusy()` guard.** Anything that calls
+  `stopNetworkStack()` is responsible for checking `dockOtaBusy()` itself. This
+  is why `dockOtaBusy()` appears in `enterLowPowerWait()`,
+  `enterBleConnectedIdle()`, `enterDeepPowerSleep()`, `enterDisplaySleep()`'s
+  trailing gate, and `loop()`'s three `displaySleeping` re-entry checks. A
+  stop-and-wait transfer of 1.4MB in 160 byte chunks takes roughly **107
+  seconds**, far longer than any screen timeout, so the display timeout will
+  always land inside one.
+
+- **A long WebConfig upload must raise `webConfigTransferActive` for its whole
+  duration and release it on completion AND on abort.** The dock firmware upload
+  handler did not, so the display timeout could stop the web server and turn
+  Wi-Fi off part way through a 1.4MB image.
+
+- **Never retry an ESP-NOW send into a stack that cannot accept it.** The
+  transfer used to spend its entire 36 second retry budget on frames the driver
+  refused with `esp now not init!`, then report the dock as out of range.
+  `serviceDockOta()` re-establishes the link before sending and fails with a
+  message naming the real problem if it cannot.
+
+- **The screen may darken during a transfer; only light sleep, BLE-connected
+  idle and deep sleep are held off.** Do not "fix" this by pinning the backlight
+  on.
+
+- **Timing margin on the begin phase is tight and must be respected.**
+  `esp_ota_begin()` erases the dock's whole 0x1E0000 spare slot before it can
+  acknowledge, measured at **5.72 s** against `DOCK_OTA_SLOW_TIMEOUT_MS = 6000`
+  - about 280 ms of headroom. A retry there makes the dock `esp_ota_abort()` and
+  erase again, which cascades. Do not lower that timeout, and do not add work to
+  the dock's `loop()` ahead of `serviceOta()`.
+
+- **Diagnose this path with `LOGS/capture-both.command` (or an equivalent dual
+  capture) before theorising.** Both failures looked identical from the remote
+  side and from WebConfig - "the dock never accepted the transfer... out of
+  range rather than busy" - while the dock sat idle and in range the whole time.
+  Inspection of the remote's OTA state machine finds nothing, because the state
+  machine is correct; the fault is always something outside it taking the radio.
+  A healthy run reads:
+
+  ```
+  DOCK   Dock: OTA begin frame received (20 bytes)
+  DOCK   Dock: firmware transfer starting - 1477824 bytes, version '1.81', into app1
+  REMOTE Dock update: ack seq=0 status=0 while in state 1
+  REMOTE Dock update: first chunk away, 170 bytes
+  REMOTE Dock update: complete, the dock is restarting
+  DOCK   Dock: restarting into the new firmware
+  DOCK   OPENREMOTE_DOCK_VERSION=1.81
+  ```
+
+- **A dock update is only proven by the dock's own reboot banner.** WebConfig
+  reaching 100% is not the test; `OPENREMOTE_DOCK_VERSION=` on the dock's serial
+  output after `restarting into the new firmware` is.
+
 ## Release artifacts
 
 Build only from the local source tree. After every completed version, keep the versioned release artifacts in both the local tree and the exact NAS destination listed below. Never overwrite an older version.
@@ -171,9 +259,47 @@ Never claim that GitHub downloads are updated merely because source was pushed. 
 
 Keep this section updated as active work progresses so a later session can resume without reconstructing decisions from chat history.
 
-### 2026-09-12 — Remote 4.68 makes dock firmware updates possible at all
+### 2026-09-12 — Remote 4.69 makes dock firmware updates work
 
-- Dock firmware updates could never complete. The remote's ordinary display timeout ran `enterLowPowerWait()` straight through an in-flight transfer, and that calls `stopNetworkStack()`, which calls `stopEspNow()` **directly** instead of going through `releaseEspNowLink()` — so the `espNowOperationBusy()` guard every other teardown path relies on to notice a running transfer was never consulted. A few seconds after "Send to Dock", with nobody touching the remote because there is nothing to touch while it works, the ESP-NOW stack was deinitialised underneath the transfer, Wi-Fi went off and the CPU stopped. Every send after that failed into a dead stack and no acknowledgement could arrive, so the transfer sat at 0% until it burned its retry budget and reported "the dock never accepted the transfer… it is out of range rather than busy". The dock was in range and idle throughout.
+- Dock firmware updates could never complete. The cause was found on a dual
+  serial capture of both boards on one clock, after an inspection-only diagnosis
+  had already produced a wrong answer; see the "Dock firmware transfers" rules
+  above, which exist so this cannot recur.
+- `dockOtaPrepare()` raises the ESP-NOW link and then spends **1131 ms**
+  checksumming the 1.4MB image off the SD card before it can set
+  `dockOtaState`. `loop()` runs on the other core throughout, read an idle
+  `dockOtaState`, concluded no transfer existed, and released the link that had
+  just been raised for it. The begin frame went into a deinitialised stack
+  (`esp now not init!`), nothing re-raised the link mid-transfer, so all six
+  attempts failed identically and the remote reported a dock that was in range
+  and idle the whole time as out of range. A `dockOtaPreparing` flag now covers
+  the whole of `dockOtaPrepare()` and is folded into `dockOtaBusy()`.
+- `serviceDockOta()` re-establishes the link before sending instead of spending
+  its full 36 second retry budget on frames the driver refuses, and fails with a
+  message naming the real problem if the link cannot be brought up.
+- Verified end to end on hardware: begin acknowledged after a 5.72 s partition
+  erase, 1,477,824 bytes transferred in roughly 107 s with zero retries, then
+  `Dock update: complete, the dock is restarting` followed by the dock's own
+  `OPENREMOTE_DOCK_VERSION=1.81` boot banner, re-pairing on channel 8 and
+  rejoining Wi-Fi.
+- **Known tight margin:** the dock's `esp_ota_begin()` erase measured 5.72 s
+  against `DOCK_OTA_SLOW_TIMEOUT_MS = 6000`, leaving about 280 ms. A slower
+  erase would trigger a retry, which makes the dock abort and erase again. Not
+  changed in 4.69 because it was not part of the reported fault; raising that
+  timeout is the obvious next hardening step.
+- Remote 4.69 builds at 2,680,688 bytes, was flashed over USB at `0x10000` with
+  esptool hash verification, and its boot banner confirms 4.69 is running. Local
+  and NAS copies are byte-identical with SHA-256
+  `7cc7d7fa1b834c37bfda18680103026c208b9fbcb98a5a85f81f8cb1e8a2d3b3`.
+- Dock firmware is unchanged. Dock 1.81 remains current; nothing was ever wrong
+  on the dock side.
+- GitHub publishing remains pending because Phillip did not ask for a GitHub
+  push in this request.
+
+### 2026-09-12 — Remote 4.68 sleep guards (necessary, but not the fault)
+
+
+- 4.68 was diagnosed by inspection and shipped believing this was the cause. It was not: the failure took 36 seconds, long before any screen timeout. The guards below are still correct and still needed - a 1.4MB stop-and-wait transfer runs for roughly 107 seconds and would hit them - but the actual fault is the one recorded under 4.69. The remote's display timeout ran `enterLowPowerWait()` straight through an in-flight transfer, and that calls `stopNetworkStack()`, which calls `stopEspNow()` **directly** instead of going through `releaseEspNowLink()` — so the `espNowOperationBusy()` guard every other teardown path relies on to notice a running transfer was never consulted. A few seconds after "Send to Dock", with nobody touching the remote because there is nothing to touch while it works, the ESP-NOW stack was deinitialised underneath the transfer, Wi-Fi went off and the CPU stopped. Every send after that failed into a dead stack and no acknowledgement could arrive, so the transfer sat at 0% until it burned its retry budget and reported "the dock never accepted the transfer… it is out of range rather than busy". The dock was in range and idle throughout.
 - `dockOtaBusy()` now appears in every sleep gate that already holds a WebConfig transfer out: `enterLowPowerWait()`, `enterBleConnectedIdle()`, `enterDeepPowerSleep()`, `enterDisplaySleep()`'s trailing gate, and `loop()`'s three `displaySleeping` re-entry checks.
 - The same fault had an upload half. `handleDockFirmwareUploadData()` never raised `webConfigTransferActive`, although `handleRuntimeConfigUploadData()` does so for exactly this reason, so the display timeout could stop the web server and turn Wi-Fi off part way through a 1.4 MB image. It now holds the flag for the duration and releases it on completion or abort, and an aborted upload reports itself rather than leaving a truncated file.
 - The screen is still free to darken during either operation; only light sleep, BLE-connected idle and deep sleep are held off, exactly as for a WebConfig transfer.

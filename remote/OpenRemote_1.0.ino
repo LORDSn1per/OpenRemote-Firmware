@@ -1,6 +1,38 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.69 - 2026-09-12
+    - Fixes the actual reason dock firmware updates failed, caught on a dual
+      serial capture rather than by inspection. dockOtaPrepare() brings the
+      ESP-NOW link up and then spends over a second checksumming the 1.4MB image
+      off the SD card before it can set dockOtaState - measured at 1131ms in
+      "WebConfig server: handleClient() took 1131ms". loop() runs on the other
+      core throughout that gap, and serviceEspNow()'s "nothing is in flight, put
+      the radio away" rule read an idle dockOtaState, decided no transfer
+      existed and released the link that had just been raised for it:
+
+        ESP-NOW: link up in 1 ms (on the station, channel 8)
+        ESP-NOW: stopped
+        ESP-NOW: link released (operation complete)
+        Dock update: 1477824 bytes, CRC 0x3E0F8E31 -> OpenRemote Dock
+        E (220689) ESPNOW: esp now not init!
+
+      The begin frame then went out into a deinitialised stack, and since
+      nothing re-raised the link mid-transfer every one of the six attempts
+      failed identically before the remote blamed the dock for being out of
+      range. A new dockOtaPreparing flag is raised for the whole of
+      dockOtaPrepare() and folded into dockOtaBusy(), so every existing guard -
+      the radio release, the sleep gates, the keepalive suppression - covers the
+      setup window and not just the armed transfer.
+    - serviceDockOta() now re-establishes the link before sending instead of
+      spending its entire 36 second retry budget pushing frames into a stack
+      that cannot accept them, and fails with a message that names the real
+      problem if the link genuinely cannot be brought up.
+    - 4.68's sleep guards were necessary but were never the active fault: this
+      failed in 36 seconds, long before any screen timeout. They stay, because a
+      stop-and-wait transfer of 1.4MB in 160 byte chunks runs for minutes and
+      would have hit them next.
+
   4.68 - 2026-09-12
     - Fixes dock firmware updates, which could not complete at all. The display
       timeout ran enterLowPowerWait() straight through an in-flight transfer:
@@ -5759,7 +5791,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.68"
+#define OPENREMOTE_VERSION_STRING "4.69"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -7834,6 +7866,16 @@ char dockOtaVersion[9] = {0};
 unsigned long dockOtaLastSendMs = 0;
 uint8_t dockOtaRetries = 0;
 String dockOtaError;
+// Set for the whole of dockOtaPrepare(), which brings the ESP-NOW link up and
+// then spends over a second checksumming a 1.4MB image off the SD card before
+// it can set dockOtaState. loop() runs on the other core throughout that gap,
+// and serviceEspNow()'s "nothing is in flight, put the radio away" rule saw an
+// idle dockOtaState and released the link that had just been raised for this
+// transfer - measured at 1131ms wide. The begin frame then went out into a
+// deinitialised stack ("esp now not init!"), and because nothing re-raises the
+// link mid-transfer, all six attempts failed the same way and the remote
+// reported a dock that had never heard anything at all.
+volatile bool dockOtaPreparing = false;
 volatile uint32_t dockOtaAckedSeq = 0;
 volatile uint8_t dockOtaAckStatus = 0;
 volatile bool dockOtaAckPending = false;
@@ -10570,7 +10612,12 @@ bool webConfigQrPageActive() {
 // act on it. holdMsLeft going steadily negative with active=yes in the link log
 // is exactly that.
 bool dockOtaBusy() {
-  return dockOtaState == DOCK_OTA_BEGIN || dockOtaState == DOCK_OTA_DATA ||
+  // dockOtaPreparing covers the setup window before dockOtaState is armed.
+  // Everything that asks "is a transfer in flight" - the radio release, the
+  // sleep gates, the keepalive suppression - has to answer yes from the moment
+  // preparation starts, not from the moment it finishes.
+  return dockOtaPreparing ||
+         dockOtaState == DOCK_OTA_BEGIN || dockOtaState == DOCK_OTA_DATA ||
          dockOtaState == DOCK_OTA_END;
 }
 
@@ -23266,7 +23313,10 @@ void dockOtaFail(const String &why) {
 // Reads the whole image once to checksum it before a byte goes on air, so a
 // truncated or corrupt file is caught here rather than by the dock a minute
 // later.
-bool dockOtaPrepare(uint8_t deviceIndex, String &error) {
+// The body. Called only through dockOtaPrepare() below, which owns the
+// dockOtaPreparing flag so that none of the error returns in here can leave it
+// set.
+static bool dockOtaPrepareInner(uint8_t deviceIndex, String &error) {
   if (!sdReady) { error = "The SD card is not available."; return false; }
   if (!SD.exists(DOCK_FIRMWARE_PATH)) {
     error = "No dock firmware has been uploaded yet.";
@@ -23319,6 +23369,15 @@ bool dockOtaPrepare(uint8_t deviceIndex, String &error) {
                 (unsigned long)total, (unsigned long)crc,
                 espNowDevices[deviceIndex].name);
   return true;
+}
+
+bool dockOtaPrepare(uint8_t deviceIndex, String &error) {
+  // Raised before anything else and dropped only once dockOtaState is armed,
+  // so the link brought up inside cannot be released out from under it.
+  dockOtaPreparing = true;
+  bool ok = dockOtaPrepareInner(deviceIndex, error);
+  dockOtaPreparing = false;
+  return ok;
 }
 
 void dockOtaSendBegin() {
@@ -23390,6 +23449,19 @@ void dockOtaSendEnd() {
 void serviceDockOta(unsigned long now) {
   if (dockOtaState == DOCK_OTA_IDLE || dockOtaState == DOCK_OTA_DONE ||
       dockOtaState == DOCK_OTA_FAILED) return;
+
+  // Sending into a deinitialised stack cannot ever succeed, and the transfer
+  // used to spend its entire 36 second retry budget doing exactly that - six
+  // begin frames, three driver-level attempts each, every one refused with
+  // "esp now not init!" - before blaming the dock for being out of range. The
+  // link is cheap to re-check (this returns immediately when the radio is
+  // already up) and a transfer is precisely the kind of explicit transaction
+  // ensureEspNowLink() exists to serve. If it genuinely cannot come up, say so
+  // instead of retrying into nothing.
+  if (!espNowRadioActive && !ensureEspNowLink()) {
+    dockOtaFail("The ESP-NOW link went down and could not be brought back up.");
+    return;
+  }
 
   if (dockOtaAckPending) {
     dockOtaAckPending = false;
