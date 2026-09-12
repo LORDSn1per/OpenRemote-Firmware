@@ -265,6 +265,59 @@ Never claim that GitHub downloads are updated merely because source was pushed. 
 
 Keep this section updated as active work progresses so a later session can resume without reconstructing decisions from chat history.
 
+### 2026-09-12 — Remote 4.71 display panel presets and a hidden Debug menu
+
+- **One preset table, three consumers.** `DisplayPanelPreset` /
+  `LCD_PANEL_PRESETS[]` in the remote firmware is the single definition of a
+  complete display configuration. The LCD Panel dropdown, the Red+Blue rescue
+  combo and the factory defaults all read it. Do not re-spell those six values
+  anywhere else - that is how a fixed panel clock ends up living in one path and
+  not the others.
+- **`DISPLAY_FACTORY_DEFAULT` is deliberately not the Adafruit preset.** They
+  differ in one field, the LCD driver: a freshly programmed ESP32 starts on
+  LovyanGFX, the Red+Blue rescue restores Arduino_GFX. The rescue exists for a
+  screen that cannot be read, so it hands back the synchronous driver that works
+  on every supported panel; a new board has no such problem and should have the
+  faster DMA driver. This is not a copy/paste slip - do not "fix" it.
+- **Anything that writes a display configuration must also call
+  `persistSettingsToRuntimeConfig()`.** `displayInverted` lives in NVS *and* in
+  `settings{}` in `runtime.json`, and `applySettingsJson()` treats the SD copy
+  as authoritative at every boot - it reads it, then calls `saveSettings()`,
+  which writes what it just read back over NVS. An NVS-only write is therefore
+  reverted by the very reboot meant to apply it. This is the 3.15 fault and
+  `applyDisplayPanelPreset()` is where it is now handled.
+- **The `prefMig1` migration must never force a display default.** It runs on a
+  fresh chip's first boot, so anything it forces overwrites the factory default
+  on exactly the boards that default exists for. It was forcing Arduino_GFX;
+  that line is gone. Remotes that already carry `prefMig1` keep their stored
+  choice either way.
+- **Settings > Debug is hidden unless `debugMenuVisible` is on**, switched from
+  "Debug Menu" on Settings > About under SD Card. Debug holds bring-up controls
+  that can leave a remote with an unreadable screen. Because of that, panel
+  selection has to stay reachable elsewhere - that is what the Display page's
+  LCD Panel dropdown is for. If Debug ever gains another control an ordinary
+  user needs, it needs a home outside Debug too.
+- **The LCD Panel prompt writes nothing until Reboot is pressed.** This is the
+  opposite of the Debug page's dropdowns, which save to Preferences immediately
+  and only then ask about rebooting, so Cancel there still leaves the value
+  stored. Cancel on LCD Panel must change nothing. It also rebuilds the page
+  rather than holding the dropdown object across the modal: settings screens are
+  recreated from scratch on every visit, so a stored widget pointer can name
+  something LVGL has already freed.
+- The two menu styles (`menuStyle` 0 = OpenRemote, 1 = OMOTE) have separate
+  renderers for every settings page. A row added to one must be added to the
+  other. The OpenRemote style positions rows by literal `y`, so hiding a row
+  means closing the gap, not leaving a hole.
+- Remote 4.71 builds at 2,682,587 bytes and was flashed over USB with esptool
+  hash verification; boot banner confirms 4.71. SHA-256
+  `d3e5d2637501b0a2c0c10c13e17c20dbc0a75ee3053da693295b8739d701272e`. Local and
+  NAS copies verified byte-identical.
+- **Not yet verified on hardware:** the Red+Blue seven-second combo, the About
+  switch, the hidden Debug row and the LCD Panel prompt are compile-and-flash
+  only. They need someone holding the buttons and reading the screen.
+- GitHub publishing remains pending because Phillip did not ask for a GitHub
+  push in this request.
+
 ### 2026-09-12 — Remote 4.70 begin-phase headroom and WebConfig 2.84 naming
 
 - Remote 4.70 raises `DOCK_OTA_SLOW_TIMEOUT_MS` from 6000 to 15000 ms. The dual
