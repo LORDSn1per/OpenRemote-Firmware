@@ -1,6 +1,14 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.87 - 2026-09-13
+    - Keeps the chunked WebConfig session awake through upload and verification.
+      Uses a sequential, unbuffered SD descriptor with checked writes/fsync;
+      failed or interrupted chunks roll offset and CRC back together before
+      retry. Reports SD errno and free space, and releases abandoned sessions.
+    - The earlier USB comparison did not prove a full database transfer: that
+      Studio transfer also failed when USB slept. Full-file validation required.
+
   4.86 - 2026-09-12
     - Removes the growing pauses from a WebConfig upload. The staging file was
       opened per chunk with FILE_APPEND, which on FAT seeks to the end by
@@ -416,7 +424,7 @@
       trailing gate, and loop()'s three displaySleeping re-entry checks.
     - Fixes the other half of the same fault: uploading the dock .bin to the SD
       card had no sleep protection either. handleRuntimeConfigUploadData()
-      raises webConfigTransferActive for exactly this reason and the dock
+      raises webConfigTransferBusy() for exactly this reason and the dock
       firmware handler never did, so the display timeout could stop the web
       server and turn Wi-Fi off part way through a 1.4MB image. It now holds the
       flag for the duration and releases it on completion or abort.
@@ -6155,7 +6163,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.86"
+#define OPENREMOTE_VERSION_STRING "4.87"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -6211,6 +6219,10 @@ static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
 #include <ctype.h>
 #include <strings.h>
 #include <sys/time.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
 #include <driver/gpio.h>
 #include <driver/i2s_std.h>
 #include <driver/uart.h>
@@ -8022,6 +8034,10 @@ bool dnsServerStarted = false;
 bool networkStackActive = false;
 bool setupApActive = false;
 volatile bool webConfigTransferActive = false;
+volatile bool chunkUploadSessionActive = false;
+bool webConfigTransferBusy() {
+  return webConfigTransferActive || chunkUploadSessionActive;
+}
 
 volatile bool webConfigTransferCancelRequested = false;
 bool bleReady = false;
@@ -8145,7 +8161,10 @@ bool deviceFileUploadOk = false;
 // avoids any bookkeeping about concurrent writers to the same temp file.
 String chunkUploadTarget;
 String chunkUploadTempPath;
-File chunkUploadFile;
+int chunkUploadFd = -1;
+bool chunkUploadWriting = false;
+unsigned long chunkUploadLastActivityMs = 0;
+static const unsigned long CHUNK_UPLOAD_IDLE_TIMEOUT_MS = 120000UL;
 size_t chunkUploadBytes = 0;
 uint32_t chunkUploadCrc = 0;
 // The confirmed state as it stood before the chunk now being received. A chunk
@@ -11732,7 +11751,7 @@ uint8_t encodeMicrophoneAdpcmSample(int16_t sample) {
 
 bool startRealMicrophoneCapture() {
   if (realMicrophoneActive) return true;
-  if (webConfigTransferActive || usbSdTransferActive() || setupApActive) {
+  if (webConfigTransferBusy() || usbSdTransferActive() || setupApActive) {
     Serial.println("I2S microphone: shared SD pins are busy");
     return false;
   }
@@ -20337,11 +20356,78 @@ String chunkUploadTempPathFor(const String &target) {
 }
 
 void closeChunkUploadSession() {
-  if (chunkUploadFile) chunkUploadFile.close();
+  if (chunkUploadFd >= 0) ::close(chunkUploadFd);
+  chunkUploadFd = -1;
+  chunkUploadWriting = false;
   chunkUploadTarget = "";
   chunkUploadTempPath = "";
   chunkUploadBytes = 0;
   chunkUploadCrc = 0;
+  chunkUploadSessionActive = false;
+}
+
+void failChunkUploadIo(const char *operation, int error, size_t requested = 0,
+                       size_t accepted = 0) {
+  if (!error) error = EIO;
+  Serial.printf("Chunked upload: SD %s failed errno=%d (%s) offset=%u "
+                "requested=%u accepted=%u confirmed=%u heap=%u\n",
+                operation, error, strerror(error), (unsigned)chunkUploadBytes,
+                (unsigned)requested, (unsigned)accepted,
+                (unsigned)chunkUploadBytesAtChunkStart,
+                (unsigned)ESP.getFreeHeap());
+  chunkUploadError = error == ENOSPC
+    ? "The SD card is full. Free space and try again."
+    : String("SD ") + operation + " failed (" + String(error) + ": " +
+        strerror(error) + "). The last complete chunk has been preserved.";
+  chunkUploadChunkOk = false;
+}
+
+void rollbackChunkUpload() {
+  if (!chunkUploadWriting) return;
+  if (chunkUploadFd >= 0) ::close(chunkUploadFd);
+  chunkUploadFd = -1;
+  // Only complete, successfully synced chunks are acknowledged. An aborted
+  // multipart request or failed disk write rolls back both offset and CRC.
+  // The next request reopens WITHOUT append and removes the unconfirmed tail.
+  chunkUploadBytes = chunkUploadBytesAtChunkStart;
+  chunkUploadCrc = chunkUploadCrcAtChunkStart;
+  chunkUploadWriting = false;
+}
+
+bool openChunkUploadFile() {
+  if (chunkUploadFd >= 0) return true;
+  String path = String("/sd") + chunkUploadTempPath;
+  errno = 0;
+  chunkUploadFd = ::open(path.c_str(), O_WRONLY | O_CREAT, 0666);
+  if (chunkUploadFd < 0) {
+    failChunkUploadIo("open", errno);
+    return false;
+  }
+  // This is used at the start or after a failed/aborted chunk, never on the
+  // healthy path. Explicit offsets make retrying safe even if a short write
+  // had already changed the file. No stdio buffer or O_APPEND seek is involved.
+  struct stat info;
+  if (::fstat(chunkUploadFd, &info) != 0 || info.st_size < (off_t)chunkUploadBytes ||
+      ::ftruncate(chunkUploadFd, (off_t)chunkUploadBytes) != 0 ||
+      ::lseek(chunkUploadFd, (off_t)chunkUploadBytes, SEEK_SET) !=
+        (off_t)chunkUploadBytes) {
+    failChunkUploadIo("resume", errno);
+    ::close(chunkUploadFd);
+    chunkUploadFd = -1;
+    return false;
+  }
+  Serial.printf("Chunked upload: sequential SD writer opened at %u for %s\n",
+                (unsigned)chunkUploadBytes, chunkUploadTarget.c_str());
+  return true;
+}
+
+void handleChunkUploadCancel() {
+  if (!requestAuthorized()) {
+    sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
+    return;
+  }
+  if (webServer.arg("target") == chunkUploadTarget) closeChunkUploadSession();
+  sendJson(200, "{\"ok\":true}");
 }
 
 void handleChunkUploadBegin() {
@@ -20360,6 +20446,8 @@ void handleChunkUploadBegin() {
     return;
   }
   closeChunkUploadSession();
+  chunkUploadSessionActive = true;
+  chunkUploadLastActivityMs = millis();
   // A large upload matters more than a dock link nobody is actively using
   // during it. 3.73 started holding the ESP-NOW/Wi-Fi-station radio up for as
   // long as the WebConfig QR page is open, which is exactly the page a
@@ -20375,6 +20463,19 @@ void handleChunkUploadBegin() {
   chunkUploadBytes = 0;
   chunkUploadCrc = 0;
   chunkUploadError = "";
+  chunkUploadBytesAtChunkStart = 0;
+  chunkUploadCrcAtChunkStart = 0;
+  const uint64_t totalBytes = SD.totalBytes();
+  const uint64_t usedBytes = SD.usedBytes();
+  const uint64_t freeBytes = totalBytes > usedBytes ? totalBytes - usedBytes : 0;
+  const size_t expectedBytes = strtoul(webServer.arg("size").c_str(), nullptr, 10);
+  Serial.printf("Chunked upload: SD free=%llu total=%llu expected=%u\n",
+                freeBytes, totalBytes, (unsigned)expectedBytes);
+  if (expectedBytes && (uint64_t)expectedBytes > freeBytes) {
+    closeChunkUploadSession();
+    sendJson(507, "{\"ok\":false,\"error\":\"Not enough free space on the SD card for this upload\"}");
+    return;
+  }
   // A String assignment is a heap allocation. Under real memory pressure it
   // can fail and leave chunkUploadTarget empty rather than throw - which used
   // to surface many chunks later as "No upload session for this target" on
@@ -20401,144 +20502,93 @@ void handleChunkUploadStatus() {
   }
   String target = webServer.arg("target");
   size_t bytes = (target.length() && target == chunkUploadTarget) ? chunkUploadBytes : 0;
+  if (target == chunkUploadTarget) chunkUploadLastActivityMs = millis();
   sendJson(200, String("{\"ok\":true,\"bytes\":") + String((unsigned)bytes) + "}");
 }
 
 void handleChunkUploadData() {
   HTTPUpload &upload = webServer.upload();
+  chunkUploadLastActivityMs = millis();
   if (upload.status == UPLOAD_FILE_START) {
+    rollbackChunkUpload();
     String target = webServer.arg("target");
     size_t offset = (size_t)strtoul(webServer.arg("offset").c_str(), nullptr, 10);
     bool authorized = requestAuthorized();
-    // A chunk at offset 0 carries everything needed to start a transfer, so a
-    // missing session is recoverable rather than fatal: open one and take the
-    // chunk. The session lives only in RAM, so anything that restarts the
-    // remote between /begin and the first chunk - or any request that closed
-    // it - used to strand the browser in a loop of "No upload session for this
-    // target" that it could never get out of, because every retry re-sent a
-    // chunk against a session that no longer existed. Only offset 0 is
-    // adopted; a mid-transfer chunk with no session still fails, since there
-    // is no way to know what came before it.
     if (authorized && sdReady && target.length() && target != chunkUploadTarget &&
         offset == 0) {
       String path = chunkUploadTempPathFor(target);
       if (path.length()) {
         closeChunkUploadSession();
+        chunkUploadSessionActive = true;
         SD.remove(path);
         chunkUploadTarget = target;
         chunkUploadTempPath = path;
-        chunkUploadBytes = 0;
-        chunkUploadCrc = 0;
-        chunkUploadError = "";
-        Serial.printf("Chunked upload: opened session for %s from a first chunk "
-                      "(no /begin held), heapFree=%u\n",
-                      target.c_str(), (unsigned)ESP.getFreeHeap());
       }
     }
+    chunkUploadWriting = false;
     chunkUploadChunkOk = authorized && sdReady &&
                          target.length() && target == chunkUploadTarget;
+    chunkUploadError = "";
     if (!chunkUploadChunkOk) {
-      // Say which of the four conditions actually failed. "No upload session"
-      // covered all of them and named none, which is why this cost several
-      // rounds of guessing.
       chunkUploadError = !authorized ? "Not authorized for this upload"
-                       : !sdReady    ? "SD card unavailable"
+                       : !sdReady ? "SD card unavailable"
                        : !target.length() ? "Upload chunk carried no target"
                        : "No upload session for this target";
-      Serial.printf("Chunked upload: chunk REFUSED - %s (asked for '%s', holding "
-                    "'%s', offset %u, held %u, auth=%d sd=%d heapFree=%u)\n",
-                    chunkUploadError.c_str(), target.c_str(),
-                    chunkUploadTarget.c_str(), (unsigned)offset,
-                    (unsigned)chunkUploadBytes, (int)authorized, (int)sdReady,
-                    (unsigned)ESP.getFreeHeap());
     } else if (offset != chunkUploadBytes) {
-      // The client and remote disagree about progress (a chunk that landed
-      // but whose response was lost, or a stale retry). Refuse rather than
-      // corrupt the file - the client re-reads /status and resumes.
       chunkUploadChunkOk = false;
       chunkUploadError = "Chunk offset mismatch";
-      chunkUploadCrcAtChunkStart = chunkUploadCrc;
+    } else {
       chunkUploadBytesAtChunkStart = chunkUploadBytes;
-    } else if (!chunkUploadFile) {
-      /*
-        Opened once for the whole transfer.
-
-        FILE_APPEND seeks to the end of the file, and on FAT that means walking
-        the cluster chain from the start - O(n) per chunk and O(n^2) over a
-        transfer. Doing it per chunk was measured on a 114MB upload as
-        handleClient() climbing 2835ms, 4449ms, 5023ms, 10333ms, 11330ms as the
-        file grew, which is precisely the "copies for a while, then pauses"
-        behaviour. The same card and the same file over USB, which never
-        reopens, ran perfectly steadily at 31KB/s - that comparison is what
-        identified the open rather than the card.
-
-        Closed by closeChunkUploadSession(), the finish handler, or an abort.
-      */
-      chunkUploadFile = SD.open(chunkUploadTempPath, FILE_APPEND);
-      chunkUploadChunkOk = (bool)chunkUploadFile;
-      if (!chunkUploadChunkOk) chunkUploadError = "Could not open upload file";
-      else Serial.printf("Chunked upload: staging file opened once for %s\n",
-                         chunkUploadTarget.c_str());
+      chunkUploadCrcAtChunkStart = chunkUploadCrc;
+      chunkUploadWriting = true;
+      chunkUploadChunkOk = openChunkUploadFile();
+    }
+    if (!chunkUploadChunkOk) {
+      Serial.printf("Chunked upload: refused offset=%u confirmed=%u: %s\n",
+                    (unsigned)offset, (unsigned)chunkUploadBytes,
+                    chunkUploadError.c_str());
     }
   } else if (upload.status == UPLOAD_FILE_WRITE && chunkUploadChunkOk) {
-    if (chunkUploadFile.write(upload.buf, upload.currentSize) != upload.currentSize) {
-      chunkUploadChunkOk = false;
-      chunkUploadError = "SD write failed during upload";
-    } else {
-      chunkUploadCrc = crc32Update(chunkUploadCrc, upload.buf, upload.currentSize);
-      chunkUploadBytes += upload.currentSize;
+    size_t accepted = 0;
+    while (accepted < upload.currentSize) {
+      errno = 0;
+      ssize_t written = ::write(chunkUploadFd, upload.buf + accepted,
+                                 upload.currentSize - accepted);
+      int error = errno;
+      if (written < 0 && error == EINTR) {
+        serviceUiDuringLongHttpTransfer();
+        continue;
+      }
+      if (written <= 0) {
+        failChunkUploadIo("write", error, upload.currentSize, accepted);
+        break;
+      }
+      chunkUploadCrc = crc32Update(chunkUploadCrc, upload.buf + accepted,
+                                    (size_t)written);
+      accepted += (size_t)written;
+      chunkUploadBytes += (size_t)written;
     }
     serviceUiDuringLongHttpTransfer();
   } else if (upload.status == UPLOAD_FILE_END) {
-    if (chunkUploadFile) {
-      // Confirm the card actually took this chunk, at the chunk that wrote it.
-      //
-      // write() returning the full count only means the SD library accepted
-      // the bytes into its own buffer; the commit happens later, and a card
-      // that falls behind loses them with nothing reported. That loss used to
-      // surface only at the very end, as a whole-file checksum failure after
-      // 2.5MB had been sent - all of it then discarded, with no way to tell
-      // which part went missing or to recover anything.
-      //
-      // Flushing and then asking the file how big it really is turns that into
-      // a per-chunk problem. chunkUploadBytes is corrected to what the card
-      // genuinely holds, so /status tells the truth and the client's existing
-      // resume logic re-sends exactly the missing span instead of the whole
-      // file. A slow card now costs a retried chunk rather than a failed
-      // update.
-      /*
-        Flushed, and deliberately left open.
-
-        This is the third attempt at this end-of-chunk step, so the reasoning is
-        worth stating plainly.
-
-        The file used to be opened per chunk with FILE_APPEND, which on FAT
-        seeks to the end by walking the cluster chain from the start - O(n) per
-        chunk, O(n^2) over a transfer. Measured on a 114MB upload: handleClient()
-        went 2835ms, 4449ms, 5023ms, 10333ms, 11330ms as the file grew, and that
-        climb IS the "it copies for a while then pauses" report. Over USB, which
-        never reopens, the same card and the same file ran perfectly steadily.
-
-        Holding the handle open fixes that, but it costs the per-chunk size
-        check: on this SD layer neither size() nor position() reports anything
-        usable on an open append handle - size() returns only fully committed
-        4KB blocks and position() returns -1. Both were tried, and both turned
-        every chunk into a false "card fell behind".
-
-        So the check is gone rather than wrong. What replaces it is not nothing:
-        write() is still checked on every buffer, so a card that refuses data
-        fails immediately and precisely; and /finish still re-reads the whole
-        file and compares its CRC against the client's, which is the only check
-        that ever proved the file was actually right. What is lost is the
-        ability to repair a partial chunk in flight - a rarer fault than the
-        stalls this removes, and one the final checksum still catches.
-      */
-      chunkUploadFile.flush();
+    if (chunkUploadChunkOk && chunkUploadFd >= 0) {
+      errno = 0;
+      if (::fsync(chunkUploadFd) != 0) failChunkUploadIo("sync", errno);
+    }
+    if (!chunkUploadChunkOk) rollbackChunkUpload();
+    else {
+      chunkUploadWriting = false;
+      // Progress once per MiB is useful during a long serial capture without
+      // logging each network buffer or slowing the transfer.
+      if (chunkUploadBytes / (1024UL * 1024UL) !=
+          chunkUploadBytesAtChunkStart / (1024UL * 1024UL)) {
+        Serial.printf("Chunked upload: synced %u bytes heap=%u\n",
+                      (unsigned)chunkUploadBytes, (unsigned)ESP.getFreeHeap());
+      }
     }
   } else if (upload.status == UPLOAD_FILE_ABORTED) {
-    if (chunkUploadFile) chunkUploadFile.close();
+    rollbackChunkUpload();
     chunkUploadChunkOk = false;
-    chunkUploadError = "Chunk upload interrupted";
+    chunkUploadError = "Chunk upload interrupted; retrying from the last complete chunk";
   }
 }
 
@@ -20552,12 +20602,18 @@ void handleChunkUploadFinish() {
     sendJson(400, "{\"ok\":false,\"error\":\"No upload session for this target\"}");
     return;
   }
-  if (chunkUploadFile) chunkUploadFile.close();
+  int closeError = 0;
+  if (chunkUploadFd >= 0 && ::close(chunkUploadFd) != 0) closeError = errno;
+  chunkUploadFd = -1;
   String path = chunkUploadTempPath;
   size_t received = chunkUploadBytes;
   String error;
   bool ok = received > 0;
   if (!ok) error = "Upload was empty";
+  if (closeError) {
+    ok = false;
+    error = String("SD close failed: ") + strerror(closeError);
+  }
 
   // End-to-end integrity check. Nothing previously verified that an upload
   // arrived complete: uploadedWebConfigLooksValid() only inspects the first
@@ -20651,9 +20707,15 @@ void handleChunkUploadFinish() {
     if (!ok) {
       error = "That is not an OpenRemote.irdb database - build one in OpenRemote Studio";
     } else {
-      SD.remove(IRDB_PATH);
-      ok = SD.rename(path, IRDB_PATH);
-      if (!ok) error = "Could not move the database into /irdb";
+      const char *previous = "/irdb/OpenRemote.previous.irdb";
+      bool hadPrevious = SD.exists(IRDB_PATH);
+      ok = !hadPrevious || ((!SD.exists(previous) || SD.remove(previous)) &&
+                            SD.rename(IRDB_PATH, previous));
+      if (ok) {
+        ok = SD.rename(path, IRDB_PATH);
+        if (!ok && hadPrevious) SD.rename(previous, IRDB_PATH);
+      }
+      if (!ok) error = "Could not install the database; previous database preserved";
       else {
         loadIrdbMetadata();
         Serial.printf("IRDB installed: %u bytes, %s, %lu devices\n",
@@ -22925,6 +22987,7 @@ void configureWebServer() {
                   irdbUploadOk ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"IRDB upload failed; use OpenRemote Studio's .irdb file\"}");
   }, handleIrdbUploadData);
   webServer.on("/api/upload/begin", HTTP_POST, handleChunkUploadBegin);
+  webServer.on("/api/upload/cancel", HTTP_POST, handleChunkUploadCancel);
   webServer.on("/api/upload/status", HTTP_GET, handleChunkUploadStatus);
   webServer.on("/api/upload/finish", HTTP_POST, handleChunkUploadFinish);
   webServer.on("/api/upload/chunk", HTTP_POST, []() {
@@ -22997,6 +23060,7 @@ void webServerTask(void *parameter) {
       webServerStarted = false;
       webServerStopRequested = false;
       webConfigTransferActive = false;
+      closeChunkUploadSession();
       Serial.printf("WebConfig server: stopped (heap=%u)\n", (unsigned)ESP.getFreeHeap());
     }
 
@@ -23030,6 +23094,11 @@ void webServerTask(void *parameter) {
       static unsigned long nextHttpHeartbeatMs = 0;
       unsigned long beforeMs = millis();
       webServer.handleClient();
+      if (chunkUploadSessionActive && !chunkUploadWriting &&
+          millis() - chunkUploadLastActivityMs > CHUNK_UPLOAD_IDLE_TIMEOUT_MS) {
+        Serial.println("Chunked upload: abandoned session expired");
+        closeChunkUploadSession();
+      }
       unsigned long spentMs = millis() - beforeMs;
       httpLoopCount++;
       if (spentMs >= 1000UL) {
@@ -34046,7 +34115,7 @@ void restoreDeepSleepRuntimeState(esp_sleep_wakeup_cause_t wakeCause) {
 bool enterDeepPowerSleep(bool allowQrPage) {
   if (!lis3dhReady || !raiseToWake ||
       (webConfigQrPageActive() && !allowQrPage) ||
-      webConfigTransferActive || dockOtaBusy() ||
+      webConfigTransferBusy() || dockOtaBusy() ||
       usbSdTransferActive() || usbStudioLinkActive() || ntpSyncPending ||
       bluetoothActivitySessionRequired() || bluetoothPairingWindowOpen() ||
       bluetoothSettingsPageActive()) {
@@ -34054,7 +34123,7 @@ bool enterDeepPowerSleep(bool allowQrPage) {
       "Deep sleep deferred: accelerometer=%s raise=%s qr=%s transfer=%s usb=%s ntp=%s ble=%s pairing=%s\n",
       lis3dhReady ? "ready" : "missing", raiseToWake ? "on" : "off",
       webConfigQrPageActive() ? "active" : "off",
-      webConfigTransferActive ? "active" : "off",
+      webConfigTransferBusy() ? "active" : "off",
       usbSdTransferActive() ? "active" : "off",
       ntpSyncPending ? "active" : "off",
       bluetoothActivitySessionRequired() ? "required" : "off",
@@ -34153,7 +34222,7 @@ bool configureApplicationPowerMode(bool connectedIdle) {
 void enterBleConnectedIdle() {
   if (bleConnectedIdleActive || !displaySleeping ||
       !bluetoothActivitySessionRequired() || webConfigQrPageActive() ||
-      webConfigTransferActive || dockOtaBusy() ||
+      webConfigTransferBusy() || dockOtaBusy() ||
       usbSdTransferActive() || usbStudioLinkActive() || ntpSyncPending ||
       wifiConnectPending) return;
 
@@ -34270,7 +34339,7 @@ void enterLowPowerWait() {
   // of range - which it never was. A WebConfig transfer is already held out of
   // here for exactly this reason; a firmware push is the same kind of work and
   // lasts far longer.
-  if (!displaySleeping || webConfigQrPageActive() || webConfigTransferActive ||
+  if (!displaySleeping || webConfigQrPageActive() || webConfigTransferBusy() ||
       dockOtaBusy() ||
       usbSdTransferActive() || usbStudioLinkActive() || ntpSyncPending || wifiConnectPending ||
       bluetoothActivitySessionRequired()) return;
@@ -34439,7 +34508,7 @@ void enterDisplaySleep() {
   nextDeepSleepAttemptMs = displaySleepStartedMs +
     (uint32_t)deepSleepMinutes * 60UL * 1000UL;
   if (!webConfigQrPageActive() && !ntpSyncPending && !dockOtaBusy() &&
-      !webConfigTransferActive && !usbSdTransferActive() && !usbStudioLinkActive()) {
+      !webConfigTransferBusy() && !usbSdTransferActive() && !usbStudioLinkActive()) {
     if (bluetoothActivitySessionRequired()) enterBleConnectedIdle();
     else enterLowPowerWait();
   }
@@ -35171,7 +35240,7 @@ void loop() {
     // left alone.
     if (bluetoothSleepEnabled && !bleActivitySessionReleased &&
         displaySleepStartedMs && !blePairingMode && !atvvAudioStarted &&
-        !webConfigQrPageActive() && !webConfigTransferActive && !dockOtaBusy() &&
+        !webConfigQrPageActive() && !webConfigTransferBusy() && !dockOtaBusy() &&
         !usbSdTransferActive() && !usbStudioLinkActive() && !ntpSyncPending &&
         !wifiConnectPending && bluetoothActivitySessionRequired() &&
         (uint32_t)(now - displaySleepStartedMs) >=
@@ -35180,7 +35249,7 @@ void loop() {
       now = millis();
     }
     bool connectedActivityIdle = !webConfigQrPageActive() &&
-      !webConfigTransferActive && !dockOtaBusy() &&
+      !webConfigTransferBusy() && !dockOtaBusy() &&
       !usbSdTransferActive() && !usbStudioLinkActive() &&
       !ntpSyncPending && !wifiConnectPending &&
       bluetoothActivitySessionRequired();
@@ -35188,7 +35257,7 @@ void loop() {
       enterBleConnectedIdle();
     }
     if (!connectedActivityIdle && !webConfigQrPageActive() && !dockOtaBusy() &&
-        !webConfigTransferActive && !usbSdTransferActive() && !usbStudioLinkActive() &&
+        !webConfigTransferBusy() && !usbSdTransferActive() && !usbStudioLinkActive() &&
         !ntpSyncPending && !wifiConnectPending) {
       if (awaitingButtonWake) {
         // A motion-only wake already got the MCU out of light sleep while
