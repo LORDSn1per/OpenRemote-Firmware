@@ -1,6 +1,43 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.71 - 2026-09-12
+    - Red + Blue held together for seven seconds restores a known-good display
+      configuration (Adafruit, invert off, Arduino_GFX, 20MHz, double buffered,
+      default pressure) and reboots immediately, with no confirmation. The lack
+      of a prompt is the point: this is the way back from a panel setting that
+      made the screen unreadable, and a dialog on a screen you cannot read is
+      not a safeguard. Seven seconds of two specific keys is the confirmation,
+      matching the hardware power button's own long hold. Both buttons still
+      fire whatever they are bound to, exactly as the existing Stop+Forward
+      settings combo does, and neither button test nor button diagnostics can
+      trip it.
+    - A freshly programmed ESP32 now comes up on Adafruit, invert off,
+      LovyanGFX, 20MHz, double buffered, default pressure. Only the driver
+      changed: the default was Arduino_GFX. Deliberately NOT the same as what
+      the rescue combo restores - a new board should start on the faster DMA
+      driver, while the rescue path hands back the synchronous driver that works
+      on every supported panel. The prefMig1 migration no longer forces
+      Arduino_GFX, because it runs on a fresh chip's FIRST boot and would have
+      overwritten the new default on precisely the boards it exists for. Remotes
+      that already carry prefMig1 are unaffected and keep their stored choice.
+    - Settings > Debug is hidden by default. It is revealed by a new "Debug
+      Menu" switch on Settings > About, directly under SD Card. Debug holds
+      hardware bring-up controls that can leave a remote with an unreadable
+      screen, so it should not be somewhere you arrive by browsing.
+    - New "LCD Panel" dropdown at the bottom of Settings > Display, under Colour
+      Depth: Adafruit, BuyDisplay-ILI9341, BuyDisplay-ST7789V. Choosing one
+      prompts with Reboot or Cancel, and Cancel genuinely changes nothing - the
+      choice is held pending and never written, unlike the Debug page's own
+      dropdowns, which save immediately and only then ask about rebooting. This
+      is what keeps panel selection reachable now that Debug is hidden.
+    - All three paths read one DisplayPanelPreset table rather than repeating
+      six values each, so they cannot drift apart. applyDisplayPanelPreset()
+      also writes displayInverted through persistSettingsToRuntimeConfig(): it
+      lives in NVS and in settings{} on the SD card, and the SD copy is
+      authoritative at boot, so an NVS-only write would be reverted by the very
+      reboot meant to apply it. That fault is the 3.15 changelog entry.
+
   4.70 - 2026-09-12
     - Raises DOCK_OTA_SLOW_TIMEOUT_MS from 6 to 15 seconds. The dual capture
       that verified 4.69 measured the dock's esp_ota_begin() partition erase at
@@ -5805,7 +5842,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.70"
+#define OPENREMOTE_VERSION_STRING "4.71"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -6360,6 +6397,55 @@ uint8_t lcdBufferMode = 1;
 // without changing the bus clock or giving up DMA. Default (2) matches the
 // ESP32's own default pad drive strength, i.e. unchanged prior behaviour.
 uint8_t lcdDriveStrength = 2;
+
+/*
+  A complete display configuration, as one row.
+
+  Three separate features now set every display option at once - the LCD Panel
+  dropdown on Settings > Display, the Red+Blue rescue combo, and the values a
+  freshly programmed ESP32 comes up with. Writing those out three times is how
+  they drift: someone fixes a panel's clock in one place and the rescue path
+  keeps handing back the old one. They all read this table instead.
+
+  driver is displayDriverChoice: 0 = LovyanGFX (DMA), 1 = Arduino_GFX
+  (synchronous). module is displayModuleChoice (DISPLAY_MODULE_*). driveStrength
+  is lcdDriveStrength, where 2 is the pad default shown in the UI as "Default".
+*/
+struct DisplayPanelPreset {
+  const char *name;
+  uint8_t module;
+  bool invert;
+  uint8_t driver;
+  uint32_t busHz;
+  uint8_t bufferMode;
+  uint8_t driveStrength;
+};
+
+static const uint8_t LCD_PANEL_ADAFRUIT = 0;
+static const uint8_t LCD_PANEL_BUYDISPLAY_ILI9341 = 1;
+static const uint8_t LCD_PANEL_BUYDISPLAY_ST7789V = 2;
+static const uint8_t LCD_PANEL_PRESET_COUNT = 3;
+
+static const DisplayPanelPreset LCD_PANEL_PRESETS[LCD_PANEL_PRESET_COUNT] = {
+  {"Adafruit",           DISPLAY_MODULE_ADAFRUIT,   false, 1, 20000000UL, 1, 2},
+  {"BuyDisplay-ILI9341", DISPLAY_MODULE_BUYDISPLAY, true,  0, 20000000UL, 1, 2},
+  {"BuyDisplay-ST7789V", DISPLAY_MODULE_ST7789,     false, 0, 20000000UL, 1, 2},
+};
+
+/*
+  What a freshly programmed ESP32 comes up with.
+
+  Deliberately NOT the same as LCD_PANEL_PRESETS[LCD_PANEL_ADAFRUIT], and the
+  difference is the LCD driver: a new board defaults to LovyanGFX, while the
+  Red+Blue rescue combo restores Arduino_GFX. That is not an oversight. The
+  rescue combo exists for a remote whose screen is unreadable, so it hands back
+  the synchronous driver that works on every panel this firmware supports, at
+  the cost of speed. A new board has no such problem and should start on the
+  faster DMA driver. Keep them separate.
+*/
+static const DisplayPanelPreset DISPLAY_FACTORY_DEFAULT = {
+  "Factory default", DISPLAY_MODULE_ADAFRUIT, false, 0, 20000000UL, 1, 2
+};
 // LCD backlight PWM frequency in Hz (see BACKLIGHT_PWM_HZ above for why this
 // is a phantom-touch suspect). Applies live via ledcChangeFrequency() - no
 // reboot needed, so it can be A/B tested against the touch overlay directly.
@@ -7167,6 +7253,14 @@ bool raiseToWake = true;
 bool physicalRepeatEnabled = true;
 uint16_t physicalRepeatDelayMs = 400;
 uint8_t physicalRepeatRateHz = 9;
+// Settings > Debug is hidden unless this is on, and the only thing that turns
+// it on is the "Debug Menu" switch under SD Card on Settings > About. It is a
+// page of hardware bring-up controls that can leave a remote with an unreadable
+// screen, so it is not something to arrive at by browsing. The panel options an
+// ordinary user might legitimately need are on Settings > Display as "LCD
+// Panel", which applies a whole known-good preset rather than six controls that
+// have to agree with each other.
+bool debugMenuVisible = false;
 bool debugSplitEnabled = true;
 bool debugTouchEnabled = false;
 bool debugCpuRamEnabled = false;
@@ -7334,6 +7428,15 @@ unsigned long physicalNavLastKeyMs = 0;
 bool physicalNavOutlineHidden = false;
 bool physicalStopHeld = false;
 bool physicalForwardHeld = false;
+// Red + Blue held together restores a known-good display configuration and
+// reboots - the way back from a panel setting that made the screen unreadable,
+// which is exactly the state in which the on-screen menus cannot be used to
+// undo it. Seven seconds, matching the hardware power button's own long hold,
+// because two adjacent colour keys are easy to catch by accident.
+bool physicalRedHeld = false;
+bool physicalBlueHeld = false;
+unsigned long displayRescueComboStartedMs = 0;
+static const uint32_t DISPLAY_RESCUE_HOLD_MS = 7000UL;
 lv_group_t *physicalNavGroup = nullptr;
 // A modal (currently just the reboot confirmation msgbox) swaps
 // physicalNavInputDevice onto this separate group while it's open, instead
@@ -8617,6 +8720,12 @@ bool addEspNowDevice(const uint8_t mac[6], const char *name);
 bool removeEspNowDevice(const uint8_t mac[6]);
 bool sendEspNowCommand(const DeviceCommand &command);
 bool dockOtaPrepare(uint8_t deviceIndex, String &error);
+void applyDisplayPanelPreset(const DisplayPanelPreset &preset);
+void serviceDisplayRescueCombo(unsigned long now);
+// Both Display page renderers build the LCD Panel row, and both sit above the
+// implementation, which needs preferences and persistSettingsToRuntimeConfig().
+uint8_t lcdPanelDropdownSelection();
+void lcdPanelDropdownEvent(lv_event_t *e);
 bool relayIrToDock(const DeviceCommand &command);
 bool dockConnected();
 extern bool nowPlayingRefreshWanted;
@@ -9322,6 +9431,14 @@ void serviceKeypad(unsigned long now) {
     // which is worse than the combo also firing two harmless commands.
     if (buttonIndex == 0) physicalStopHeld = pressed;
     if (buttonIndex == 3) physicalForwardHeld = pressed;
+    // Red (19) + Blue (22), timed by serviceDisplayRescueCombo(). Tracked the
+    // same way as the combo above and with the same consequence: both buttons
+    // still fire whatever they are individually bound to. Buffering them to
+    // suppress that would put latency on every ordinary colour-key press.
+    // Both sit below the button-test and diagnostic branches, which `continue`
+    // before reaching here, so neither mode can trip the rescue.
+    if (buttonIndex == 19) physicalRedHeld = pressed;
+    if (buttonIndex == 22) physicalBlueHeld = pressed;
     if (pressed && physicalStopHeld && physicalForwardHeld && !physicalSettingsPageActive()) {
       enterPhysicalSettingsNav();
     }
@@ -10414,19 +10531,20 @@ void loadSettings() {
   displayGamma = constrain((int)preferences.getUShort("gamma", 100), 50, 250);
   displaySaturation = constrain((int)preferences.getUShort("saturation", 100), 0, 200);
   displayRgb666 = preferences.getBool("rgb666", false);
-  displayInverted = preferences.getBool("invert", false);
-  // Arduino_GFX (index 1) is the default LCD driver. LovyanGFX's DMA path is
-  // faster but this panel exhibits touch problems with it, so the safe
-  // synchronous driver is what a remote should come up with unless the user
-  // deliberately selects otherwise in Settings > Debug.
-  displayDriverChoice = preferences.getUChar("dispDrv", 1);
-  displayModuleChoice = preferences.getUChar("dispMod", 0);
+  displayInverted = preferences.getBool("invert", DISPLAY_FACTORY_DEFAULT.invert);
+  // Every one of these defaults is DISPLAY_FACTORY_DEFAULT's, spelled out here
+  // because Preferences wants a literal per key. A freshly programmed ESP32 has
+  // none of them stored and therefore comes up on exactly that configuration:
+  // Adafruit, invert off, LovyanGFX, 20MHz, double buffered, default pressure.
+  displayDriverChoice = preferences.getUChar("dispDrv", DISPLAY_FACTORY_DEFAULT.driver);
+  displayModuleChoice = preferences.getUChar("dispMod", DISPLAY_FACTORY_DEFAULT.module);
   // Defaults to 20MHz. A fresh flash or a factory reset therefore comes up at
   // the speed every supported panel is known to tolerate; anyone running an
   // ILI9341 can raise it to 40 in LCD Clock and that choice is then kept.
-  lcdFreqHz = preferences.getULong("lcdFreqHz", 20000000UL);
-  lcdBufferMode = preferences.getUChar("lcdBufMode", 1);
-  lcdDriveStrength = constrain((int)preferences.getUChar("lcdDriveStr", 2), 0, 3);
+  lcdFreqHz = preferences.getULong("lcdFreqHz", DISPLAY_FACTORY_DEFAULT.busHz);
+  lcdBufferMode = preferences.getUChar("lcdBufMode", DISPLAY_FACTORY_DEFAULT.bufferMode);
+  lcdDriveStrength = constrain(
+    (int)preferences.getUChar("lcdDriveStr", DISPLAY_FACTORY_DEFAULT.driveStrength), 0, 3);
   backlightPwmHz = preferences.getULong("blPwmHz", BACKLIGHT_PWM_HZ);
   if (!backlightPwmFrequencyValid(backlightPwmHz)) backlightPwmHz = BACKLIGHT_PWM_HZ;
   menuStyle = preferences.getUChar("menuStyle", 0);
@@ -10438,6 +10556,7 @@ void loadSettings() {
   physicalRepeatRateHz = constrain(
     (int)preferences.getUChar("btnRate", 9),
     (int)BUTTON_REPEAT_RATE_MIN_HZ, (int)BUTTON_REPEAT_RATE_MAX_HZ);
+  debugMenuVisible = preferences.getBool("dbgMenu", false);
   debugSplitEnabled = preferences.getBool("dbgSplit", false);
   bluetoothSleepEnabled = preferences.getBool("bleSleep", false);
   debugTouchEnabled = preferences.getBool("dbgTouch", false);
@@ -10488,22 +10607,28 @@ void loadSettings() {
   // remote still came up on the wrong driver with the split-line overlay on.
   // This forces both to their intended values exactly once, then records that
   // it has run so a later deliberate change in Settings > Debug sticks.
+  //
+  // The driver is deliberately no longer forced here. This block runs exactly
+  // once per remote, and on a freshly programmed ESP32 it runs on the FIRST
+  // boot - so forcing Arduino_GFX would have overwritten the new LovyanGFX
+  // factory default before anyone saw it, on precisely the boards that default
+  // exists for. Every remote that needed the original correction has already
+  // had it and carries prefMig1, so dropping it now changes nothing for them;
+  // their stored dispDrv is read normally above and left alone.
   preferences.begin(PREFERENCES_NAMESPACE, false);
   if (!preferences.getBool("prefMig1", false)) {
-    displayDriverChoice = 1;              // Arduino_GFX
     debugSplitEnabled = false;
     debugTouchEnabled = false;
     debugCpuRamEnabled = false;
     debugAccelerometerEnabled = false;
     debugFpsEnabled = false;
-    preferences.putUChar("dispDrv", displayDriverChoice);
     preferences.putBool("dbgSplit", false);
     preferences.putBool("dbgTouch", false);
     preferences.putBool("dbgCpu", false);
     preferences.putBool("dbgAccel", false);
     preferences.putBool("dbgFps", false);
     preferences.putBool("prefMig1", true);
-    Serial.println("Preferences migrated: Arduino_GFX driver, all debug overlays off");
+    Serial.println("Preferences migrated: all debug overlays off");
   }
   preferences.end();
   bool migratedWifiProfile = false;
@@ -10592,6 +10717,7 @@ void saveSettings() {
   preferences.putBool("btnRpt", physicalRepeatEnabled);
   preferences.putUShort("btnDelay", physicalRepeatDelayMs);
   preferences.putUChar("btnRate", physicalRepeatRateHz);
+  preferences.putBool("dbgMenu", debugMenuVisible);
   preferences.putBool("dbgSplit", debugSplitEnabled);
   preferences.putBool("bleSleep", bluetoothSleepEnabled);
   preferences.putBool("dbgTouch", debugTouchEnabled);
@@ -25998,9 +26124,12 @@ void renderSettingsHomeOmote() {
   makeOmoteRow(card, "Dock", "Blaster dock pairing over ESP-NOW", y, rowH, nullptr,
     [](lv_event_t *e) { openSettingsView(SETTINGS_DOCK); });
   makeOmoteDivider(card, y + rowH); y += rowH + 1;
-  makeOmoteRow(card, "Debug", "Touch, display, sensors and microphone", y, rowH, nullptr,
-    [](lv_event_t *e) { openSettingsView(SETTINGS_DEBUG); });
-  makeOmoteDivider(card, y + rowH); y += rowH + 1;
+  // Hidden unless Settings > About > Debug Menu is on.
+  if (debugMenuVisible) {
+    makeOmoteRow(card, "Debug", "Touch, display, sensors and microphone", y, rowH, nullptr,
+      [](lv_event_t *e) { openSettingsView(SETTINGS_DEBUG); });
+    makeOmoteDivider(card, y + rowH); y += rowH + 1;
+  }
   makeOmoteRow(card, "Backup / Restore", "Full configuration backups", y, rowH, nullptr,
     [](lv_event_t *e) { openSettingsView(SETTINGS_BACKUP); });
   makeOmoteDivider(card, y + rowH); y += rowH + 1;
@@ -26153,11 +26282,18 @@ void renderSettingsHome() {
     [](lv_event_t *e) { openSettingsView(SETTINGS_BUTTONS); });
   makeSettingRow("Dock", "Blaster dock pairing over ESP-NOW", 308, nullptr,
     [](lv_event_t *e) { openSettingsView(SETTINGS_DOCK); });
-  makeSettingRow("Debug", "Touch, display, sensors and microphone", 358, nullptr,
-    [](lv_event_t *e) { openSettingsView(SETTINGS_DEBUG); });
-  makeSettingRow("Backup / Restore", "Full configuration backups", 408, nullptr,
+  // Rows here are positioned by literal y, so removing Debug has to close the
+  // gap rather than leave a hole. Hidden unless About > Debug Menu is on.
+  int homeRowY = 358;
+  if (debugMenuVisible) {
+    makeSettingRow("Debug", "Touch, display, sensors and microphone", homeRowY, nullptr,
+      [](lv_event_t *e) { openSettingsView(SETTINGS_DEBUG); });
+    homeRowY += 50;
+  }
+  makeSettingRow("Backup / Restore", "Full configuration backups", homeRowY, nullptr,
     [](lv_event_t *e) { openSettingsView(SETTINGS_BACKUP); });
-  makeSettingRow("About", "Version, device and battery information", 458, nullptr,
+  homeRowY += 50;
+  makeSettingRow("About", "Version, device and battery information", homeRowY, nullptr,
     [](lv_event_t *e) { openSettingsView(SETTINGS_ABOUT); });
 }
 
@@ -27595,13 +27731,23 @@ void renderDisplayPageOmote() {
   makeDisplaySlider("Motion sensitivity", sliderH * 2 + 8, 1, 100, wakeSensitivity, 3, sleepCard, 14, 196, true);
   y += 3 * sliderH + 2 + 12;
 
-  lv_obj_t *optionsCard = makeOmoteCard(content, y, 2 * rowH + 1);
+  lv_obj_t *optionsCard = makeOmoteCard(content, y, 3 * rowH + 2);
   lv_obj_t *wakeDropdown = makeOmoteDropdownRow(optionsCard, "Wake", 0, rowH, 108);
   lv_dropdown_set_options(wakeDropdown, "Motion\nButton");
   lv_dropdown_set_selected(wakeDropdown, wakeMode == WAKE_MODE_BUTTON ? 1 : 0);
   lv_obj_add_event_cb(wakeDropdown, wakeModeDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
   makeOmoteDivider(optionsCard, rowH);
   makeOmoteRow(optionsCard, "Colour Depth", displayRgb666 ? "RGB666 panel transfer" : "RGB565 panel transfer", rowH + 1, rowH, &displayRgb666);
+  makeOmoteDivider(optionsCard, 2 * rowH + 1);
+  // Sets the whole panel configuration in one go, so the six individual
+  // controls on Settings > Debug are not the only way to change a panel - which
+  // matters now that Debug is hidden by default.
+  lv_obj_t *panelDropdown = makeOmoteDropdownRow(optionsCard, "LCD Panel",
+                                                 2 * rowH + 2, rowH, 150);
+  lv_dropdown_set_options(panelDropdown,
+                          "Adafruit\nBuyDisplay-ILI9341\nBuyDisplay-ST7789V");
+  lv_dropdown_set_selected(panelDropdown, lcdPanelDropdownSelection());
+  lv_obj_add_event_cb(panelDropdown, lcdPanelDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
 }
 
 void renderDisplayPage() {
@@ -27639,6 +27785,23 @@ void renderDisplayPage() {
   lv_obj_add_event_cb(wakeDropdown, wakeModeDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
   addPhysicalNavFocusable(wakeDropdown);
   makeSettingRow("Colour Depth", displayRgb666 ? "RGB666 panel transfer" : "RGB565 panel transfer", 420, &displayRgb666);
+
+  lv_obj_t *panelPanel = lv_obj_create(content);
+  lv_obj_set_pos(panelPanel, 8, 470);
+  lv_obj_set_size(panelPanel, 224, 44);
+  lv_obj_clear_flag(panelPanel, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(panelPanel, LV_OBJ_FLAG_CLICKABLE);
+  stylePanel(panelPanel, lvRgb(34, 35, 39), lvRgb(54, 56, 62));
+  makeLabel(panelPanel, "LCD Panel", 8, 14, &lv_font_montserrat_14, textPrimary());
+  lv_obj_t *panelDropdown = lv_dropdown_create(panelPanel);
+  lv_obj_set_pos(panelDropdown, 224 - 150 - 8, 6);
+  lv_obj_set_size(panelDropdown, 150, 32);
+  styleDebugDropdown(panelDropdown);
+  lv_dropdown_set_options(panelDropdown,
+                          "Adafruit\nBuyDisplay-ILI9341\nBuyDisplay-ST7789V");
+  lv_dropdown_set_selected(panelDropdown, lcdPanelDropdownSelection());
+  lv_obj_add_event_cb(panelDropdown, lcdPanelDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
+  addPhysicalNavFocusable(panelDropdown);
 }
 
 void buttonSliderEvent(lv_event_t *e) {
@@ -27893,6 +28056,192 @@ void showDebugRebootConfirmation(bool hard) {
 void debugRebootButtonEvent(lv_event_t *e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
   showDebugRebootConfirmation((bool)(uintptr_t)lv_event_get_user_data(e));
+}
+
+/*
+  Writes a whole panel configuration to both places it has to live.
+
+  displayInverted is the trap here, and it has caught this project once before
+  (see the 3.15 changelog): it is persisted in NVS AND in settings{} inside
+  runtime.json on the SD card, and applySettingsJson() treats the SD copy as
+  authoritative at every boot - it reads it and then calls saveSettings(), which
+  writes what it just read straight back over NVS. An NVS-only write here would
+  therefore be silently reverted by the very reboot that is meant to apply it.
+  persistSettingsToRuntimeConfig() pushes the in-memory value to the SD copy so
+  the two agree before the remote restarts.
+
+  The other five are NVS-only hardware config with no SD counterpart.
+*/
+void applyDisplayPanelPreset(const DisplayPanelPreset &preset) {
+  displayModuleChoice = preset.module;
+  displayInverted = preset.invert;
+  displayDriverChoice = preset.driver;
+  lcdFreqHz = preset.busHz;
+  lcdBufferMode = preset.bufferMode;
+  lcdDriveStrength = preset.driveStrength;
+  preferences.begin(PREFERENCES_NAMESPACE, false);
+  preferences.putUChar("dispMod", displayModuleChoice);
+  preferences.putBool("invert", displayInverted);
+  preferences.putUChar("dispDrv", displayDriverChoice);
+  preferences.putULong("lcdFreqHz", lcdFreqHz);
+  preferences.putUChar("lcdBufMode", lcdBufferMode);
+  preferences.putUChar("lcdDriveStr", lcdDriveStrength);
+  preferences.end();
+  persistSettingsToRuntimeConfig();
+  Serial.printf("Display preset applied: %s - module %u, invert %s, driver %s, "
+                "%luMHz, %s buffered, pressure %u\n",
+                preset.name, (unsigned)preset.module,
+                preset.invert ? "on" : "off",
+                preset.driver == 0 ? "LovyanGFX" : "Arduino_GFX",
+                (unsigned long)(preset.busHz / 1000000UL),
+                preset.bufferMode ? "double" : "single",
+                (unsigned)preset.driveStrength);
+}
+
+/*
+  Red + Blue held for seven seconds: restore the Adafruit configuration and
+  reboot, with no confirmation of any kind.
+
+  No prompt is the whole point. This exists for a remote whose screen is
+  unreadable - the wrong panel driver, an inverted mono mess, a bus clock the
+  fitted panel cannot take - and a confirmation dialog on a screen you cannot
+  read is not a safety feature, it is the thing standing between the user and
+  the fix. Seven seconds of two specific keys is the confirmation.
+
+  Deliberately restores Arduino_GFX rather than the LovyanGFX factory default:
+  see DISPLAY_FACTORY_DEFAULT's comment. This path optimises for "works on
+  anything", not for speed.
+*/
+void serviceDisplayRescueCombo(unsigned long now) {
+  if (!physicalRedHeld || !physicalBlueHeld) {
+    displayRescueComboStartedMs = 0;
+    return;
+  }
+  if (!displayRescueComboStartedMs) {
+    displayRescueComboStartedMs = now;
+    return;
+  }
+  if ((uint32_t)(now - displayRescueComboStartedMs) < DISPLAY_RESCUE_HOLD_MS) return;
+  displayRescueComboStartedMs = 0;
+  Serial.println("Display rescue: Red+Blue held for seven seconds - restoring the "
+                 "Adafruit panel configuration and rebooting");
+  // Read BEFORE the preset overwrites displayDriverChoice. Whether a DMA
+  // transfer has to be waited out depends on the driver that is running now,
+  // not the one that will run after the reboot, and calling tft.waitDMA() on
+  // the strength of the new value would be asking the wrong driver.
+  bool lovyanRunning = displayDriverChoice == 0;
+  applyDisplayPanelPreset(LCD_PANEL_PRESETS[LCD_PANEL_ADAFRUIT]);
+  Serial.flush();
+  if (lovyanRunning) tft.waitDMA();
+  delay(100);
+  // The full digital reset, as the Display Module dropdown already uses: the
+  // panel is initialised once in setup() and a soft restart is not guaranteed
+  // to leave the bus in a state the other driver can re-init cleanly.
+  esp_rom_software_reset_system();
+  while (true) delay(1000);
+}
+
+// Which preset, if any, the current settings correspond to. -1 when the six
+// values do not form one of the three known-good combinations, which is
+// entirely possible - Settings > Debug can still set each of them individually.
+int8_t currentLcdPanelPresetIndex() {
+  for (uint8_t i = 0; i < LCD_PANEL_PRESET_COUNT; i++) {
+    const DisplayPanelPreset &p = LCD_PANEL_PRESETS[i];
+    if (p.module == displayModuleChoice && p.invert == displayInverted &&
+        p.driver == displayDriverChoice && p.busHz == lcdFreqHz &&
+        p.bufferMode == lcdBufferMode && p.driveStrength == lcdDriveStrength) {
+      return (int8_t)i;
+    }
+  }
+  return -1;
+}
+
+// What the dropdown should show. An exact match wins; failing that the panel
+// actually fitted is the more useful thing to display than an arbitrary first
+// entry, because the module is the part the user recognises.
+uint8_t lcdPanelDropdownSelection() {
+  int8_t exact = currentLcdPanelPresetIndex();
+  if (exact >= 0) return (uint8_t)exact;
+  for (uint8_t i = 0; i < LCD_PANEL_PRESET_COUNT; i++) {
+    if (LCD_PANEL_PRESETS[i].module == displayModuleChoice) return i;
+  }
+  return LCD_PANEL_ADAFRUIT;
+}
+
+lv_obj_t *lcdPanelConfirmBox = nullptr;
+uint8_t lcdPanelPendingPreset = 0;
+
+/*
+  Nothing is written until Reboot is pressed.
+
+  This is the opposite of how the Debug page's own dropdowns work - those save
+  to Preferences the instant they change and only then ask about rebooting, so
+  Cancel there leaves the new value stored and it takes effect at the next
+  reboot anyway. Cancel here must genuinely change nothing, so the choice is
+  held in lcdPanelPendingPreset and the dropdown is put back where it was.
+*/
+void confirmLcdPanelChange(lv_event_t *e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED || !lcdPanelConfirmBox) return;
+  const char *choice = lv_msgbox_get_active_btn_text(lcdPanelConfirmBox);
+  bool confirmed = choice && strcmp(choice, "Reboot") == 0;
+  lv_msgbox_close(lcdPanelConfirmBox);
+  lcdPanelConfirmBox = nullptr;
+  if (physicalNavInputDevice && physicalNavGroup) {
+    lv_indev_set_group(physicalNavInputDevice, physicalNavGroup);
+  }
+  if (!confirmed) {
+    // Rebuild the page rather than reaching back for the dropdown object. Every
+    // settings screen is recreated from scratch on each visit, so a pointer
+    // held across this modal can name a widget LVGL has already freed. Nothing
+    // was written, so the rebuild re-reads the unchanged settings and puts the
+    // selection back on its own.
+    pendingUiRefresh = settingsView == SETTINGS_DISPLAY;
+    Serial.println("LCD Panel: change cancelled, nothing written");
+    return;
+  }
+  bool lovyanRunning = displayDriverChoice == 0;
+  applyDisplayPanelPreset(LCD_PANEL_PRESETS[lcdPanelPendingPreset]);
+  Serial.flush();
+  if (lovyanRunning) tft.waitDMA();
+  delay(100);
+  esp_rom_software_reset_system();
+  while (true) delay(1000);
+}
+
+void lcdPanelDropdownEvent(lv_event_t *e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  if (lcdPanelConfirmBox) return;
+  uint16_t selected = lv_dropdown_get_selected(lv_event_get_target(e));
+  if (selected >= LCD_PANEL_PRESET_COUNT) return;
+  lcdPanelPendingPreset = (uint8_t)selected;
+  lastWakeMs = millis();
+
+  const DisplayPanelPreset &preset = LCD_PANEL_PRESETS[selected];
+  static char message[176];
+  snprintf(message, sizeof(message),
+           "Apply the %s settings and restart now?\n\n"
+           "Invert %s, %s, %luMHz, %s buffered.",
+           preset.name, preset.invert ? "on" : "off",
+           preset.driver == 0 ? "LovyanGFX" : "Arduino_GFX",
+           (unsigned long)(preset.busHz / 1000000UL),
+           preset.bufferMode ? "double" : "single");
+  static const char *buttons[] = {"Reboot", "Cancel", ""};
+  lcdPanelConfirmBox = lv_msgbox_create(lv_scr_act(), "Change LCD panel?",
+                                        message, buttons, false);
+  lv_obj_set_width(lcdPanelConfirmBox, 220);
+  lv_obj_center(lcdPanelConfirmBox);
+  lv_obj_add_event_cb(lcdPanelConfirmBox, confirmLcdPanelChange,
+                      LV_EVENT_VALUE_CHANGED, nullptr);
+  // Same modal group handling as showDebugRebootConfirmation(), so D-pad and OK
+  // reach the dialog's buttons and not the page behind it.
+  if (physicalNavModalGroup) {
+    lv_group_remove_all_objs(physicalNavModalGroup);
+    lv_obj_t *buttonMatrix = findMsgboxButtonMatrix(lcdPanelConfirmBox);
+    if (buttonMatrix) lv_group_add_obj(physicalNavModalGroup, buttonMatrix);
+    if (physicalNavInputDevice) {
+      lv_indev_set_group(physicalNavInputDevice, physicalNavModalGroup);
+    }
+  }
 }
 
 // LCD driver, clock and buffering choices only take effect at boot (the
@@ -28864,7 +29213,8 @@ void renderAboutPageOmote() {
   lv_obj_set_style_text_align(nameLabel, LV_TEXT_ALIGN_CENTER, 0);
 
   const int rowH = 48;
-  lv_obj_t *infoCard = makeOmoteCard(content, 34, 5 * rowH + 4);
+  // Six rows now: the five information rows plus the Debug Menu switch.
+  lv_obj_t *infoCard = makeOmoteCard(content, 34, 6 * rowH + 5);
   String webVersion = installedWebConfigVersion();
   makeOmoteRow(infoCard, "Firmware", OPENREMOTE_VERSION_TEXT, 0, rowH, nullptr);
   makeOmoteDivider(infoCard, rowH);
@@ -28876,8 +29226,14 @@ void renderAboutPageOmote() {
   makeOmoteRow(infoCard, "Setup network", setupApSsid.c_str(), 3 * rowH + 3, rowH, nullptr);
   makeOmoteDivider(infoCard, 4 * rowH + 3);
   makeOmoteRow(infoCard, "SD Card", sdStatusText, 4 * rowH + 4, rowH, nullptr);
+  makeOmoteDivider(infoCard, 5 * rowH + 4);
+  // The only way to reveal Settings > Debug. Placed here, at the bottom of the
+  // page nobody visits by accident, rather than anywhere it could be flipped on
+  // while looking for something else.
+  makeOmoteRow(infoCard, "Debug Menu", "Show Debug in Settings",
+               5 * rowH + 5, rowH, &debugMenuVisible);
 
-  int batteryY = 34 + 5 * rowH + 4 + 16;
+  int batteryY = 34 + 6 * rowH + 5 + 16;
   makeLabel(content, "Battery", 8, batteryY, &lv_font_montserrat_16, textPrimary());
   makeBatteryMetricRows(batteryY + 34, true);
 }
@@ -28901,9 +29257,10 @@ void renderAboutPage() {
   makeSettingRow("WebConfig", webVersion.length() ? webVersion.c_str() : "Not installed", 152, nullptr);
   makeSettingRow("Setup network", setupApSsid.c_str(), 202, nullptr);
   makeSettingRow("SD Card", sdStatusText, 252, nullptr);
+  makeSettingRow("Debug Menu", "Show Debug in Settings", 302, &debugMenuVisible);
 
-  makeLabel(content, "Battery", 10, 310, &lv_font_montserrat_16, textPrimary());
-  makeBatteryMetricRows(336);
+  makeLabel(content, "Battery", 10, 360, &lv_font_montserrat_16, textPrimary());
+  makeBatteryMetricRows(386);
 }
 
 void renderSettingsPage() {
@@ -33531,6 +33888,7 @@ void loop() {
   serviceIrLearning(now);
   serviceKeypad(now);
   serviceHardwarePowerHold(now);
+  serviceDisplayRescueCombo(now);
   serviceHeldIrRepeat(now);
   serviceButtonTest(now);
   serviceActivitySequence(now);
