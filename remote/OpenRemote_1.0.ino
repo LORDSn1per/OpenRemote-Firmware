@@ -1,6 +1,26 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.74 - 2026-09-12
+    - Fixes "Dock only" IR routing transmitting nothing at all when no dock is
+      paired. useDock was false because there is no dock and useLocal was false
+      because the route says dock, so both emitters stayed silent: every command
+      did nothing and the time pill never flashed, because nothing was ever
+      sent. Reached easily - restore a backup onto a remote whose dock is not
+      paired, or just forget the dock while the route points at it. A route
+      naming hardware that is not present is a stale preference, not an
+      instruction to stay silent, so the remote now falls back to its own
+      emitter and says so on the serial log. The saved route is deliberately
+      left alone, so pairing a dock again restores the intended behaviour
+      without setting it up twice.
+    - The "Transmit IR from" row is no longer hidden when nothing is paired,
+      which is what made the above unfixable from the remote's own screen: the
+      one control that could undo a stale "Dock only" was itself gated on having
+      a dock. It now appears whenever the route names anything other than this
+      remote, with a hint explaining what is happening. The genuinely
+      dock-specific switches - RF433, Dock LED, Homebridge via dock, Tx Power -
+      stay hidden as before, since those really do have nothing to act on.
+
   4.73 - 2026-09-12
     - Makes writing runtime.json atomic, which is a data-loss fix and the most
       important thing in this release. saveRuntimeConfigDocument() used to
@@ -5899,7 +5919,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.73"
+#define OPENREMOTE_VERSION_STRING "4.74"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -15686,7 +15706,32 @@ bool transmitIrCommand(const DeviceCommand &command) {
   // Routing applies to real IR only - a Bluetooth or Homebridge command has
   // nothing a dock could transmit, and those returned above.
   bool useDock = irRoute != IR_ROUTE_REMOTE && espNowDeviceCount > 0;
-  bool useLocal = irRoute != IR_ROUTE_DOCK;
+  /*
+    "Dock only" with no dock paired used to transmit nothing at all.
+
+    useDock was already false because there is no dock, and useLocal was false
+    because the route says dock - so both emitters stayed silent, every command
+    did nothing, and the time pill never flashed because nothing was ever sent.
+    Reached easily: restore a backup onto a remote whose dock is not paired, or
+    simply forget the dock while the route is set to it. The settings row that
+    would put the route back is itself hidden when no dock is paired, so the
+    remote could not be talked out of it from its own screen either.
+
+    A route naming hardware that is not there is a stale preference, not an
+    instruction to do nothing. Fall back to the emitter this remote actually
+    has. The saved route is deliberately left alone, so pairing a dock again
+    restores the intended behaviour without the user setting it up twice.
+  */
+  bool useLocal = irRoute != IR_ROUTE_DOCK || espNowDeviceCount == 0;
+  if (irRoute == IR_ROUTE_DOCK && espNowDeviceCount == 0) {
+    static unsigned long lastDockRouteWarningMs = 0;
+    unsigned long nowMs = millis();
+    if (!lastDockRouteWarningMs || (nowMs - lastDockRouteWarningMs) > 10000UL) {
+      lastDockRouteWarningMs = nowMs;
+      Serial.println("IR: route is \"Dock only\" but no dock is paired - "
+                     "using this remote's emitter instead");
+    }
+  }
   bool wentLocal = false;
   bool wentViaDock = false;
   if (irRoute == IR_ROUTE_BOTH) {
@@ -28916,14 +28961,25 @@ void renderDockPageOmote() {
               2 * rowH + 2, rowH, nullptr, toggleEspNowDevicesModal);
   y += 3 * rowH + 2 + 14;
 
-  // Only shown once a dock exists to apply them to - three dead controls on a
-  // page with nothing paired explains nothing and invites fiddling.
-  if (espNowDeviceCount > 0) {
-    lv_obj_t *dockCard = makeOmoteCard(content, y, 5 * rowH + 4);
+  /*
+    The dock-specific switches stay hidden with nothing paired - dead controls
+    explain nothing and invite fiddling. "Transmit IR from" is different: while
+    it names anything other than this remote it is actively deciding where
+    commands go, and hiding it is what made a stale "Dock only" unfixable from
+    the remote's own screen. Shown whenever it still has something to undo.
+  */
+  bool dockControlsVisible = espNowDeviceCount > 0;
+  bool routeControlVisible = dockControlsVisible || irRoute != IR_ROUTE_REMOTE;
+  if (routeControlVisible) {
+    int routeCardRows = dockControlsVisible ? 5 : 1;
+    lv_obj_t *dockCard = makeOmoteCard(content, y, routeCardRows * rowH + (routeCardRows - 1));
     lv_obj_t *routeDropdown = makeOmoteDropdownRow(dockCard, "Transmit IR from", 0, rowH, 132);
     lv_dropdown_set_options(routeDropdown, IR_ROUTE_OPTIONS);
     lv_dropdown_set_selected(routeDropdown, irRoute);
     lv_obj_add_event_cb(routeDropdown, irRouteDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
+    if (!dockControlsVisible) {
+      y += rowH + 14;
+    } else {
     makeOmoteDivider(dockCard, rowH);
     makeOmoteRow(dockCard, "Dock RF433", "Let the dock send RF433 commands",
                  rowH + 1, rowH, &dockRfEnabled);
@@ -28941,15 +28997,20 @@ void renderDockPageOmote() {
     lv_dropdown_set_selected(txDropdown, espNowTxPower);
     lv_obj_add_event_cb(txDropdown, espNowTxPowerDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
     y += 5 * rowH + 4 + 14;
+    }
   }
 
   lv_obj_t *hint = makeLabel(content,
     espNowDeviceCount > 0
       ? "The dock relays IR and RF433 for devices the remote cannot reach directly. "
         "Sequential sends twice, so do not use it for toggle commands such as Power."
-      : "A dock relays IR and RF433 commands for devices the remote cannot reach "
-        "directly. Turn ESP-NOW on, then use Paired devices to search for a dock "
-        "in pairing mode.",
+      : irRoute != IR_ROUTE_REMOTE
+        ? "Transmit IR from still names a dock, but none is paired - commands are "
+          "coming from this remote's own emitter. Set it to This remote to make "
+          "that the saved choice, or pair a dock again."
+        : "A dock relays IR and RF433 commands for devices the remote cannot reach "
+          "directly. Turn ESP-NOW on, then use Paired devices to search for a dock "
+          "in pairing mode.",
     10, y, &lv_font_montserrat_12, lvRgb(150, 160, 175));
   lv_obj_set_width(hint, 216);
   lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
@@ -29020,7 +29081,8 @@ void renderDockPage() {
   makeSettingRow("Search for a dock", "Find a dock in pairing mode", 152, nullptr,
                  toggleEspNowDevicesModal);
   int hintY = 214;
-  if (espNowDeviceCount > 0) {
+  // See renderDockPageOmote() for why the route row outlives the dock-only ones.
+  if (espNowDeviceCount > 0 || irRoute != IR_ROUTE_REMOTE) {
     lv_obj_t *routeRow = makeSettingRow("Transmit IR from", "", 202, nullptr, nullptr);
     lv_obj_t *routeDropdown = lv_dropdown_create(routeRow);
     lv_obj_set_pos(routeDropdown, 112, 8);
