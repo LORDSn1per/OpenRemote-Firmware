@@ -1,6 +1,18 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.84 - 2026-09-12
+    - Lets the IR database arrive over USB at all. Every USB file transfer was
+      capped at 4MB, so Studio's "Send to Remote" refused a 114MB database
+      before a byte moved, with "USB payload is empty or too large". 4MB is the
+      right ceiling for a WebConfig page or a .ir device file - it is a sanity
+      check against a mis-picked file rather than a capacity limit - so the cap
+      is now per destination: the database path gets 512MB, everything else is
+      unchanged.
+    - The refusal now names the size offered and the limit that rejected it. The
+      bare message sent someone hunting through Studio for a fault that was a
+      constant in the firmware.
+
   4.83 - 2026-09-12
     - Makes a large upload run at the card's real speed instead of crawling
       between long pauses. A chunk the card only partly took was answered with
@@ -6113,7 +6125,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.83"
+#define OPENREMOTE_VERSION_STRING "4.84"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -6342,6 +6354,13 @@ static const uint8_t MAX_WIFI_PROFILES = 8;
 static const uint8_t MAX_WIFI_SCAN_RESULTS = 12;
 static const size_t IRDB_STREAM_CHUNK_BYTES = 1024;
 static const size_t USB_IMPORT_MAX_BYTES = 4UL * 1024UL * 1024UL;
+// The IR database is the one thing that legitimately dwarfs everything else
+// this link carries. 4MB is the right ceiling for a WebConfig page or a .ir
+// device file - it is a sanity check against a mis-picked file, not a capacity
+// limit - but a real database is over a hundred megabytes, so it needs its own.
+// Still bounded: this refuses a file larger than any database Studio builds,
+// rather than trusting whatever length arrives.
+static const size_t USB_IRDB_MAX_BYTES = 512UL * 1024UL * 1024UL;
 static const size_t USB_IO_CHUNK_BYTES = 192;
 static const size_t USB_UPLOAD_WINDOW_BYTES = 1024;
 static const uint16_t USB_IO_BUDGET_BYTES = USB_UPLOAD_WINDOW_BYTES;
@@ -17395,8 +17414,13 @@ bool beginUsbFileUpload(Stream &port, UsbSerialSession &session,
     usbImportReply(port, "{\"ok\":false,\"error\":\"SD card unavailable\"}");
     return false;
   }
-  if (length == 0 || length > USB_IMPORT_MAX_BYTES) {
-    usbImportReply(port, "{\"ok\":false,\"error\":\"USB payload is empty or too large\"}");
+  size_t limit = (finalPath == IRDB_PATH) ? USB_IRDB_MAX_BYTES : USB_IMPORT_MAX_BYTES;
+  if (length == 0 || length > limit) {
+    // Says which limit and what was offered, because "too large" alone sent
+    // someone hunting through Studio for a fault that was a constant here.
+    usbImportReply(port, String("{\"ok\":false,\"error\":\"USB payload is empty or "
+                               "too large - ") + String((unsigned long)length) +
+                         " bytes offered, limit " + String((unsigned long)limit) + "\"}");
     return false;
   }
 
