@@ -4,7 +4,7 @@ import contextlib, datetime as dt, glob, hashlib, io, json, os, re, select, shut
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-APP_VERSION="2.80"
+APP_VERSION="2.81"
 SERIAL_BAUD=460800
 # 2.68 adds Linux as a third supported platform. Until now every non-Windows
 # branch in this file assumed macOS outright - AppleScript dialogs, diskutil,
@@ -645,21 +645,81 @@ def guess_names(root,fp):
     bits=[nice(x) for x in filt[2:]] if len(filt)>=3 else []; bits.append(nice(fp.name))
     model=" ".join([b for b in bits if b.lower() not in ("ir","infrared")]).strip() or nice(fp.name)
     return cat,brand,re.sub(r"\s+"," ",model)
-def create_db(records, db_path, metadata):
+def create_db(records, db_path, metadata, plan):
+    """Writes the SQLite half of the .irdb.
+
+    Deliberately WITHOUT the IR payloads. They live once, in the detail section
+    appended after this database, and each row carries the offset and length
+    that locate them there. Studio seeks to them exactly as the remote does.
+
+    Keeping them in the table as well was costing 80MB on a real 14,551 device
+    database - 104.8MB became 207.7MB once the detail section was appended - and
+    every byte of that duplicate then had to travel to the remote over Wi-Fi.
+    """
     if db_path.exists(): db_path.unlink()
     con=sqlite3.connect(db_path); cur=con.cursor()
     cur.execute("PRAGMA journal_mode=OFF"); cur.execute("PRAGMA synchronous=OFF")
     cur.execute("CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT)")
-    cur.execute("""CREATE TABLE remotes(id TEXT PRIMARY KEY,category TEXT,brand TEXT,model TEXT,source TEXT,format TEXT,original_path TEXT,button_count INTEGER,buttons_json TEXT,protocols_json TEXT,ir_json TEXT,search TEXT)""")
+    cur.execute("""CREATE TABLE remotes(id TEXT PRIMARY KEY,category TEXT,brand TEXT,model TEXT,source TEXT,format TEXT,original_path TEXT,button_count INTEGER,buttons_json TEXT,protocols_json TEXT,detail_offset INTEGER,detail_length INTEGER,search TEXT)""")
     cur.execute("CREATE INDEX idx_search ON remotes(search)"); cur.execute("CREATE INDEX idx_brand_model ON remotes(brand,model)")
     for k,v in metadata.items(): cur.execute("INSERT INTO metadata VALUES(?,?)",(k,json.dumps(v) if not isinstance(v,str) else v))
-    rows=[(r["id"],r["category"],r["brand"],r["model"],r["source"],r["format"],r["original_path"],r["button_count"],json.dumps(r["buttons"],ensure_ascii=False),json.dumps(r["protocols"],ensure_ascii=False),json.dumps(r["ir"],ensure_ascii=False),r["search"]) for r in records]
-    cur.executemany("INSERT INTO remotes VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",rows); con.commit(); con.close()
+    placement=plan["placement"]
+    rows=[(r["id"],r["category"],r["brand"],r["model"],r["source"],r["format"],r["original_path"],r["button_count"],json.dumps(r["buttons"],ensure_ascii=False),json.dumps(r["protocols"],ensure_ascii=False),placement[r["id"]][0],placement[r["id"]][1],r["search"]) for r in records]
+    cur.executemany("INSERT INTO remotes VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",rows); con.commit(); con.close()
 IRDB_INDEX_MAGIC=b"ORIDX1\x00\x00"
 IRDB_INDEX_FOOTER_SIZE=64
 IRDB_INDEX_FORMAT_VERSION=2
 
-def append_embedded_index(db_path, records, metadata=None):
+def plan_embedded_index(records):
+    """Builds the two appended sections and every record's place in them.
+
+    Separated from writing so create_db() can store each record's detail offset
+    in its row. That is what lets the IR payload live in exactly one place: the
+    SQLite table keeps the searchable metadata Studio queries, and the appended
+    detail section keeps the codes, which both Studio and the remote read from
+    there by seeking.
+
+    Storing it twice cost 80MB on a real database - 104.8MB became 207.7MB - and
+    the whole of that duplicate had to be uploaded to the remote over Wi-Fi.
+    """
+    search_lines=[]
+    detail_blobs=[]
+    placement={}
+    detail_offset=0
+    for r in records:
+        detail={
+            "id":r["id"],"category":r["category"],"type":r["category"],
+            "brand":r["brand"],"model":r["model"],"source":r["source"],
+            "format":r["format"],"originalPath":r["original_path"],
+            "buttonCount":r["button_count"],"commands":r["buttons"],
+            "protocols":r["protocols"],"protocol":", ".join(r["protocols"]),
+            "search":r["search"],"irJson":json.dumps(r["ir"],ensure_ascii=False)
+        }
+        blob=json.dumps(detail,ensure_ascii=False,separators=(",",":")).encode("utf-8")
+        # The search line is deliberately lean - the remote scans EVERY line of
+        # this section on every keystroke, lowercasing each one to match it, so
+        # each field costs both SD read time and a string allocation on an
+        # ESP32. Measured on the real 14,551-device database: carrying
+        # everything the detail record has costs 12.1MB and about six seconds a
+        # search; this set costs 3.0MB and about 1.4 seconds. All of it remains
+        # in the detail record, fetched only for the device being imported.
+        line={
+            "id":r["id"],"category":r["category"],"brand":r["brand"],
+            "model":r["model"],"source":r["source"],"format":r["format"],
+            "buttonCount":r["button_count"],"protocol":", ".join(r["protocols"]),
+            "o":detail_offset,"l":len(blob)
+        }
+        search_lines.append(json.dumps(line,ensure_ascii=False,separators=(",",":")).encode("utf-8"))
+        detail_blobs.append(blob)
+        placement[r["id"]]=(detail_offset,len(blob))
+        detail_offset+=len(blob)
+    return {
+        "search_bytes":b"\n".join(search_lines)+(b"\n" if search_lines else b""),
+        "detail_bytes":b"".join(detail_blobs),
+        "placement":placement,
+    }
+
+def append_embedded_index(db_path, records, metadata=None, plan=None):
     """Append a searchable index to the end of the SQLite .irdb file.
 
     One file instead of three. The remote used to need OpenRemote.irdb,
@@ -683,50 +743,9 @@ def append_embedded_index(db_path, records, metadata=None):
     record, so importing a device is one scan of the small section followed by
     a single seek - never a walk of the whole database.
     """
-    search_lines=[]
-    detail_blobs=[]
-    detail_offset=0
-    for r in records:
-        detail={
-            "id":r["id"],"category":r["category"],"type":r["category"],
-            "brand":r["brand"],"model":r["model"],"source":r["source"],
-            "format":r["format"],"originalPath":r["original_path"],
-            "buttonCount":r["button_count"],"commands":r["buttons"],
-            "protocols":r["protocols"],"protocol":", ".join(r["protocols"]),
-            "search":r["search"],"irJson":json.dumps(r["ir"],ensure_ascii=False)
-        }
-        blob=json.dumps(detail,ensure_ascii=False,separators=(",",":")).encode("utf-8")
-        # The search line is deliberately lean. The remote scans EVERY line of
-        # this section on every keystroke, and it does so by lowercasing each
-        # line and substring-matching it, so each field costs both SD read time
-        # and a string allocation on an ESP32.
-        #
-        # Measured on the real 14,551-device database: carrying everything the
-        # detail record has costs 12.1 MB and about six seconds a search. This
-        # set costs 2.9 MB and about 1.4 seconds. What was dropped is the button
-        # list, the protocol array, the original path, and the pre-lowercased
-        # "search" blob - the blob because the remote lowercases the whole line
-        # anyway, so brand, model, category and source stay matchable without
-        # it. The one capability genuinely traded away is finding a device by a
-        # button it happens to have; everything a person actually types into a
-        # remote-control search still matches.
-        #
-        # All of it remains in the detail record, which is fetched only for the
-        # single device being imported.
-        line={
-            "id":r["id"],"category":r["category"],"brand":r["brand"],
-            "model":r["model"],"source":r["source"],"format":r["format"],
-            "buttonCount":r["button_count"],"protocol":", ".join(r["protocols"]),
-            # Offset and length of this device's detail record WITHIN the detail
-            # section, so the two sections can be rebuilt independently.
-            "o":detail_offset,"l":len(blob)
-        }
-        search_lines.append(json.dumps(line,ensure_ascii=False,separators=(",",":")).encode("utf-8"))
-        detail_blobs.append(blob)
-        detail_offset+=len(blob)
-
-    search_bytes=b"\n".join(search_lines)+(b"\n" if search_lines else b"")
-    detail_bytes=b"".join(detail_blobs)
+    if plan is None: plan=plan_embedded_index(records)
+    search_bytes=plan["search_bytes"]
+    detail_bytes=plan["detail_bytes"]
     # A third small section carrying what the remote shows about the database
     # itself - how many devices and when it was built. Without it the remote can
     # only learn that from a Database Manifest.json copied alongside, and the
@@ -1126,11 +1145,14 @@ def build_database(save_parent, selected):
     created=dt.datetime.now().astimezone().isoformat(timespec="seconds")
     brands=len(set(r["brand"] for r in records)); buttons=sum(r["button_count"] for r in records)
     metadata={"database_name":"OpenRemote IRDB","database_version":version,"created_date":created,"scrape_date_local":created,"device_count":len(records),"brand_count":brands,"button_count":buttons,"builder_version":APP_VERSION,"format":"sqlite-irdb","sources":[r["name"] for r in repos]}
-    db_path=release/"OpenRemote.irdb"; create_db(records,db_path,metadata)
+    db_path=release/"OpenRemote.irdb"
+    # Planned first: the rows need to know where their payloads will land.
+    index_plan=plan_embedded_index(records)
+    create_db(records,db_path,metadata,index_plan)
     index_path=release/"search.jsonl"; details_dir=release/"details"; create_search_indexes(records,index_path,details_dir)
     # Appended last, so the SQLite file above is complete and closed first.
     log("Embedding the searchable index into OpenRemote.irdb...")
-    embedded=append_embedded_index(db_path,records,metadata)
+    embedded=append_embedded_index(db_path,records,metadata,index_plan)
     log(f"Embedded index: {embedded['search_bytes']/1024/1024:.2f} MB searchable, "
         f"{embedded['detail_bytes']/1024/1024:.1f} MB of device detail, "
         f"{embedded['device_count']} devices")
@@ -1208,11 +1230,56 @@ def search_db(query):
     for row in rows:
         d=dict(row); d["buttons"]=json.loads(d.pop("buttons_json") or "[]"); d["protocols"]=json.loads(d.pop("protocols_json") or "[]"); results.append(d)
     return {"results":results,"total":total,"shown":len(results)}
+def read_irdb_footer(db_path):
+    """The 64-byte trailer that locates the appended sections, or None."""
+    try:
+        size=db_path.stat().st_size
+        if size<IRDB_INDEX_FOOTER_SIZE: return None
+        with open(db_path,"rb") as f:
+            f.seek(size-IRDB_INDEX_FOOTER_SIZE)
+            footer=f.read(IRDB_INDEX_FOOTER_SIZE)
+        if footer[:8]!=IRDB_INDEX_MAGIC: return None
+        so,sl,do,dl,count,ver=struct.unpack_from("<QQQQII",footer,8)
+        meta_off,meta_len=(0,0)
+        if ver>=2: meta_off,meta_len=struct.unpack_from("<QI",footer,52)
+        return {"search_offset":so,"search_length":sl,"detail_offset":do,
+                "detail_length":dl,"device_count":count,"version":ver,
+                "meta_offset":meta_off,"meta_length":meta_len}
+    except Exception:
+        return None
+
+def read_irdb_detail(db_path,offset,length):
+    """One device's full record, read straight out of the detail section."""
+    footer=read_irdb_footer(db_path)
+    if not footer or length<=0: return None
+    if offset<0 or offset+length>footer["detail_length"]: return None
+    try:
+        with open(db_path,"rb") as f:
+            f.seek(footer["detail_offset"]+offset)
+            return json.loads(f.read(length).decode("utf-8"))
+    except Exception:
+        return None
+
 def device_detail(id):
     if not ACTIVE_DB.exists(): return {"error":"No OpenRemote.irdb loaded yet."}
-    con=sqlite3.connect(ACTIVE_DB); con.row_factory=sqlite3.Row; row=con.execute("SELECT * FROM remotes WHERE id=?",(id,)).fetchone(); con.close()
+    con=sqlite3.connect(ACTIVE_DB); con.row_factory=sqlite3.Row
+    row=con.execute("SELECT * FROM remotes WHERE id=?",(id,)).fetchone(); con.close()
     if not row: return {"error":"Device not found."}
-    d=dict(row); d["buttons"]=json.loads(d.pop("buttons_json") or "[]"); d["protocols"]=json.loads(d.pop("protocols_json") or "[]"); d["ir"]=json.loads(d.pop("ir_json") or "[]"); return d
+    d=dict(row)
+    d["buttons"]=json.loads(d.pop("buttons_json") or "[]")
+    d["protocols"]=json.loads(d.pop("protocols_json") or "[]")
+    keys=set(d.keys())
+    if "ir_json" in keys:
+        # A database built before the payload was de-duplicated. Still readable,
+        # so an older .irdb keeps working rather than silently losing its codes.
+        d["ir"]=json.loads(d.pop("ir_json") or "[]")
+        return d
+    offset=d.pop("detail_offset",None); length=d.pop("detail_length",None)
+    record=read_irdb_detail(ACTIVE_DB,offset or 0,length or 0) if length else None
+    if record is None:
+        return {"error":"This database's IR payload section is missing or unreadable. Rebuild it in IRDB Builder."}
+    d["ir"]=json.loads(record.get("irJson") or "[]")
+    return d
 
 SUPPORTED_PROTOCOLS={"NEC","NECext","NEC1","Samsung32","RC5","RC5X","RC6","SIRC","SIRC15","SIRC20"}
 def command_id(name,idx):
