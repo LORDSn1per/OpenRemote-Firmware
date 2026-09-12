@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import contextlib, datetime as dt, glob, hashlib, io, json, os, re, select, shutil, socket, sqlite3, struct, subprocess, sys, threading, time, urllib.parse, urllib.request, webbrowser, zipfile
+import contextlib, datetime as dt, glob, hashlib, io, json, os, re, select, shutil, socket, sqlite3, struct, subprocess, sys, threading, time, urllib.parse, urllib.request, webbrowser, zipfile, zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-APP_VERSION="2.79"
+APP_VERSION="2.80"
 SERIAL_BAUD=460800
 # 2.68 adds Linux as a third supported platform. Until now every non-Windows
 # branch in this file assumed macOS outright - AppleScript dialogs, diskutil,
@@ -655,6 +655,96 @@ def create_db(records, db_path, metadata):
     for k,v in metadata.items(): cur.execute("INSERT INTO metadata VALUES(?,?)",(k,json.dumps(v) if not isinstance(v,str) else v))
     rows=[(r["id"],r["category"],r["brand"],r["model"],r["source"],r["format"],r["original_path"],r["button_count"],json.dumps(r["buttons"],ensure_ascii=False),json.dumps(r["protocols"],ensure_ascii=False),json.dumps(r["ir"],ensure_ascii=False),r["search"]) for r in records]
     cur.executemany("INSERT INTO remotes VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",rows); con.commit(); con.close()
+IRDB_INDEX_MAGIC=b"ORIDX1\x00\x00"
+IRDB_INDEX_FOOTER_SIZE=64
+IRDB_INDEX_FORMAT_VERSION=1
+
+def append_embedded_index(db_path, records):
+    """Append a searchable index to the end of the SQLite .irdb file.
+
+    One file instead of three. The remote used to need OpenRemote.irdb,
+    search.jsonl AND a details/ folder of 14,000-odd files copied to its SD
+    card, and because the Release Notes only ever mentioned the .irdb, the
+    other two were never copied and WebConfig's IRDB search had nothing to read.
+
+    SQLite takes its database size from the page count in its own header, so
+    bytes appended after that are ignored by every reader - the file stays a
+    perfectly valid SQLite database that Studio opens exactly as before. The
+    remote does not parse SQLite at all; it reads a fixed 64-byte footer at the
+    end of the file, which tells it where the two appended sections start.
+
+    Layout:
+        [ SQLite database        ]  unchanged, byte for byte
+        [ search section, JSONL  ]  one compact line per device
+        [ detail section, JSON   ]  full records, concatenated
+        [ 64-byte footer         ]
+
+    Each search line carries the byte offset and length of its own detail
+    record, so importing a device is one scan of the small section followed by
+    a single seek - never a walk of the whole database.
+    """
+    search_lines=[]
+    detail_blobs=[]
+    detail_offset=0
+    for r in records:
+        detail={
+            "id":r["id"],"category":r["category"],"type":r["category"],
+            "brand":r["brand"],"model":r["model"],"source":r["source"],
+            "format":r["format"],"originalPath":r["original_path"],
+            "buttonCount":r["button_count"],"commands":r["buttons"],
+            "protocols":r["protocols"],"protocol":", ".join(r["protocols"]),
+            "search":r["search"],"irJson":json.dumps(r["ir"],ensure_ascii=False)
+        }
+        blob=json.dumps(detail,ensure_ascii=False,separators=(",",":")).encode("utf-8")
+        # The search line is deliberately lean. The remote scans EVERY line of
+        # this section on every keystroke, and it does so by lowercasing each
+        # line and substring-matching it, so each field costs both SD read time
+        # and a string allocation on an ESP32.
+        #
+        # Measured on the real 14,551-device database: carrying everything the
+        # detail record has costs 12.1 MB and about six seconds a search. This
+        # set costs 2.9 MB and about 1.4 seconds. What was dropped is the button
+        # list, the protocol array, the original path, and the pre-lowercased
+        # "search" blob - the blob because the remote lowercases the whole line
+        # anyway, so brand, model, category and source stay matchable without
+        # it. The one capability genuinely traded away is finding a device by a
+        # button it happens to have; everything a person actually types into a
+        # remote-control search still matches.
+        #
+        # All of it remains in the detail record, which is fetched only for the
+        # single device being imported.
+        line={
+            "id":r["id"],"category":r["category"],"brand":r["brand"],
+            "model":r["model"],"source":r["source"],"format":r["format"],
+            "buttonCount":r["button_count"],"protocol":", ".join(r["protocols"]),
+            # Offset and length of this device's detail record WITHIN the detail
+            # section, so the two sections can be rebuilt independently.
+            "o":detail_offset,"l":len(blob)
+        }
+        search_lines.append(json.dumps(line,ensure_ascii=False,separators=(",",":")).encode("utf-8"))
+        detail_blobs.append(blob)
+        detail_offset+=len(blob)
+
+    search_bytes=b"\n".join(search_lines)+(b"\n" if search_lines else b"")
+    detail_bytes=b"".join(detail_blobs)
+
+    with db_path.open("ab") as f:
+        search_start=f.tell()
+        f.write(search_bytes)
+        detail_start=f.tell()
+        f.write(detail_bytes)
+        footer=bytearray(IRDB_INDEX_FOOTER_SIZE)
+        footer[0:8]=IRDB_INDEX_MAGIC
+        struct.pack_into("<QQQQII",footer,8,
+                         search_start,len(search_bytes),
+                         detail_start,len(detail_bytes),
+                         len(records),IRDB_INDEX_FORMAT_VERSION)
+        struct.pack_into("<I",footer,48,zlib.crc32(search_bytes) & 0xFFFFFFFF)
+        f.write(bytes(footer))
+    return {"search_offset":search_start,"search_bytes":len(search_bytes),
+            "detail_offset":detail_start,"detail_bytes":len(detail_bytes),
+            "device_count":len(records),"format_version":IRDB_INDEX_FORMAT_VERSION}
+
 def create_search_indexes(records, search_path, details_dir):
     if search_path.exists(): search_path.unlink()
     if details_dir.exists(): shutil.rmtree(details_dir)
@@ -1026,9 +1116,24 @@ def build_database(save_parent, selected):
     metadata={"database_name":"OpenRemote IRDB","database_version":version,"created_date":created,"scrape_date_local":created,"device_count":len(records),"brand_count":brands,"button_count":buttons,"builder_version":APP_VERSION,"format":"sqlite-irdb","sources":[r["name"] for r in repos]}
     db_path=release/"OpenRemote.irdb"; create_db(records,db_path,metadata)
     index_path=release/"search.jsonl"; details_dir=release/"details"; create_search_indexes(records,index_path,details_dir)
-    manifest={**metadata,"irdb_sha256":hash_file(db_path,"sha256"),"irdb_size_bytes":db_path.stat().st_size,"search_index_file":"search.jsonl","search_index_sha256":hash_file(index_path,"sha256"),"search_index_size_bytes":index_path.stat().st_size,"detail_dir":"details","detail_file_count":len(records)}
+    # Appended last, so the SQLite file above is complete and closed first.
+    log("Embedding the searchable index into OpenRemote.irdb...")
+    embedded=append_embedded_index(db_path,records)
+    log(f"Embedded index: {embedded['search_bytes']/1024/1024:.2f} MB searchable, "
+        f"{embedded['detail_bytes']/1024/1024:.1f} MB of device detail, "
+        f"{embedded['device_count']} devices")
+    manifest={**metadata,"irdb_sha256":hash_file(db_path,"sha256"),"irdb_size_bytes":db_path.stat().st_size,"search_index_file":"search.jsonl","search_index_sha256":hash_file(index_path,"sha256"),"search_index_size_bytes":index_path.stat().st_size,"detail_dir":"details","detail_file_count":len(records),"embedded_index":embedded}
     (release/"Database Manifest.json").write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding="utf-8")
-    (release/"Release Notes.txt").write_text(f"OpenRemote.irdb\nVersion: {version}\nCreated: {created}\nDevices: {len(records)}\nBrands: {brands}\nButtons: {buttons}\n\nCopy OpenRemote.irdb to the remote SD card.\n",encoding="utf-8")
+    (release/"Release Notes.txt").write_text(
+        f"OpenRemote.irdb\nVersion: {version}\nCreated: {created}\n"
+        f"Devices: {len(records)}\nBrands: {brands}\nButtons: {buttons}\n\n"
+        f"Copy OpenRemote.irdb to /irdb on the remote SD card. That one file is\n"
+        f"all the remote needs - the searchable index is inside it, so WebConfig\n"
+        f"can search every device and import one without a computer.\n\n"
+        f"search.jsonl and details/ are the older separate-file form of the same\n"
+        f"index. Firmware 4.77 and newer read the copy inside OpenRemote.irdb and\n"
+        f"do not need them; they are kept here only for older firmware.\n",
+        encoding="utf-8")
     shutil.copy2(db_path,ACTIVE_DB); STATE["db_path"]=str(ACTIVE_DB); STATE["bin_mb"]=db_path.stat().st_size/1024/1024
     dest=Path(save_parent)/f"OpenRemote.irdb v{version}"
     if dest.exists(): shutil.rmtree(dest)

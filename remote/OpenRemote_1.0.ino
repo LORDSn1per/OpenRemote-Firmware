@@ -1,6 +1,32 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.77 - 2026-09-12
+    - Reads the IRDB search index from inside OpenRemote.irdb, so WebConfig can
+      search all 14,551 devices and import one with no computer involved. The
+      remote previously needed three things copied to its SD card - the
+      database, search.jsonl, and a details/ folder holding one file per device
+      - and because Studio's release notes only ever mentioned the database, the
+      other two were never copied and the search had nothing to read. The whole
+      feature has been present and unusable since 1.14.
+    - Studio 2.80 now appends the index to the end of the .irdb. SQLite takes
+      its size from the page count in its own header and ignores trailing bytes,
+      so the file stays a valid database Studio opens exactly as before, while
+      the remote reads a 64-byte footer at the end to find two appended
+      sections: a compact JSONL line per device, then the full records. Each
+      search line carries the offset and length of its own detail record, so
+      importing is one scan of the small section and a single seek.
+    - Every offset is bounds checked against the file before a seek. A
+      truncated or half-copied database would otherwise send the reader into
+      nothing, and an index that cannot be trusted is worse than no index.
+    - The older separate search.jsonl and details/ files still work; the
+      embedded copy is simply preferred when present. /api/config reports either
+      form as installed, so existing cards keep working untouched.
+    - Measured on the real 14,551-device database: the search section is 3.0 MB
+      at about 206 bytes a line, which is what a full scan costs on every
+      keystroke. Carrying everything the detail record holds would have cost
+      12.1 MB and roughly six seconds a search.
+
   4.76 - 2026-09-12
     - Fixes OpenRemote Studio USB imports losing the first letter of the device
       file name. "ORUSB IRFILE " is thirteen characters and the parser started
@@ -5953,7 +5979,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.76"
+#define OPENREMOTE_VERSION_STRING "4.77"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -8845,6 +8871,9 @@ bool addEspNowDevice(const uint8_t mac[6], const char *name);
 bool removeEspNowDevice(const uint8_t mac[6]);
 bool sendEspNowCommand(const DeviceCommand &command);
 bool dockOtaPrepare(uint8_t deviceIndex, String &error);
+// Reported by /api/config, which is built well above the IRDB handlers.
+bool irdbSearchAvailable();
+bool irdbDetailAvailable();
 void applyDisplayPanelPreset(const DisplayPanelPreset &preset);
 void serviceDisplayRescueCombo(unsigned long now);
 // Both Display page renderers build the LCD Panel row, and both sit above the
@@ -13166,8 +13195,10 @@ String buildStatusJson() {
   doc["webConfigInstalled"] = sdReady && SD.exists(WEB_CONFIG_PATH);
   doc["webConfigVersion"] = installedWebConfigVersion();
   doc["irdbInstalled"] = sdReady && SD.exists(IRDB_PATH);
-  doc["irdbSearchIndexInstalled"] = sdReady && SD.exists(IRDB_SEARCH_INDEX_PATH);
-  doc["irdbDetailIndexInstalled"] = sdReady && SD.exists(IRDB_DETAIL_DIR);
+  // True for either form: the index embedded in OpenRemote.irdb, or the older
+  // separate search.jsonl and details/ files.
+  doc["irdbSearchIndexInstalled"] = irdbSearchAvailable();
+  doc["irdbDetailIndexInstalled"] = irdbDetailAvailable();
   doc["irdbBuildDate"] = irdbBuildDate;
   doc["irdbDeviceCount"] = irdbDeviceCount;
   doc["deviceFileCount"] = countSavedIrDeviceFiles();
@@ -18189,13 +18220,107 @@ bool lineMatchesSearchTerms(const String &line, const String terms[], uint8_t te
   return true;
 }
 
+/*
+  The searchable index that OpenRemote Studio appends to OpenRemote.irdb.
+
+  The remote used to need three things copied to its SD card - the database,
+  search.jsonl, and a details/ folder holding one file per device, fourteen
+  thousand of them. Studio's release notes only ever mentioned the database, so
+  in practice the other two were never copied and WebConfig's IRDB search had
+  nothing to read at all.
+
+  Studio now appends the index to the end of the .irdb itself. SQLite takes its
+  size from the page count in its own header and ignores anything after it, so
+  the file remains a valid database that Studio opens exactly as before, while
+  the remote - which does not parse SQLite - reads a fixed 64-byte footer at the
+  very end to find the two appended sections.
+
+      [ SQLite database       ]
+      [ search section, JSONL ]  one compact line per device
+      [ detail section, JSON  ]  full records, concatenated
+      [ 64-byte footer        ]
+
+  Each search line carries "o" and "l", the offset and length of that device's
+  detail record within the detail section, so importing is one scan of the small
+  section and then a single seek - never a walk of the whole database.
+*/
+struct IrdbEmbeddedIndex {
+  bool present = false;
+  uint64_t searchOffset = 0;
+  uint64_t searchLength = 0;
+  uint64_t detailOffset = 0;
+  uint64_t detailLength = 0;
+  uint32_t deviceCount = 0;
+  uint32_t formatVersion = 0;
+};
+
+static const size_t IRDB_INDEX_FOOTER_SIZE = 64;
+
+bool readIrdbEmbeddedIndex(IrdbEmbeddedIndex &out) {
+  if (!sdReady || !SD.exists(IRDB_PATH)) return false;
+  File file = SD.open(IRDB_PATH, FILE_READ);
+  if (!file) return false;
+  uint64_t size = (uint64_t)file.size();
+  if (size < IRDB_INDEX_FOOTER_SIZE) { file.close(); return false; }
+  if (!file.seek((uint32_t)(size - IRDB_INDEX_FOOTER_SIZE))) { file.close(); return false; }
+  uint8_t footer[IRDB_INDEX_FOOTER_SIZE];
+  int got = file.read(footer, sizeof(footer));
+  file.close();
+  if (got != (int)sizeof(footer)) return false;
+  static const uint8_t magic[8] = {'O','R','I','D','X','1',0,0};
+  if (memcmp(footer, magic, sizeof(magic)) != 0) return false;
+  memcpy(&out.searchOffset, footer + 8, 8);
+  memcpy(&out.searchLength, footer + 16, 8);
+  memcpy(&out.detailOffset, footer + 24, 8);
+  memcpy(&out.detailLength, footer + 32, 8);
+  memcpy(&out.deviceCount, footer + 40, 4);
+  memcpy(&out.formatVersion, footer + 44, 4);
+  // Every section must lie inside the file and before the footer. A truncated
+  // or half-copied database would otherwise send the reader seeking into
+  // nothing, and an index that cannot be trusted is worse than no index.
+  uint64_t limit = size - IRDB_INDEX_FOOTER_SIZE;
+  if (out.formatVersion != 1) return false;
+  if (out.searchOffset > limit || out.searchLength > limit - out.searchOffset) return false;
+  if (out.detailOffset > limit || out.detailLength > limit - out.detailOffset) return false;
+  out.present = out.searchLength > 0;
+  return out.present;
+}
+
+bool irdbSearchAvailable() {
+  IrdbEmbeddedIndex index;
+  if (readIrdbEmbeddedIndex(index)) return true;
+  return sdReady && SD.exists(IRDB_SEARCH_INDEX_PATH);
+}
+
+bool irdbDetailAvailable() {
+  IrdbEmbeddedIndex index;
+  if (readIrdbEmbeddedIndex(index)) return index.detailLength > 0;
+  return sdReady && SD.exists(IRDB_DETAIL_DIR);
+}
+
+// Reads one newline-terminated line from an open file without running past a
+// section boundary. The embedded sections are followed immediately by more
+// data, so readStringUntil('\n') alone would happily read into the next one.
+bool readIrdbIndexLine(File &file, uint64_t stopAt, String &line) {
+  line = "";
+  while ((uint64_t)file.position() < stopAt) {
+    int c = file.read();
+    if (c < 0) break;
+    if (c == '\n') return true;
+    if (c != '\r' && line.length() < 2048) line += (char)c;
+  }
+  return line.length() > 0;
+}
+
 void handleIrdbSearch() {
   if (!requestAuthorized()) {
     sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
     return;
   }
-  if (!sdReady || !SD.exists(IRDB_SEARCH_INDEX_PATH)) {
-    sendJson(404, "{\"ok\":false,\"error\":\"Copy /irdb/search.jsonl to the SD card from the latest OpenRemote package\"}");
+  IrdbEmbeddedIndex embedded;
+  bool useEmbedded = readIrdbEmbeddedIndex(embedded);
+  if (!useEmbedded && (!sdReady || !SD.exists(IRDB_SEARCH_INDEX_PATH))) {
+    sendJson(404, "{\"ok\":false,\"error\":\"Copy OpenRemote.irdb to /irdb on the SD card - build it with OpenRemote Studio\"}");
     return;
   }
 
@@ -18217,10 +18342,21 @@ void handleIrdbSearch() {
     start = space + 1;
   }
 
-  File file = SD.open(IRDB_SEARCH_INDEX_PATH, FILE_READ);
+  File file = SD.open(useEmbedded ? IRDB_PATH : IRDB_SEARCH_INDEX_PATH, FILE_READ);
   if (!file) {
-    sendJson(500, "{\"ok\":false,\"error\":\"Could not open /irdb/search.jsonl\"}");
+    sendJson(500, "{\"ok\":false,\"error\":\"Could not open the IRDB search index\"}");
     return;
+  }
+  // Bounded to the search section when reading the embedded copy; the detail
+  // section follows it immediately with no separator of its own.
+  uint64_t scanStop = (uint64_t)file.size();
+  if (useEmbedded) {
+    if (!file.seek((uint32_t)embedded.searchOffset)) {
+      file.close();
+      sendJson(500, "{\"ok\":false,\"error\":\"Could not seek to the embedded IRDB index\"}");
+      return;
+    }
+    scanStop = embedded.searchOffset + embedded.searchLength;
   }
 
   const uint8_t maxResults = 25;
@@ -18234,8 +18370,9 @@ void handleIrdbSearch() {
   webServer.send(200, "application/json", "");
   webServer.sendContent("{\"ok\":true,\"results\":[");
 
-  while (file.available()) {
-    String line = file.readStringUntil('\n');
+  while ((uint64_t)file.position() < scanStop) {
+    String line;
+    if (!readIrdbIndexLine(file, scanStop, line)) break;
     line.trim();
     lines++;
     if (line.length() && lineMatchesSearchTerms(line, terms, termCount)) {
@@ -18264,8 +18401,9 @@ void handleIrdbSearch() {
   webServer.sendContent(String(lines));
   webServer.sendContent("}");
   webServer.sendContent("");
-  Serial.printf("IRDB search \"%s\": %u/%u shown from %u index lines\n",
-                query.c_str(), (unsigned)shown, (unsigned)total, (unsigned)lines);
+  Serial.printf("IRDB search \"%s\": %u/%u shown from %u index lines (%s)\n",
+                query.c_str(), (unsigned)shown, (unsigned)total, (unsigned)lines,
+                useEmbedded ? "embedded in OpenRemote.irdb" : "/irdb/search.jsonl");
 }
 
 void handleIrdbDetail() {
@@ -18273,8 +18411,10 @@ void handleIrdbDetail() {
     sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
     return;
   }
-  if (!sdReady || !SD.exists(IRDB_DETAIL_DIR)) {
-    sendJson(404, "{\"ok\":false,\"error\":\"Copy /irdb/details to the SD card from the latest OpenRemote package\"}");
+  IrdbEmbeddedIndex embedded;
+  bool useEmbedded = readIrdbEmbeddedIndex(embedded) && embedded.detailLength > 0;
+  if (!useEmbedded && (!sdReady || !SD.exists(IRDB_DETAIL_DIR))) {
+    sendJson(404, "{\"ok\":false,\"error\":\"Copy OpenRemote.irdb to /irdb on the SD card - build it with OpenRemote Studio\"}");
     return;
   }
 
@@ -18291,6 +18431,67 @@ void handleIrdbDetail() {
       return;
     }
   }
+  if (useEmbedded) {
+    File file = SD.open(IRDB_PATH, FILE_READ);
+    if (!file || !file.seek((uint32_t)embedded.searchOffset)) {
+      if (file) file.close();
+      sendJson(500, "{\"ok\":false,\"error\":\"Could not read the embedded IRDB index\"}");
+      return;
+    }
+    // The id is matched against the line's own "id" field rather than anywhere
+    // in the line, so a device whose model text happens to contain another
+    // device's id cannot be served by mistake.
+    String needle = String("\"id\":\"") + id + "\"";
+    uint64_t stopAt = embedded.searchOffset + embedded.searchLength;
+    uint64_t offset = 0;
+    uint64_t length = 0;
+    bool found = false;
+    unsigned long lastYieldMs = millis();
+    while ((uint64_t)file.position() < stopAt) {
+      String line;
+      if (!readIrdbIndexLine(file, stopAt, line)) break;
+      if (line.indexOf(needle) >= 0) {
+        int at = line.lastIndexOf("\"o\":");
+        int lengthAt = line.lastIndexOf("\"l\":");
+        if (at >= 0 && lengthAt >= 0) {
+          offset = (uint64_t)strtoull(line.c_str() + at + 4, nullptr, 10);
+          length = (uint64_t)strtoull(line.c_str() + lengthAt + 4, nullptr, 10);
+          found = length > 0 && offset + length <= embedded.detailLength;
+        }
+        break;
+      }
+      unsigned long now = millis();
+      if (now - lastYieldMs >= 10UL) { lastYieldMs = now; delay(1); }
+    }
+    if (!found) {
+      file.close();
+      sendJson(404, "{\"ok\":false,\"error\":\"Device not found in the embedded IRDB index\"}");
+      return;
+    }
+    if (!file.seek((uint32_t)(embedded.detailOffset + offset))) {
+      file.close();
+      sendJson(500, "{\"ok\":false,\"error\":\"Could not seek to the device record\"}");
+      return;
+    }
+    webServer.sendHeader("Cache-Control", "no-store");
+    webServer.setContentLength((size_t)length);
+    webServer.send(200, "application/json", "");
+    uint8_t chunk[512];
+    uint64_t remaining = length;
+    while (remaining) {
+      size_t want = (size_t)min<uint64_t>(remaining, sizeof(chunk));
+      int got = file.read(chunk, want);
+      if (got <= 0) break;
+      webServer.sendContent((const char *)chunk, (size_t)got);
+      remaining -= (uint64_t)got;
+      delay(0);
+    }
+    file.close();
+    Serial.printf("IRDB detail \"%s\": %lu bytes from the embedded index\n",
+                  id.c_str(), (unsigned long)length);
+    return;
+  }
+
   String prefix = id.substring(0, id.length() >= 2 ? 2 : id.length());
   String path = String(IRDB_DETAIL_DIR) + "/" + prefix + "/" + id + ".json";
   File file = SD.open(path, FILE_READ);
