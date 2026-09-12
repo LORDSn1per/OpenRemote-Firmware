@@ -1,6 +1,18 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.89 - 2026-09-13
+    - Stops a body posted to the wrong upload route from crashing the remote.
+      WebServer calls a route's single upload callback for a multipart body and
+      for a raw one alike, and never says which it chose - webServer.upload()
+      and webServer.raw() each dereference a pointer that is null until a body
+      of that kind has been seen. So a raw POST to /api/upload/chunk, or a
+      multipart one to /api/upload/raw, was a null dereference on any remote
+      that had not already handled that exact kind of upload since boot. Both
+      routes now decide for themselves, by the same test the library used -
+      "Content-Type begins with multipart/" - and a mismatched body is simply
+      refused for want of a target.
+
   4.88 - 2026-09-13
     - Lifts the WebConfig upload off 170KB/s. Four things were in the way and
       all four are fixed; none of them was the SD card, which has never been
@@ -6196,7 +6208,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.88"
+#define OPENREMOTE_VERSION_STRING "4.89"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -20929,7 +20941,7 @@ void abortChunkUploadRequest() {
   chunkUploadError = "Chunk upload interrupted; retrying from the last complete chunk";
 }
 
-void handleChunkUploadData() {
+void handleChunkUploadMultipart() {
   HTTPUpload &upload = webServer.upload();
   chunkUploadLastActivityMs = millis();
   if (upload.status == UPLOAD_FILE_START) {
@@ -20961,7 +20973,7 @@ void handleChunkUploadData() {
   The same applies to the response handler for this route, which is why it
   reads its size and CRC from headers too.
 */
-void handleChunkUploadRaw() {
+void handleChunkUploadOctetStream() {
   HTTPRaw &raw = webServer.raw();
   chunkUploadLastActivityMs = millis();
   if (raw.status == RAW_START) {
@@ -20975,6 +20987,26 @@ void handleChunkUploadRaw() {
   } else if (raw.status == RAW_ABORTED) {
     abortChunkUploadRequest();
   }
+}
+
+/*
+  Picks the transport the same way the web server did.
+
+  Both upload routes share one handler function, because the library calls the
+  route's single upload callback for a multipart body AND for a raw one. Which
+  of the two it chose is not exposed: webServer.upload() and webServer.raw()
+  each dereference a unique_ptr that is null until a body of that kind has been
+  seen, so a raw POST to /api/upload/chunk - or a multipart one to
+  /api/upload/raw - would have crashed the remote outright on a fresh boot.
+
+  The library's own choice is "Content-Type begins with multipart/"
+  (Parsing.cpp), so mirroring that exactly is the one test that cannot disagree
+  with it. A body posted to the wrong route now simply finds no target and is
+  refused, which is what a mismatch deserves.
+*/
+void handleChunkUploadData() {
+  if (webServer.header("Content-Type").startsWith("multipart/")) handleChunkUploadMultipart();
+  else handleChunkUploadOctetStream();
 }
 
 void handleChunkUploadFinish() {
@@ -23264,8 +23296,11 @@ void configureWebServer() {
   // The raw upload path never parses the query string (see
   // handleChunkUploadRaw), so its target and offset arrive as headers and have
   // to be collected explicitly.
-  const char *headers[] = {"X-OpenRemote-Token", "X-OR-Target", "X-OR-Offset"};
-  webServer.collectHeaders(headers, 3);
+  // Content-Type is collected because the upload routes have to tell a
+  // multipart body from a raw one themselves - see handleChunkUploadData().
+  const char *headers[] = {"X-OpenRemote-Token", "X-OR-Target", "X-OR-Offset",
+                           "Content-Type"};
+  webServer.collectHeaders(headers, 4);
   webServer.on("/", HTTP_GET, serveWebConfig);
   webServer.on("/index.html", HTTP_GET, serveWebConfig);
   webServer.on("/hotspot-detect.html", HTTP_GET, serveCaptivePortal);
@@ -23395,7 +23430,7 @@ void configureWebServer() {
                     ? String("{\"ok\":true,\"bytes\":") + String((unsigned)chunkUploadBytes) + "}"
                     : String("{\"ok\":false,\"error\":\"") + chunkUploadError +
                       "\",\"bytes\":" + String((unsigned)chunkUploadBytes) + "}");
-  }, handleChunkUploadRaw);
+  }, handleChunkUploadData);
   webServer.on("/api/sd/format", HTTP_POST, handleSdRebuild);
   webServer.on("/api/factory-reset", HTTP_POST, handleFactoryReset);
   webServer.on("/api/backups", HTTP_GET, handleBackupList);
