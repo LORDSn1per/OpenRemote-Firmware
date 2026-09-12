@@ -1,6 +1,32 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.76 - 2026-09-12
+    - Fixes OpenRemote Studio USB imports losing the first letter of the device
+      file name. "ORUSB IRFILE " is thirteen characters and the parser started
+      reading the filename at index 14, so Studio sent
+      Ir_Plus_S_SONY_STR_DB2000_2078c337.ir and the remote saved
+      r_Plus_S_SONY_STR_DB2000_2078c337.ir. Every other ORUSB command already
+      used an offset equal to its own prefix length - IRFILE was the only one
+      out of step, which is why nothing else ever lost a character. The length
+      is now taken from the literal itself so it cannot drift again.
+    - Folds device, activity, macro, command and tile names into the ASCII range
+      the LCD fonts actually contain. The built-in Montserrat faces carry the
+      compact ASCII range and nothing else, so every code point above 0x7F drew
+      the font's missing-glyph square - and Homebridge and Home Assistant names
+      are full of them. A non-breaking space between words turned "Office
+      Ceiling Fan" into "Office[]Ceiling[]Fan" on screen; curly apostrophes and
+      full-width commas did the same.
+    - The dock has folded exactly this punctuation out of media titles since
+      1.60, because Android apps emit it too. Device names arrive over a
+      different path entirely - WebConfig into runtime.json - and never went
+      near that code. copyDisplayTextAscii() is the same mapping, applied where
+      names enter the runtime model, so it fixes everything already configured
+      without anyone re-importing. Handles NBSP, curly quotes, en/em dashes,
+      bullets, middle dots, ellipses, full-width comma and apostrophe, word
+      joiners and a stray BOM; anything genuinely unmappable becomes "?" rather
+      than vanishing, so a lost character is visible instead of silent.
+
   4.75 - 2026-09-12
     - A dock this remote is already paired with is no longer recorded as a
       pairing candidate. It still answers a pairing scan, and the scan recorded
@@ -5927,7 +5953,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.75"
+#define OPENREMOTE_VERSION_STRING "4.76"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -13434,6 +13460,67 @@ void handleWifiForgetApi() {
   sendJson(202, "{\"ok\":true,\"accepted\":true}");
 }
 
+/*
+  Folds text into the ASCII range the LCD fonts actually contain.
+
+  The Montserrat faces built into this firmware carry the compact ASCII range
+  and nothing else, so every code point above 0x7F renders as the font's
+  missing-glyph square. Homebridge and Home Assistant accessory names are full
+  of them: a non-breaking space between words, a curly apostrophe in "Jane's
+  Lamp", a full-width comma. Imported straight through, "Office Ceiling Fan"
+  arrives on screen as "Office[]Ceiling[]Fan".
+
+  This is the same mapping the dock already applies to media titles in
+  copyMediaTextAscii() - the dock has needed it since 1.60 because Android apps
+  emit the same punctuation - but device, activity, macro and command names come
+  in over a completely different path (WebConfig into runtime.json) and never
+  went near it. Applied here, at the point names enter the runtime model, so it
+  covers everything already configured without anyone re-importing.
+
+  An unsupported code point becomes "?" rather than being dropped: a visible
+  question mark says "a character did not survive" and keeps word spacing,
+  where silently deleting it produces a name that looks deliberate and wrong.
+*/
+void copyDisplayTextAscii(const char *source, char *destination, size_t size) {
+  if (!destination || !size) return;
+  destination[0] = '\0';
+  if (!source) return;
+  size_t out = 0;
+  auto append = [&](const char *text) {
+    while (*text && out + 1 < size) destination[out++] = *text++;
+  };
+  const uint8_t *p = (const uint8_t *)source;
+  while (*p && out + 1 < size) {
+    if (*p < 0x80) {
+      destination[out++] = (*p >= 0x20 || *p == '\t') ? (char)*p : ' ';
+      p++;
+      continue;
+    }
+    if (p[0] == 0xC2 && p[1] == 0xA0) { append(" "); p += 2; continue; }   // NBSP
+    if (p[0] == 0xC2 && p[1] == 0xB7) { append(" - "); p += 2; continue; } // middle dot
+    if (p[0] == 0xE2 && p[1] == 0x80) {
+      if (p[2] >= 0x98 && p[2] <= 0x9B) append("'");
+      else if (p[2] == 0x9C || p[2] == 0x9D) append("\"");
+      else if (p[2] >= 0x90 && p[2] <= 0x95) append("-");
+      else if (p[2] == 0xA2) append(" - ");
+      else if (p[2] == 0xA6) append("...");
+      else append(" ");
+      p += 3;
+      continue;
+    }
+    if (p[0] == 0xE2 && p[1] == 0x81 && p[2] == 0xA0) { p += 3; continue; } // word joiner
+    if (p[0] == 0xEF && p[1] == 0xBC && p[2] == 0x8C) { append(","); p += 3; continue; }
+    if (p[0] == 0xEF && p[1] == 0xBC && p[2] == 0x87) { append("'"); p += 3; continue; }
+    if (p[0] == 0xEF && p[1] == 0xBB && p[2] == 0xBF) { p += 3; continue; } // BOM
+    append("?");
+    if ((*p & 0xE0) == 0xC0) p += 2;
+    else if ((*p & 0xF0) == 0xE0) p += 3;
+    else if ((*p & 0xF8) == 0xF0) p += 4;
+    else p++;
+  }
+  destination[out] = '\0';
+}
+
 void applySettingsJson(JsonVariantConst settings) {
   if (settings.isNull()) return;
   bool previousWifiOn = wifiOn;
@@ -16155,7 +16242,7 @@ void loadRuntimeModel(JsonDocument &doc) {
       sourceName.indexOf("chromecast") >= 0 || sourceName.indexOf("google tv") >= 0;
     Device &device = devices[DEVICE_COUNT++];
     strlcpy(device.id, sourceId, sizeof(device.id));
-    strlcpy(device.name, source["name"] | "Unnamed device", sizeof(device.name));
+    copyDisplayTextAscii(source["name"] | "Unnamed device", device.name, sizeof(device.name));
     const char *transport = source["protocol"] | "";
     if (!transport[0]) transport = source["transport"] | "IR";
     strlcpy(device.transport, transport, sizeof(device.transport));
@@ -16164,7 +16251,7 @@ void loadRuntimeModel(JsonDocument &doc) {
       DeviceCommand &runtimeCommand = device.commands[device.commandCount];
       const char *label = command["name"] | "";
       if (!label[0]) label = command["label"] | "Command";
-      strlcpy(runtimeCommand.label, label, sizeof(runtimeCommand.label));
+      copyDisplayTextAscii(label, runtimeCommand.label, sizeof(runtimeCommand.label));
       strlcpy(runtimeCommand.id, command["id"] | "", sizeof(runtimeCommand.id));
       runtimeCommand.showText = true;
       runtimeCommand.repeatDefault = command["repeat"] | false;
@@ -16335,7 +16422,7 @@ void loadRuntimeModel(JsonDocument &doc) {
     if (MACRO_COUNT >= MAX_RUNTIME_MACROS) break;
     Macro &macro = macros[MACRO_COUNT++];
     strlcpy(macro.id, source["id"] | "", sizeof(macro.id));
-    strlcpy(macro.name, source["name"] | "Unnamed macro", sizeof(macro.name));
+    copyDisplayTextAscii(source["name"] | "Unnamed macro", macro.name, sizeof(macro.name));
     for (JsonObjectConst step : source["steps"].as<JsonArrayConst>()) {
       appendRuntimeSequenceStep(macro.steps, macro.stepCount, nullptr, step, doc);
       if (macro.stepCount >= MAX_ACTIVITY_STEPS) break;
@@ -16348,7 +16435,7 @@ void loadRuntimeModel(JsonDocument &doc) {
     uint8_t activityIndex = ACTIVITY_COUNT++;
     Activity &activity = activities[activityIndex];
     strlcpy(activity.id, source["id"] | "", sizeof(activity.id));
-    strlcpy(activity.name, source["name"] | "Unnamed activity", sizeof(activity.name));
+    copyDisplayTextAscii(source["name"] | "Unnamed activity", activity.name, sizeof(activity.name));
     const char *activityIconSource = source["iconSrc"] | "";
     activity.iconPath = duplicateRuntimeString(activityIconSource[0] == '/'
       ? String("S:") + activityIconSource : String(activityIconSource));
@@ -16384,7 +16471,7 @@ void loadRuntimeModel(JsonDocument &doc) {
         (tile.kind == Tile::ACTIVITY ? "Activity" :
          (tile.kind == Tile::MACRO ? "Macro" :
           (tile.kind == Tile::WIDGET ? "Widget" : "Button")));
-      strlcpy(tile.label, label, sizeof(tile.label));
+      copyDisplayTextAscii(label, tile.label, sizeof(tile.label));
       if (tile.kind == Tile::WIDGET) {
         if (tile.widgetKind == WIDGET_WEATHER) weatherWidgetPlaced = true;
         // Nothing else on a widget is configurable - it draws its own face.
@@ -17690,12 +17777,20 @@ void handleUsbCommand(Stream &port, UsbSerialSession &session, String command) {
       : "{\"ok\":false,\"error\":\"Factory reset could not rebuild user folders\"}");
     if (ok) hardRestartPending = true;
   } else if (command.startsWith("ORUSB IRFILE ")) {
-    int nameEnd = command.indexOf(' ', 14);
+    // 13, not 14. "ORUSB IRFILE " is thirteen characters, so the filename
+    // starts at index 13 - starting at 14 silently ate its first character and
+    // every Studio import landed one letter short: Studio sent
+    // Ir_Plus_S_SONY_STR_DB2000_2078c337.ir and the remote saved
+    // r_Plus_S_SONY_STR_DB2000_2078c337.ir. Every other ORUSB command already
+    // uses an offset equal to its own prefix length; this was the only one out
+    // of step, which is why nothing else lost a character.
+    static const size_t IRFILE_PREFIX_LENGTH = sizeof("ORUSB IRFILE ") - 1;
+    int nameEnd = command.indexOf(' ', IRFILE_PREFIX_LENGTH);
     if (nameEnd < 0) {
       usbImportReply(port, "{\"ok\":false,\"error\":\"Missing .ir filename or length\"}");
       return;
     }
-    String fileName = command.substring(14, nameEnd);
+    String fileName = command.substring(IRFILE_PREFIX_LENGTH, nameEnd);
     size_t length = (size_t)command.substring(nameEnd + 1).toInt();
     clearUsbDownload(session);
     beginUsbIrUpload(port, session, fileName, length);
