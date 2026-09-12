@@ -1,6 +1,14 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.75 - 2026-09-12
+    - A dock this remote is already paired with is no longer recorded as a
+      pairing candidate. It still answers a pairing scan, and the scan recorded
+      it regardless, so the device list showed the dock twice - once with
+      Rename/Forget and again below it as "found nearby" with an Add button.
+      Pressing that Add only updated the existing entry's name, so it looked
+      like adding a dock simply did not save. One cause, both symptoms.
+
   4.74 - 2026-09-12
     - Fixes "Dock only" IR routing transmitting nothing at all when no dock is
       paired. useDock was false because there is no dock and useLocal was false
@@ -5919,7 +5927,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.74"
+#define OPENREMOTE_VERSION_STRING "4.75"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -22885,7 +22893,13 @@ void onEspNowDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int 
     memcpy(&packet, data, sizeof(packet));
     if (packet.magic == ESPNOW_ANNOUNCE_MAGIC) {
       packet.name[sizeof(packet.name) - 1] = '\0';
-      if (findEspNowCandidateIndexByMac(info->src_addr) < 0 &&
+      // A dock this remote is already paired with is not a candidate. It still
+      // answers a pairing scan, and recording it here made it appear a second
+      // time in the device list with an "Add" button beside the entry it
+      // already had - and since adding a known MAC only updates its name,
+      // pressing Add looked like it did nothing at all.
+      if (findEspNowDeviceIndexByMac(info->src_addr) < 0 &&
+          findEspNowCandidateIndexByMac(info->src_addr) < 0 &&
           espNowCandidateCount < MAX_ESPNOW_DEVICES) {
         EspNowCandidate &candidate = espNowCandidates[espNowCandidateCount++];
         memcpy(candidate.mac, info->src_addr, 6);

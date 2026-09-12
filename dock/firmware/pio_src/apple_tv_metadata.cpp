@@ -449,25 +449,75 @@ void compactArtworkUrl(String &url) {
 uint16_t *jpegTarget = nullptr;
 uint16_t jpegTargetWidth = 0;
 uint16_t jpegTargetHeight = 0;
+/*
+  The rectangle of the DECODED image that fills the target, in decoded pixels.
+
+  JPEGDEC only decodes at 1/1, 1/2, 1/4 or 1/8, so the decoded image almost
+  never matches the target exactly. The old callback blitted it 1:1 at a centre
+  offset and let the clip throw away everything that did not fit - which meant
+  the excess was not scaled down, it was cropped off. On a large source that is
+  brutal: a 1000x1500 Plex poster decodes at 1/8 to 125x187, and blitting that
+  into a 64x96 frame discards 49% of the width and 49% of the height, leaving a
+  hard centre crop of the middle of the poster. That is the "still cropping out
+  most of the artwork" fault, and it survived the 1.80 portrait work because
+  that fixed the target's aspect ratio without touching how pixels got into it.
+
+  These four describe object-fit: cover - the largest centred rectangle of the
+  decoded image that has the target's aspect ratio. Sampling it across the whole
+  target scales instead of crops, so a portrait target fed a portrait poster now
+  keeps the entire image, while a square target still centre-crops a portrait
+  source exactly as before.
+*/
+uint16_t jpegCropX = 0;
+uint16_t jpegCropY = 0;
+uint16_t jpegCropWidth = 0;
+uint16_t jpegCropHeight = 0;
 
 int drawJpegBlock(JPEGDRAW *block) {
   if (!jpegTarget || !block || !block->pPixels) return 0;
-  int sourceX = 0;
-  int destinationX = block->x;
-  int copyWidth = block->iWidth;
-  if (destinationX < 0) {
-    sourceX = -destinationX;
-    copyWidth -= sourceX;
-    destinationX = 0;
-  }
-  copyWidth = min(copyWidth, (int)jpegTargetWidth - destinationX);
-  if (copyWidth <= 0) return 1;
-  for (int sourceY = 0; sourceY < block->iHeight; sourceY++) {
-    int destinationY = block->y + sourceY;
-    if (destinationY < 0 || destinationY >= jpegTargetHeight) continue;
-    memcpy(jpegTarget + destinationY * jpegTargetWidth + destinationX,
-           block->pPixels + sourceY * block->iWidth + sourceX,
-           (size_t)copyWidth * 2);
+  if (!jpegCropWidth || !jpegCropHeight || !jpegTargetWidth || !jpegTargetHeight) return 0;
+
+  // Nearest neighbour, driven from the destination so every target pixel is
+  // written exactly once and no gaps appear between decoded blocks. Only the
+  // destination range this block can actually supply is walked, rather than the
+  // whole frame per block.
+  const uint32_t cropW = jpegCropWidth;
+  const uint32_t cropH = jpegCropHeight;
+  const uint32_t targetW = jpegTargetWidth;
+  const uint32_t targetH = jpegTargetHeight;
+  const int blockX = block->x;
+  const int blockY = block->y;
+  const int blockW = block->iWidth;
+  const int blockH = block->iHeight;
+
+  // Source span this block covers, expressed in crop-relative coordinates.
+  int spanStartX = blockX - (int)jpegCropX;
+  int spanStartY = blockY - (int)jpegCropY;
+  int spanEndX = spanStartX + blockW;
+  int spanEndY = spanStartY + blockH;
+  if (spanEndX <= 0 || spanEndY <= 0) return 1;
+  if (spanStartX >= (int)cropW || spanStartY >= (int)cropH) return 1;
+
+  // Destination pixels whose sample point falls inside that span.
+  int firstX = (int)(((uint32_t)max(spanStartX, 0) * targetW + cropW - 1) / cropW);
+  int lastX = (int)(((uint32_t)min(spanEndX, (int)cropW) * targetW + cropW - 1) / cropW);
+  int firstY = (int)(((uint32_t)max(spanStartY, 0) * targetH + cropH - 1) / cropH);
+  int lastY = (int)(((uint32_t)min(spanEndY, (int)cropH) * targetH + cropH - 1) / cropH);
+  if (lastX > (int)targetW) lastX = (int)targetW;
+  if (lastY > (int)targetH) lastY = (int)targetH;
+
+  for (int destinationY = firstY; destinationY < lastY; destinationY++) {
+    int sourceY = (int)(((uint32_t)destinationY * cropH) / targetH) + (int)jpegCropY;
+    int blockRow = sourceY - blockY;
+    if (blockRow < 0 || blockRow >= blockH) continue;
+    const uint16_t *sourceRow = block->pPixels + (size_t)blockRow * blockW;
+    uint16_t *destinationRow = jpegTarget + (size_t)destinationY * targetW;
+    for (int destinationX = firstX; destinationX < lastX; destinationX++) {
+      int sourceX = (int)(((uint32_t)destinationX * cropW) / targetW) + (int)jpegCropX;
+      int blockColumn = sourceX - blockX;
+      if (blockColumn < 0 || blockColumn >= blockW) continue;
+      destinationRow[destinationX] = sourceRow[blockColumn];
+    }
   }
   return 1;
 }
@@ -1721,7 +1771,31 @@ bool AppleTvMetadataClient::decodeArtwork(const char *url, uint16_t *rgb565,
   static const int scaleOptions[] = {
     0, JPEG_SCALE_HALF, JPEG_SCALE_QUARTER, JPEG_SCALE_EIGHTH
   };
-  bool decoded = jpeg->decode(x, y, scaleOptions[scale]) != 0;
+  (void)x;
+  (void)y;
+  // object-fit: cover - the largest centred rectangle of the decoded image that
+  // carries the target's aspect ratio. When the two already match, as they do
+  // for a portrait poster going into a proportional portrait target, this is the
+  // whole image and nothing is lost.
+  if ((uint32_t)decodedWidth * targetHeight >= (uint32_t)decodedHeight * targetWidth) {
+    jpegCropHeight = (uint16_t)decodedHeight;
+    jpegCropWidth = (uint16_t)max(1u, (unsigned)(((uint32_t)decodedHeight * targetWidth) / targetHeight));
+  } else {
+    jpegCropWidth = (uint16_t)decodedWidth;
+    jpegCropHeight = (uint16_t)max(1u, (unsigned)(((uint32_t)decodedWidth * targetHeight) / targetWidth));
+  }
+  if (jpegCropWidth > decodedWidth) jpegCropWidth = (uint16_t)decodedWidth;
+  if (jpegCropHeight > decodedHeight) jpegCropHeight = (uint16_t)decodedHeight;
+  jpegCropX = (uint16_t)((decodedWidth - (int)jpegCropWidth) / 2);
+  jpegCropY = (uint16_t)((decodedHeight - (int)jpegCropHeight) / 2);
+  Serial.printf("Media: artwork %dx%d decoded at 1/%d to %dx%d, sampling %ux%u at %u,%u into %ux%u\n",
+                imageWidth, imageHeight, 1 << scale, decodedWidth, decodedHeight,
+                (unsigned)jpegCropWidth, (unsigned)jpegCropHeight,
+                (unsigned)jpegCropX, (unsigned)jpegCropY,
+                (unsigned)targetWidth, (unsigned)targetHeight);
+  // Decoded at the origin now: the callback scales rather than relying on a
+  // negative blit offset to crop.
+  bool decoded = jpeg->decode(0, 0, scaleOptions[scale]) != 0;
   if (!decoded) Serial.println("Apple TV: JPEG decode failed");
   jpeg->close();
   delete jpeg;

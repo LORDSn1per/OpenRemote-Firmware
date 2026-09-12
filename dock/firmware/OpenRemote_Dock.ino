@@ -1,6 +1,29 @@
 /*
   OpenRemote Dock firmware change log (newest first)
 
+  1.82 - 2026-09-12
+    - Scales artwork into the transfer frame instead of cropping it. JPEGDEC
+      only decodes at 1/1, 1/2, 1/4 or 1/8, so the decoded image almost never
+      matches the target exactly - and drawJpegBlock() blitted it 1:1 at a
+      centre offset and let the clip discard everything that did not fit. The
+      excess was not scaled down, it was cut off. On a large source that is
+      brutal: a 1000x1500 poster decodes at 1/8 to 125x187, and blitting that
+      into a 64x96 frame throws away 49% of the width and 49% of the height,
+      leaving a hard centre crop of the middle of the poster. That is why Plex
+      and Prime Video art still lost most of the picture even after 1.80 gave
+      it the right shape - 1.80 fixed the frame's aspect ratio without changing
+      how pixels got into it.
+    - drawJpegBlock() now samples nearest-neighbour from the largest centred
+      rectangle of the decoded image carrying the target's aspect ratio, which
+      is object-fit: cover. A portrait poster going into a proportional portrait
+      frame therefore keeps the whole image, while a square frame still centre
+      crops a portrait source exactly as Apple TV and ABC expect. Verified by
+      simulation across seven decode/target combinations: every target pixel is
+      written exactly once, with no gaps at block boundaries.
+    - Logs the decode at its real sizes ("artwork 1000x1500 decoded at 1/8 to
+      125x187, sampling 124x186 at 0,0 into 64x96"), so a future crop complaint
+      can be read off the log instead of inferred.
+
   1.81 - 2026-09-12
     - Prioritises dock-info replies, OTA state and LED timing ahead of blocking
       Cast, ADB and HTTP work. WebConfig range checks now receive a current
@@ -1205,7 +1228,7 @@ static inline bool serialHostAttached() {
 }
 
 
-#define OPENREMOTE_DOCK_VERSION_STRING "1.81"
+#define OPENREMOTE_DOCK_VERSION_STRING "1.82"
 
 // A literal in the built image, so a tool holding the .bin can tell what it is
 // without running it. The remote firmware carries the same idea under
