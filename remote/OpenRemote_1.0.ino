@@ -1,6 +1,49 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.27 - 2026-09-13
+    - A backup or restore started from WebConfig draws its progress as a
+      full-screen overlay over whatever page is up, replacing the bar 5.25 put
+      under the QR code (which never appeared, and depended on being on that
+      screen). Switching to the Backup/Restore page instead would have torn the
+      session down: openSettingsView() treats leaving the QR page as the user
+      being finished and calls requestWebServerStop() and
+      scheduleNetworkShutdown().
+
+  5.26 - 2026-09-13
+    - The queued backup now announces itself through setLcdBackupStatus(), which
+      is what un-hides the animated bar. Without it the whole backup ran with
+      the bar hidden and stepLcdBackupAnim() returning early, so 5.25's bar on
+      the QR page never appeared even though the percentages were being
+      computed correctly.
+    - A WebConfig restore is queued for the Arduino loop as well, so it drives
+      the same bar, returns immediately for polling, and stops racing the loop
+      for the SD card. POST /api/backups/restore now answers 202 and the result
+      is read from /api/backups/progress.
+
+  5.25 - 2026-09-13
+    - The Backup/Restore progress bar now appears under the QR code on the
+      WebConfig screen. That is the screen actually on the remote while
+      WebConfig is in use, and a backup or restore started from there runs on
+      the Arduino loop (5.24), so it drives the same bar the LCD menu uses -
+      it simply had nowhere to draw it and the remote sat on the QR code for
+      the whole minute-plus.
+    - lcdBackupTrack/AnimBar/StatusLabel are cleared when the page is rebuilt.
+      They point into the content area that lv_obj_clean() deletes and nothing
+      reset them, so they dangled; harmless while only the backup screen read
+      them, not now that a backup can run under any page.
+
+  5.24 - 2026-09-13
+    - A backup requested over HTTP is queued and run by the Arduino loop, and
+      POST /api/backups/create returns straight away. It used to do the whole
+      85-second job inside the request: the web server takes one connection at
+      a time so nothing could ask how far along it was - WebConfig sat at 5%
+      and looked hung - the progress helpers ignore any core but 1 so nothing
+      was measured, and the writing raced the loop for the SD card. Running it
+      where the LCD menu runs it fixes all three.
+    - New GET /api/backups/progress reports phase, percent, the finished name
+      and any error, and answers in milliseconds while a backup is running.
+
   5.23 - 2026-09-13
     - Starting a backup or a restore from the LCD scrolls back to the top and
       repaints before the work begins. Both block the Arduino loop for a minute
@@ -6673,7 +6716,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.23"
+#define OPENREMOTE_VERSION_STRING "5.27"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -8894,6 +8937,26 @@ float lcdBackupBandLow = 0.0f;
 float lcdBackupBandHigh = 1.0f;
 float lcdBackupFraction = 0.0f;
 char lcdBackupPhase[24] = "";
+
+/*
+  A backup asked for over HTTP is run by the Arduino loop, not by the request.
+
+  Doing it inside the handler meant one blocking call of about 85 seconds. The
+  web server takes a single connection at a time, so nothing could ask how far
+  along it was - WebConfig showed 5% for a minute and a half and looked hung -
+  and the progress helpers ignore any core but 1, so nothing was being measured
+  either. It also put the writing on core 0, racing the loop for the SD card.
+
+  Running it where the LCD menu runs it fixes all three at once: the progress
+  bar is driven, there is no second user of the card, and the request returns
+  immediately so /api/backups/progress can be polled while it works.
+*/
+volatile bool backupRequestPending = false;
+volatile bool backupRequestRunning = false;
+volatile bool restoreRequestPending = false;
+char restoreRequestName[64] = "";
+char backupRequestName[64] = "";
+char backupRequestError[128] = "";
 volatile bool pendingRuntimeReload = false;
 volatile bool runtimeReloadCanRollback = false;
 volatile unsigned long runtimeReloadAfterMs = 0;
@@ -9936,6 +9999,16 @@ void renderBackupRestorePage();
 void stepLcdBackupAnim();
 void beginLcdBackupProgress(uint16_t total);
 void beginLcdBackupPhase(const char *phase, uint16_t total, float low, float high);
+// Defined with the Backup/Restore screen, used earlier by the WebConfig QR
+// page, which shows the same bar while a WebConfig-triggered backup runs.
+lv_obj_t *makeLcdBackupTrack(lv_obj_t *parent, int y);
+lv_obj_t *makeLcdBackupAnimBar(lv_obj_t *parent, int y);
+// Also used by serviceQueuedBackup(), which runs well before this is defined.
+void setLcdBackupStatus(const String &message);
+void hideBackupOverlay();
+lv_color_t textPrimary();
+lv_obj_t *makeLabel(lv_obj_t *parent, const char *text, int x, int y,
+                    const lv_font_t *font, lv_color_t colour);
 void setLcdBackupPhaseFraction(const char *phase, float within, float low, float high);
 void advanceLcdBackupProgress();
 void renderAboutPage();
@@ -22127,18 +22200,133 @@ void handleBackupCreateApi() {
     sendJson(503, "{\"ok\":false,\"error\":\"SD card unavailable\"}");
     return;
   }
+  if (backupRequestPending || backupRequestRunning) {
+    sendJson(409, "{\"ok\":false,\"error\":\"A backup is already being written\"}");
+    return;
+  }
+  backupRequestName[0] = '\0';
+  backupRequestError[0] = '\0';
+  backupRequestPending = true;
+  Serial.println("Backup create (WebConfig): queued for the Arduino loop");
+  sendJson(202, "{\"ok\":true,\"started\":true}");
+}
+
+/*
+  How far the queued backup has got. Safe to poll: it only reads state the loop
+  publishes, so it answers in milliseconds while the backup is running.
+*/
+void handleBackupProgressApi() {
+  if (!requestAuthorized()) {
+    sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
+    return;
+  }
+  JsonDocument doc;
+  bool busy = backupRequestPending || backupRequestRunning || restoreRequestPending;
+  doc["ok"] = true;
+  doc["running"] = busy;
+  doc["phase"] = busy ? lcdBackupPhase : "";
+  float f = lcdBackupFraction < 0.0f ? 0.0f : (lcdBackupFraction > 1.0f ? 1.0f : lcdBackupFraction);
+  doc["percent"] = busy ? (int)(f * 100.0f + 0.5f) : (backupRequestName[0] ? 100 : 0);
+  doc["name"] = backupRequestName;
+  doc["error"] = backupRequestError;
+  String body;
+  serializeJson(doc, body);
+  sendJson(200, body);
+}
+
+/*
+  The progress bar for a backup or restore that WebConfig asked for, drawn over
+  whatever page happens to be on screen.
+
+  Switching to the Backup/Restore page would have been simpler, but
+  openSettingsView() treats leaving the WebConfig QR page as "the user is done"
+  and calls requestWebServerStop() and scheduleNetworkShutdown() - it would tear
+  down the very session that asked for the backup. An overlay on the top layer
+  belongs to no page, so it needs no navigation and has no side effects.
+
+  It also replaces the bar 5.25 put under the QR code, which depended on being
+  on that particular screen.
+*/
+lv_obj_t *backupOverlay = nullptr;
+
+void showBackupOverlay(bool restoring) {
+  if (xPortGetCoreID() != 1) return;
+  hideBackupOverlay();
+  backupOverlay = lv_obj_create(lv_layer_top());
+  lv_obj_remove_style_all(backupOverlay);
+  lv_obj_set_pos(backupOverlay, 0, 0);
+  lv_obj_set_size(backupOverlay, LCD_W, LCD_H);
+  lv_obj_set_style_bg_opa(backupOverlay, LV_OPA_COVER, 0);
+  lv_obj_set_style_bg_color(backupOverlay, lvRgb(0x0B, 0x10, 0x18), 0);
+  lv_obj_clear_flag(backupOverlay, LV_OBJ_FLAG_SCROLLABLE);
+
+  makeLabel(backupOverlay, restoring ? "Restoring backup" : "Creating backup",
+            12, 120, &lv_font_montserrat_14, textPrimary());
+  makeLabel(backupOverlay, "Started from WebConfig", 12, 142,
+            &lv_font_montserrat_10, lvRgb(155, 165, 180));
+  lcdBackupTrack = makeLcdBackupTrack(backupOverlay, 170);
+  lcdBackupAnimBar = makeLcdBackupAnimBar(backupOverlay, 170);
+  lcdBackupStatusLabel = makeLabel(backupOverlay, "", 12, 180,
+                                   &lv_font_montserrat_10, lvRgb(155, 165, 180));
+  lv_refr_now(nullptr);
+}
+
+void hideBackupOverlay() {
+  if (xPortGetCoreID() != 1) return;
+  if (backupOverlay && lv_obj_is_valid(backupOverlay)) lv_obj_del(backupOverlay);
+  backupOverlay = nullptr;
+  lcdBackupTrack = nullptr;
+  lcdBackupAnimBar = nullptr;
+  lcdBackupStatusLabel = nullptr;
+}
+
+void serviceQueuedBackup() {
+  if (backupRequestRunning) return;
+  if (!backupRequestPending && !restoreRequestPending) return;
+  bool restoring = restoreRequestPending;
+  backupRequestPending = false;
+  restoreRequestPending = false;
+  backupRequestRunning = true;
+  /*
+    Announced through setLcdBackupStatus() so the bar actually appears.
+
+    It is what un-hides the animated bar - on a message ending in "..." - and
+    the LCD menu has always called it. The queued path did not, so the whole
+    backup ran with the bar hidden and stepLcdBackupAnim() returning early: the
+    percentages were being computed and drawn nowhere.
+  */
+  showBackupOverlay(restoring);
+  setLcdBackupStatus(restoring ? "Restoring full backup..." : "Creating full backup...");
   String createdName;
   String error;
   uint32_t startedMs = millis();
-  bool ok = createLcdFullBackup(createdName, error);
-  Serial.printf("Backup create (WebConfig): %s %s took=%ums\n",
+  bool ok;
+  if (restoring) {
+    // reloadNow=false: the model is rebuilt through scheduleRuntimeReloadAfterSync().
+    ok = restoreLcdFullBackup(restoreRequestName, error, false);
+    createdName = restoreRequestName;
+  } else {
+    ok = createLcdFullBackup(createdName, error);
+  }
+  if (ok) {
+    strlcpy(backupRequestName, createdName.c_str(), sizeof(backupRequestName));
+    backupRequestError[0] = '\0';
+  } else {
+    backupRequestName[0] = '\0';
+    strlcpy(backupRequestError, error.c_str(), sizeof(backupRequestError));
+  }
+  setLcdBackupStatus(ok ? (restoring ? "Restore complete" : "Backup created successfully")
+                        : error);
+  Serial.printf("%s (WebConfig): %s %s took=%ums\n",
+                restoring ? "SD restore" : "Backup create",
                 ok ? createdName.c_str() : "-", ok ? "ok" : error.c_str(),
                 (unsigned)(millis() - startedMs));
-  if (!ok) {
-    sendJson(500, String("{\"ok\":false,\"error\":\"") + error + "\"}");
-    return;
-  }
-  sendJson(200, String("{\"ok\":true,\"name\":\"") + createdName + "\"}");
+  lv_refr_now(nullptr);
+  vTaskDelay(pdMS_TO_TICKS(1200));   // let the finished message be read
+  hideBackupOverlay();
+  backupRequestRunning = false;
+  if (restoring && ok) scheduleRuntimeReloadAfterSync();
+  pendingUiRefresh = true;
 }
 
 void handleBackupRestoreApi() {
@@ -22159,19 +22347,22 @@ void handleBackupRestoreApi() {
     sendJson(400, "{\"ok\":false,\"error\":\"Invalid backup filename\"}");
     return;
   }
-  String error;
-  uint32_t startedMs = millis();
-  // reloadNow=false: the runtime model must be rebuilt by the main loop, not
-  // by this HTTP worker on core 0, since LVGL on core 1 references it.
-  bool ok = restoreLcdFullBackup(clean.c_str(), error, false);
-  Serial.printf("SD restore (WebConfig): %s %s took=%ums\n", clean.c_str(),
-                ok ? "ok" : error.c_str(), (unsigned)(millis() - startedMs));
-  if (!ok) {
-    sendJson(400, String("{\"ok\":false,\"error\":\"") + error + "\"}");
+  if (backupRequestPending || backupRequestRunning || restoreRequestPending) {
+    sendJson(409, "{\"ok\":false,\"error\":\"The remote is already busy with a backup\"}");
     return;
   }
-  sendJson(200, String("{\"ok\":true,\"name\":\"") + clean + "\"}");
-  scheduleRuntimeReloadAfterSync();
+  /*
+    Queued for the Arduino loop rather than done here, for the same reasons as
+    a backup: the request returns at once so /api/backups/progress can be
+    polled, the progress bar is driven (the helpers ignore any core but 1), and
+    the writing no longer races the loop for the SD card.
+  */
+  strlcpy(restoreRequestName, clean.c_str(), sizeof(restoreRequestName));
+  backupRequestName[0] = '\0';
+  backupRequestError[0] = '\0';
+  restoreRequestPending = true;
+  Serial.printf("SD restore (WebConfig): %s queued for the Arduino loop\n", clean.c_str());
+  sendJson(202, "{\"ok\":true,\"started\":true}");
 }
 
 // ---------------------------------------------------------------------------
@@ -25606,6 +25797,7 @@ void configureWebServer() {
                                     : "{\"ok\":false,\"error\":\"Upload failed\"}");
   }, handleSdBrowseUploadData);
   webServer.on("/api/backups/create", HTTP_POST, handleBackupCreateApi);
+  webServer.on("/api/backups/progress", HTTP_GET, handleBackupProgressApi);
   webServer.on("/api/backups", HTTP_GET, handleBackupList);
   webServer.on("/api/backups/file", HTTP_GET, handleBackupDownload);
   webServer.on("/api/backups/file", HTTP_DELETE, handleBackupDelete);
@@ -36206,6 +36398,16 @@ void renderCurrentPage() {
   pendingSettingsSlideDirection = 0;
 
   lv_obj_clean(topBar);
+  /*
+    Cleared with the page that owned them. These point at objects inside
+    content, and lv_obj_clean() has just deleted them - nothing ever reset the
+    globals, so they dangled until the next screen that happened to rebuild
+    them. Harmless only because a backup was the one thing that read them, and
+    now that a WebConfig backup can run while any page is up, it is not.
+  */
+  lcdBackupTrack = nullptr;
+  lcdBackupAnimBar = nullptr;
+  lcdBackupStatusLabel = nullptr;
   lv_obj_clean(content);
   // Every widget instance points into the objects just destroyed, and an
   // expanded widget hangs off uiRoot rather than content, so it would
@@ -37891,6 +38093,8 @@ void loop() {
     pendingBluetoothApply = false;
     applyBluetoothState();
   }
+  serviceQueuedBackup();
+  now = millis();
   if (runtimeSettingsSavePending &&
       (int32_t)(now - runtimeSettingsSaveAtMs) >= 0) {
     runtimeSettingsSavePending = !persistSettingsToRuntimeConfig();
