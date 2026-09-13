@@ -1,6 +1,17 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.11 - 2026-09-13
+    - Homebridge accessory names are folded into ASCII as they are discovered,
+      not only where they are drawn. A Homebridge name routinely holds a
+      non-breaking space between words - "Office<U+00A0>Ceiling<U+00A0>Fan" -
+      and the LCD fonts carry ASCII only, so each one drew a missing-glyph box.
+      copyDisplayTextAscii() has folded names entering the runtime model since
+      4.76, which fixed the screen, but the raw U+00A0 still went into
+      runtime.json and into every backup, leaving every later consumer to fold
+      it again. Cleaned at the point it enters the system instead, so what is
+      stored is what is shown.
+
   5.10 - 2026-09-13
     - Backups now carry Wi-Fi and service credentials. Wi-Fi networks and
       passwords, Homebridge address/username/password, MQTT host/user/password/
@@ -6538,7 +6549,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.10"
+#define OPENREMOTE_VERSION_STRING "5.11"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -17358,6 +17369,8 @@ void loadRuntimeModel(JsonDocument &doc) {
       sourceName.indexOf("chromecast") >= 0 || sourceName.indexOf("google tv") >= 0;
     Device &device = devices[DEVICE_COUNT++];
     strlcpy(device.id, sourceId, sizeof(device.id));
+    // Also written back folded by buildRuntimePayload's next save, so a name
+    // imported before 5.11 stops carrying its non-breaking spaces around.
     copyDisplayTextAscii(source["name"] | "Unnamed device", device.name, sizeof(device.name));
     const char *transport = source["protocol"] | "";
     if (!transport[0]) transport = source["transport"] | "IR";
@@ -24448,7 +24461,23 @@ void handleHomebridgeDiscover() {
     if (!name[0]) name = service["displayName"] | "";
     if (!name[0]) name = service["name"] | "";
     if (!name[0]) name = service["type"] | "Homebridge accessory";
-    accessory["name"] = name;
+    /*
+      Folded here, not only where it is displayed.
+
+      Homebridge names routinely contain a non-breaking space between words -
+      "Office\u00A0Ceiling\u00A0Fan" - and the LCD fonts carry ASCII only, so
+      every one of those drew a missing-glyph box. copyDisplayTextAscii() has
+      folded names as they enter the runtime model since 4.76, which fixes the
+      screen, but the raw U+00A0 still went into runtime.json and into every
+      backup, leaving every future consumer to fold it again.
+
+      Cleaning it at the point it enters the system means what is stored is what
+      is shown, and a name copied out of a backup or read over the API is
+      already the name on the remote's screen.
+    */
+    char foldedName[64];
+    copyDisplayTextAscii(name, foldedName, sizeof(foldedName));
+    accessory["name"] = foldedName;
     const char *serviceType = service["type"] | "";
     if (!serviceType[0]) serviceType = service["serviceType"] | "Accessory";
     accessory["type"] = serviceType;
