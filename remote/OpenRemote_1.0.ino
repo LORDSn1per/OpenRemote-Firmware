@@ -1,6 +1,23 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.97 - 2026-09-13
+    - New POST /api/ir/send, so a device can be tried from the IR database
+      before it is added. /api/command/test can only fire a command that
+      already exists in the runtime model, which is no use for deciding whether
+      a database record is the right one - the only way to find out was to add
+      the device, test it, and delete it again if wrong. This takes the signal
+      itself in exactly the shape loadRuntimeModel() reads from runtime.json
+      ("ir": {type, protocol, address, command, bits, frequency, data}), so
+      WebConfig hands over an entry straight out of the database with no
+      translation of its own, and the same parsing rules apply.
+    - It transmits through transmitIrCommand() like everything else, so the IR
+      route decides whether it leaves by this remote's emitter, the dock, or
+      both, and an oversized frame still falls back to the local emitter.
+      Nothing is stored: the command lives on the stack for the request and its
+      raw timings are freed before returning, so trying fifty candidates costs
+      nothing permanent.
+
   4.96 - 2026-09-13
     - A transient SD error no longer throws away the chunk it happened in, and
       this is the real cause of "SD write failed (5: I/O error)" rather than
@@ -6331,7 +6348,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.96"
+#define OPENREMOTE_VERSION_STRING "4.97"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -23035,6 +23052,86 @@ void handleCustomIconRename() {
                 "\",\"name\":\"" + iconDisplayName(newPath) + "\"}");
 }
 
+/*
+  Transmits one IR signal that is not a saved device.
+
+  /api/command/test can only fire a command that already exists in the runtime
+  model, which is no use for trying a device out of the IR database before
+  adding it - the whole point being to find out whether it is the right one.
+  This takes the signal itself, in exactly the shape loadRuntimeModel() reads
+  from runtime.json ("ir": {type, protocol, address, command, bits, frequency,
+  data}), so WebConfig can hand over an entry straight out of the database's
+  irJson with no translation of its own.
+
+  It goes out through transmitIrCommand() like everything else, so the IR route
+  setting decides whether it leaves by this remote's emitter, the dock, or
+  both, and a frame too large for the dock link still falls back locally.
+
+  Nothing is stored. The command lives on the stack for the length of the
+  request and its raw timings are freed before returning, so trying fifty
+  candidates costs nothing permanent.
+*/
+void handleIrSendApi() {
+  if (!requestAuthorized()) {
+    sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
+    return;
+  }
+  JsonDocument doc;
+  if (deserializeJson(doc, webServer.arg("plain"))) {
+    sendJson(400, "{\"ok\":false,\"error\":\"Invalid IR signal request\"}");
+    return;
+  }
+  JsonObjectConst ir = doc["ir"].is<JsonObjectConst>()
+    ? doc["ir"].as<JsonObjectConst>() : doc.as<JsonObjectConst>();
+
+  DeviceCommand command = {};
+  command.slot = 0;
+  command.showText = true;
+  copyDisplayTextAscii(doc["label"] | "IRDB test", command.label, sizeof(command.label));
+
+  const char *type = ir["type"] | "";
+  if (strcmp(type, "raw") == 0) {
+    uint32_t frequency = ir["frequency"] | 38000;
+    command.frequencyKhz = constrain((int)(frequency / 1000U), 20, 60);
+    if (loadRawTimings(command, ir["data"] | "")) command.kind = DeviceCommand::RAW;
+  } else if (strcmp(type, "parsed") == 0) {
+    strlcpy(command.protocol, ir["protocol"] | "", sizeof(command.protocol));
+    const char *addressText = ir["address"] | "";
+    const char *commandText = ir["command"] | "";
+    command.address = addressText[0] ? parseFlipperHex(addressText)
+                                     : (uint32_t)(ir["addressValue"] | 0U);
+    command.command = commandText[0] ? parseFlipperHex(commandText)
+                                     : (uint32_t)(ir["commandValue"] | 0U);
+    command.sonyBits = ir["bits"] | 0;
+    command.kind = DeviceCommand::PARSED;
+  } else if (strcmp(type, "pronto") == 0) {
+    if (loadProntoTimings(command, ir["data"] | "")) command.kind = DeviceCommand::RAW;
+  } else {
+    sendJson(400, "{\"ok\":false,\"error\":\"Unsupported IR signal type\"}");
+    return;
+  }
+
+  if (command.kind != DeviceCommand::RAW && command.kind != DeviceCommand::PARSED) {
+    if (command.rawTimings) { free(command.rawTimings); command.rawTimings = nullptr; }
+    sendJson(400, "{\"ok\":false,\"error\":\"That IR signal carried no usable data\"}");
+    return;
+  }
+
+  bool sent = transmitIrCommand(command);
+  Serial.printf("IRDB test send: %s %s (%s) -> %s\n", command.label,
+                command.kind == DeviceCommand::RAW ? "raw" : command.protocol,
+                command.kind == DeviceCommand::RAW ? String(command.rawCount).c_str() : "parsed",
+                sent ? "sent" : "FAILED");
+  if (command.rawTimings) { free(command.rawTimings); command.rawTimings = nullptr; }
+
+  if (!sent) {
+    sendJson(422, "{\"ok\":false,\"error\":\"Nothing transmitted. Check the IR route in "
+                  "Settings, and that a dock is paired if the route is Dock only.\"}");
+    return;
+  }
+  sendJson(200, "{\"ok\":true,\"sent\":true}");
+}
+
 void handleCommandTest() {
   if (!requestAuthorized()) {
     sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
@@ -23912,6 +24009,7 @@ void configureWebServer() {
   webServer.on("/api/config", HTTP_POST, handleRuntimeConfigUpload,
                handleRuntimeConfigUploadData);
   webServer.on("/api/command/test", HTTP_POST, handleCommandTest);
+  webServer.on("/api/ir/send", HTTP_POST, handleIrSendApi);
   webServer.on("/api/homeassistant/config", HTTP_POST, handleHomeAssistantConfigApi);
   webServer.on("/api/homeassistant/status", HTTP_GET, handleHomeAssistantStatusApi);
   webServer.on("/api/homeassistant/discover", HTTP_POST, handleHomeAssistantDiscover);
