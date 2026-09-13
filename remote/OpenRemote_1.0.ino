@@ -1,6 +1,24 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.96 - 2026-09-13
+    - A transient SD error no longer throws away the chunk it happened in, and
+      this is the real cause of "SD write failed (5: I/O error)" rather than
+      4.95's guess. FatFs makes a write error STICKY: a failed disk write calls
+      ABORT(), which sets fp->err (ff.c:237), and from then on f_write returns
+      that error on entry without attempting anything (ff.c:4069). So does
+      f_lseek (ff.c:4966). Only f_open clears it (ff.c:3881). One momentary
+      glitch from the card therefore kills the file handle outright - every
+      later write comes back EIO having accepted nothing, which is exactly the
+      "requested=16384 accepted=0" the logs kept showing - and 4.90's recovery,
+      which seeked back and retried, never had a chance because the seek fails
+      for the same reason as the write. The writer now closes and reopens the
+      descriptor at the confirmed byte count, which is the only thing that
+      clears fp->err, and carries on. Reopening was always what the chunk-level
+      recovery did; doing it here means the megabyte in flight survives too.
+    - Measured on the bench through /api/upload/raw: 1MB chunks move at
+      575-636KB/s. The transport was never the limit.
+
   4.95 - 2026-09-13
     - Fixes the "SD write failed (5: I/O error)" that has broken large uploads
       since 4.88, and it was self-inflicted. 4.88's double-buffered writer took
@@ -6313,7 +6331,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.95"
+#define OPENREMOTE_VERSION_STRING "4.96"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -20882,6 +20900,43 @@ bool startChunkWriter() {
   return true;
 }
 
+/*
+  Clears a poisoned file handle, which is the only way to survive a card glitch.
+
+  FatFs makes a write error STICKY. A failed disk write calls ABORT(), which
+  sets fp->err (ff.c:237); f_write then checks fp->err on entry and returns
+  immediately for ever after (ff.c:4069), and so does f_lseek (ff.c:4966). Only
+  f_open clears it (ff.c:3881).
+
+  So one transient error from the card does not cost one write - it kills the
+  handle. Every later write comes back EIO having accepted nothing, which is
+  precisely the "requested=16384 accepted=0" in the logs. It also means 4.90's
+  recovery, which seeked back to the confirmed offset and retried, never had a
+  chance: the seek fails for exactly the same reason as the write.
+
+  Reopening at the byte count the card is known to hold is the whole fix. The
+  chunk survives, and the transfer does not lose a megabyte to a glitch that
+  cleared in microseconds.
+*/
+bool reopenChunkWriteFd() {
+  if (chunkUploadFd >= 0) {
+    ::close(chunkUploadFd);
+    chunkUploadFd = -1;
+  }
+  String path = String("/sd") + chunkUploadTempPath;
+  errno = 0;
+  int fd = ::open(path.c_str(), O_WRONLY | O_CREAT, 0666);
+  if (fd < 0) return false;
+  // Everything past the confirmed count is unwritten or unreliable.
+  if (::ftruncate(fd, (off_t)chunkUploadBytes) != 0 ||
+      ::lseek(fd, (off_t)chunkUploadBytes, SEEK_SET) != (off_t)chunkUploadBytes) {
+    ::close(fd);
+    return false;
+  }
+  chunkUploadFd = fd;
+  return true;
+}
+
 void chunkWriteWorker(void *) {
   for (;;) {
     ChunkWriteBlock block;
@@ -20904,24 +20959,12 @@ void chunkWriteWorker(void *) {
           continue;
         }
         if (written <= 0) {
-          /*
-            An SD card that pauses to do its own internal housekeeping answers
-            EIO rather than waiting, and is ready again within milliseconds.
-            Four of these landed in the first 66MB of a 114MB transfer, and
-            each one used to cost a rolled-back chunk, a reopen and a 192KB
-            re-send - about a second - for a fault that clears in twenty.
-
-            The offset after a failed write is not guaranteed, so the retry
-            seeks back to the byte count that is actually confirmed before
-            trying again. A card that refuses this many times in a row is a
-            real failure and still fails the chunk, with the whole recovery
-            path behind it unchanged.
-          */
-          if (++stalls <= 10 &&
-              ::lseek(chunkUploadFd, (off_t)chunkUploadBytes, SEEK_SET) ==
-                (off_t)chunkUploadBytes) {
+          // Reopen, do not seek - see reopenChunkWriteFd(). A card that keeps
+          // refusing a freshly opened handle is a real failure and still fails
+          // the chunk, with the whole recovery path behind it unchanged.
+          if (++stalls <= 6) {
             vTaskDelay(pdMS_TO_TICKS(5));
-            continue;
+            if (reopenChunkWriteFd()) continue;
           }
           chunkWriteErrno = error ? error : EIO;
           chunkWriteFailedOp = "write";
@@ -20931,8 +20974,8 @@ void chunkWriteWorker(void *) {
           break;
         }
         if (stalls) {
-          Serial.printf("Chunked upload: card stalled %u time(s) at %u, "
-                        "recovered without losing the chunk\n",
+          Serial.printf("Chunked upload: card glitched %u time(s) at %u, "
+                        "handle reopened, chunk intact\n",
                         (unsigned)stalls, (unsigned)chunkUploadBytes);
           stalls = 0;
         }
