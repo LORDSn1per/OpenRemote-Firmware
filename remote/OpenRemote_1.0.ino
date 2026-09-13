@@ -1,6 +1,27 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.98 - 2026-09-13
+    - "Backup upload failed" when saving a full backup to the SD card, and the
+      same latent fault in every other multipart upload. Reproduced from the
+      bench: 64KB, 512KB and 2MB saved fine, 6MB failed, and the IDENTICAL 3MB
+      file then succeeded once and failed twice in a row - not a size limit, the
+      SD card glitching. Saving to a computer always worked because that path
+      never touches the card.
+    - Each handler had one unguarded `file.write(...) == currentSize`, and FatFs
+      marks a handle failed on any disk error and refuses every later write
+      until it is reopened (the same trap 4.96 fixed for the chunked path). One
+      glitch therefore killed the whole upload, and this card glitches about
+      once every 800KB, so anything past a megabyte or two was a coin toss.
+      A shared writeUploadChunkToSd() truncates back to the byte count the card
+      is known to hold - upload.totalSize, which WebServer advances only after
+      the handler returns (Parsing.cpp:362) - reopens, and retries. Backups,
+      device files, WebConfig, the IR database, icons, themes, widget wallpapers
+      and staged firmware all use it.
+    - The helper takes the path from the File rather than an argument. Naming
+      the seven staging paths by hand got four wrong on the first attempt, and
+      that mistake would have silently truncated an unrelated file.
+
   4.97 - 2026-09-13
     - New POST /api/ir/send, so a device can be tried from the IR database
       before it is added. /api/command/test can only fire a command that
@@ -6348,7 +6369,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.97"
+#define OPENREMOTE_VERSION_STRING "4.98"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -20570,6 +20591,53 @@ void handleBackupDelete() {
            removed ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"Could not delete backup\"}");
 }
 
+/*
+  Writes one upload buffer to the SD card, surviving a transient card error.
+
+  FatFs marks a file handle as failed on any disk error and refuses every later
+  write until it is reopened - see the long note on reopenChunkWriteFd(). This
+  card glitches roughly once every 800KB, so any upload past a megabyte or two
+  was a coin toss: the identical 3MB backup succeeded once and then failed twice
+  in a row, which is exactly what "Backup upload failed" was. Saving to a
+  computer worked because that path never touches the card at all.
+
+  Every multipart upload handler had the same single unguarded write and the
+  same coin toss - backups, device files, WebConfig, the IR database, icons,
+  themes, wallpapers, staged firmware - so they all call this now.
+
+  `confirmed` is the byte count the card is known to hold, which for a
+  multipart upload is upload.totalSize: WebServer adds currentSize to it only
+  AFTER this handler returns (Parsing.cpp:362), so during the call it is
+  precisely the total before this buffer. The recovery truncates back to that
+  and reopens for append, because reopening with FILE_WRITE would empty the
+  file and FatFs will not write through the failed handle again.
+*/
+bool writeUploadChunkToSd(File &file, size_t confirmed,
+                          const uint8_t *data, size_t length) {
+  for (uint8_t attempt = 0; attempt < 6; attempt++) {
+    if (file && file.write(data, length) == length) return true;
+    if (!file) return false;
+    // Asked of the file rather than passed in. Every caller stages to a
+    // different path and naming them by hand got four of seven wrong on the
+    // first attempt - a mistake that would have truncated an unrelated file.
+    String path = file.path();
+    file.close();
+    if (!path.length()) return false;
+    delay(5);
+    String posixPath = String("/sd") + path;
+    int fd = ::open(posixPath.c_str(), O_WRONLY);
+    if (fd >= 0) {
+      ::ftruncate(fd, (off_t)confirmed);
+      ::close(fd);
+    }
+    file = SD.open(path, FILE_APPEND);
+    if (!file) return false;
+    Serial.printf("SD upload: card glitched at %u in %s, handle reopened\n",
+                  (unsigned)confirmed, path.c_str());
+  }
+  return false;
+}
+
 void handleBackupUploadData() {
   HTTPUpload &upload = webServer.upload();
   if (upload.status == UPLOAD_FILE_START) {
@@ -20587,7 +20655,7 @@ void handleBackupUploadData() {
     Serial.printf("Backup upload: name=%s authorized=%d sdReady=%d fileOpen=%d\n",
                   upload.filename.c_str(), (int)authorized, (int)sdReady, (int)backupUploadOk);
   } else if (upload.status == UPLOAD_FILE_WRITE && backupUploadOk) {
-    backupUploadOk = backupUploadFile.write(upload.buf, upload.currentSize) == upload.currentSize;
+    backupUploadOk = writeUploadChunkToSd(backupUploadFile, upload.totalSize, upload.buf, upload.currentSize);
     if (!backupUploadOk) Serial.println("Backup upload: SD write failed mid-transfer");
     serviceUiDuringLongHttpTransfer();
   } else if (upload.status == UPLOAD_FILE_END) {
@@ -20632,8 +20700,7 @@ void handleDeviceFileUploadData() {
     Serial.printf("Device file upload: name=%s authorized=%d sdReady=%d fileOpen=%d\n",
                   requested.c_str(), (int)authorized, (int)sdReady, (int)deviceFileUploadOk);
   } else if (upload.status == UPLOAD_FILE_WRITE && deviceFileUploadOk) {
-    deviceFileUploadOk =
-      deviceFileUploadFile.write(upload.buf, upload.currentSize) == upload.currentSize;
+    deviceFileUploadOk = writeUploadChunkToSd(deviceFileUploadFile, upload.totalSize, upload.buf, upload.currentSize);
     if (!deviceFileUploadOk) Serial.println("Device file upload: SD write failed mid-transfer");
     serviceUiDuringLongHttpTransfer();
   } else if (upload.status == UPLOAD_FILE_END) {
@@ -22057,7 +22124,7 @@ void handleWebConfigUploadData() {
     webConfigUploadOk = webConfigUploadOk && (bool)webConfigUploadFile;
     Serial.printf("WebConfig upload: %s\n", upload.filename.c_str());
   } else if (upload.status == UPLOAD_FILE_WRITE && webConfigUploadOk) {
-    webConfigUploadOk = webConfigUploadFile.write(upload.buf, upload.currentSize) == upload.currentSize;
+    webConfigUploadOk = writeUploadChunkToSd(webConfigUploadFile, upload.totalSize, upload.buf, upload.currentSize);
     serviceUiDuringLongHttpTransfer();
   } else if (upload.status == UPLOAD_FILE_END) {
     if (webConfigUploadFile) webConfigUploadFile.close();
@@ -22082,7 +22149,7 @@ void handleIrdbUploadData() {
     irdbUploadOk = irdbUploadOk && (bool)irdbUploadFile;
     Serial.printf("IRDB upload: %s\n", upload.filename.c_str());
   } else if (upload.status == UPLOAD_FILE_WRITE && irdbUploadOk) {
-    irdbUploadOk = irdbUploadFile.write(upload.buf, upload.currentSize) == upload.currentSize;
+    irdbUploadOk = writeUploadChunkToSd(irdbUploadFile, upload.totalSize, upload.buf, upload.currentSize);
     serviceUiDuringLongHttpTransfer();
   } else if (upload.status == UPLOAD_FILE_END) {
     if (irdbUploadFile) irdbUploadFile.close();
@@ -22831,7 +22898,7 @@ void handleCustomIconUploadData() {
     if (customIconUploadOk) customIconUploadFile = SD.open("/tmp/custom_icon.upload", FILE_WRITE);
     customIconUploadOk = customIconUploadOk && (bool)customIconUploadFile;
   } else if (upload.status == UPLOAD_FILE_WRITE && customIconUploadOk) {
-    customIconUploadOk = customIconUploadFile.write(upload.buf, upload.currentSize) == upload.currentSize;
+    customIconUploadOk = writeUploadChunkToSd(customIconUploadFile, upload.totalSize, upload.buf, upload.currentSize);
     serviceUiDuringLongHttpTransfer();
   } else if (upload.status == UPLOAD_FILE_END) {
     if (customIconUploadFile) customIconUploadFile.close();
@@ -22917,7 +22984,7 @@ void handleThemeUploadData() {
     if (themeUploadOk) themeUploadFile = SD.open("/tmp/theme.upload", FILE_WRITE);
     themeUploadOk = themeUploadOk && (bool)themeUploadFile;
   } else if (upload.status == UPLOAD_FILE_WRITE && themeUploadOk) {
-    themeUploadOk = themeUploadFile.write(upload.buf, upload.currentSize) == upload.currentSize;
+    themeUploadOk = writeUploadChunkToSd(themeUploadFile, upload.totalSize, upload.buf, upload.currentSize);
     serviceUiDuringLongHttpTransfer();
   } else if (upload.status == UPLOAD_FILE_END) {
     if (themeUploadFile) themeUploadFile.close();
@@ -22959,8 +23026,7 @@ void handleWidgetWallpaperUploadData() {
     }
     widgetWallpaperUploadOk = widgetWallpaperUploadOk && (bool)widgetWallpaperUploadFile;
   } else if (upload.status == UPLOAD_FILE_WRITE && widgetWallpaperUploadOk) {
-    widgetWallpaperUploadOk =
-      widgetWallpaperUploadFile.write(upload.buf, upload.currentSize) == upload.currentSize;
+    widgetWallpaperUploadOk = writeUploadChunkToSd(widgetWallpaperUploadFile, upload.totalSize, upload.buf, upload.currentSize);
     serviceUiDuringLongHttpTransfer();
   } else if (upload.status == UPLOAD_FILE_END) {
     if (widgetWallpaperUploadFile) widgetWallpaperUploadFile.close();
