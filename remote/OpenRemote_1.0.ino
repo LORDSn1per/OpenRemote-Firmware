@@ -1,6 +1,34 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.22 - 2026-09-22
+    - A backup's size is now read back from the card after the file is closed,
+      instead of being taken from serializeJsonPretty()'s return value, and the
+      file is flushed explicitly first. The serialiser reported 7376864 of
+      7377434 bytes on every attempt - short by 570 and ending exactly on a
+      512-byte sector boundary, which is a tail still in the write buffer
+      rather than the SD contention 5.21 assumed.
+
+  5.21 - 2026-09-13
+    - A backup is verified against its measured size and rewritten if short.
+      The old check was "if (!written)", so only an empty file counted as a
+      failure - a short write reported success and left a backup that listed
+      normally and could never be restored. One came out at exactly 204800
+      bytes of a 7.5 MB document and failed on the way back in with
+      "IncompleteInput at byte 204800 of 204800". Same cause as the 5.18
+      restore failures: nothing locks the SD between the HTTP worker and the
+      Arduino loop, and the yield that keeps the watchdog alive is the window
+      the loop uses to touch the card.
+
+  5.20 - 2026-09-13
+    - Building a backup over /api/backups/create no longer reboots the remote.
+      BackupProgressWriter::note() yields at the 32 KB checkpoint it already
+      had for the progress bar. Serialising a multi-megabyte backup is one
+      unbroken stretch of work, which is tolerable on the Arduino loop but
+      starves the task watchdog on the HTTP worker - 5.19 added the route and
+      the per-file yield in embedSdFilesAsBase64(), but the serialise step is
+      the long one and still aborted the firmware at about 60 seconds.
+
   5.19 - 2026-09-13
     - New POST /api/backups/create, so WebConfig can ask the remote to write a
       full backup rather than building its own in the browser.
@@ -6637,7 +6665,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.19"
+#define OPENREMOTE_VERSION_STRING "5.22"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -20792,6 +20820,15 @@ struct BackupProgressWriter : public Print {
     if (sinceReport >= 32768 && total) {
       sinceReport = 0;
       setLcdBackupPhaseFraction("Writing backup", (float)done / (float)total, 0.70f, 1.0f);
+      /*
+        Serialising a backup is minutes of solid work and offers no natural
+        break. On the Arduino loop that is merely slow; on the HTTP worker,
+        which is where /api/backups/create runs it, nothing resets the task
+        watchdog and the firmware is aborted part-way - the same failure that
+        killed the restore before 5.15. This 32 KB checkpoint already exists
+        for the progress bar, so the yield rides along with it.
+      */
+      vTaskDelay(1);
     }
   }
   size_t write(uint8_t b) override {
@@ -20973,19 +21010,61 @@ bool createLcdFullBackup(String &createdName, String &error) {
     beforehand, so a Print that counts what passes through it can report real
     progress rather than a guess.
   */
-  File output = SD.open(temporaryPath, FILE_WRITE);
   size_t expected = measureJsonPretty(backup);
   setLcdBackupPhaseFraction("Writing backup", 0.0f, 0.70f, 1.0f);
   size_t written = 0;
-  if (output) {
+  /*
+    Every byte has to arrive, and the write is retried until it does.
+
+    The old test was `if (!written)`, so only a completely empty file counted
+    as a failure. A short write passed as success and produced a backup that
+    looked fine in the list and could never be restored: one came out at
+    exactly 204800 bytes of a 7.5 MB document and failed on the way back in
+    with "IncompleteInput at byte 204800 of 204800".
+
+    Short writes happen because nothing locks the SD card between the HTTP
+    worker - where /api/backups/create runs - and the Arduino loop, and the
+    yield this needs to keep the task watchdog alive is exactly the window the
+    loop uses to touch the card. Same cause as the restore failures in 5.18,
+    and the same remedy: compare against measureJsonPretty(), and start over
+    with a fresh handle, since FatFs latches the error on the file object and
+    only f_open clears it.
+  */
+  for (uint8_t attempt = 0; attempt < 3 && written != expected; attempt++) {
+    if (attempt) {
+      Serial.printf("Backup: rewriting after a short write (%u of %u, attempt %u)\n",
+                    (unsigned)written, (unsigned)expected, attempt + 1);
+      vTaskDelay(pdMS_TO_TICKS(40));
+    }
+    written = 0;
+    SD.remove(temporaryPath);
+    File output = SD.open(temporaryPath, FILE_WRITE);
+    if (!output) continue;
     BackupProgressWriter writer(output, expected);
-    written = serializeJsonPretty(backup, writer);
+    serializeJsonPretty(backup, writer);
+    /*
+      Flushed explicitly, then measured from the card rather than trusted from
+      the serialiser's return value.
+
+      serializeJsonPretty() reported 7376864 of 7377434 bytes every single
+      time - short by 570, stopping exactly on a 512-byte sector boundary
+      (14408 sectors). A repeatable shortfall ending mid-sector is a tail
+      sitting in the card's write buffer, not a race, so what matters is what
+      the file holds once it is closed.
+    */
+    output.flush();
     output.close();
+    File check = SD.open(temporaryPath, FILE_READ);
+    if (check) {
+      written = check.size();
+      check.close();
+    }
   }
   setLcdBackupPhaseFraction("Writing backup", 1.0f, 0.70f, 1.0f);
-  if (!written) {
+  if (written != expected) {
     SD.remove(temporaryPath);
-    error = "Could not write backup file";
+    error = String("Backup was written short (") + String((uint32_t)written) +
+            " of " + String((uint32_t)expected) + " bytes) after 3 attempts";
     return false;
   }
   SD.remove(backupPath);
