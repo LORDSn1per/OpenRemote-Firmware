@@ -1,6 +1,32 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.01 - 2026-09-13
+    - An SD card browser in WebConfig, under Settings, with a real file manager
+      behind it: GET /api/sd/browse and /api/sd/download, POST /api/sd/upload,
+      /api/sd/mkdir, /api/sd/rename, /api/sd/copy and /api/sd/delete. Every
+      action applies to the card immediately rather than waiting for a
+      Synchronise, because it is the card being edited and not a model of it.
+      Deliberately unguarded beyond path safety - it can delete runtime.json or
+      the IR database, which is the point of having it - so the card carries a
+      warning and destructive actions confirm first. The only rule enforced in
+      firmware is that a path is absolute and contains no "..", traversal being
+      the one way out of the card.
+    - The rollback copy of the IR database now lives in /irdb/Rollback, one
+      place instead of two. The chunked upload path kept it at
+      /irdb/OpenRemote.previous.irdb and the older multipart path at
+      /backups/OpenRemote.previous.irdb - and that second one is why an SD card
+      holding nothing but small backups had grown by 142MB: a 114MB database
+      sitting among the user's own backups, looking like one of them. Both
+      legacy copies are relocated at boot, by rename, so no card carries a
+      stray one.
+    - Removing the database from WebConfig now frees the rollback as well.
+      Leaving it behind freed only half the space the button implies, and a
+      rollback for a database that is no longer installed protects nothing.
+    - One continuous progress bar across a whole backup. 4.99 counted only the
+      base64 embed, so the SD folder copy that runs first still showed the old
+      bounce and the real bar appeared part way through.
+
   4.99 - 2026-09-13
     - The backup/restore screen on the remote shows a real progress bar instead
       of a block sliding back and forth. The old indicator moved only when a
@@ -6384,7 +6410,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.99"
+#define OPENREMOTE_VERSION_STRING "5.01"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -6670,6 +6696,21 @@ static const char *DEVICE_INDEX_PATH = "/devices/index.txt";
 static const char *IRDB_PATH = "/irdb/OpenRemote.irdb";
 static const char *IRDB_SEARCH_INDEX_PATH = "/irdb/search.jsonl";
 static const char *IRDB_DETAIL_DIR = "/irdb/details";
+/*
+  Where the outgoing database goes when a new one is installed.
+
+  It used to land in two different places depending on which upload route was
+  used - /irdb/OpenRemote.previous.irdb from the chunked path, and
+  /backups/OpenRemote.previous.irdb from the older multipart one. The second is
+  plainly wrong: it drops 114MB into the folder the user's actual backups live
+  in, where it looks like a backup, and it is why an SD card holding "small
+  backups" had grown by 142MB with nothing to show for it.
+
+  One place now, named for what it is. Under /irdb, which isBackupExcludedPath()
+  already refuses, so a rollback copy can never be swept into a backup.
+*/
+static const char *IRDB_ROLLBACK_DIR = "/irdb/Rollback";
+static const char *IRDB_ROLLBACK_PATH = "/irdb/Rollback/OpenRemote.irdb";
 static const char *IRDB_MANIFEST_PATH = "/irdb/manifest.json";
 static const char *IRDB_ALT_MANIFEST_PATH = "/irdb/Database Manifest.json";
 
@@ -11748,6 +11789,30 @@ void clearStaleUploadStaging() {
   if (removed) {
     Serial.printf("Startup: cleared %lu stale staging file(s) from /tmp, %.1f MB freed\n",
                   (unsigned long)removed, freed / 1048576.0);
+  }
+
+  /*
+    Move a rollback database left by an older firmware into /irdb/Rollback.
+
+    Two earlier locations existed, and one of them - /backups - put a 114MB
+    file among the user's own backups, where it looked like one and quietly
+    accounted for most of an SD card that had "only small backups" on it.
+    Moved rather than deleted: it is still a usable rollback, it is just in the
+    wrong place. Renames on the same volume, so nothing is copied.
+  */
+  const char *legacyRollbacks[] = {
+    "/backups/OpenRemote.previous.irdb", "/irdb/OpenRemote.previous.irdb"
+  };
+  for (const char *legacy : legacyRollbacks) {
+    if (!SD.exists(legacy)) continue;
+    uint64_t size = 0;
+    File probe = SD.open(legacy, FILE_READ);
+    if (probe) { size = (uint64_t)probe.size(); probe.close(); }
+    if (!SD.exists(IRDB_ROLLBACK_DIR)) SD.mkdir(IRDB_ROLLBACK_DIR);
+    bool moved = !SD.exists(IRDB_ROLLBACK_PATH) && SD.rename(legacy, IRDB_ROLLBACK_PATH);
+    if (!moved) moved = SD.remove(legacy);   // A newer rollback already exists.
+    Serial.printf("Startup: %s rollback database from %s (%.1f MB)\n",
+                  moved ? "relocated" : "could not relocate", legacy, size / 1048576.0);
   }
 }
 
@@ -19076,6 +19141,25 @@ bool lineMatchesSearchTerms(const String &line, const String terms[], uint8_t te
   detail record within the detail section, so importing is one scan of the small
   section and then a single seek - never a walk of the whole database.
 */
+/*
+  Moves the database now on the card into the rollback folder.
+
+  Also sweeps up the two legacy locations, so a card that has been through an
+  older firmware stops carrying a stray 114MB copy - the /backups one in
+  particular, which shows up among the user's own backups.
+*/
+bool rollbackExistingIrdb() {
+  if (!SD.exists(IRDB_ROLLBACK_DIR)) SD.mkdir(IRDB_ROLLBACK_DIR);
+  SD.remove("/backups/OpenRemote.previous.irdb");
+  SD.remove("/irdb/OpenRemote.previous.irdb");
+  SD.remove(IRDB_ROLLBACK_PATH);
+  if (!SD.exists(IRDB_PATH)) return true;
+  bool moved = SD.rename(IRDB_PATH, IRDB_ROLLBACK_PATH);
+  Serial.printf("IRDB: previous database %s %s\n",
+                moved ? "kept at" : "could NOT be moved to", IRDB_ROLLBACK_PATH);
+  return moved;
+}
+
 bool readIrdbEmbeddedIndex(IrdbEmbeddedIndex &out) {
   if (!sdReady || !SD.exists(IRDB_PATH)) return false;
   File file = SD.open(IRDB_PATH, FILE_READ);
@@ -19225,6 +19309,14 @@ void handleIrdbDelete() {
   File probe = SD.open(IRDB_PATH, FILE_READ);
   if (probe) { freed = (uint64_t)probe.size(); probe.close(); }
   bool removed = SD.exists(IRDB_PATH) && SD.remove(IRDB_PATH);
+  // The rollback copy goes with it. Leaving it behind frees only half the
+  // space "Remove from SD card" implies, and a rollback for a database that is
+  // no longer installed protects nothing.
+  if (SD.exists(IRDB_ROLLBACK_PATH)) {
+    File rollback = SD.open(IRDB_ROLLBACK_PATH, FILE_READ);
+    if (rollback) { freed += (uint64_t)rollback.size(); rollback.close(); }
+    SD.remove(IRDB_ROLLBACK_PATH);
+  }
   // The older separate-file form, if this card still carries it.
   if (SD.exists(IRDB_SEARCH_INDEX_PATH)) SD.remove(IRDB_SEARCH_INDEX_PATH);
   if (SD.exists(IRDB_DETAIL_DIR)) deleteSdTree(IRDB_DETAIL_DIR);
@@ -20178,6 +20270,23 @@ bool createLcdFullBackup(String &createdName, String &error) {
     "/config", "/devices", "/activities", "/macros",
     "/themes/Default", "/themes/Custom", "/widgets/Wallpapers", "/icons/Custom"
   };
+  /*
+    Count everything before anything starts, so one bar spans the whole job.
+
+    A backup has two file-heavy phases: this copy of the SD folders into
+    _assets, and the base64 embed further down. Counting only the embed left
+    the copy running against a zero total, which fell back to the old bounce -
+    so the first thing seen was still the sliding block, and the real bar only
+    appeared part way through. countSdFiles() walks directory entries without
+    reading any file, which is nothing beside copying and encoding them.
+  */
+  uint32_t plannedFiles = 0;
+  for (const char *source : sourceFolders) plannedFiles += countSdFiles(source);
+  plannedFiles += countSdFiles("/icons/Custom") + countSdFiles("/themes/Default") +
+                  countSdFiles("/themes/Custom") + countSdFiles("/widgets/Wallpapers") +
+                  countSdFiles("/devices");
+  beginLcdBackupProgress((uint16_t)(plannedFiles > 65535UL ? 65535UL : plannedFiles));
+
   bool assetsOk = true;
   for (const char *source : sourceFolders) {
     String destination = assetsPath + source;
@@ -20250,18 +20359,8 @@ bool createLcdFullBackup(String &createdName, String &error) {
   // physical _assets folder copy below - nativeAssets only helps restoring
   // onto *this* SD card; a copy saved to a computer needs everything inline
   // to restore onto a different remote or a fresh card.
-  /*
-    Count first, then embed. countSdFiles() walks the same five directories
-    embedSdFilesAsBase64() is about to, so the total is exact rather than
-    estimated, and it is cheap next to reading and base64-encoding every one of
-    those files. This is the slow part of a backup and now the only part that
-    needs to drive the bar.
-  */
-  beginLcdBackupProgress((uint16_t)(countSdFiles("/icons/Custom") +
-                                    countSdFiles("/themes/Default") +
-                                    countSdFiles("/themes/Custom") +
-                                    countSdFiles("/widgets/Wallpapers") +
-                                    countSdFiles("/devices")));
+  // The embed half. Its files are already in the total counted at the top -
+  // starting a second count here would reset the bar to zero mid-backup.
   JsonArray icons = data["icons"].to<JsonArray>();
   embedSdFilesAsBase64(icons, "/icons/Custom");
   JsonArray themeAssets = backup["themeAssets"].to<JsonArray>();
@@ -20511,6 +20610,241 @@ String sanitizeBackupFileName(String name) {
                  lower.endsWith(".txt") || lower.endsWith(".gc") ||
                  lower.endsWith(".gcir");
   return allowed ? output : "";
+}
+
+/* ------------------------------------------------------------------------
+   SD card browser
+
+   A real file manager over HTTP: list, download, upload, copy, move, rename,
+   create and delete, applied to the card immediately rather than staged for a
+   sync. It exists because everything else in WebConfig is a curated view of
+   the card, and when something is wrong in a way those views do not cover -
+   a stray file, a folder that should not be there, a config to pull off and
+   inspect - the only alternative was pulling the card out.
+
+   It is deliberately unguarded beyond path safety: this can delete
+   runtime.json, the IR database or the whole of /www, and that is the point of
+   having it. WebConfig labels it as dangerous and asks before anything
+   destructive.
+
+   The one rule enforced here is that a path is absolute and contains no "..".
+   Everything reachable is on the card by construction, so traversal is the
+   only way out of it.
+   ------------------------------------------------------------------------ */
+bool writeUploadChunkToSd(File &file, size_t confirmed,
+                          const uint8_t *data, size_t length);
+
+bool sdBrowserPathOk(const String &path) {
+  if (path.length() < 1 || path.length() > 190) return false;
+  if (path[0] != '/') return false;
+  if (path.indexOf("..") >= 0) return false;
+  return true;
+}
+
+bool sdBrowserReject(const String &path) {
+  if (!sdReady) {
+    sendJson(503, "{\"ok\":false,\"error\":\"SD card unavailable\"}");
+    return true;
+  }
+  if (!sdBrowserPathOk(path)) {
+    sendJson(400, "{\"ok\":false,\"error\":\"That path is not allowed\"}");
+    return true;
+  }
+  return false;
+}
+
+// Like copySdTree() but without the backup exclusions - the browser is allowed
+// to copy anything the user points it at, including /irdb and /backups.
+bool copySdTreeRaw(const String &sourcePath, const String &destinationPath) {
+  File source = SD.open(sourcePath);
+  if (!source) return false;
+  if (!source.isDirectory()) {
+    source.close();
+    return copySdFile(sourcePath, destinationPath);
+  }
+  if (!SD.exists(destinationPath) && !SD.mkdir(destinationPath)) {
+    source.close();
+    return false;
+  }
+  bool ok = true;
+  while (true) {
+    File entry = source.openNextFile();
+    if (!entry) break;
+    String entryPath = entry.path();
+    String name = entryPath.substring(entryPath.lastIndexOf('/') + 1);
+    entry.close();
+    if (!name.length()) continue;
+    ok = copySdTreeRaw(entryPath, destinationPath + "/" + name) && ok;
+    serviceUiDuringLongHttpTransfer();
+  }
+  source.close();
+  return ok;
+}
+
+void handleSdBrowseList() {
+  if (!requestAuthorized()) { sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}"); return; }
+  String path = webServer.arg("path");
+  if (!path.length()) path = "/";
+  if (sdBrowserReject(path)) return;
+  File root = SD.open(path);
+  if (!root || !root.isDirectory()) {
+    if (root) root.close();
+    sendJson(404, "{\"ok\":false,\"error\":\"No such folder\"}");
+    return;
+  }
+  JsonDocument doc(&psramJsonAllocator);
+  doc["ok"] = true;
+  doc["path"] = path;
+  JsonArray entries = doc["entries"].to<JsonArray>();
+  // Capped because /irdb/details on an older card holds thousands of files and
+  // neither the JSON nor the browser table is worth building at that size.
+  const uint16_t maxEntries = 400;
+  uint16_t shown = 0, total = 0;
+  while (true) {
+    File entry = root.openNextFile();
+    if (!entry) break;
+    total++;
+    if (shown < maxEntries) {
+      String entryPath = entry.path();
+      JsonObject row = entries.add<JsonObject>();
+      row["name"] = entryPath.substring(entryPath.lastIndexOf('/') + 1);
+      row["dir"] = entry.isDirectory();
+      row["size"] = (double)(entry.isDirectory() ? 0 : entry.size());
+      shown++;
+    }
+    entry.close();
+    if ((total % 64) == 0) serviceUiDuringLongHttpTransfer();
+  }
+  root.close();
+  doc["shown"] = shown;
+  doc["total"] = total;
+  doc["freeBytes"] = (double)(SD.totalBytes() - SD.usedBytes());
+  doc["totalBytes"] = (double)SD.totalBytes();
+  String body;
+  serializeJson(doc, body);
+  sendJson(200, body);
+}
+
+void handleSdBrowseDownload() {
+  if (!requestAuthorized()) { sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}"); return; }
+  String path = webServer.arg("path");
+  if (sdBrowserReject(path)) return;
+  File file = SD.open(path, FILE_READ);
+  if (!file || file.isDirectory()) {
+    if (file) file.close();
+    sendJson(404, "{\"ok\":false,\"error\":\"No such file\"}");
+    return;
+  }
+  String name = path.substring(path.lastIndexOf('/') + 1);
+  webServer.sendHeader("Cache-Control", "no-store");
+  webServer.sendHeader("Content-Disposition", String("attachment; filename=\"") + name + "\"");
+  webServer.streamFile(file, "application/octet-stream");
+  file.close();
+}
+
+void handleSdBrowseMkdir() {
+  if (!requestAuthorized()) { sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}"); return; }
+  JsonDocument doc;
+  deserializeJson(doc, webServer.arg("plain"));
+  String path = doc["path"] | "";
+  if (sdBrowserReject(path)) return;
+  if (SD.exists(path)) { sendJson(409, "{\"ok\":false,\"error\":\"That name is already taken\"}"); return; }
+  bool ok = SD.mkdir(path);
+  Serial.printf("SD browser: mkdir %s %s\n", path.c_str(), ok ? "ok" : "FAILED");
+  sendJson(ok ? 200 : 500, ok ? "{\"ok\":true}"
+                              : "{\"ok\":false,\"error\":\"Could not create that folder\"}");
+}
+
+void handleSdBrowseRename() {
+  if (!requestAuthorized()) { sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}"); return; }
+  JsonDocument doc;
+  deserializeJson(doc, webServer.arg("plain"));
+  String from = doc["from"] | "";
+  String to = doc["to"] | "";
+  if (sdBrowserReject(from) || sdBrowserReject(to)) return;
+  if (!SD.exists(from)) { sendJson(404, "{\"ok\":false,\"error\":\"No such file or folder\"}"); return; }
+  if (SD.exists(to)) { sendJson(409, "{\"ok\":false,\"error\":\"That name is already taken\"}"); return; }
+  // Works for a folder as well as a file, and moves rather than copies when
+  // the destination is elsewhere on the same card.
+  bool ok = SD.rename(from, to);
+  Serial.printf("SD browser: rename %s -> %s %s\n", from.c_str(), to.c_str(), ok ? "ok" : "FAILED");
+  sendJson(ok ? 200 : 500, ok ? "{\"ok\":true}"
+                              : "{\"ok\":false,\"error\":\"Could not rename that\"}");
+}
+
+void handleSdBrowseCopy() {
+  if (!requestAuthorized()) { sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}"); return; }
+  JsonDocument doc;
+  deserializeJson(doc, webServer.arg("plain"));
+  String from = doc["from"] | "";
+  String to = doc["to"] | "";
+  if (sdBrowserReject(from) || sdBrowserReject(to)) return;
+  if (!SD.exists(from)) { sendJson(404, "{\"ok\":false,\"error\":\"No such file or folder\"}"); return; }
+  if (SD.exists(to)) { sendJson(409, "{\"ok\":false,\"error\":\"That name is already taken\"}"); return; }
+  // Copying a folder into itself would recurse until the card filled.
+  if (to.startsWith(from + "/")) {
+    sendJson(400, "{\"ok\":false,\"error\":\"Cannot copy a folder into itself\"}");
+    return;
+  }
+  bool ok = copySdTreeRaw(from, to);
+  Serial.printf("SD browser: copy %s -> %s %s\n", from.c_str(), to.c_str(), ok ? "ok" : "FAILED");
+  sendJson(ok ? 200 : 500, ok ? "{\"ok\":true}"
+                              : "{\"ok\":false,\"error\":\"Could not copy that\"}");
+}
+
+void handleSdBrowseDelete() {
+  if (!requestAuthorized()) { sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}"); return; }
+  JsonDocument doc;
+  deserializeJson(doc, webServer.arg("plain"));
+  String path = doc["path"] | "";
+  if (sdBrowserReject(path)) return;
+  if (path == "/") { sendJson(400, "{\"ok\":false,\"error\":\"Refusing to delete the card root\"}"); return; }
+  if (!SD.exists(path)) { sendJson(404, "{\"ok\":false,\"error\":\"No such file or folder\"}"); return; }
+  File probe = SD.open(path);
+  bool directory = probe && probe.isDirectory();
+  if (probe) probe.close();
+  bool ok;
+  if (directory) {
+    deleteSdTree(path);
+    ok = !SD.exists(path);
+  } else {
+    ok = SD.remove(path);
+  }
+  Serial.printf("SD browser: delete %s %s %s\n", directory ? "folder" : "file",
+                path.c_str(), ok ? "ok" : "FAILED");
+  sendJson(ok ? 200 : 500, ok ? "{\"ok\":true}"
+                              : "{\"ok\":false,\"error\":\"Could not delete that\"}");
+}
+
+File sdBrowserUploadFile;
+String sdBrowserUploadTarget;
+bool sdBrowserUploadOk = false;
+
+void handleSdBrowseUploadData() {
+  HTTPUpload &upload = webServer.upload();
+  if (upload.status == UPLOAD_FILE_START) {
+    String target = webServer.arg("path");
+    sdBrowserUploadOk = requestAuthorized() && sdReady && sdBrowserPathOk(target);
+    sdBrowserUploadTarget = sdBrowserUploadOk ? target : "";
+    SD.remove("/tmp/sdbrowse.upload");
+    if (sdBrowserUploadOk) sdBrowserUploadFile = SD.open("/tmp/sdbrowse.upload", FILE_WRITE);
+    sdBrowserUploadOk = sdBrowserUploadOk && (bool)sdBrowserUploadFile;
+    Serial.printf("SD browser upload: %s ok=%d\n", target.c_str(), (int)sdBrowserUploadOk);
+  } else if (upload.status == UPLOAD_FILE_WRITE && sdBrowserUploadOk) {
+    sdBrowserUploadOk = writeUploadChunkToSd(sdBrowserUploadFile, upload.totalSize,
+                                             upload.buf, upload.currentSize);
+    serviceUiDuringLongHttpTransfer();
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (sdBrowserUploadFile) sdBrowserUploadFile.close();
+    if (sdBrowserUploadOk) {
+      SD.remove(sdBrowserUploadTarget);
+      sdBrowserUploadOk = SD.rename("/tmp/sdbrowse.upload", sdBrowserUploadTarget);
+    }
+  } else if (upload.status == UPLOAD_FILE_ABORTED) {
+    if (sdBrowserUploadFile) sdBrowserUploadFile.close();
+    SD.remove("/tmp/sdbrowse.upload");
+    sdBrowserUploadOk = false;
+  }
 }
 
 void handleBackupList() {
@@ -21845,13 +22179,12 @@ void handleChunkUploadFinish() {
     if (!ok) {
       error = "That is not an OpenRemote.irdb database - build one in OpenRemote Studio";
     } else {
-      const char *previous = "/irdb/OpenRemote.previous.irdb";
       bool hadPrevious = SD.exists(IRDB_PATH);
-      ok = !hadPrevious || ((!SD.exists(previous) || SD.remove(previous)) &&
-                            SD.rename(IRDB_PATH, previous));
+      ok = rollbackExistingIrdb();
       if (ok) {
         ok = SD.rename(path, IRDB_PATH);
-        if (!ok && hadPrevious) SD.rename(previous, IRDB_PATH);
+        // Put it back if the new one could not be moved into place.
+        if (!ok && hadPrevious) SD.rename(IRDB_ROLLBACK_PATH, IRDB_PATH);
       }
       if (!ok) error = "Could not install the database; previous database preserved";
       else {
@@ -22202,8 +22535,7 @@ void handleIrdbUploadData() {
   } else if (upload.status == UPLOAD_FILE_END) {
     if (irdbUploadFile) irdbUploadFile.close();
     if (irdbUploadOk) {
-      SD.remove("/backups/OpenRemote.previous.irdb");
-      if (SD.exists(IRDB_PATH)) SD.rename(IRDB_PATH, "/backups/OpenRemote.previous.irdb");
+      rollbackExistingIrdb();
       irdbUploadOk = SD.rename("/tmp/OpenRemote.upload.irdb", IRDB_PATH);
     }
   } else if (upload.status == UPLOAD_FILE_ABORTED) {
@@ -24237,6 +24569,18 @@ void configureWebServer() {
   webServer.on("/api/upload/verify", HTTP_POST, handleChunkUploadVerify);
   webServer.on("/api/sd/format", HTTP_POST, handleSdRebuild);
   webServer.on("/api/factory-reset", HTTP_POST, handleFactoryReset);
+  webServer.on("/api/sd/browse", HTTP_GET, handleSdBrowseList);
+  webServer.on("/api/sd/download", HTTP_GET, handleSdBrowseDownload);
+  webServer.on("/api/sd/mkdir", HTTP_POST, handleSdBrowseMkdir);
+  webServer.on("/api/sd/rename", HTTP_POST, handleSdBrowseRename);
+  webServer.on("/api/sd/copy", HTTP_POST, handleSdBrowseCopy);
+  webServer.on("/api/sd/delete", HTTP_POST, handleSdBrowseDelete);
+  webServer.on("/api/sd/upload", HTTP_POST, []() {
+    if (!requestAuthorized()) webServer.send(403, "application/json", "{\"ok\":false}");
+    else sendJson(sdBrowserUploadOk ? 200 : 400,
+                  sdBrowserUploadOk ? "{\"ok\":true}"
+                                    : "{\"ok\":false,\"error\":\"Upload failed\"}");
+  }, handleSdBrowseUploadData);
   webServer.on("/api/backups", HTTP_GET, handleBackupList);
   webServer.on("/api/backups/file", HTTP_GET, handleBackupDownload);
   webServer.on("/api/backups/file", HTTP_DELETE, handleBackupDelete);
