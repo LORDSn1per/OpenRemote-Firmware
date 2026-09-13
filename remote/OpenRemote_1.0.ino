@@ -1,6 +1,15 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.14 - 2026-09-13
+    - A restored credentials block no longer applies empty strings. "" is a
+      valid const char *, so the old pointer-only test wrote it over a working
+      login. runtime.json holds an empty credentials block after a factory
+      reset, and WebConfig re-uploads that block unchanged on every sync, so
+      Homebridge, MQTT and Home Assistant credentials were wiped moments after
+      being saved - which read as "WebConfig is not saving my username and
+      password" when saving had in fact worked every time.
+
   5.13 - 2026-09-13
     - Fixes the Homebridge names that showed as boxes on the LCD. The devices[]
       loop folded names to ASCII, but the devicePages[] loop that runs after it
@@ -6572,7 +6581,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.13"
+#define OPENREMOTE_VERSION_STRING "5.14"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -14506,9 +14515,25 @@ void applySettingsJson(JsonVariantConst settings) {
   */
   JsonObjectConst credentials = settings["credentials"].as<JsonObjectConst>();
   if (!credentials.isNull()) {
+    /*
+      An empty string is not a value, it is the absence of one.
+
+      "" is a perfectly valid const char *, so testing the pointer alone
+      applied it and blanked the target. WebConfig does not model this block
+      and re-uploads whatever it read at page load, so once runtime.json held
+      an empty credentials block - which it does after a factory reset, since
+      persistSettingsToRuntimeConfig() writes the current values whatever they
+      are - every sync wiped the Homebridge, MQTT and Home Assistant logins
+      that had just been saved. Saving worked; the next sync undid it.
+
+      Skipping empties means a credential cannot be cleared by restoring a file
+      that omits it, which is the safer direction and what the note above this
+      block already said was intended. Clearing one is done from its own
+      settings page.
+    */
     auto takeString = [&](const char *key, String &target) {
       const char *value = credentials[key].as<const char *>();
-      if (value) target = value;
+      if (value && value[0]) target = value;
     };
     takeString("homebridgeAddress", homebridgeAddress);
     takeString("homebridgeUsername", homebridgeUsername);
