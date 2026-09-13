@@ -1788,7 +1788,7 @@ def usb_factory_reset(port):
         return {"error":str(e)}
 
 BACKUP_CATEGORIES={"full-backup","devices","learned","activities","macros",
-                   "icons","themes","learned-device"}
+                   "icons","themes","learned-device","device"}
 
 def describe_backup_payload(payload):
     """Validates a backup file and summarises it, or raises.
@@ -1811,12 +1811,24 @@ def describe_backup_payload(payload):
         counts=doc.get("counts") or {}
         bits=[f"{counts.get(k,0)} {k}" for k in ("devices","activities","macros","icons","themes")]
         return "Full backup - "+", ".join(bits)
-    if category=="learned-device":
+    if category in ("learned-device","device"):
+        # "device" is WebConfig 3.26's Backup Device export: the same shape as
+        # the older learned-device file but for any kind of device, so it says
+        # which - infrared, RF433, Homebridge, MQTT, Home Assistant or
+        # Bluetooth - rather than calling a Homebridge accessory a learned IR
+        # device. It reached here already, because the format string starts
+        # with "OpenRemote", but was summarised as a bare "device backup".
         device=doc.get("device") or {}
         commands=device.get("commands")
+        count=len(commands) if isinstance(commands,list) else 0
+        kind=str(doc.get("deviceKindLabel") or doc.get("deviceKind") or "").strip()
+        if category=="device":
+            # The label already reads as a noun ("Homebridge accessory",
+            # "Bluetooth remote"), so appending "device" to it doubles up.
+            return "%s - %s, %d command(s)"%(
+                kind or "OpenRemote device", device.get("name") or "unnamed", count)
         return "learned IR device - %s, %d command(s)"%(
-            device.get("name") or "unnamed",
-            len(commands) if isinstance(commands,list) else 0)
+            device.get("name") or "unnamed", count)
     if category:
         items=doc.get("items")
         n=len(items) if isinstance(items,list) else (1 if doc.get("device") else 0)

@@ -1,6 +1,14 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.32 - 2026-09-14
+    - Restores a single-device file written by WebConfig's "Backup Device"
+      (category "device"). It is the same shape as the older learned-device
+      export but covers any kind of device, not only a learned IR one, and
+      Studio routes such a file into /backups - so without this the remote
+      refused the last step of the round trip with "This backup category cannot
+      be restored".
+
   5.31 - 2026-09-14
     - /api/status answers from cached values while a backup runs instead of
       touching the SD card. It did four SD.exists() calls, a directory walk and
@@ -6752,7 +6760,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.31"
+#define OPENREMOTE_VERSION_STRING "5.32"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -20752,6 +20760,12 @@ bool backupCategoryIsRestorable(const char *category) {
   return strcmp(category, "devices") == 0 ||
          strcmp(category, "learned") == 0 ||
          strcmp(category, "learned-device") == 0 ||
+         // WebConfig 3.26's "Backup Device" writes one device under
+         // category "device" - the same shape as a learned-device export but
+         // for any kind of device, not only a learned IR one. Studio routes
+         // such a file into /backups, so the remote has to be able to apply
+         // it or the round trip stops here.
+         strcmp(category, "device") == 0 ||
          strcmp(category, "activities") == 0 ||
          strcmp(category, "macros") == 0 ||
          strcmp(category, "icons") == 0 ||
@@ -20800,7 +20814,7 @@ bool restoreCategoryBackup(JsonDocument &backup, String &error) {
   // merge below has a single shape to deal with.
   JsonDocument singleItem(&psramJsonAllocator);
   JsonArrayConst items;
-  if (category == "learned-device") {
+  if (category == "learned-device" || category == "device") {
     if (!backup["device"].is<JsonObjectConst>()) {
       error = "This .ir file has no device in it";
       return false;
@@ -20870,7 +20884,8 @@ bool restoreCategoryBackup(JsonDocument &backup, String &error) {
   }
 
   const char *targetKey = nullptr;
-  if (category == "devices" || category == "learned" || category == "learned-device") {
+  if (category == "devices" || category == "learned" ||
+      category == "learned-device" || category == "device") {
     targetKey = "devices";
   } else if (category == "activities") {
     targetKey = "activities";
@@ -21978,7 +21993,8 @@ void handleBackupList() {
             // A category export has no per-category counts block, just one
             // total, so report it against its own category.
             if (!isFull) {
-              const char *key = strcmp(category, "learned-device") == 0 ? "learned" : category;
+              const char *key = (strcmp(category, "learned-device") == 0 ||
+                                 strcmp(category, "device") == 0) ? "learned" : category;
               long total = parsed ? (long)(summary["count"] | 1) : backupHeadNumber(head, nullptr, "count");
               if (item[key].is<int>()) item[key] = (int)(total ? total : 1);
             }
@@ -33346,7 +33362,8 @@ void chooseLcdBackup(lv_event_t *e) {
     strlcpy(title, "Restore full backup?", sizeof(title));
   } else {
     snprintf(title, sizeof(title), "Merge %s backup?",
-             strcmp(category, "learned-device") == 0 ? "device" : category);
+             (strcmp(category, "learned-device") == 0 ||
+              strcmp(category, "device") == 0) ? "device" : category);
   }
   lcdBackupConfirmBox = lv_msgbox_create(
     lv_scr_act(), title, lcdBackupEntries[index].displayDate,
