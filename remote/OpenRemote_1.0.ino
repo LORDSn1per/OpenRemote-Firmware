@@ -1,6 +1,29 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.35 - 2026-09-14
+    - Deleting a backup accepts .ir as well as .json. A single-device export is
+      named "<Device> (IR).ir", and /backups already accepted it on upload and
+      applied it on restore, so a file could be put there and never removed
+      except through the SD browser.
+
+  5.34 - 2026-09-14
+    - ORUSB WEBCONFIG ON now actually opens the page. 5.33 called
+      openSettingsView(SETTINGS_WIFI_QR), which sets the sub-view but leaves
+      currentPage where it was - and webConfigQrPageActive() requires the
+      settings page to be the one on screen as well, so the command was
+      accepted and nothing happened. It uses jumpToWebConfigQr(), the same
+      helper the on-screen shortcut uses.
+
+  5.33 - 2026-09-14
+    - New ORUSB WEBCONFIG ON / OFF / URL. WebConfig could only be reached by
+      pressing through the LCD menu, so anything needing the HTTP API - Studio,
+      a test, a support session - needed someone standing at the remote, and
+      every firmware flash dropped it again. URL reports the address and token
+      so a caller does not have to read them off the screen. The work is
+      deferred to loop() because openSettingsView() touches LVGL, which belongs
+      to core 1.
+
   5.32 - 2026-09-14
     - Restores a single-device file written by WebConfig's "Backup Device"
       (category "device"). It is the same shape as the older learned-device
@@ -6760,7 +6783,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.32"
+#define OPENREMOTE_VERSION_STRING "5.35"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -8995,6 +9018,19 @@ char lcdBackupPhase[24] = "";
   bar is driven, there is no second user of the card, and the request returns
   immediately so /api/backups/progress can be polled while it works.
 */
+/*
+  WebConfig can be started and stopped over USB.
+
+  It could only be reached by pressing through the LCD menu, so anything that
+  needs the HTTP API - Studio, a test, a support session - needed someone
+  standing at the remote to enable it first, and every firmware flash dropped
+  it again. The request is a flag rather than the work itself because
+  openSettingsView() deletes LVGL objects, and LVGL belongs to the Arduino loop
+  on core 1 while USB commands are parsed elsewhere.
+*/
+volatile bool usbWebConfigStartRequest = false;
+volatile bool usbWebConfigStopRequest = false;
+
 volatile bool backupRequestPending = false;
 volatile bool backupRequestRunning = false;
 volatile bool restoreRequestPending = false;
@@ -19321,6 +19357,29 @@ void handleUsbCommand(Stream &port, UsbSerialSession &session, String command) {
     }
     usbImportReply(port, String("{\"ok\":true,\"exists\":") + (exists ? "true" : "false") +
                          ",\"size\":" + String(size) + "}");
+  } else if (command == "ORUSB WEBCONFIG ON" || command == "ORUSB WEBCONFIG OFF" ||
+             command == "ORUSB WEBCONFIG URL") {
+    if (command.endsWith(" URL")) {
+      JsonDocument doc;
+      doc["ok"] = true;
+      doc["active"] = webConfigQrPageActive();
+      doc["url"] = webConfigQrPageActive() ? webConfigUrl() : String("");
+      doc["token"] = setupToken;
+      doc["ip"] = WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString()
+                                                : WiFi.softAPIP().toString();
+      String body;
+      serializeJson(doc, body);
+      usbImportReply(port, body);
+      return;
+    }
+    bool on = command.endsWith(" ON");
+    // Only flagged here. The loop opens or closes the page, because
+    // openSettingsView() touches LVGL and that belongs to core 1.
+    if (on) { usbWebConfigStartRequest = true; usbWebConfigStopRequest = false; }
+    else { usbWebConfigStopRequest = true; usbWebConfigStartRequest = false; }
+    usbImportReply(port, String("{\"ok\":true,\"requested\":\"") +
+                   (on ? "on" : "off") + "\",\"token\":\"" + setupToken +
+                   "\"}");
   } else if (command.startsWith("ORUSB RESTORE ")) {
     // Applies a backup already sitting in /backups, so Studio can copy a
     // backup over USB and then have the remote actually install it - the
@@ -22043,7 +22102,11 @@ void handleBackupDelete() {
   String name = sanitizeBackupFileName(webServer.arg("name"));
   String lowerName = name;
   lowerName.toLowerCase();
-  if (!name.length() || !lowerName.endsWith(".json")) {
+  // .ir as well as .json: a single-device export is named "<Device> (IR).ir"
+  // and /backups accepts it on upload and applies it on restore, so refusing
+  // to delete it left a file that could be put there and never taken away
+  // except through the SD browser.
+  if (!name.length() || !(lowerName.endsWith(".json") || lowerName.endsWith(".ir"))) {
     sendJson(400, "{\"ok\":false,\"error\":\"Invalid backup filename\"}");
     return;
   }
@@ -22455,6 +22518,39 @@ void hideBackupOverlay() {
 */
 bool sdBusyWithBackupJob() {
   return backupRequestRunning || backupRequestPending || restoreRequestPending;
+}
+
+/*
+  Opens or closes the WebConfig page when USB asked for it. Runs from loop(),
+  so openSettingsView() and the LVGL work it does are on the right core.
+*/
+void jumpToWebConfigQr(lv_event_t *e);
+
+void serviceUsbWebConfigRequest() {
+  if (usbWebConfigStartRequest) {
+    usbWebConfigStartRequest = false;
+    if (!webConfigQrPageActive()) {
+      Serial.println("USB: opening WebConfig");
+      /*
+        jumpToWebConfigQr(), not openSettingsView() alone.
+
+        webConfigQrPageActive() is true only when the settings PAGE is the one
+        on screen AND its sub-view is the QR page. openSettingsView() sets the
+        sub-view but leaves currentPage wherever it was, so on any normal page
+        the request was accepted, the flag cleared, and nothing happened -
+        active stayed false forever. This is the same helper the on-screen
+        shortcut button uses, so the two paths land identically.
+      */
+      jumpToWebConfigQr(nullptr);
+    }
+  }
+  if (usbWebConfigStopRequest) {
+    usbWebConfigStopRequest = false;
+    if (webConfigQrPageActive()) {
+      Serial.println("USB: closing WebConfig");
+      openSettingsView(SETTINGS_HOME);
+    }
+  }
 }
 
 void serviceQueuedBackup() {
@@ -38278,6 +38374,7 @@ void loop() {
     pendingBluetoothApply = false;
     applyBluetoothState();
   }
+  serviceUsbWebConfigRequest();
   serviceQueuedBackup();
   now = millis();
   if (runtimeSettingsSavePending &&
