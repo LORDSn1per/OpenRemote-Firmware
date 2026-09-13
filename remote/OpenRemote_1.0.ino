@@ -1,6 +1,13 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.29 - 2026-09-14
+    - A backup or restore started from the LCD's own Backup/Restore page now
+      shows the same full-screen overlay, ring and all, that a WebConfig one
+      does, and says which it was. This replaces 5.23's scroll-to-the-top
+      workaround: the overlay covers the screen whatever is scrolled where, so
+      the bar can no longer be below the fold.
+
   5.28 - 2026-09-14
     - The backup overlay gains an animated ring above the text, and the bar and
       labels move down to make room. The ring is stepped by hand from
@@ -6723,7 +6730,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.28"
+#define OPENREMOTE_VERSION_STRING "5.29"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -22288,7 +22295,7 @@ void stepBackupOverlayMark() {
   }
 }
 
-void showBackupOverlay(bool restoring) {
+void showBackupOverlay(bool restoring, const char *note) {
   if (xPortGetCoreID() != 1) return;
   hideBackupOverlay();
   backupOverlay = lv_obj_create(lv_layer_top());
@@ -22319,7 +22326,7 @@ void showBackupOverlay(bool restoring) {
 
   makeLabel(backupOverlay, restoring ? "Restoring backup" : "Creating backup",
             12, 196, &lv_font_montserrat_14, textPrimary());
-  makeLabel(backupOverlay, "Started from WebConfig", 12, 218,
+  makeLabel(backupOverlay, note ? note : "", 12, 218,
             &lv_font_montserrat_10, lvRgb(155, 165, 180));
   lcdBackupTrack = makeLcdBackupTrack(backupOverlay, 248);
   lcdBackupAnimBar = makeLcdBackupAnimBar(backupOverlay, 248);
@@ -22353,7 +22360,7 @@ void serviceQueuedBackup() {
     backup ran with the bar hidden and stepLcdBackupAnim() returning early: the
     percentages were being computed and drawn nowhere.
   */
-  showBackupOverlay(restoring);
+  showBackupOverlay(restoring, "Started from WebConfig");
   setLcdBackupStatus(restoring ? "Restoring full backup..." : "Creating full backup...");
   String createdName;
   String error;
@@ -33171,27 +33178,17 @@ void setLcdBackupStatus(const String &message) {
   lv_refr_now(nullptr);
 }
 
-/*
-  Put the progress bar on screen before the work starts.
-
-  Both of these block the Arduino loop for a minute or more, so whatever is
-  visible when they begin is what stays visible until they finish. The bar and
-  the status line sit at the top of the backup screen, but the button that
-  starts a restore is down in the list of backups - so the screen was left
-  scrolled past them and the whole operation looked like a freeze. Scrolled
-  back and painted synchronously here, because after this point nothing gets a
-  chance to redraw.
-*/
-static void showLcdBackupProgressArea() {
-  if (!content) return;
-  lv_obj_scroll_to_y(content, 0, LV_ANIM_OFF);
-  lv_refr_now(NULL);
-}
-
 void createBackupFromLcd(lv_event_t *e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  /*
+    The same overlay a WebConfig backup gets, rather than the bar buried in the
+    page. The button that starts this sits below the fold, so the progress bar
+    was off-screen and the minute-plus of work looked like a freeze; 5.23
+    scrolled the page to the top to cope, which the overlay makes unnecessary
+    because it covers the screen whatever is scrolled where.
+  */
+  showBackupOverlay(false, "Started on the remote");
   setLcdBackupStatus("Creating full backup...");
-  showLcdBackupProgressArea();
   String name;
   String error;
   if (createLcdFullBackup(name, error)) {
@@ -33199,6 +33196,9 @@ void createBackupFromLcd(lv_event_t *e) {
   } else {
     setLcdBackupStatus(error);
   }
+  lv_refr_now(nullptr);
+  vTaskDelay(pdMS_TO_TICKS(1200));
+  hideBackupOverlay();
   pendingUiRefresh = true;
 }
 
@@ -33210,14 +33210,17 @@ void confirmBackupRestore(lv_event_t *e) {
   lcdBackupConfirmBox = nullptr;
   if (!restore) return;
 
+  showBackupOverlay(true, "Started on the remote");
   setLcdBackupStatus("Restoring full backup...");
-  showLcdBackupProgressArea();
   String error;
   if (restoreLcdFullBackup(lcdPendingBackupName, error)) {
     setLcdBackupStatus("Restore complete");
   } else {
     setLcdBackupStatus(error);
   }
+  lv_refr_now(nullptr);
+  vTaskDelay(pdMS_TO_TICKS(1200));
+  hideBackupOverlay();
   pendingUiRefresh = true;
 }
 
