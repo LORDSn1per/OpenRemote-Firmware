@@ -1,6 +1,21 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.99 - 2026-09-13
+    - The backup/restore screen on the remote shows a real progress bar instead
+      of a block sliding back and forth. The old indicator moved only when a
+      file finished, so on a backup with a few large wallpapers it sat still for
+      seconds and then jumped - which is what made it look glitchy - and it
+      never said how far along anything was.
+    - Both jobs are dominated by one countable thing, files, and both totals are
+      exact rather than estimated. A restore takes its total from the length of
+      the embedded file array it has already parsed. A backup counts the five
+      directories it is about to walk with countSdFiles(), which is cheap beside
+      reading and base64-encoding every file in them.
+    - There is a track behind the fill now, so a part-full bar reads as
+      progress. Where a total genuinely is not known the old bounce still runs,
+      because a moving bar beats a frozen one.
+
   4.98 - 2026-09-13
     - "Backup upload failed" when saving a full backup to the SD card, and the
       same latent fault in every other multipart upload. Reproduced from the
@@ -6369,7 +6384,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.98"
+#define OPENREMOTE_VERSION_STRING "4.99"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -8543,7 +8558,24 @@ char lcdPendingBackupName[64] = "";
 lv_obj_t *lcdBackupStatusLabel = nullptr;
 lv_obj_t *lcdBackupConfirmBox = nullptr;
 lv_obj_t *lcdBackupAnimBar = nullptr;
+lv_obj_t *lcdBackupTrack = nullptr;
 unsigned long lcdBackupAnimStartMs = 0;
+/*
+  Real progress for a backup or restore, instead of a bar that bounced.
+
+  The old indicator was a 36px block sliding back and forth, and it only moved
+  when a file finished - so on a backup with a handful of large wallpapers it
+  sat still for seconds and then jumped, which is what made it look glitchy. It
+  also never said how far along anything was.
+
+  Both jobs are dominated by one countable thing: files. A restore knows its
+  total exactly (the embedded array's length) and a backup can count the
+  directories it is about to walk, so the bar can show genuine progress. When a
+  total genuinely is not known the old bounce is still there as a fallback,
+  because a moving bar is better than a frozen one.
+*/
+uint16_t lcdBackupStepsDone = 0;
+uint16_t lcdBackupStepsTotal = 0;
 volatile bool pendingRuntimeReload = false;
 volatile bool runtimeReloadCanRollback = false;
 volatile unsigned long runtimeReloadAfterMs = 0;
@@ -9584,6 +9616,8 @@ extern uint8_t dockRenameIndex;
 void renderBatteryPage();
 void renderBackupRestorePage();
 void stepLcdBackupAnim();
+void beginLcdBackupProgress(uint16_t total);
+void advanceLcdBackupProgress();
 void renderAboutPage();
 uint16_t countSavedIrDeviceFiles();
 uint8_t *readSdFileToPsramBuffer(File &file, size_t &outSize);
@@ -19538,7 +19572,7 @@ bool copySdTree(const String &sourcePath, const String &destinationPath) {
     String destination = destinationPath + "/" + name;
     ok = (directory ? copySdTree(entryPath, destination)
                     : copySdFile(entryPath, destination)) && ok;
-    stepLcdBackupAnim();
+    advanceLcdBackupProgress();
   }
   source.close();
   return ok;
@@ -19645,12 +19679,14 @@ void embedSdFilesAsBase64(JsonArray target, const String &directory) {
     fileEntry["path"] = path;
     fileEntry["data"] = reinterpret_cast<const char *>(encoded);
     free(encoded);
-    stepLcdBackupAnim();
+    advanceLcdBackupProgress();
   }
   root.close();
 }
 
 bool restoreEmbeddedFiles(JsonArrayConst files, String &error) {
+  // Exact, and free: the array is already parsed.
+  beginLcdBackupProgress((uint16_t)files.size());
   for (JsonObjectConst fileEntry : files) {
     const char *path = fileEntry["path"] | "";
     const char *data = fileEntry["data"] | "";
@@ -19692,7 +19728,7 @@ bool restoreEmbeddedFiles(JsonArrayConst files, String &error) {
       error = String("Could not restore ") + path;
       return false;
     }
-    stepLcdBackupAnim();
+    advanceLcdBackupProgress();
   }
   return true;
 }
@@ -20214,6 +20250,18 @@ bool createLcdFullBackup(String &createdName, String &error) {
   // physical _assets folder copy below - nativeAssets only helps restoring
   // onto *this* SD card; a copy saved to a computer needs everything inline
   // to restore onto a different remote or a fresh card.
+  /*
+    Count first, then embed. countSdFiles() walks the same five directories
+    embedSdFilesAsBase64() is about to, so the total is exact rather than
+    estimated, and it is cheap next to reading and base64-encoding every one of
+    those files. This is the slow part of a backup and now the only part that
+    needs to drive the bar.
+  */
+  beginLcdBackupProgress((uint16_t)(countSdFiles("/icons/Custom") +
+                                    countSdFiles("/themes/Default") +
+                                    countSdFiles("/themes/Custom") +
+                                    countSdFiles("/widgets/Wallpapers") +
+                                    countSdFiles("/devices")));
   JsonArray icons = data["icons"].to<JsonArray>();
   embedSdFilesAsBase64(icons, "/icons/Custom");
   JsonArray themeAssets = backup["themeAssets"].to<JsonArray>();
@@ -31384,14 +31432,42 @@ void stepLcdBackupAnim() {
   // another task is rendering.
   if (xPortGetCoreID() != 1) return;
   if (!lcdBackupAnimBar || lv_obj_has_flag(lcdBackupAnimBar, LV_OBJ_FLAG_HIDDEN)) return;
-  const uint32_t periodMs = 1200UL;
   const int trackWidth = 204;
-  const int barWidth = 36;
-  uint32_t phase = (millis() - lcdBackupAnimStartMs) % periodMs;
-  float ratio = (float)phase / (float)periodMs;
-  float bounce = ratio < 0.5f ? (ratio * 2.0f) : (2.0f - ratio * 2.0f);
-  lv_obj_set_x(lcdBackupAnimBar, 10 + (int)(bounce * (trackWidth - barWidth)));
+  if (lcdBackupStepsTotal) {
+    uint16_t done = lcdBackupStepsDone > lcdBackupStepsTotal ? lcdBackupStepsTotal
+                                                            : lcdBackupStepsDone;
+    int width = (int)((uint32_t)trackWidth * done / lcdBackupStepsTotal);
+    if (width < 2) width = 2;
+    lv_obj_set_x(lcdBackupAnimBar, 10);
+    lv_obj_set_width(lcdBackupAnimBar, width);
+  } else {
+    const uint32_t periodMs = 1200UL;
+    const int barWidth = 36;
+    uint32_t phase = (millis() - lcdBackupAnimStartMs) % periodMs;
+    float ratio = (float)phase / (float)periodMs;
+    float bounce = ratio < 0.5f ? (ratio * 2.0f) : (2.0f - ratio * 2.0f);
+    lv_obj_set_width(lcdBackupAnimBar, barWidth);
+    lv_obj_set_x(lcdBackupAnimBar, 10 + (int)(bounce * (trackWidth - barWidth)));
+  }
   lv_refr_now(nullptr);
+}
+
+// Called before a job that can count its work. total == 0 keeps the bounce.
+void beginLcdBackupProgress(uint16_t total) {
+  if (xPortGetCoreID() != 1) return;
+  lcdBackupStepsTotal = total;
+  lcdBackupStepsDone = 0;
+  if (lcdBackupTrack) {
+    if (total) lv_obj_clear_flag(lcdBackupTrack, LV_OBJ_FLAG_HIDDEN);
+    else lv_obj_add_flag(lcdBackupTrack, LV_OBJ_FLAG_HIDDEN);
+  }
+  stepLcdBackupAnim();
+}
+
+void advanceLcdBackupProgress() {
+  if (xPortGetCoreID() != 1) return;
+  if (lcdBackupStepsDone < 0xFFFF) lcdBackupStepsDone++;
+  stepLcdBackupAnim();
 }
 
 void setLcdBackupStatus(const String &message) {
@@ -31401,9 +31477,17 @@ void setLcdBackupStatus(const String &message) {
   if (lcdBackupAnimBar) {
     if (inProgress) {
       lcdBackupAnimStartMs = millis();
+      // Starts as a bounce and becomes a real bar the moment something counts
+      // its work with beginLcdBackupProgress().
+      lcdBackupStepsTotal = 0;
+      lcdBackupStepsDone = 0;
+      lv_obj_set_width(lcdBackupAnimBar, 36);
       lv_obj_clear_flag(lcdBackupAnimBar, LV_OBJ_FLAG_HIDDEN);
     } else {
       lv_obj_add_flag(lcdBackupAnimBar, LV_OBJ_FLAG_HIDDEN);
+      if (lcdBackupTrack) lv_obj_add_flag(lcdBackupTrack, LV_OBJ_FLAG_HIDDEN);
+      lcdBackupStepsTotal = 0;
+      lcdBackupStepsDone = 0;
     }
   }
   lv_refr_now(nullptr);
@@ -31470,6 +31554,20 @@ void chooseLcdBackup(lv_event_t *e) {
 // Thin bouncing bar shown under the backup/restore status line while a
 // backup or restore is in progress (see stepLcdBackupAnim()) - hidden the
 // rest of the time.
+lv_obj_t *makeLcdBackupTrack(lv_obj_t *parent, int y) {
+  lv_obj_t *track = lv_obj_create(parent);
+  lv_obj_remove_style_all(track);
+  lv_obj_set_size(track, 204, 3);
+  lv_obj_set_pos(track, 10, y);
+  lv_obj_set_style_radius(track, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_color(track, lvRgb(0x33, 0x3A, 0x45), 0);
+  lv_obj_set_style_bg_opa(track, LV_OPA_COVER, 0);
+  lv_obj_clear_flag(track, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(track, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_flag(track, LV_OBJ_FLAG_HIDDEN);
+  return track;
+}
+
 lv_obj_t *makeLcdBackupAnimBar(lv_obj_t *parent, int y) {
   lv_obj_t *bar = lv_obj_create(parent);
   lv_obj_remove_style_all(bar);
@@ -31494,6 +31592,7 @@ void renderBackupRestorePageOmote() {
     10, 90, &lv_font_montserrat_10, textPrimary());
   lv_obj_set_style_text_opa(statusLabel, LV_OPA_60, 0);
   lcdBackupStatusLabel = statusLabel;
+  lcdBackupTrack = makeLcdBackupTrack(content, 104);
   lcdBackupAnimBar = makeLcdBackupAnimBar(content, 104);
 
   loadLcdBackupEntries();
@@ -31534,6 +31633,7 @@ void renderBackupRestorePage() {
   lcdBackupStatusLabel = makeLabel(
     content, lcdBackupStatus[0] ? lcdBackupStatus : "Backups are saved on the SD card",
     10, 90, &lv_font_montserrat_10, lvRgb(160, 170, 185));
+  lcdBackupTrack = makeLcdBackupTrack(content, 104);
   lcdBackupAnimBar = makeLcdBackupAnimBar(content, 104);
 
   loadLcdBackupEntries();
