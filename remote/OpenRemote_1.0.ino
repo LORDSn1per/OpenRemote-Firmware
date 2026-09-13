@@ -1,6 +1,14 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.23 - 2026-09-13
+    - Starting a backup or a restore from the LCD scrolls back to the top and
+      repaints before the work begins. Both block the Arduino loop for a minute
+      or more, so whatever is on screen when they start is what stays there -
+      and the restore button is down in the list of backups, well past the
+      progress bar, so the screen sat on the list and the whole thing looked
+      like a freeze.
+
   5.22 - 2026-09-22
     - A backup's size is now read back from the card after the file is closed,
       instead of being taken from serializeJsonPretty()'s return value, and the
@@ -6665,7 +6673,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.22"
+#define OPENREMOTE_VERSION_STRING "5.23"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -32912,9 +32920,27 @@ void setLcdBackupStatus(const String &message) {
   lv_refr_now(nullptr);
 }
 
+/*
+  Put the progress bar on screen before the work starts.
+
+  Both of these block the Arduino loop for a minute or more, so whatever is
+  visible when they begin is what stays visible until they finish. The bar and
+  the status line sit at the top of the backup screen, but the button that
+  starts a restore is down in the list of backups - so the screen was left
+  scrolled past them and the whole operation looked like a freeze. Scrolled
+  back and painted synchronously here, because after this point nothing gets a
+  chance to redraw.
+*/
+static void showLcdBackupProgressArea() {
+  if (!content) return;
+  lv_obj_scroll_to_y(content, 0, LV_ANIM_OFF);
+  lv_refr_now(NULL);
+}
+
 void createBackupFromLcd(lv_event_t *e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
   setLcdBackupStatus("Creating full backup...");
+  showLcdBackupProgressArea();
   String name;
   String error;
   if (createLcdFullBackup(name, error)) {
@@ -32934,6 +32960,7 @@ void confirmBackupRestore(lv_event_t *e) {
   if (!restore) return;
 
   setLcdBackupStatus("Restoring full backup...");
+  showLcdBackupProgressArea();
   String error;
   if (restoreLcdFullBackup(lcdPendingBackupName, error)) {
     setLcdBackupStatus("Restore complete");
