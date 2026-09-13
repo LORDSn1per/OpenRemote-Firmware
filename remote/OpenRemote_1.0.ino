@@ -1,6 +1,16 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.94 - 2026-09-13
+    - Times a chunked upload in four parts and reports the averages: idle (the
+      client's turnaround and a fresh TCP connection, because the server closes
+      the connection on every response), recv (first body byte to last), drain
+      (waiting for the SD writer) and sync (fsync). A 120MB upload runs at
+      ~356KB/s - 538ms per 192KB chunk - and guessing which part of that is the
+      slow one has already cost one wrong fix: 4.90 moved the SD writer to
+      another core on the theory it was starving the socket, and the rate did
+      not move at all. Measurement first this time.
+
   4.93 - 2026-09-13
     - Makes 4.92's air conditioner fallback actually work. It called
       transmitLocalIrCommand() and got a silent false every time, so the frame
@@ -6283,7 +6293,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.93"
+#define OPENREMOTE_VERSION_STRING "4.94"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -8355,6 +8365,57 @@ uint32_t chunkUploadCrcAtChunkStart = 0;
   would walk the FAT cluster chain from the start every time, which is the same
   O(n^2) trap that made uploads themselves crawl before 4.86.
 */
+/*
+  Where the time in a transfer actually goes.
+
+  A 120MB upload runs at ~356KB/s, which is 538ms for each 192KB chunk, and
+  guessing at which part of that is the slow one has already cost one wrong fix
+  (4.90 moved the SD writer to another core on the theory that it was starving
+  the socket; the transfer rate did not move). So each chunk is now timed in
+  four parts and the averages reported every so often:
+
+    idle  - between one chunk being acknowledged and the next arriving. This is
+            the client's turnaround plus a fresh TCP connection, because the
+            web server sends "Connection: close" on every response.
+    recv  - first body byte to last. TCP-window bound if anything is.
+    drain - waiting for the SD writer to finish what is still buffered.
+    sync  - fsync, which forces the FAT and directory entry out.
+
+  Whatever dominates is the thing worth fixing, and the numbers also say what a
+  different chunk size would buy: total = bytes/recvRate + chunks*(fixed cost).
+*/
+struct ChunkUploadTiming {
+  uint32_t chunks;
+  uint32_t bytes;
+  uint32_t idleMs;
+  uint32_t recvMs;
+  uint32_t drainMs;
+  uint32_t syncMs;
+};
+ChunkUploadTiming chunkTiming = {};
+unsigned long chunkTimingPrevEndMs = 0;
+unsigned long chunkTimingStartMs = 0;
+unsigned long chunkTimingFirstFeedMs = 0;
+unsigned long chunkTimingLastFeedMs = 0;
+static const uint32_t CHUNK_TIMING_REPORT_EVERY = 32;
+
+void reportChunkTiming() {
+  if (!chunkTiming.chunks) return;
+  uint32_t n = chunkTiming.chunks;
+  uint32_t totalMs = chunkTiming.idleMs + chunkTiming.recvMs +
+                     chunkTiming.drainMs + chunkTiming.syncMs;
+  uint32_t kbps = totalMs ? (uint32_t)((uint64_t)chunkTiming.bytes * 1000ULL / totalMs / 1024ULL) : 0;
+  Serial.printf("Chunk timing over %lu chunks (%lu KB): idle %lums  recv %lums  "
+                "drain %lums  sync %lums  = %lums/chunk, %lu KB/s\n",
+                (unsigned long)n, (unsigned long)(chunkTiming.bytes / 1024),
+                (unsigned long)(chunkTiming.idleMs / n),
+                (unsigned long)(chunkTiming.recvMs / n),
+                (unsigned long)(chunkTiming.drainMs / n),
+                (unsigned long)(chunkTiming.syncMs / n),
+                (unsigned long)(totalMs / n), (unsigned long)kbps);
+  chunkTiming = {};
+}
+
 String chunkVerifyTarget;
 File chunkVerifyFile;
 size_t chunkVerifyOffset = 0;
@@ -21143,7 +21204,11 @@ void beginChunkUploadRequest(const String &target, size_t offset, bool authorize
     Serial.printf("Chunked upload: refused offset=%u confirmed=%u: %s\n",
                   (unsigned)offset, (unsigned)chunkUploadBytes,
                   chunkUploadError.c_str());
+    return;
   }
+  chunkTimingStartMs = millis();
+  chunkTimingFirstFeedMs = 0;
+  chunkTimingLastFeedMs = 0;
 }
 
 // Reports a failure the writer task hit, in the request that caused it.
@@ -21164,6 +21229,8 @@ bool chunkWriterHealthy() {
 */
 void feedChunkUpload(const uint8_t *data, size_t length) {
   if (!chunkUploadChunkOk) return;
+  if (!chunkTimingFirstFeedMs) chunkTimingFirstFeedMs = millis();
+  chunkTimingLastFeedMs = millis();
   if (!chunkWriterHealthy()) return;
   size_t consumed = 0;
   while (consumed < length) {
@@ -21192,6 +21259,7 @@ void feedChunkUpload(const uint8_t *data, size_t length) {
 }
 
 void finishChunkUploadRequest() {
+  unsigned long drainStartMs = millis();
   if (chunkUploadChunkOk) {
     // Everything still buffered has to reach the card before the chunk can be
     // acknowledged, or a reported offset would run ahead of the file.
@@ -21199,9 +21267,28 @@ void finishChunkUploadRequest() {
     if (!chunkWriterHealthy()) { /* reported */ }
     else if (!drained) failChunkUploadIo("write", ETIMEDOUT);
   }
+  unsigned long syncStartMs = millis();
   if (chunkUploadChunkOk && chunkUploadFd >= 0) {
     errno = 0;
     if (::fsync(chunkUploadFd) != 0) failChunkUploadIo("sync", errno);
+  }
+  unsigned long syncEndMs = millis();
+  if (chunkUploadChunkOk && chunkTimingStartMs) {
+    chunkTiming.chunks++;
+    chunkTiming.bytes += (uint32_t)(chunkUploadBytes - chunkUploadBytesAtChunkStart);
+    if (chunkTimingPrevEndMs && chunkTimingStartMs > chunkTimingPrevEndMs) {
+      chunkTiming.idleMs += (uint32_t)(chunkTimingStartMs - chunkTimingPrevEndMs);
+    }
+    if (chunkTimingFirstFeedMs) {
+      chunkTiming.recvMs += (uint32_t)(chunkTimingLastFeedMs - chunkTimingFirstFeedMs);
+      // The wait for the first body byte belongs to the turnaround, not the
+      // transfer: it is the request line, headers and TCP handshake.
+      chunkTiming.idleMs += (uint32_t)(chunkTimingFirstFeedMs - chunkTimingStartMs);
+    }
+    chunkTiming.drainMs += (uint32_t)(syncStartMs - drainStartMs);
+    chunkTiming.syncMs += (uint32_t)(syncEndMs - syncStartMs);
+    chunkTimingPrevEndMs = syncEndMs;
+    if (chunkTiming.chunks >= CHUNK_TIMING_REPORT_EVERY) reportChunkTiming();
   }
   if (!chunkUploadChunkOk) rollbackChunkUpload();
   else {
@@ -21551,6 +21638,8 @@ void handleChunkUploadFinish() {
   }
 
   if (!ok && target != "webconfig") SD.remove(path);
+  reportChunkTiming();
+  chunkTimingPrevEndMs = 0;
   Serial.printf("Chunked upload: finish target=%s %s received=%u heapFree=%u %s\n",
                 target.c_str(), ok ? "committed" : "FAILED",
                 (unsigned)received, (unsigned)ESP.getFreeHeap(), ok ? "" : error.c_str());
