@@ -1,6 +1,24 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.07 - 2026-09-13
+    - An LCD backup records its widget count. It has always embedded the widget
+      wallpapers and never counted them, so it listed "0 widgets" beside a
+      WebConfig backup of the same card reporting 3. The files were in there
+      either way; only the tally was missing.
+
+  5.06 - 2026-09-13
+    - The backup list shows its counts again. 5.02 stopped reading whole backup
+      files to list them, which fixed a large backup vanishing from the list -
+      but the counts the restore list displays live in a nested "counts" object
+      that only the full parse read, so every backup started reporting
+      "0 devices, 0 activities, 0 macros, 0 icons, 0 themes". Recovered from the
+      head with backupHeadNumber(): the block sits at byte 155 of a real backup
+      and ends before 300, comfortably inside the head already being read, so
+      nothing extra is fetched. The search is anchored to "counts" because
+      "devices" appears again further down in data and deviceFiles.
+    - Widget counts are reported too, which the old path never did.
+
   5.05 - 2026-09-13
     - The SD browser now refuses outright to delete, move or rename the four
       paths that leave the remote unable to recover by itself: /config,
@@ -6469,7 +6487,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.05"
+#define OPENREMOTE_VERSION_STRING "5.07"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -20422,6 +20440,10 @@ bool createLcdFullBackup(String &createdName, String &error) {
   counts["macros"] = runtime["macros"].as<JsonArrayConst>().size();
   counts["icons"] = countSdFiles("/icons/Custom");
   counts["themes"] = runtime["themes"].as<JsonArrayConst>().size();
+  // An LCD backup embeds the widget wallpapers but never counted them, so it
+  // reported "0 widgets" beside a WebConfig backup of the same card saying 3.
+  // The files were always in there; only the tally was missing.
+  counts["widgets"] = countSdFiles("/widgets/Wallpapers");
 
   JsonObject data = backup["data"].to<JsonObject>();
   data["devices"].set(runtime["devices"]);
@@ -20696,6 +20718,38 @@ bool backupHeadValue(const char *head, const char *key, char *out, size_t outSiz
   while (*at && *at != '"' && i + 1 < outSize) out[i++] = *at++;
   out[i] = '\0';
   return i > 0;
+}
+
+/*
+  The numeric counterpart, scoped to a section.
+
+  Needed because the counts are what the restore list shows - "9 devices,
+  4 activities" - and 5.02 stopped reading them the moment it stopped parsing
+  whole files, so every backup reported zero of everything. The block sits at
+  byte 155 of a real backup and ends before 300, well inside the head that is
+  already being read, so nothing extra is fetched to recover it.
+
+  `section` anchors the search: "devices" appears again further down the file in
+  data and deviceFiles, and without the anchor the first match after the start
+  would not reliably be the one in counts.
+*/
+long backupHeadNumber(const char *head, const char *section, const char *key) {
+  if (!head || !key) return 0;
+  const char *from = head;
+  if (section) {
+    from = strstr(head, section);
+    if (!from) return 0;
+  }
+  char needle[32];
+  snprintf(needle, sizeof(needle), "\"%s\"", key);
+  const char *at = strstr(from, needle);
+  if (!at) return 0;
+  at = strchr(at + strlen(needle), ':');
+  if (!at) return 0;
+  at++;
+  while (*at == ' ' || *at == '\t' || *at == '\r' || *at == '\n') at++;
+  if (*at < '0' || *at > '9') return 0;
+  return strtol(at, nullptr, 10);
 }
 
 // Reads the first bytes of an open file into a caller-owned buffer.
@@ -21179,7 +21233,10 @@ void handleBackupList() {
             nested object and only worth a full parse on a file small enough
             that reading it costs nothing.
           */
-          char head[768];
+          // 1536, not 768: counts ends around byte 300 in a real backup, and
+          // the margin means a field added ahead of it cannot silently push it
+          // out of the window and take the numbers back to zero.
+          char head[1536];
           readFileHead(entry, head, sizeof(head));
           char headCategory[40] = "";
           char headExportedAt[48] = "";
@@ -21215,18 +21272,21 @@ void handleBackupList() {
             item["exportedAt"] = exportedAt;
             item["appVersion"] = parsed ? (summary["appVersion"] | "") : "";
             item["category"] = category;
+            // From the parse when it ran, from the head when it did not.
             JsonObjectConst counts = summary["counts"];
-            item["devices"] = counts["devices"] | 0;
-            item["learned"] = counts["learned"] | 0;
-            item["activities"] = counts["activities"] | 0;
-            item["macros"] = counts["macros"] | 0;
-            item["icons"] = counts["icons"] | 0;
-            item["themes"] = counts["themes"] | 0;
+            item["devices"]    = parsed ? (counts["devices"]    | 0) : (int)backupHeadNumber(head, "\"counts\"", "devices");
+            item["learned"]    = parsed ? (counts["learned"]    | 0) : (int)backupHeadNumber(head, "\"counts\"", "learned");
+            item["activities"] = parsed ? (counts["activities"] | 0) : (int)backupHeadNumber(head, "\"counts\"", "activities");
+            item["macros"]     = parsed ? (counts["macros"]     | 0) : (int)backupHeadNumber(head, "\"counts\"", "macros");
+            item["icons"]      = parsed ? (counts["icons"]      | 0) : (int)backupHeadNumber(head, "\"counts\"", "icons");
+            item["themes"]     = parsed ? (counts["themes"]     | 0) : (int)backupHeadNumber(head, "\"counts\"", "themes");
+            item["widgets"]    = parsed ? (counts["widgets"]    | 0) : (int)backupHeadNumber(head, "\"counts\"", "widgets");
             // A category export has no per-category counts block, just one
             // total, so report it against its own category.
             if (!isFull) {
               const char *key = strcmp(category, "learned-device") == 0 ? "learned" : category;
-              if (item[key].is<int>()) item[key] = summary["count"] | 1;
+              long total = parsed ? (long)(summary["count"] | 1) : backupHeadNumber(head, nullptr, "count");
+              if (item[key].is<int>()) item[key] = (int)(total ? total : 1);
             }
           }
         }
