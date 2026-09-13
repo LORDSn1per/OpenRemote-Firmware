@@ -1,6 +1,26 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  4.95 - 2026-09-13
+    - Fixes the "SD write failed (5: I/O error)" that has broken large uploads
+      since 4.88, and it was self-inflicted. 4.88's double-buffered writer took
+      its two 64KB buffers from PSRAM, because the board has 8MB spare and
+      128KB is most of the free internal heap. But sdmmc_write_sectors() only
+      DMAs a buffer directly when it is aligned AND not external RAM, and
+      ESP32-S3 does not define SOC_SDMMC_PSRAM_DMA_CAPABLE - so a PSRAM source
+      always took the bounce path instead: a heap_caps_malloc(MALLOC_CAP_DMA)
+      of INTERNAL memory per write, a copy of every byte through it, and
+      transfers in 8KB pieces (SDSPI sets unaligned_multi_block_rw_max_chunk_
+      size to 16 sectors). When that allocation failed under heap pressure it
+      returned ESP_ERR_NO_MEM, which arrives as EIO. The logs say so plainly in
+      hindsight: every write failure sits at 74-82KB free internal heap against
+      an ~84KB baseline, and the partial byte counts are always multiples of
+      8KB. The buffers are 16KB of internal DMA-capable memory now, which skips
+      the allocation, the copy and the splitting entirely.
+    - Measured alongside this: a 1MB chunk posted straight to /api/upload/raw
+      with curl moves at 575-600KB/s against the 344KB/s a 192KB chunk manages,
+      so the transport was never the limit - the per-chunk fixed cost is.
+
   4.94 - 2026-09-13
     - Times a chunked upload in four parts and reports the averages: idle (the
       client's turnaround and a fresh TCP connection, because the server closes
@@ -6293,7 +6313,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "4.94"
+#define OPENREMOTE_VERSION_STRING "4.95"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -8189,7 +8209,34 @@ bool chunkUploadRadioBoosted = false;
   lock is needed: the HTTP task reads chunkUploadBytes and chunkUploadCrc only
   after drainChunkWriter() has confirmed the writer is idle.
 */
-static const size_t CHUNK_WRITE_BUFFER_BYTES = 64UL * 1024UL;
+/*
+  16KB of INTERNAL, DMA-capable memory each - not 64KB of PSRAM.
+
+  4.88 allocated these with ps_malloc, on the reasonable-sounding grounds that
+  the board has 8MB of PSRAM going spare and 128KB is most of the free internal
+  heap. That was wrong, and it is what has been throwing errno 5 across every
+  large upload since.
+
+  sdmmc_write_sectors() only hands a buffer straight to DMA when it is aligned
+  AND not in external RAM - ESP32-S3 does not define
+  SOC_SDMMC_PSRAM_DMA_CAPABLE, so a PSRAM source always fails that test.
+  Everything else goes down the bounce path, which for each write calls
+  heap_caps_malloc(MALLOC_CAP_DMA) for an INTERNAL staging buffer, memcpies
+  through it, and writes in unaligned_multi_block_rw_max_chunk_size pieces -
+  16 sectors, 8KB, for SDSPI. So every 64KB "write from PSRAM" was really an
+  internal allocation plus a copy of every byte plus eight separate transfers,
+  and when that allocation failed under heap pressure it returned ESP_ERR_NO_MEM
+  and surfaced as EIO. Hence the correlation the logs show: every single write
+  failure sits at 74-82KB free internal heap against an ~84KB baseline, and the
+  partial counts are always multiples of 8KB (accepted=32768 is four bounce
+  iterations landing and the fifth failing to allocate).
+
+  Internal DMA memory skips all of it: no per-write allocation to fail, no copy,
+  and the whole buffer goes out in one multi-block transfer. Smaller because
+  internal heap is the scarce one, and 16KB is still 32 sectors - large enough
+  that per-call overhead is irrelevant.
+*/
+static const size_t CHUNK_WRITE_BUFFER_BYTES = 16UL * 1024UL;
 static const uint8_t CHUNK_WRITE_BUFFER_COUNT = 2;
 
 struct ChunkWriteBlock {
@@ -20764,17 +20811,33 @@ bool startChunkWriter() {
   chunkFillUsed = 0;
   for (uint8_t i = 0; i < CHUNK_WRITE_BUFFER_COUNT; i++) {
     if (!chunkWriteBuffers[i]) {
-      // PSRAM by preference - 128KB is most of the free internal heap, and the
-      // board has 8MB of PSRAM sitting idle. The fallback is for a board built
-      // without it, where the upload is slower but still works.
-      chunkWriteBuffers[i] = (uint8_t *)ps_malloc(CHUNK_WRITE_BUFFER_BYTES);
-      if (!chunkWriteBuffers[i]) chunkWriteBuffers[i] = (uint8_t *)malloc(CHUNK_WRITE_BUFFER_BYTES);
+      // MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL is the whole point - see the note
+      // on CHUNK_WRITE_BUFFER_BYTES. PSRAM here silently costs a copy of every
+      // byte and an allocation that can fail mid-transfer.
+      chunkWriteBuffers[i] = (uint8_t *)heap_caps_malloc(
+        CHUNK_WRITE_BUFFER_BYTES, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+      if (!chunkWriteBuffers[i]) {
+        // Still works from PSRAM, just back on the bounce path. Said out loud
+        // rather than silently, because it changes both speed and failure rate.
+        chunkWriteBuffers[i] = (uint8_t *)ps_malloc(CHUNK_WRITE_BUFFER_BYTES);
+        if (chunkWriteBuffers[i]) {
+          Serial.printf("Chunked upload: no internal DMA memory for a %uKB "
+                        "buffer, falling back to PSRAM (slower, and writes can "
+                        "fail under heap pressure)\n",
+                        (unsigned)(CHUNK_WRITE_BUFFER_BYTES / 1024));
+        }
+      }
       if (!chunkWriteBuffers[i]) {
         Serial.printf("Chunked upload: no room for a %uKB write buffer "
                       "(heap=%u psram=%u)\n",
                       (unsigned)(CHUNK_WRITE_BUFFER_BYTES / 1024),
                       (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
         return false;
+      }
+      if (!esp_ptr_external_ram(chunkWriteBuffers[i]) && i == 0) {
+        Serial.printf("Chunked upload: %u x %uKB internal DMA write buffers\n",
+                      (unsigned)CHUNK_WRITE_BUFFER_COUNT,
+                      (unsigned)(CHUNK_WRITE_BUFFER_BYTES / 1024));
       }
     }
   }
