@@ -1,6 +1,18 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.19 - 2026-09-13
+    - New POST /api/backups/create, so WebConfig can ask the remote to write a
+      full backup rather than building its own in the browser.
+      createLcdFullBackup() already existed but only the LCD menu could reach
+      it, so the two sides produced different files - and the browser's version
+      embedded whatever an asset fetch returned, which for a missing wallpaper
+      was the WebConfig page itself at HTTP 200: 1.9 MB of HTML stored as a
+      .rgb565, three of them, taking one backup to 14.9 MB against 6.8 MB for
+      the same configuration and past what the remote can parse back in.
+    - embedSdFilesAsBase64() yields once per file, since it now runs on the HTTP
+      worker as well as the Arduino loop.
+
   5.18 - 2026-09-13
     - A short write while restoring an embedded asset is retried with a fresh
       file handle, up to three times. Nothing locks the SD card between the HTTP
@@ -6625,7 +6637,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.18"
+#define OPENREMOTE_VERSION_STRING "5.19"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -20202,6 +20214,11 @@ void embedSdFilesAsBase64(JsonArray target, const String &directory) {
     size_t rawSize = 0;
     uint8_t *raw = readSdFileToPsramBuffer(entry, rawSize);
     entry.close();
+    // One per file. This runs on the Arduino loop for an LCD backup but on the
+    // HTTP worker for /api/backups/create, and a full backup is tens of files
+    // and several megabytes of reading and base64 - the same shape that let the
+    // task watchdog abort the restore before 5.15.
+    vTaskDelay(1);
     if (!raw || !rawSize) {
       if (raw) free(raw);
       continue;
@@ -21999,6 +22016,44 @@ uint32_t crc32Update(uint32_t crc, const uint8_t *data, size_t length) {
 // runtime.json - to restore data that had never left the card. This runs the
 // same restoreLcdFullBackup() the LCD's own Backup/Restore menu uses, so an
 // SD restore costs no upload at all and behaves identically either way.
+/*
+  Build a full backup on the remote, on request.
+
+  createLcdFullBackup() has always existed but only the LCD menu could reach it,
+  so WebConfig built its own backup in the browser instead - a different shape
+  from the remote's, and one that embedded whatever an asset fetch returned. A
+  missing wallpaper answered with the WebConfig page itself, HTTP 200, and 1.9 MB
+  of HTML was stored as a .rgb565; three of those took one backup to 14.9 MB
+  against the remote's 6.8 MB for the same configuration, past what the remote
+  can parse back in ("NoMemory at byte 5876730 of 10117360").
+
+  With this route WebConfig can ask for the remote's own backup and download it,
+  so there is one format, written by one piece of code, restorable from either
+  side.
+*/
+void handleBackupCreateApi() {
+  if (!requestAuthorized()) {
+    sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
+    return;
+  }
+  if (!sdReady) {
+    sendJson(503, "{\"ok\":false,\"error\":\"SD card unavailable\"}");
+    return;
+  }
+  String createdName;
+  String error;
+  uint32_t startedMs = millis();
+  bool ok = createLcdFullBackup(createdName, error);
+  Serial.printf("Backup create (WebConfig): %s %s took=%ums\n",
+                ok ? createdName.c_str() : "-", ok ? "ok" : error.c_str(),
+                (unsigned)(millis() - startedMs));
+  if (!ok) {
+    sendJson(500, String("{\"ok\":false,\"error\":\"") + error + "\"}");
+    return;
+  }
+  sendJson(200, String("{\"ok\":true,\"name\":\"") + createdName + "\"}");
+}
+
 void handleBackupRestoreApi() {
   if (!requestAuthorized()) {
     sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
@@ -25463,6 +25518,7 @@ void configureWebServer() {
                   sdBrowserUploadOk ? "{\"ok\":true}"
                                     : "{\"ok\":false,\"error\":\"Upload failed\"}");
   }, handleSdBrowseUploadData);
+  webServer.on("/api/backups/create", HTTP_POST, handleBackupCreateApi);
   webServer.on("/api/backups", HTTP_GET, handleBackupList);
   webServer.on("/api/backups/file", HTTP_GET, handleBackupDownload);
   webServer.on("/api/backups/file", HTTP_DELETE, handleBackupDelete);
