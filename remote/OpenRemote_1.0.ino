@@ -1,6 +1,39 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.18 - 2026-09-13
+    - A short write while restoring an embedded asset is retried with a fresh
+      file handle, up to three times. Nothing locks the SD card between the HTTP
+      worker and the Arduino loop, so every yield in the write loop lets the
+      loop read the files being written - which is why the failures always
+      landed on /themes/*.rgb565, the ones the LCD renders, and why a restore
+      from the LCD menu never failed: that path runs on the loop itself, so
+      there is no second user of the card. Restarted rather than resumed
+      because FatFs latches the error on the file object and only f_open clears
+      it.
+
+  5.17 - 2026-09-13
+    - Fixes the restore failing on a theme file every time in 5.16. The base64
+      scratch buffer was a 3 KB local array, so it sat on the stack of the HTTP
+      worker - already deep inside the web server and ArduinoJson - and
+      overflowed it. The short write that followed came from a File object in
+      corrupted stack memory and was reported as "Could not restore <path>",
+      which looked like an SD fault. It is one heap allocation for the whole
+      call now. Yields also went from every 3 KB to every 24 KB: nothing locks
+      the SD card between the HTTP worker and the Arduino loop, so each yield
+      is a window for both to use it at once, and they are now as sparse as the
+      watchdog allows.
+
+  5.16 - 2026-09-13
+    - Restoring a backup no longer allocates each embedded asset whole.
+      restoreEmbeddedFiles() ps_malloc()'d the entire decoded file - nearly
+      2 MB of contiguous PSRAM for one expanded wallpaper - which works on a
+      clean heap and fails on a fragmented one. That is why a backup restored
+      from the LCD menu but not from WebConfig, and why the same file restored
+      twice in a row returned "ok" and then "Out of memory restoring backed-up
+      icons/themes". It now decodes and writes 4 KB of base64 at a time, so the
+      working set is 3 KB whatever the asset's size.
+
   5.15 - 2026-09-13
     - Restoring a full backup no longer trips the task watchdog.
       restoreEmbeddedFiles() decoded and wrote every embedded asset back to
@@ -6592,7 +6625,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.15"
+#define OPENREMOTE_VERSION_STRING "5.18"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -20200,6 +20233,24 @@ void embedSdFilesAsBase64(JsonArray target, const String &directory) {
 bool restoreEmbeddedFiles(JsonArrayConst files, String &error) {
   // Exact, and free: the array is already parsed.
   beginLcdBackupProgress((uint16_t)files.size());
+  /*
+    One scratch buffer for the whole call, on the heap.
+
+    It was a plain local array, which put 3 KB on the stack of whichever task
+    was running - and this runs on the HTTP worker, already deep inside
+    ArduinoJson and the web server. That overflowed it: 5.16 failed every
+    restore with "Could not restore <some theme file>", a short write from a
+    File object sitting in smashed stack memory, which read as an SD fault and
+    is not one.
+  */
+  const size_t B64_BLOCK = 4096;                     // a multiple of 4
+  const size_t B64_DECODED = (B64_BLOCK / 4) * 3;
+  uint8_t *decodeBuffer = static_cast<uint8_t *>(malloc(B64_DECODED));
+  if (!decodeBuffer) {
+    error = "Out of memory restoring backed-up icons/themes";
+    return false;
+  }
+  uint32_t blockCount = 0;
   for (JsonObjectConst fileEntry : files) {
     const char *path = fileEntry["path"] | "";
     const char *data = fileEntry["data"] | "";
@@ -20216,58 +20267,82 @@ bool restoreEmbeddedFiles(JsonArrayConst files, String &error) {
     }
     if (!path[0] || !data[0]) continue;
     size_t dataLen = strlen(data);
-    size_t decodedLen = 0;
-    mbedtls_base64_decode(nullptr, 0, &decodedLen,
-                          reinterpret_cast<const unsigned char *>(data), dataLen);
-    uint8_t *decoded = static_cast<uint8_t *>(ps_malloc(decodedLen));
-    if (!decoded) {
-      error = "Out of memory restoring backed-up icons/themes";
-      return false;
-    }
-    size_t actualLen = 0;
-    int rc = mbedtls_base64_decode(decoded, decodedLen, &actualLen,
-                                   reinterpret_cast<const unsigned char *>(data), dataLen);
-    if (rc != 0) {
-      free(decoded);
-      error = String("Corrupt embedded asset data for ") + path;
-      return false;
-    }
+    /*
+      Retried from the top, with a fresh handle, because a short write here is
+      not a bad card.
+
+      Nothing locks the SD between the HTTP worker and the Arduino loop, and
+      every yield in the write loop below is a window for the loop to read the
+      very files being written - which is why the failures land on
+      /themes/*.rgb565, the ones the LCD renders from. A restore over HTTP
+      failed perhaps two times in five that way, always on a theme, while the
+      same backup restored from the LCD menu never did: that path runs ON the
+      Arduino loop, so there is no second user of the card.
+
+      Once a write fails FatFs latches the error on the file object and every
+      later write to it fails too - ABORT() sets fp->err, f_write checks it,
+      and only f_open clears it (see the note on reopenChunkWriteFd()). So the
+      handle is closed and the file started again rather than resumed.
+    */
+    bool ok = false;
+    for (uint8_t attempt = 0; attempt < 3 && !ok; attempt++) {
+      if (attempt) {
+        Serial.printf("Restore: retrying %s (attempt %u)\n", path, attempt + 1);
+        vTaskDelay(pdMS_TO_TICKS(40));
+      }
     SD.remove(path);
     File out = SD.open(path, FILE_WRITE);
     /*
-      Written in chunks with a yield between them, not in one call.
+      Decoded and written a block at a time, never allocated whole.
 
-      This loop is the whole restore: 65 files and several megabytes for a
-      full backup, decoded and written back to back. Nothing in it yielded, so
-      on the HTTP worker (core 0) the idle task never ran and the task
-      watchdog aborted the firmware mid-restore - "Task watchdog got
-      triggered ... IDLE0 (CPU 0) ... Aborting", then a reboot. That is the
-      crash, and it was never out of memory: the parse ahead of this already
-      feeds the watchdog every 16 KB through BufferedSdJsonStream::refill(),
-      and the largest wallpaper here decodes to nearly 2 MB, which is seconds
-      of SD writing on its own - past the 5 s timeout without help.
+      This used to ps_malloc() the entire decoded asset - up to nearly 2 MB of
+      *contiguous* PSRAM for one expanded wallpaper - and a full backup is
+      around 65 such files. That succeeds on a clean heap and fails once PSRAM
+      is fragmented, which it always is with the web server up, so restoring
+      from WebConfig failed where the same file restored from the LCD menu
+      worked. It was intermittent in the worst way: the same backup, restored
+      twice in a row, went "ok" then "Out of memory restoring backed-up
+      icons/themes".
+
+      Base64 is a fixed 4:3 encoding and these strings carry no whitespace, so
+      any block of input whose length is a multiple of 4 decodes standalone.
+      Padding can only appear in the final block. That caps the working set at
+      3 KB however large the asset is, and the yield per block keeps the task
+      watchdog fed - a full backup is minutes of decoding and SD writing on one
+      HTTP worker, which used to abort the firmware outright.
     */
-    bool ok = (bool)out;
-    if (ok) {
-      const size_t CHUNK = 32768;
-      size_t written = 0;
-      while (written < actualLen) {
-        size_t take = min(CHUNK, actualLen - written);
-        if (out.write(decoded + written, take) != take) { ok = false; break; }
-        written += take;
-        vTaskDelay(1);
+    ok = (bool)out;
+    size_t offset = 0;
+    while (ok && offset < dataLen) {
+      size_t take = min(B64_BLOCK, dataLen - offset);
+      size_t produced = 0;
+      int rc = mbedtls_base64_decode(decodeBuffer, B64_DECODED, &produced,
+                                     reinterpret_cast<const unsigned char *>(data + offset),
+                                     take);
+      if (rc != 0) {
+        if (out) out.close();
+        free(decodeBuffer);
+        error = String("Corrupt embedded asset data for ") + path;
+        return false;
       }
+      if (produced && out.write(decodeBuffer, produced) != produced) ok = false;
+      offset += take;
+      // Every 8th block - 24 KB written - rather than every one. The watchdog
+      // only needs feeding a few times a second, and each yield is a window
+      // for the Arduino loop to touch the same SD card with no lock between
+      // them, so they are kept as sparse as the timeout allows.
+      if ((++blockCount & 7) == 0) vTaskDelay(1);
     }
     if (out) out.close();
-    free(decoded);
-    // Also once per file, so a backup made of many small assets yields too.
-    vTaskDelay(1);
+    }
     if (!ok) {
-      error = String("Could not restore ") + path;
+      free(decodeBuffer);
+      error = String("Could not restore ") + path + " after 3 attempts";
       return false;
     }
     advanceLcdBackupProgress();
   }
+  free(decodeBuffer);
   return true;
 }
 
