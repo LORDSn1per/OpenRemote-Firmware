@@ -1,6 +1,42 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.03 - 2026-09-13
+    - A backup no longer writes everything twice. Every one used to copy
+      /config, /devices, /activities, /macros, both theme folders, the widget
+      wallpapers and the custom icons into a sibling _assets folder AND embed
+      the same files again as base64 inside the JSON - so a 6.8MB backup
+      actually cost 13.8MB of card and took twice as long. A backup is now one
+      self-contained JSON, which is what WebConfig has always produced.
+    - The copy only served restoring onto the same card, and
+      restoreLcdFullBackup() already prefers it when present and falls back to
+      the embedded data otherwise. Checked before removing it: the copy
+      preserved exactly one thing the embed does not, /config/version.json, a
+      hundred bytes the SD bootstrap writes at startup anyway. /activities and
+      /macros are empty and runtime.json travels as runtimeConfig.
+    - Existing backups with an _assets folder still restore through it -
+      restoreNativeBackupAssets() is untouched and verifies the folder is
+      really there - and deleting a backup still removes its folder.
+
+  5.02 - 2026-09-13
+    - A backup larger than a few megabytes no longer vanishes from the list.
+      Listing read every file into PSRAM in full and parsed it, to recover two
+      short strings from the first two hundred bytes - so a file too big to
+      allocate was silently dropped. With widget wallpapers embedded as base64
+      a full backup is now ~6.8MB against ~3.6MB before, which crossed that
+      line: a freshly created backup reported success and never appeared, while
+      two smaller ones listed fine. The file had always been written correctly;
+      the listing could not read it back. Both the LCD list and
+      /api/backups now scan a fixed head instead, and only fall back to a full
+      parse for a file small enough that it costs nothing.
+    - That also removes the ten second wait to open Backup/Restore, which was
+      13MB of backups being read and parsed to draw three rows.
+    - The progress bar names its phase and shows a percentage, and no longer
+      stalls near the end. Collecting files is 0-70%; writing the document to
+      the card - the longest single step, previously reporting nothing at all -
+      is 70-100%, measured against measureJsonPretty() through a counting Print
+      so it is real progress rather than a guess.
+
   5.01 - 2026-09-13
     - An SD card browser in WebConfig, under Settings, with a real file manager
       behind it: GET /api/sd/browse and /api/sd/download, POST /api/sd/upload,
@@ -6410,7 +6446,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.01"
+#define OPENREMOTE_VERSION_STRING "5.03"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -8617,6 +8653,20 @@ unsigned long lcdBackupAnimStartMs = 0;
 */
 uint16_t lcdBackupStepsDone = 0;
 uint16_t lcdBackupStepsTotal = 0;
+/*
+  A backup is not one job but three, and only the middle one counts files.
+
+  The bar reached about 97% and then sat there with nothing to explain it,
+  because after the last file is embedded the whole multi-megabyte document
+  still has to be serialised to the card - the single longest step, and the one
+  that was reporting nothing at all. Each phase now owns a band of the bar and
+  names itself, so the percentage always means something and never stalls
+  silently at the end.
+*/
+float lcdBackupBandLow = 0.0f;
+float lcdBackupBandHigh = 1.0f;
+float lcdBackupFraction = 0.0f;
+char lcdBackupPhase[24] = "";
 volatile bool pendingRuntimeReload = false;
 volatile bool runtimeReloadCanRollback = false;
 volatile unsigned long runtimeReloadAfterMs = 0;
@@ -9658,6 +9708,8 @@ void renderBatteryPage();
 void renderBackupRestorePage();
 void stepLcdBackupAnim();
 void beginLcdBackupProgress(uint16_t total);
+void beginLcdBackupPhase(const char *phase, uint16_t total, float low, float high);
+void setLcdBackupPhaseFraction(const char *phase, float within, float low, float high);
 void advanceLcdBackupProgress();
 void renderAboutPage();
 uint16_t countSavedIrDeviceFiles();
@@ -20233,6 +20285,41 @@ void backupDateStrings(char *fileStamp, size_t fileStampSize,
   }
 }
 
+/*
+  Counts bytes on their way to the card so the write can report progress.
+
+  serializeJsonPretty() offers no progress of its own and is the longest step
+  of a backup; measureJsonPretty() gives the exact size beforehand, so counting
+  what passes through turns that silence into a real percentage.
+*/
+struct BackupProgressWriter : public Print {
+  Print &target;
+  size_t total;
+  size_t done = 0;
+  size_t sinceReport = 0;
+  BackupProgressWriter(Print &t, size_t bytes) : target(t), total(bytes) {}
+  void note(size_t bytes) {
+    done += bytes;
+    sinceReport += bytes;
+    // Redrawing per byte would cost far more than the write itself. 32KB is
+    // roughly one percent of a typical backup.
+    if (sinceReport >= 32768 && total) {
+      sinceReport = 0;
+      setLcdBackupPhaseFraction("Writing backup", (float)done / (float)total, 0.70f, 1.0f);
+    }
+  }
+  size_t write(uint8_t b) override {
+    size_t n = target.write(b);
+    note(n);
+    return n;
+  }
+  size_t write(const uint8_t *buffer, size_t size) override {
+    size_t n = target.write(buffer, size);
+    note(n);
+    return n;
+  }
+};
+
 bool createLcdFullBackup(String &createdName, String &error) {
   if (!sdReady || !SD.exists(RUNTIME_CONFIG_PATH)) {
     error = "Runtime configuration is unavailable";
@@ -20259,17 +20346,26 @@ bool createLcdFullBackup(String &createdName, String &error) {
   backupDateStrings(stamp, sizeof(stamp), exportedAt, sizeof(exportedAt));
   createdName = String("OpenRemote_Backup_") + stamp + ".json";
   String backupPath = String("/backups/") + createdName;
-  String assetsPath = backupPath.substring(0, backupPath.length() - 5) + "_assets";
-  deleteSdTree(assetsPath);
-  if (!SD.mkdir(assetsPath)) {
-    error = "Could not create backup asset folder";
-    return false;
-  }
+  /*
+    No _assets folder. The backup is one self-contained JSON, like WebConfig's.
 
-  const char *sourceFolders[] = {
-    "/config", "/devices", "/activities", "/macros",
-    "/themes/Default", "/themes/Custom", "/widgets/Wallpapers", "/icons/Custom"
-  };
+    Every backup used to copy /config, /devices, /activities, /macros, both
+    theme folders, the widget wallpapers and the custom icons into a sibling
+    _assets folder - and then embed the same files again as base64 inside the
+    JSON. Two copies of everything, so a 6.8MB backup actually cost 13.8MB and
+    took twice as long to write.
+
+    The copy only ever served restoring onto the same card: restoreLcdFullBackup()
+    uses it when present and falls back to the embedded data otherwise, which is
+    the path every WebConfig backup has always taken. Checked before removing
+    it, the copy preserved exactly one thing the embed does not - /config/
+    version.json, a hundred bytes the SD bootstrap writes at startup anyway.
+    /activities and /macros are empty, and runtime.json travels as runtimeConfig.
+
+    Backups that already have an _assets folder still restore through it;
+    restoreNativeBackupAssets() is untouched and checks the folder is really
+    there. New ones simply do not make one.
+  */
   /*
     Count everything before anything starts, so one bar spans the whole job.
 
@@ -20280,26 +20376,12 @@ bool createLcdFullBackup(String &createdName, String &error) {
     appeared part way through. countSdFiles() walks directory entries without
     reading any file, which is nothing beside copying and encoding them.
   */
-  uint32_t plannedFiles = 0;
-  for (const char *source : sourceFolders) plannedFiles += countSdFiles(source);
-  plannedFiles += countSdFiles("/icons/Custom") + countSdFiles("/themes/Default") +
-                  countSdFiles("/themes/Custom") + countSdFiles("/widgets/Wallpapers") +
-                  countSdFiles("/devices");
-  beginLcdBackupProgress((uint16_t)(plannedFiles > 65535UL ? 65535UL : plannedFiles));
-
-  bool assetsOk = true;
-  for (const char *source : sourceFolders) {
-    String destination = assetsPath + source;
-    int slash = destination.lastIndexOf('/');
-    String parent = destination.substring(0, slash);
-    if (!SD.exists(parent)) SD.mkdir(parent);
-    assetsOk = copySdTree(source, destination) && assetsOk;
-  }
-  if (!assetsOk) {
-    deleteSdTree(assetsPath);
-    error = "Could not copy all SD backup data";
-    return false;
-  }
+  uint32_t plannedFiles = countSdFiles("/icons/Custom") + countSdFiles("/themes/Default") +
+                          countSdFiles("/themes/Custom") + countSdFiles("/widgets/Wallpapers") +
+                          countSdFiles("/devices");
+  beginLcdBackupPhase("Reading files",
+                      (uint16_t)(plannedFiles > 65535UL ? 65535UL : plannedFiles),
+                      0.0f, 0.70f);
 
   JsonDocument backup(&psramJsonAllocator);
   backup["format"] = "OpenRemote Full Backup";
@@ -20308,7 +20390,8 @@ bool createLcdFullBackup(String &createdName, String &error) {
   backup["firmwareVersion"] = OPENREMOTE_VERSION_TEXT;
   backup["category"] = "full-backup";
   backup["exportedAt"] = exportedAt;
-  backup["nativeAssets"] = assetsPath;
+  // Deliberately absent: there is no sibling folder to point at any more, and
+  // restoreLcdFullBackup() checks the folder really exists before trusting it.
   JsonObject counts = backup["counts"].to<JsonObject>();
   counts["devices"] = DEVICE_COUNT;
   counts["learned"] = 0;
@@ -20390,19 +20473,34 @@ bool createLcdFullBackup(String &createdName, String &error) {
 
   String temporaryPath = "/tmp/lcd-full-backup.json";
   SD.remove(temporaryPath);
+  /*
+    The write is the last 30% of the bar, and it used to be none of it.
+
+    Everything above counts files, so the bar reached the end of the embed and
+    then sat at about 97% with no text while the whole multi-megabyte document
+    was serialised to the card - the single longest step in a backup, and the
+    one reporting nothing. measureJsonPretty() gives the exact output size
+    beforehand, so a Print that counts what passes through it can report real
+    progress rather than a guess.
+  */
   File output = SD.open(temporaryPath, FILE_WRITE);
-  size_t written = output ? serializeJsonPretty(backup, output) : 0;
-  if (output) output.close();
+  size_t expected = measureJsonPretty(backup);
+  setLcdBackupPhaseFraction("Writing backup", 0.0f, 0.70f, 1.0f);
+  size_t written = 0;
+  if (output) {
+    BackupProgressWriter writer(output, expected);
+    written = serializeJsonPretty(backup, writer);
+    output.close();
+  }
+  setLcdBackupPhaseFraction("Writing backup", 1.0f, 0.70f, 1.0f);
   if (!written) {
     SD.remove(temporaryPath);
-    deleteSdTree(assetsPath);
     error = "Could not write backup file";
     return false;
   }
   SD.remove(backupPath);
   if (!SD.rename(temporaryPath, backupPath)) {
     SD.remove(temporaryPath);
-    deleteSdTree(assetsPath);
     error = "Could not finalise backup file";
     return false;
   }
@@ -20541,6 +20639,52 @@ void formatBackupDisplayDate(const char *exportedAt, char *output, size_t output
   }
 }
 
+/*
+  Pulls one short "key":"value" out of the start of a backup file.
+
+  Listing backups used to read every file into PSRAM in full and parse it, to
+  recover two short strings that sit in the first two hundred bytes. On this
+  card that meant reading 13MB to draw a list of three - about ten seconds
+  before the Backup/Restore screen would even appear - and worse, a file big
+  enough that the PSRAM allocation failed was silently dropped from the list.
+  That is why a 6.78MB backup and a freshly created one were both missing while
+  two smaller ones showed: the backup had been written correctly, the listing
+  simply could not read it back.
+
+  Both writers - createLcdFullBackup() here and backupAllCategories() in
+  WebConfig - put format, version, appVersion, category and exportedAt at the
+  very top of the object, so a fixed head is always enough. Deliberately a
+  plain scan rather than a JSON parse: a truncated prefix is not valid JSON and
+  cannot be parsed, which is the whole reason the file was being read whole.
+*/
+bool backupHeadValue(const char *head, const char *key, char *out, size_t outSize) {
+  if (!head || !key || !out || outSize < 2) return false;
+  char needle[32];
+  snprintf(needle, sizeof(needle), "\"%s\"", key);
+  const char *at = strstr(head, needle);
+  if (!at) return false;
+  at = strchr(at + strlen(needle), ':');
+  if (!at) return false;
+  at++;
+  while (*at == ' ' || *at == '\t' || *at == '\r' || *at == '\n') at++;
+  if (*at != '"') return false;
+  at++;
+  size_t i = 0;
+  while (*at && *at != '"' && i + 1 < outSize) out[i++] = *at++;
+  out[i] = '\0';
+  return i > 0;
+}
+
+// Reads the first bytes of an open file into a caller-owned buffer.
+size_t readFileHead(File &file, char *buffer, size_t capacity) {
+  if (!file || capacity < 2) return 0;
+  file.seek(0);
+  int got = file.read((uint8_t *)buffer, capacity - 1);
+  if (got < 0) got = 0;
+  buffer[got] = '\0';
+  return (size_t)got;
+}
+
 void loadLcdBackupEntries() {
   lcdBackupCount = 0;
   File root = SD.open("/backups");
@@ -20557,24 +20701,44 @@ void loadLcdBackupEntries() {
       String lower = name;
       lower.toLowerCase();
       if (lower.endsWith(".json") || lower.endsWith(".ir")) {
-        JsonDocument filter;
-        filter["category"] = true;
-        filter["exportedAt"] = true;
-        size_t rawSize = 0;
-        uint8_t *raw = readSdFileToPsramBuffer(entry, rawSize);
-        JsonDocument summary(&psramJsonAllocator);
-        DeserializationError jsonError = raw
-          ? deserializeJson(summary, raw, rawSize, DeserializationOption::Filter(filter))
-          : DeserializationError::EmptyInput;
-        if (raw) free(raw);
-        const char *category = summary["category"] | "";
+        char head[768];
+        readFileHead(entry, head, sizeof(head));
+        char category[40] = "";
+        char exportedAt[48] = "";
+        bool read = backupHeadValue(head, "category", category, sizeof(category)) &&
+                    backupHeadValue(head, "exportedAt", exportedAt, sizeof(exportedAt));
+        if (!read) {
+          // Something this firmware did not write, or a shape it does not know.
+          // Small enough to parse properly is worth one full read; anything
+          // larger is skipped rather than risking the allocation that used to
+          // drop big backups from the list without a word.
+          size_t fileSize = (size_t)entry.size();
+          if (fileSize && fileSize < 512UL * 1024UL) {
+            JsonDocument filter;
+            filter["category"] = true;
+            filter["exportedAt"] = true;
+            size_t rawSize = 0;
+            entry.seek(0);
+            uint8_t *raw = readSdFileToPsramBuffer(entry, rawSize);
+            JsonDocument summary(&psramJsonAllocator);
+            DeserializationError jsonError = raw
+              ? deserializeJson(summary, raw, rawSize, DeserializationOption::Filter(filter))
+              : DeserializationError::EmptyInput;
+            if (raw) free(raw);
+            if (!jsonError) {
+              strlcpy(category, summary["category"] | "", sizeof(category));
+              strlcpy(exportedAt, summary["exportedAt"] | "", sizeof(exportedAt));
+              read = category[0] != '\0';
+            }
+          }
+        }
         // Category exports are now restorable, so listing only full backups
         // here would leave them invisible on the remote itself.
-        if (!jsonError && (strcmp(category, "full-backup") == 0 ||
-                           backupCategoryIsRestorable(category))) {
+        if (read && (strcmp(category, "full-backup") == 0 ||
+                     backupCategoryIsRestorable(category))) {
           LcdBackupEntry &backup = lcdBackupEntries[lcdBackupCount++];
           strlcpy(backup.name, name.c_str(), sizeof(backup.name));
-          strlcpy(backup.exportedAt, summary["exportedAt"] | "", sizeof(backup.exportedAt));
+          strlcpy(backup.exportedAt, exportedAt, sizeof(backup.exportedAt));
           formatBackupDisplayDate(backup.exportedAt, backup.displayDate, sizeof(backup.displayDate));
           strlcpy(backup.category, category, sizeof(backup.category));
         }
@@ -20866,6 +21030,22 @@ void handleBackupList() {
         String lowerName = name;
         lowerName.toLowerCase();
         if (lowerName.endsWith(".json") || lowerName.endsWith(".ir")) {
+          /*
+            Same trap as the LCD list: reading multi-megabyte backups whole,
+            to recover a handful of short fields at the top, and silently
+            dropping any file too large to allocate. The head gives category
+            and exportedAt for anything either writer produced; counts are a
+            nested object and only worth a full parse on a file small enough
+            that reading it costs nothing.
+          */
+          char head[768];
+          readFileHead(entry, head, sizeof(head));
+          char headCategory[40] = "";
+          char headExportedAt[48] = "";
+          bool fromHead = backupHeadValue(head, "category", headCategory, sizeof(headCategory)) &&
+                          backupHeadValue(head, "exportedAt", headExportedAt, sizeof(headExportedAt));
+          size_t entrySize = (size_t)entry.size();
+          bool wantFullParse = !fromHead || entrySize < 512UL * 1024UL;
           JsonDocument filter;
           filter["category"] = true;
           filter["exportedAt"] = true;
@@ -20873,20 +21053,26 @@ void handleBackupList() {
           filter["counts"] = true;
           filter["count"] = true;
           size_t rawSize = 0;
-          uint8_t *raw = readSdFileToPsramBuffer(entry, rawSize);
+          entry.seek(0);
+          uint8_t *raw = wantFullParse ? readSdFileToPsramBuffer(entry, rawSize) : nullptr;
           JsonDocument summary(&psramJsonAllocator);
           DeserializationError error = raw
             ? deserializeJson(summary, raw, rawSize, DeserializationOption::Filter(filter))
             : DeserializationError::EmptyInput;
           if (raw) free(raw);
-          const char *category = summary["category"] | "";
+          // The head wins when the file was too large to parse; the parse wins
+          // when it ran, because it also carries the counts.
+          bool parsed = raw && !error;
+          const char *category = parsed ? (summary["category"] | "") : headCategory;
+          const char *exportedAt = parsed ? (summary["exportedAt"] | "") : headExportedAt;
+          bool usable = parsed || fromHead;
           bool isFull = strcmp(category, "full-backup") == 0;
-          if (!error && (isFull || backupCategoryIsRestorable(category))) {
+          if (usable && (isFull || backupCategoryIsRestorable(category))) {
             JsonObject item = files.add<JsonObject>();
             item["name"] = name;
             item["size"] = entry.size();
-            item["exportedAt"] = summary["exportedAt"] | "";
-            item["appVersion"] = summary["appVersion"] | "";
+            item["exportedAt"] = exportedAt;
+            item["appVersion"] = parsed ? (summary["appVersion"] | "") : "";
             item["category"] = category;
             JsonObjectConst counts = summary["counts"];
             item["devices"] = counts["devices"] | 0;
@@ -31777,13 +31963,17 @@ void stepLcdBackupAnim() {
   if (xPortGetCoreID() != 1) return;
   if (!lcdBackupAnimBar || lv_obj_has_flag(lcdBackupAnimBar, LV_OBJ_FLAG_HIDDEN)) return;
   const int trackWidth = 204;
-  if (lcdBackupStepsTotal) {
-    uint16_t done = lcdBackupStepsDone > lcdBackupStepsTotal ? lcdBackupStepsTotal
-                                                            : lcdBackupStepsDone;
-    int width = (int)((uint32_t)trackWidth * done / lcdBackupStepsTotal);
+  if (lcdBackupPhase[0]) {
+    float f = lcdBackupFraction < 0.0f ? 0.0f : (lcdBackupFraction > 1.0f ? 1.0f : lcdBackupFraction);
+    int width = (int)(trackWidth * f);
     if (width < 2) width = 2;
     lv_obj_set_x(lcdBackupAnimBar, 10);
     lv_obj_set_width(lcdBackupAnimBar, width);
+    if (lcdBackupStatusLabel) {
+      char text[48];
+      snprintf(text, sizeof(text), "%s %d%%", lcdBackupPhase, (int)(f * 100.0f + 0.5f));
+      lv_label_set_text(lcdBackupStatusLabel, text);
+    }
   } else {
     const uint32_t periodMs = 1200UL;
     const int barWidth = 36;
@@ -31796,21 +31986,46 @@ void stepLcdBackupAnim() {
   lv_refr_now(nullptr);
 }
 
-// Called before a job that can count its work. total == 0 keeps the bounce.
-void beginLcdBackupProgress(uint16_t total) {
+// A phase that counts files, occupying [low..high] of the bar.
+void beginLcdBackupPhase(const char *phase, uint16_t total, float low, float high) {
   if (xPortGetCoreID() != 1) return;
+  strlcpy(lcdBackupPhase, phase ? phase : "Working", sizeof(lcdBackupPhase));
   lcdBackupStepsTotal = total;
   lcdBackupStepsDone = 0;
-  if (lcdBackupTrack) {
-    if (total) lv_obj_clear_flag(lcdBackupTrack, LV_OBJ_FLAG_HIDDEN);
-    else lv_obj_add_flag(lcdBackupTrack, LV_OBJ_FLAG_HIDDEN);
-  }
+  lcdBackupBandLow = low;
+  lcdBackupBandHigh = high;
+  lcdBackupFraction = low;
+  if (lcdBackupTrack) lv_obj_clear_flag(lcdBackupTrack, LV_OBJ_FLAG_HIDDEN);
+  stepLcdBackupAnim();
+}
+
+void beginLcdBackupProgress(uint16_t total) {
+  beginLcdBackupPhase("Collecting", total, 0.0f, 1.0f);
+}
+
+// A phase measured in bytes rather than files - the final write.
+void setLcdBackupPhaseFraction(const char *phase, float within, float low, float high) {
+  if (xPortGetCoreID() != 1) return;
+  strlcpy(lcdBackupPhase, phase ? phase : "Working", sizeof(lcdBackupPhase));
+  lcdBackupStepsTotal = 0;
+  lcdBackupBandLow = low;
+  lcdBackupBandHigh = high;
+  if (within < 0.0f) within = 0.0f;
+  if (within > 1.0f) within = 1.0f;
+  lcdBackupFraction = low + (high - low) * within;
+  if (lcdBackupTrack) lv_obj_clear_flag(lcdBackupTrack, LV_OBJ_FLAG_HIDDEN);
   stepLcdBackupAnim();
 }
 
 void advanceLcdBackupProgress() {
   if (xPortGetCoreID() != 1) return;
   if (lcdBackupStepsDone < 0xFFFF) lcdBackupStepsDone++;
+  if (lcdBackupStepsTotal) {
+    uint16_t done = lcdBackupStepsDone > lcdBackupStepsTotal ? lcdBackupStepsTotal
+                                                            : lcdBackupStepsDone;
+    lcdBackupFraction = lcdBackupBandLow +
+      (lcdBackupBandHigh - lcdBackupBandLow) * ((float)done / (float)lcdBackupStepsTotal);
+  }
   stepLcdBackupAnim();
 }
 
@@ -31825,6 +32040,8 @@ void setLcdBackupStatus(const String &message) {
       // its work with beginLcdBackupProgress().
       lcdBackupStepsTotal = 0;
       lcdBackupStepsDone = 0;
+      lcdBackupPhase[0] = '\0';
+      lcdBackupFraction = 0.0f;
       lv_obj_set_width(lcdBackupAnimBar, 36);
       lv_obj_clear_flag(lcdBackupAnimBar, LV_OBJ_FLAG_HIDDEN);
     } else {
@@ -31832,6 +32049,7 @@ void setLcdBackupStatus(const String &message) {
       if (lcdBackupTrack) lv_obj_add_flag(lcdBackupTrack, LV_OBJ_FLAG_HIDDEN);
       lcdBackupStepsTotal = 0;
       lcdBackupStepsDone = 0;
+      lcdBackupPhase[0] = '\0';
     }
   }
   lv_refr_now(nullptr);
