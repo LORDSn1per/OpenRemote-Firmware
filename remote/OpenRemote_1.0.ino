@@ -1,6 +1,29 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.05 - 2026-09-13
+    - The SD browser now refuses outright to delete, move or rename the four
+      paths that leave the remote unable to recover by itself: /config,
+      /config/runtime.json, /www and /www/index.html. Enforced in the firmware,
+      not in the page - a warning relies on being read, and on WebConfig being
+      the only thing that ever calls these endpoints, and neither holds. The
+      listing marks them so the page can say why before anyone clicks rather
+      than after.
+    - Everything else stays deletable, including the IR database and the
+      backups: those cost a re-copy, not a dead remote, and being able to clear
+      them is most of the point of a file browser. Copying a protected path is
+      allowed - the original stays put - and so is replacing one by uploading
+      over it, which is how a WebConfig update works.
+
+  5.04 - 2026-09-13
+    - GET /api/sd/size returns the recursive size of a folder - bytes, files and
+      subfolders - in one request. The browser could add up what /api/sd/browse
+      gives it, but only one level at a time, so finding the size of /backups
+      would mean a request per subfolder. Here it is a single directory
+      traversal that reads no file contents at all. Behind a button in WebConfig
+      rather than shown for every row, because on a folder like /irdb it is
+      still a walk and most of the time nobody is asking.
+
   5.03 - 2026-09-13
     - A backup no longer writes everything twice. Every one used to copy
       /config, /devices, /activities, /macros, both theme folders, the widget
@@ -6446,7 +6469,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.03"
+#define OPENREMOTE_VERSION_STRING "5.05"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -20805,6 +20828,57 @@ bool sdBrowserPathOk(const String &path) {
   return true;
 }
 
+/*
+  Paths the browser may never remove or move, enforced here rather than in the
+  page.
+
+  A warning is not a guard: it relies on the user reading it, and on WebConfig
+  being the only thing that ever calls these endpoints. Neither holds. So the
+  refusal lives in the firmware, and the UI mirrors it purely as a courtesy.
+
+  The list is deliberately short - only what leaves the remote unable to
+  recover by itself:
+
+    /config             the runtime configuration folder
+    /config/runtime.json  every device, activity, macro, page and setting
+    /www                the folder WebConfig is served from
+    /www/index.html     WebConfig itself - delete it and the page that would
+                        let you put it back is the page you just deleted
+
+  Everything else stays deletable, including /irdb and the backups: those cost
+  a re-copy, not a dead remote, and being able to clear them is most of why a
+  file browser is useful. Copying a protected path is fine, since it leaves the
+  original where it is. Replacing one by upload is fine too - that is how a
+  WebConfig update works.
+*/
+bool sdBrowserProtectedPath(const String &path) {
+  static const char *protectedPaths[] = {
+    "/config", "/config/runtime.json", "/www", "/www/index.html"
+  };
+  String lower = path;
+  lower.toLowerCase();
+  if (lower.length() > 1 && lower.endsWith("/")) lower.remove(lower.length() - 1);
+  for (const char *candidate : protectedPaths) {
+    if (lower == candidate) return true;
+    // An ancestor too: deleting a folder takes everything under it with it, so
+    // refusing /config while allowing whatever might one day contain it would
+    // be a guard with a hole in it. Nothing sits above these today except the
+    // card root, which is refused separately - this keeps that true if the
+    // list ever grows a deeper path.
+    if (String(candidate).startsWith(lower + "/")) return true;
+  }
+  return false;
+}
+
+bool sdBrowserRejectProtected(const String &path, const char *verb) {
+  if (!sdBrowserProtectedPath(path)) return false;
+  Serial.printf("SD browser: refused to %s protected path %s\n", verb, path.c_str());
+  sendJson(403, String("{\"ok\":false,\"protected\":true,\"error\":\"") + path +
+                " is required for the remote to work and cannot be " + verb +
+                ". Copy it or replace it by uploading over it instead.\"}");
+  return true;
+}
+
 bool sdBrowserReject(const String &path) {
   if (!sdReady) {
     sendJson(503, "{\"ok\":false,\"error\":\"SD card unavailable\"}");
@@ -20882,10 +20956,73 @@ void handleSdBrowseList() {
   root.close();
   doc["shown"] = shown;
   doc["total"] = total;
+  // So the page can mark them rather than discovering the refusal on click.
+  for (JsonObject row : entries) {
+    String childPath = path == "/" ? String("/") + (const char *)row["name"]
+                                   : path + "/" + (const char *)row["name"];
+    if (sdBrowserProtectedPath(childPath)) row["protected"] = true;
+  }
   doc["freeBytes"] = (double)(SD.totalBytes() - SD.usedBytes());
   doc["totalBytes"] = (double)SD.totalBytes();
   String body;
   serializeJson(doc, body);
+  sendJson(200, body);
+}
+
+/*
+  Recursive size of a folder, in one request.
+
+  The browser could add up what /api/sd/browse returns, but only for one level:
+  finding the size of /backups would mean a request per subfolder, and the card
+  is full of trees the browser has no reason to walk. Done here it is a single
+  directory traversal with no file reads at all.
+
+  Behind a button rather than shown for every row, because on a folder like
+  /irdb it is still a walk, and most of the time nobody is asking.
+*/
+void sdBrowseMeasure(const String &path, uint64_t &bytes, uint32_t &files, uint32_t &folders) {
+  File root = SD.open(path);
+  if (!root) return;
+  if (!root.isDirectory()) {
+    bytes += (uint64_t)root.size();
+    files++;
+    root.close();
+    return;
+  }
+  while (true) {
+    File entry = root.openNextFile();
+    if (!entry) break;
+    String childPath = entry.path();
+    bool directory = entry.isDirectory();
+    uint64_t size = directory ? 0 : (uint64_t)entry.size();
+    entry.close();
+    if (directory) {
+      folders++;
+      sdBrowseMeasure(childPath, bytes, files, folders);
+      serviceUiDuringLongHttpTransfer();
+    } else {
+      bytes += size;
+      files++;
+    }
+  }
+  root.close();
+}
+
+void handleSdBrowseSize() {
+  if (!requestAuthorized()) { sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}"); return; }
+  String path = webServer.arg("path");
+  if (sdBrowserReject(path)) return;
+  if (!SD.exists(path)) { sendJson(404, "{\"ok\":false,\"error\":\"No such folder\"}"); return; }
+  uint64_t bytes = 0;
+  uint32_t files = 0, folders = 0;
+  unsigned long startedMs = millis();
+  sdBrowseMeasure(path, bytes, files, folders);
+  Serial.printf("SD browser: measured %s = %.2f MB in %lu file(s), %lums\n",
+                path.c_str(), bytes / 1048576.0, (unsigned long)files,
+                (unsigned long)(millis() - startedMs));
+  String body = String("{\"ok\":true,\"bytes\":") + String((double)bytes, 0) +
+                ",\"files\":" + String((unsigned long)files) +
+                ",\"folders\":" + String((unsigned long)folders) + "}";
   sendJson(200, body);
 }
 
@@ -20926,6 +21063,9 @@ void handleSdBrowseRename() {
   String from = doc["from"] | "";
   String to = doc["to"] | "";
   if (sdBrowserReject(from) || sdBrowserReject(to)) return;
+  // A rename is also how the browser moves things, so this covers Cut as well
+  // as Rename - both would take the path out from under the firmware.
+  if (sdBrowserRejectProtected(from, "moved or renamed")) return;
   if (!SD.exists(from)) { sendJson(404, "{\"ok\":false,\"error\":\"No such file or folder\"}"); return; }
   if (SD.exists(to)) { sendJson(409, "{\"ok\":false,\"error\":\"That name is already taken\"}"); return; }
   // Works for a folder as well as a file, and moves rather than copies when
@@ -20963,6 +21103,7 @@ void handleSdBrowseDelete() {
   String path = doc["path"] | "";
   if (sdBrowserReject(path)) return;
   if (path == "/") { sendJson(400, "{\"ok\":false,\"error\":\"Refusing to delete the card root\"}"); return; }
+  if (sdBrowserRejectProtected(path, "deleted")) return;
   if (!SD.exists(path)) { sendJson(404, "{\"ok\":false,\"error\":\"No such file or folder\"}"); return; }
   File probe = SD.open(path);
   bool directory = probe && probe.isDirectory();
@@ -24757,6 +24898,7 @@ void configureWebServer() {
   webServer.on("/api/factory-reset", HTTP_POST, handleFactoryReset);
   webServer.on("/api/sd/browse", HTTP_GET, handleSdBrowseList);
   webServer.on("/api/sd/download", HTTP_GET, handleSdBrowseDownload);
+  webServer.on("/api/sd/size", HTTP_GET, handleSdBrowseSize);
   webServer.on("/api/sd/mkdir", HTTP_POST, handleSdBrowseMkdir);
   webServer.on("/api/sd/rename", HTTP_POST, handleSdBrowseRename);
   webServer.on("/api/sd/copy", HTTP_POST, handleSdBrowseCopy);
