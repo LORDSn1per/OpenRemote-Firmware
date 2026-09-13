@@ -1,6 +1,16 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.09 - 2026-09-13
+    - A dock that answers is reported as in range. "In range" is decided from
+      lastSeenMs, which was set only when a dock returned an info packet in
+      reply to a ping - so a dock sitting there working read as "not in range"
+      while pressing its pill flashed its LED, which only works because the
+      frame was acknowledged. Sending it a command had the same non-effect. An
+      ESP-NOW unicast is acknowledged by the receiving MAC, so any successful
+      send now counts as proof of presence, including one that succeeded through
+      the channel-recovery path.
+
   5.08 - 2026-09-13
     - A renamed .ir-file device keeps its name through a backup and restore.
       Devices imported from Studio or the IR database exist only as
@@ -6510,7 +6520,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.08"
+#define OPENREMOTE_VERSION_STRING "5.09"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -27007,6 +27017,28 @@ void serviceDockOta(unsigned long now) {
 static const uint8_t ESPNOW_SEND_MAX_ATTEMPTS = 3;
 static const uint32_t ESPNOW_SEND_ATTEMPT_TIMEOUT_MS = 15;
 
+/*
+  An acknowledged send is proof the dock is there, and now counts as one.
+
+  lastSeenMs - the only thing "in range" is decided from - was set solely when a
+  dock returned an info packet in reply to a ping. So a dock that plainly WAS
+  in range still read as "not in range": pressing its pill flashed its LED,
+  which only works because the frame was acknowledged at the MAC layer, and the
+  status did not budge. Sending it a command had the same effect, or rather the
+  same lack of one.
+
+  An ESP-NOW unicast is acknowledged by the receiving MAC, so a true return from
+  here means that specific dock answered on the air. That is the same quality of
+  evidence as an info reply and there is no reason to weigh it less.
+*/
+void noteEspNowDockSeen(const uint8_t mac[6]) {
+  for (uint8_t i = 0; i < espNowDeviceCount; i++) {
+    if (memcmp(espNowDevices[i].mac, mac, 6) != 0) continue;
+    espNowDevices[i].lastSeenMs = millis();
+    return;
+  }
+}
+
 bool sendEspNowWithRetry(const uint8_t mac[6], const uint8_t *payload, size_t len) {
   for (uint8_t attempt = 0; attempt < ESPNOW_SEND_MAX_ATTEMPTS; attempt++) {
     espNowSendWaiting = true;
@@ -27032,12 +27064,16 @@ bool sendEspNowWithRetry(const uint8_t mac[6], const uint8_t *payload, size_t le
       if (attempt) {
         Serial.printf("ESP-NOW: send recovered on attempt %u\n", (unsigned)(attempt + 1));
       }
+      noteEspNowDockSeen(mac);
       return true;
     }
     espNowSendWaiting = false;  // Timed out - stop waiting, next attempt rearms it.
   }
   Serial.printf("ESP-NOW: send failed after %u attempts\n", (unsigned)ESPNOW_SEND_MAX_ATTEMPTS);
-  return espNowRecoverChannel(mac, payload, len);
+  // Succeeding on another channel is still the dock answering.
+  bool recovered = espNowRecoverChannel(mac, payload, len);
+  if (recovered) noteEspNowDockSeen(mac);
+  return recovered;
 }
 
 /*
