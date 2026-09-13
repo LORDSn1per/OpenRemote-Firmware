@@ -1,6 +1,29 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.13 - 2026-09-13
+    - Fixes the Homebridge names that showed as boxes on the LCD. The devices[]
+      loop folded names to ASCII, but the devicePages[] loop that runs after it
+      overrode the name with a raw strlcpy, putting the U+00A0 straight back
+      into the field the renderer draws from. 5.10 and 5.11 both missed this
+      because they looked at where names are imported, not at what overwrites
+      them afterwards. The 5.12 boot report named the field and its bytes and
+      settled it. Every other writer of a name the LCD draws - IR-file devices,
+      and paired ESP-NOW devices on both the load and the add path - now folds
+      as well, since each was a raw copy with the same exposure.
+    - The 5.12 non-ASCII boot report is kept. It is silent when names are clean
+      and costs one pass over eight short strings, and it is the only thing that
+      distinguishes "the fold is wrong" from "something overwrites it after".
+
+  5.12 - 2026-09-13
+    - Reports any device name the runtime model holds that is not pure ASCII,
+      with its bytes. The LCD fonts carry ASCII only, so a byte above 0x7F is a
+      missing-glyph box on screen; copyDisplayTextAscii() is supposed to make
+      that impossible and, tested in isolation against the exact bytes from this
+      remote, does - yet boxes survived 5.10 and 5.11. This says what is in the
+      struct the renderer actually draws from, so the next screenshot can be
+      checked against it rather than reasoned about.
+
   5.11 - 2026-09-13
     - Homebridge accessory names are folded into ASCII as they are discovered,
       not only where they are drawn. A Homebridge name routinely holds a
@@ -6549,7 +6572,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.11"
+#define OPENREMOTE_VERSION_STRING "5.13"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -14590,7 +14613,7 @@ void applySettingsJson(JsonVariantConst settings) {
       if (!parseMacAddress(entry["mac"] | "", mac)) continue;
       EspNowPairedDevice &device = espNowDevices[espNowDeviceCount++];
       memcpy(device.mac, mac, 6);
-      strlcpy(device.name, entry["name"] | "ESP-NOW Device", sizeof(device.name));
+      copyDisplayTextAscii(entry["name"] | "ESP-NOW Device", device.name, sizeof(device.name));
     }
     if (espNowRadioActive) espNowRegisterAllPeers();
     espNowDevicesModalDirty = true;
@@ -15113,7 +15136,7 @@ bool loadIrDeviceFileIntoRuntime(const String &rawPath) {
   const char *renamed = irDeviceNameOverrideFor(path);
   String deviceName = renamed ? String(renamed) : irDeviceDisplayName(path);
   strlcpy(device.id, deviceId.c_str(), sizeof(device.id));
-  strlcpy(device.name, deviceName.c_str(), sizeof(device.name));
+  copyDisplayTextAscii(deviceName.c_str(), device.name, sizeof(device.name));
   strlcpy(device.transport, "IR", sizeof(device.transport));
 
   DeviceCommand *command = nullptr;
@@ -17708,7 +17731,12 @@ void loadRuntimeModel(JsonDocument &doc) {
     smartBindingsApplied[deviceIndex] =
       !page.containsKey("smartBindingsApplied") || (page["smartBindingsApplied"] | false);
     const char *displayName = page["name"] | "";
-    if (displayName[0]) strlcpy(device->name, displayName, sizeof(device->name));
+    // Folded, not copied raw: this runs after the devices[] loop and overrides
+    // the name it already folded, so a raw copy here puts non-ASCII back into
+    // the field the LCD draws from. That is exactly what it did - Homebridge
+    // names hold U+00A0 and showed as boxes on every boot until this line
+    // folded too.
+    if (displayName[0]) copyDisplayTextAscii(displayName, device->name, sizeof(device->name));
     strlcpy(device->themePath, page["themePath"] | "", sizeof(device->themePath));
     JsonObjectConst powerTracking = page["powerTracking"].as<JsonObjectConst>();
     if (!powerTracking.isNull()) {
@@ -17790,6 +17818,27 @@ void loadRuntimeModel(JsonDocument &doc) {
   applyRuntimeThemeRowCalibration();
   rebuildPages();
   requestPageStripRebuild();
+  /*
+    Names the model actually holds, and whether any byte in them is non-ASCII.
+
+    The LCD fonts carry ASCII only, so a byte above 0x7F is a missing-glyph box
+    on screen. copyDisplayTextAscii() is supposed to make that impossible, and
+    tested in isolation against the exact bytes from this remote's Homebridge
+    names it does - yet boxes persisted through 5.10 and 5.11. Rather than guess
+    at a third explanation, this reports what is in the struct the renderer
+    draws from, so the next screenshot can be checked against it instead of
+    inferred from.
+  */
+  for (uint8_t i = 0; i < DEVICE_COUNT; i++) {
+    bool nonAscii = false;
+    for (const char *c = devices[i].name; *c; c++) {
+      if ((uint8_t)*c > 0x7F) { nonAscii = true; break; }
+    }
+    if (!nonAscii) continue;
+    Serial.printf("Runtime model: device %u name is NOT ascii: \"%s\" [", i, devices[i].name);
+    for (const char *c = devices[i].name; *c; c++) Serial.printf("%02X ", (uint8_t)*c);
+    Serial.println("]");
+  }
   Serial.printf("Runtime model: %u devices, %u activities (.ir file load: %lums)\n",
                 DEVICE_COUNT, ACTIVITY_COUNT, (unsigned long)irFilesMs);
 }
@@ -26724,7 +26773,7 @@ bool addEspNowDevice(const uint8_t mac[6], const char *name) {
   const char *safeName = (name && name[0]) ? name : "ESP-NOW Device";
   int existing = findEspNowDeviceIndexByMac(mac);
   if (existing >= 0) {
-    strlcpy(espNowDevices[existing].name, safeName, sizeof(espNowDevices[existing].name));
+    copyDisplayTextAscii(safeName, espNowDevices[existing].name, sizeof(espNowDevices[existing].name));
   } else {
     if (espNowDeviceCount >= MAX_ESPNOW_DEVICES) {
       Serial.println("ESP-NOW: paired device list is full");
@@ -26732,7 +26781,7 @@ bool addEspNowDevice(const uint8_t mac[6], const char *name) {
     }
     EspNowPairedDevice &device = espNowDevices[espNowDeviceCount++];
     memcpy(device.mac, mac, 6);
-    strlcpy(device.name, safeName, sizeof(device.name));
+    copyDisplayTextAscii(safeName, device.name, sizeof(device.name));
   }
   if (espNowRadioActive) espNowRegisterAllPeers();
 
