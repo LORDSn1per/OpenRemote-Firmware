@@ -1,6 +1,28 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.31 - 2026-09-14
+    - /api/status answers from cached values while a backup runs instead of
+      touching the SD card. It did four SD.exists() calls, a directory walk and
+      an open of the 120 MB IRDB on every request, and WebConfig polls it
+      continuously for the battery pill - so it was the second user of the card
+      that made the backup write short and start over. 5.30 guarded the other
+      SD endpoints but missed this one, which is the busiest. It also reports
+      backupBusy so WebConfig can tell.
+    - A backup or restore started on the LCD raises the same busy flag, so the
+      SD endpoints stay off the card for those too. WebConfig can be open and
+      polling whichever end started the job.
+
+  5.30 - 2026-09-14
+    - Endpoints that read the SD card answer 409 while a backup or restore is
+      running. Nothing locks the card between the Arduino loop, which does the
+      work, and the HTTP worker, so WebConfig's own polling - the backup list,
+      the runtime config - was a second user of it and caused short writes. The
+      size check then rejected the file and started over: "100%, back to 70%,
+      again and again", sometimes losing all three attempts. Refusing those
+      reads for the minute a backup takes beats rewriting megabytes two or
+      three times.
+
   5.29 - 2026-09-14
     - A backup or restore started from the LCD's own Backup/Restore page now
       shows the same full-screen overlay, ring and all, that a WebConfig one
@@ -6730,7 +6752,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.29"
+#define OPENREMOTE_VERSION_STRING "5.31"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -10021,6 +10043,7 @@ lv_obj_t *makeLcdBackupAnimBar(lv_obj_t *parent, int y);
 void setLcdBackupStatus(const String &message);
 void hideBackupOverlay();
 void stepBackupOverlayMark();
+bool sdBusyWithBackupJob();
 lv_color_t textPrimary();
 lv_obj_t *makeLabel(lv_obj_t *parent, const char *text, int x, int y,
                     const lv_font_t *font, lv_color_t colour);
@@ -14320,23 +14343,54 @@ String buildStatusJson() {
   doc["ok"] = true;
   doc["firmwareVersion"] = OPENREMOTE_VERSION_TEXT;
   doc["remoteName"] = remoteName;
-  doc["webConfigInstalled"] = sdReady && SD.exists(WEB_CONFIG_PATH);
+  /*
+    Answered from the last known values while a backup is running, because
+    every one of these touches the SD card - SD.exists() four times over, a
+    directory walk in countSavedIrDeviceFiles(), and an open of the 120 MB
+    IRDB just to read its size.
+
+    WebConfig polls /api/status continuously for the battery pill, so during a
+    backup it was a second user of the card with no lock between it and the
+    Arduino loop doing the writing. That is what made the write come out short,
+    the size check reject it, and the whole thing start again - "100%, back to
+    70%, again and again". 5.30 refused the other SD endpoints but missed this
+    one, which is the one WebConfig calls most.
+
+    Cached rather than refused: the pill keeps working, and none of these
+    change while a backup is being written.
+  */
+  static bool cachedSdFacts = false;
+  static bool cachedWebConfigInstalled = false;
+  static bool cachedIrdbInstalled = false;
+  static uint32_t cachedIrdbSize = 0;
+  static uint16_t cachedDeviceFileCount = 0;
+  if (!sdBusyWithBackupJob()) {
+    cachedWebConfigInstalled = sdReady && SD.exists(WEB_CONFIG_PATH);
+    cachedIrdbInstalled = sdReady && SD.exists(IRDB_PATH);
+    cachedDeviceFileCount = countSavedIrDeviceFiles();
+    if (cachedIrdbInstalled) {
+      File irdb = SD.open(IRDB_PATH, FILE_READ);
+      cachedIrdbSize = irdb ? (uint32_t)irdb.size() : 0;
+      if (irdb) irdb.close();
+    } else {
+      cachedIrdbSize = 0;
+    }
+    cachedSdFacts = true;
+  }
+  doc["webConfigInstalled"] = cachedWebConfigInstalled;
   doc["webConfigVersion"] = installedWebConfigVersion();
-  doc["irdbInstalled"] = sdReady && SD.exists(IRDB_PATH);
+  doc["irdbInstalled"] = cachedIrdbInstalled;
   // True for either form: the index embedded in OpenRemote.irdb, or the older
   // separate search.jsonl and details/ files.
   doc["irdbSearchIndexInstalled"] = irdbSearchAvailable();
   doc["irdbDetailIndexInstalled"] = irdbDetailAvailable();
   doc["irdbBuildDate"] = irdbBuildDate;
   doc["irdbDeviceCount"] = irdbDeviceCount;
-  doc["deviceFileCount"] = countSavedIrDeviceFiles();
+  doc["deviceFileCount"] = cachedDeviceFileCount;
   doc["deviceCount"] = DEVICE_COUNT;
   doc["activityCount"] = ACTIVITY_COUNT;
-  if (sdReady && SD.exists(IRDB_PATH)) {
-    File irdb = SD.open(IRDB_PATH, FILE_READ);
-    doc["irdbSizeBytes"] = irdb ? irdb.size() : 0;
-    if (irdb) irdb.close();
-  }
+  if (cachedSdFacts) doc["irdbSizeBytes"] = cachedIrdbSize;
+  doc["backupBusy"] = sdBusyWithBackupJob();
   doc["sdReady"] = sdReady;
   doc["sdStatus"] = sdStatusText;
   doc["wifiEnabled"] = wifiOn;
@@ -19572,6 +19626,10 @@ void handleRuntimeConfigUpload() {
 }
 
 void handleRuntimeConfigDownload() {
+  if (sdBusyWithBackupJob()) {
+    sendJson(409, "{\"ok\":false,\"busy\":true,\"error\":\"The remote is writing a backup\"}");
+    return;
+  }
   if (!requestAuthorized()) {
     sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
     return;
@@ -21594,6 +21652,10 @@ bool copySdTreeRaw(const String &sourcePath, const String &destinationPath) {
 }
 
 void handleSdBrowseList() {
+  if (sdBusyWithBackupJob()) {
+    sendJson(409, "{\"ok\":false,\"busy\":true,\"error\":\"The remote is writing a backup\"}");
+    return;
+  }
   if (!requestAuthorized()) { sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}"); return; }
   String path = webServer.arg("path");
   if (!path.length()) path = "/";
@@ -21683,6 +21745,10 @@ void sdBrowseMeasure(const String &path, uint64_t &bytes, uint32_t &files, uint3
 }
 
 void handleSdBrowseSize() {
+  if (sdBusyWithBackupJob()) {
+    sendJson(409, "{\"ok\":false,\"busy\":true,\"error\":\"The remote is writing a backup\"}");
+    return;
+  }
   if (!requestAuthorized()) { sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}"); return; }
   String path = webServer.arg("path");
   if (sdBrowserReject(path)) return;
@@ -21701,6 +21767,10 @@ void handleSdBrowseSize() {
 }
 
 void handleSdBrowseDownload() {
+  if (sdBusyWithBackupJob()) {
+    sendJson(409, "{\"ok\":false,\"busy\":true,\"error\":\"The remote is writing a backup\"}");
+    return;
+  }
   if (!requestAuthorized()) { sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}"); return; }
   String path = webServer.arg("path");
   if (sdBrowserReject(path)) return;
@@ -21827,6 +21897,10 @@ void handleSdBrowseUploadData() {
 }
 
 void handleBackupList() {
+  if (sdBusyWithBackupJob()) {
+    sendJson(409, "{\"ok\":false,\"busy\":true,\"error\":\"The remote is writing a backup\"}");
+    return;
+  }
   if (!requestAuthorized()) {
     sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
     return;
@@ -21921,6 +21995,10 @@ void handleBackupList() {
 }
 
 void handleBackupDownload() {
+  if (sdBusyWithBackupJob()) {
+    sendJson(409, "{\"ok\":false,\"busy\":true,\"error\":\"The remote is writing a backup\"}");
+    return;
+  }
   if (!requestAuthorized()) {
     sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
     return;
@@ -22343,6 +22421,24 @@ void hideBackupOverlay() {
   lcdBackupTrack = nullptr;
   lcdBackupAnimBar = nullptr;
   lcdBackupStatusLabel = nullptr;
+}
+
+/*
+  True while the Arduino loop is writing or reading a backup.
+
+  Nothing locks the SD card between the loop and the HTTP worker, so any
+  endpoint that touches the card while a backup is being written is a second
+  user of it - and the result was short writes. createLcdFullBackup() then
+  found the file smaller than measureJsonPretty() predicted and started over,
+  which is the "100% back to 70%, again and again" the user saw: WebConfig's
+  own polling (the backup list, the runtime config) was corrupting the write it
+  was watching. Three attempts could all lose the same way.
+
+  Refusing those reads for the minute or so a backup takes is far better than
+  rewriting several megabytes two or three times.
+*/
+bool sdBusyWithBackupJob() {
+  return backupRequestRunning || backupRequestPending || restoreRequestPending;
 }
 
 void serviceQueuedBackup() {
@@ -33189,6 +33285,13 @@ void createBackupFromLcd(lv_event_t *e) {
   */
   showBackupOverlay(false, "Started on the remote");
   setLcdBackupStatus("Creating full backup...");
+  /*
+    Raised for a job started here too, not just one queued from WebConfig.
+    It is what keeps /api/status and the other SD endpoints off the card while
+    this writes - and WebConfig can be open and polling throughout, whichever
+    end started the job.
+  */
+  backupRequestRunning = true;
   String name;
   String error;
   if (createLcdFullBackup(name, error)) {
@@ -33196,6 +33299,7 @@ void createBackupFromLcd(lv_event_t *e) {
   } else {
     setLcdBackupStatus(error);
   }
+  backupRequestRunning = false;
   lv_refr_now(nullptr);
   vTaskDelay(pdMS_TO_TICKS(1200));
   hideBackupOverlay();
@@ -33212,12 +33316,14 @@ void confirmBackupRestore(lv_event_t *e) {
 
   showBackupOverlay(true, "Started on the remote");
   setLcdBackupStatus("Restoring full backup...");
+  backupRequestRunning = true;   // see createBackupFromLcd()
   String error;
   if (restoreLcdFullBackup(lcdPendingBackupName, error)) {
     setLcdBackupStatus("Restore complete");
   } else {
     setLcdBackupStatus(error);
   }
+  backupRequestRunning = false;
   lv_refr_now(nullptr);
   vTaskDelay(pdMS_TO_TICKS(1200));
   hideBackupOverlay();
