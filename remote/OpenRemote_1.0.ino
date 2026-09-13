@@ -1,6 +1,17 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.15 - 2026-09-13
+    - Restoring a full backup no longer trips the task watchdog.
+      restoreEmbeddedFiles() decoded and wrote every embedded asset back to
+      back with no yield - 65 files and several megabytes for a full backup,
+      one of them nearly 2 MB decoded - so the idle task on whichever core ran
+      it never got a turn and the watchdog aborted mid-restore and rebooted.
+      Captured on hardware: "Task watchdog got triggered ... IDLE0 (CPU 0) ...
+      Aborting", reset reason "task watchdog". It was never memory; the parse
+      ahead of it already yields every 16 KB. Assets are now written in 32 KB
+      chunks with a yield between, plus one per file.
+
   5.14 - 2026-09-13
     - A restored credentials block no longer applies empty strings. "" is a
       valid const char *, so the old pointer-only test wrote it over a working
@@ -6581,7 +6592,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.14"
+#define OPENREMOTE_VERSION_STRING "5.15"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -20223,9 +20234,34 @@ bool restoreEmbeddedFiles(JsonArrayConst files, String &error) {
     }
     SD.remove(path);
     File out = SD.open(path, FILE_WRITE);
-    bool ok = out && out.write(decoded, actualLen) == actualLen;
+    /*
+      Written in chunks with a yield between them, not in one call.
+
+      This loop is the whole restore: 65 files and several megabytes for a
+      full backup, decoded and written back to back. Nothing in it yielded, so
+      on the HTTP worker (core 0) the idle task never ran and the task
+      watchdog aborted the firmware mid-restore - "Task watchdog got
+      triggered ... IDLE0 (CPU 0) ... Aborting", then a reboot. That is the
+      crash, and it was never out of memory: the parse ahead of this already
+      feeds the watchdog every 16 KB through BufferedSdJsonStream::refill(),
+      and the largest wallpaper here decodes to nearly 2 MB, which is seconds
+      of SD writing on its own - past the 5 s timeout without help.
+    */
+    bool ok = (bool)out;
+    if (ok) {
+      const size_t CHUNK = 32768;
+      size_t written = 0;
+      while (written < actualLen) {
+        size_t take = min(CHUNK, actualLen - written);
+        if (out.write(decoded + written, take) != take) { ok = false; break; }
+        written += take;
+        vTaskDelay(1);
+      }
+    }
     if (out) out.close();
     free(decoded);
+    // Also once per file, so a backup made of many small assets yields too.
+    vTaskDelay(1);
     if (!ok) {
       error = String("Could not restore ") + path;
       return false;
