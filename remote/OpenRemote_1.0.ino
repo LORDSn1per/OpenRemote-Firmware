@@ -1,6 +1,13 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.28 - 2026-09-14
+    - The backup overlay gains an animated ring above the text, and the bar and
+      labels move down to make room. The ring is stepped by hand from
+      stepLcdBackupAnim() rather than being an lv_anim or a spinner: those
+      advance inside lv_timer_handler(), and the Arduino loop is inside the
+      backup for the whole minute-plus, so a real animation would never tick.
+
   5.27 - 2026-09-13
     - A backup or restore started from WebConfig draws its progress as a
       full-screen overlay over whatever page is up, replacing the bar 5.25 put
@@ -6716,7 +6723,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.27"
+#define OPENREMOTE_VERSION_STRING "5.28"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -10006,6 +10013,7 @@ lv_obj_t *makeLcdBackupAnimBar(lv_obj_t *parent, int y);
 // Also used by serviceQueuedBackup(), which runs well before this is defined.
 void setLcdBackupStatus(const String &message);
 void hideBackupOverlay();
+void stepBackupOverlayMark();
 lv_color_t textPrimary();
 lv_obj_t *makeLabel(lv_obj_t *parent, const char *text, int x, int y,
                     const lv_font_t *font, lv_color_t colour);
@@ -22249,6 +22257,37 @@ void handleBackupProgressApi() {
 */
 lv_obj_t *backupOverlay = nullptr;
 
+/*
+  The mark above the text, animated by hand.
+
+  LVGL's own animations - a spinner, or anything driven by lv_anim - advance
+  inside lv_timer_handler(), and the Arduino loop is sitting inside the backup
+  for the whole minute-plus, so none of them would ever tick. stepLcdBackupAnim()
+  is already called whenever progress moves and already forces a redraw, so the
+  ring is advanced from there instead and moves exactly when the work does.
+
+  Eight dots around a circle with a comet tail: the brightest dot leads and the
+  three behind it fade out, which reads as rotation without needing a real
+  animation timer.
+*/
+#define BACKUP_OVERLAY_DOTS 8
+lv_obj_t *backupOverlayDots[BACKUP_OVERLAY_DOTS] = {nullptr};
+
+void stepBackupOverlayMark() {
+  if (!backupOverlay || !lv_obj_is_valid(backupOverlay)) return;
+  uint8_t lead = (uint8_t)((millis() / 110UL) % BACKUP_OVERLAY_DOTS);
+  for (uint8_t i = 0; i < BACKUP_OVERLAY_DOTS; i++) {
+    if (!backupOverlayDots[i]) continue;
+    uint8_t behind = (uint8_t)((lead + BACKUP_OVERLAY_DOTS - i) % BACKUP_OVERLAY_DOTS);
+    lv_opa_t opa = behind == 0 ? LV_OPA_COVER
+                 : behind == 1 ? LV_OPA_70
+                 : behind == 2 ? LV_OPA_40
+                 : behind == 3 ? LV_OPA_20
+                               : LV_OPA_10;
+    lv_obj_set_style_bg_opa(backupOverlayDots[i], opa, 0);
+  }
+}
+
 void showBackupOverlay(bool restoring) {
   if (xPortGetCoreID() != 1) return;
   hideBackupOverlay();
@@ -22260,13 +22299,31 @@ void showBackupOverlay(bool restoring) {
   lv_obj_set_style_bg_color(backupOverlay, lvRgb(0x0B, 0x10, 0x18), 0);
   lv_obj_clear_flag(backupOverlay, LV_OBJ_FLAG_SCROLLABLE);
 
+  // Centred on (120, 120), radius 34, so the ring sits well clear of the text.
+  const int cx = 120, cy = 120, radius = 34, dot = 9;
+  for (uint8_t i = 0; i < BACKUP_OVERLAY_DOTS; i++) {
+    float angle = (float)i * (2.0f * 3.14159265f / (float)BACKUP_OVERLAY_DOTS) - 1.5707963f;
+    lv_obj_t *d = lv_obj_create(backupOverlay);
+    lv_obj_remove_style_all(d);
+    lv_obj_set_size(d, dot, dot);
+    lv_obj_set_pos(d, cx + (int)(cosf(angle) * radius) - dot / 2,
+                      cy + (int)(sinf(angle) * radius) - dot / 2);
+    lv_obj_set_style_radius(d, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(d, lvRgb(0x21, 0x96, 0xF3), 0);
+    lv_obj_set_style_bg_opa(d, LV_OPA_20, 0);
+    lv_obj_clear_flag(d, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(d, LV_OBJ_FLAG_CLICKABLE);
+    backupOverlayDots[i] = d;
+  }
+  stepBackupOverlayMark();
+
   makeLabel(backupOverlay, restoring ? "Restoring backup" : "Creating backup",
-            12, 120, &lv_font_montserrat_14, textPrimary());
-  makeLabel(backupOverlay, "Started from WebConfig", 12, 142,
+            12, 196, &lv_font_montserrat_14, textPrimary());
+  makeLabel(backupOverlay, "Started from WebConfig", 12, 218,
             &lv_font_montserrat_10, lvRgb(155, 165, 180));
-  lcdBackupTrack = makeLcdBackupTrack(backupOverlay, 170);
-  lcdBackupAnimBar = makeLcdBackupAnimBar(backupOverlay, 170);
-  lcdBackupStatusLabel = makeLabel(backupOverlay, "", 12, 180,
+  lcdBackupTrack = makeLcdBackupTrack(backupOverlay, 248);
+  lcdBackupAnimBar = makeLcdBackupAnimBar(backupOverlay, 248);
+  lcdBackupStatusLabel = makeLabel(backupOverlay, "", 12, 258,
                                    &lv_font_montserrat_10, lvRgb(155, 165, 180));
   lv_refr_now(nullptr);
 }
@@ -22275,6 +22332,7 @@ void hideBackupOverlay() {
   if (xPortGetCoreID() != 1) return;
   if (backupOverlay && lv_obj_is_valid(backupOverlay)) lv_obj_del(backupOverlay);
   backupOverlay = nullptr;
+  for (uint8_t i = 0; i < BACKUP_OVERLAY_DOTS; i++) backupOverlayDots[i] = nullptr;
   lcdBackupTrack = nullptr;
   lcdBackupAnimBar = nullptr;
   lcdBackupStatusLabel = nullptr;
@@ -33019,6 +33077,7 @@ void stepLcdBackupAnim() {
   // another task is rendering.
   if (xPortGetCoreID() != 1) return;
   if (!lcdBackupAnimBar || lv_obj_has_flag(lcdBackupAnimBar, LV_OBJ_FLAG_HIDDEN)) return;
+  stepBackupOverlayMark();
   const int trackWidth = 204;
   if (lcdBackupPhase[0]) {
     float f = lcdBackupFraction < 0.0f ? 0.0f : (lcdBackupFraction > 1.0f ? 1.0f : lcdBackupFraction);
