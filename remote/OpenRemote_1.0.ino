@@ -1,6 +1,29 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.08 - 2026-09-13
+    - A renamed .ir-file device keeps its name through a backup and restore.
+      Devices imported from Studio or the IR database exist only as
+      /devices/<name>_<hash>.ir and were always named from that filename;
+      buildRuntimePayload() strips fileBacked devices from runtime.json by
+      design, so renaming one in WebConfig changed nothing on the remote and the
+      new name lived in one browser tab. It looked like it had stuck until a
+      restore rebuilt the model from the files and every device came back with
+      its original filename - "Fetch TV" returning as "etch Fetch TV Box AUS".
+    - The name is stored as a small path-keyed map in settings.irDeviceNames and
+      applied when the model is built. Being in settings means the post-sync
+      rewrite protects it from the same drop that used to lose espNowDevices,
+      and it travels inside runtimeConfig in an LCD backup and inside
+      currentRemoteSettings() in a WebConfig one - so both backup and both
+      restore paths carry it identically, with neither needing to know the key
+      exists.
+    - New POST /api/devices/file/name. Keyed by path, and the file itself is
+      never renamed: the device id comes from stableIrFileId() over that path,
+      so renaming the file would silently detach every activity that refers to
+      the device.
+    - The backup's own device summary uses the custom name too, so a backup can
+      no longer list a device under a name the remote is not showing.
+
   5.07 - 2026-09-13
     - An LCD backup records its widget count. It has always embedded the widget
       wallpapers and never counted them, so it listed "0 widgets" beside a
@@ -6487,7 +6510,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.07"
+#define OPENREMOTE_VERSION_STRING "5.08"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -14884,6 +14907,76 @@ String normaliseIrDevicePath(const String &name) {
   return String("/devices/") + name;
 }
 
+/*
+  Custom names for .ir-file devices.
+
+  A device imported from Studio or the IR database lives only as
+  /devices/<name>_<hash>.ir, and its display name was always derived from that
+  filename by irDeviceDisplayName(). Renaming it in WebConfig changed nothing on
+  the remote: buildRuntimePayload() strips fileBacked devices from runtime.json
+  by design, so the new name lived in one browser tab and nowhere else. It
+  looked like it had stuck - until a restore rebuilt the model from the files
+  and every device came back with its original filename, which is exactly how it
+  was reported ("Fetch TV" returning as "etch Fetch TV Box AUS").
+
+  So the name is stored as its own small map, keyed by file path, inside
+  settings - which means the 4.33 post-sync rewrite protects it from being
+  dropped on every sync the same way it protects espNowDevices, and it travels
+  inside runtimeConfig in every backup without any further work.
+
+  Keyed by path rather than by the derived name, because the filename carries a
+  hash suffix and two devices can share a display name.
+*/
+static const uint8_t MAX_IR_NAME_OVERRIDES = 24;
+struct IrDeviceNameOverride {
+  char path[72];
+  char name[32];
+};
+IrDeviceNameOverride irNameOverrides[MAX_IR_NAME_OVERRIDES];
+uint8_t irNameOverrideCount = 0;
+
+const char *irDeviceNameOverrideFor(const String &path) {
+  for (uint8_t i = 0; i < irNameOverrideCount; i++) {
+    if (path == irNameOverrides[i].path) return irNameOverrides[i].name;
+  }
+  return nullptr;
+}
+
+bool setIrDeviceNameOverride(const String &path, const String &name) {
+  for (uint8_t i = 0; i < irNameOverrideCount; i++) {
+    if (path != irNameOverrides[i].path) continue;
+    if (!name.length()) {
+      // Clearing it puts the device back to its filename.
+      for (uint8_t j = i; j + 1 < irNameOverrideCount; j++) {
+        irNameOverrides[j] = irNameOverrides[j + 1];
+      }
+      irNameOverrideCount--;
+      return true;
+    }
+    copyDisplayTextAscii(name.c_str(), irNameOverrides[i].name, sizeof(irNameOverrides[i].name));
+    return true;
+  }
+  if (!name.length()) return true;
+  if (irNameOverrideCount >= MAX_IR_NAME_OVERRIDES) return false;
+  IrDeviceNameOverride &entry = irNameOverrides[irNameOverrideCount++];
+  strlcpy(entry.path, path.c_str(), sizeof(entry.path));
+  copyDisplayTextAscii(name.c_str(), entry.name, sizeof(entry.name));
+  return true;
+}
+
+void loadIrDeviceNameOverrides(JsonObjectConst map) {
+  irNameOverrideCount = 0;
+  if (map.isNull()) return;
+  for (JsonPairConst entry : map) {
+    if (irNameOverrideCount >= MAX_IR_NAME_OVERRIDES) break;
+    const char *name = entry.value().as<const char *>();
+    if (!name || !name[0]) continue;
+    IrDeviceNameOverride &row = irNameOverrides[irNameOverrideCount++];
+    strlcpy(row.path, entry.key().c_str(), sizeof(row.path));
+    copyDisplayTextAscii(name, row.name, sizeof(row.name));
+  }
+}
+
 String irDeviceDisplayName(const String &path) {
   String name = path.substring(path.lastIndexOf('/') + 1);
   if (name.endsWith(".ir") || name.endsWith(".IR")) name.remove(name.length() - 3);
@@ -14930,7 +15023,9 @@ bool loadIrDeviceFileIntoRuntime(const String &rawPath) {
 
   Device &device = devices[DEVICE_COUNT];
   String deviceId = stableIrFileId("irf_", path);
-  String deviceName = irDeviceDisplayName(path);
+  // The user's name if they set one, otherwise the filename.
+  const char *renamed = irDeviceNameOverrideFor(path);
+  String deviceName = renamed ? String(renamed) : irDeviceDisplayName(path);
   strlcpy(device.id, deviceId.c_str(), sizeof(device.id));
   strlcpy(device.name, deviceName.c_str(), sizeof(device.name));
   strlcpy(device.transport, "IR", sizeof(device.transport));
@@ -15061,7 +15156,8 @@ bool appendIrDeviceFileSummary(JsonArray target, const String &rawPath) {
   }
   JsonObject device = target.add<JsonObject>();
   device["id"] = deviceId;
-  device["name"] = irDeviceDisplayName(path);
+  const char *summaryName = irDeviceNameOverrideFor(path);
+  device["name"] = summaryName ? summaryName : irDeviceDisplayName(path).c_str();
   device["source"] = "OpenRemote Studio";
   device["transport"] = "ir";
   device["type"] = "IRDB device";
@@ -17164,6 +17260,10 @@ void loadRuntimeModel(JsonDocument &doc) {
   // rebuildDisplayColourLut() call further down - but unlike that one, this
   // does correctness-critical parsing of the user's actual devices, so it is
   // measured here rather than rewritten blind.
+  // Before the files, because loadIrDeviceFileIntoRuntime() consults it as it
+  // names each device. applySettingsJson() runs later in this same function,
+  // so the map is read straight from the document rather than waiting for it.
+  loadIrDeviceNameOverrides(doc["settings"]["irDeviceNames"].as<JsonObjectConst>());
   uint32_t irFilesStartMs = millis();
   loadIrDeviceFilesIntoRuntime();
   uint32_t irFilesMs = millis() - irFilesStartMs;
@@ -17748,6 +17848,22 @@ bool persistSettingsToRuntimeConfig() {
     JsonObject entry = espNowDevicesOut.add<JsonObject>();
     entry["mac"] = formatMacAddress(espNowDevices[i].mac);
     entry["name"] = espNowDevices[i].name;
+  }
+  /*
+    Beside espNowDevices deliberately. Both are things WebConfig does not model
+    and would otherwise drop on every sync; writing them here means the
+    post-sync rewrite (see scheduleRuntimeReloadAfterSync) restores both, and
+    both travel inside runtimeConfig in an LCD backup and inside
+    currentRemoteSettings() in a WebConfig one - so the two backup paths behave
+    identically without either needing to know about this key.
+  */
+  if (irNameOverrideCount) {
+    JsonObject irNamesOut = settings["irDeviceNames"].to<JsonObject>();
+    for (uint8_t i = 0; i < irNameOverrideCount; i++) {
+      irNamesOut[irNameOverrides[i].path] = irNameOverrides[i].name;
+    }
+  } else {
+    settings.remove("irDeviceNames");
   }
   settings["debugTouch"] = debugTouchEnabled;
   settings["debugCpuRam"] = debugCpuRamEnabled;
@@ -21452,6 +21568,55 @@ void handleBackupUploadData() {
 // devices, no matter what the backup JSON contained - buildRuntimePayload()
 // deliberately omits fileBacked devices from runtime.json, and POST
 // /api/config never writes /devices. This accepts the real .ir bytes back.
+/*
+  Renames an .ir-file device without touching the file.
+
+  Renaming the file itself would change the id every other record keys on -
+  activities reference a device by stableIrFileId(), which is derived from the
+  path - so an activity would silently lose its device the moment it was
+  renamed. The name is recorded against the path instead and applied when the
+  model is built.
+*/
+void handleIrDeviceRenameApi() {
+  if (!requestAuthorized()) {
+    sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
+    return;
+  }
+  JsonDocument doc;
+  if (deserializeJson(doc, webServer.arg("plain"))) {
+    sendJson(400, "{\"ok\":false,\"error\":\"Invalid rename request\"}");
+    return;
+  }
+  String path = doc["path"] | "";
+  String name = doc["name"] | "";
+  name.trim();
+  if (!path.startsWith("/devices/") || path.indexOf("..") >= 0) {
+    sendJson(400, "{\"ok\":false,\"error\":\"That is not a device file\"}");
+    return;
+  }
+  if (!SD.exists(path)) {
+    sendJson(404, "{\"ok\":false,\"error\":\"No such device file\"}");
+    return;
+  }
+  if (!setIrDeviceNameOverride(path, name)) {
+    sendJson(507, "{\"ok\":false,\"error\":\"Too many renamed device files\"}");
+    return;
+  }
+  // Applied to the device already in memory as well, so the remote's own screen
+  // changes now rather than at the next reload.
+  String deviceId = stableIrFileId("irf_", path);
+  Device *device = findRuntimeDevice(deviceId.c_str());
+  if (device) {
+    String applied = name.length() ? name : irDeviceDisplayName(path);
+    copyDisplayTextAscii(applied.c_str(), device->name, sizeof(device->name));
+  }
+  scheduleRuntimeSettingsSave();
+  pendingUiRefresh = true;
+  Serial.printf("IR device rename: %s -> %s\n", path.c_str(),
+                name.length() ? name.c_str() : "(filename)");
+  sendJson(200, "{\"ok\":true}");
+}
+
 void handleDeviceFileUploadData() {
   HTTPUpload &upload = webServer.upload();
   if (upload.status == UPLOAD_FILE_START) {
@@ -24858,6 +25023,7 @@ void configureWebServer() {
   webServer.on("/api/identify/remote", HTTP_POST, handleRemoteIdentifyApi);
   webServer.on("/api/identify/dock", HTTP_POST, handleDockIdentifyApi);
   webServer.on("/api/media/artwork/clear", HTTP_POST, handleMediaArtworkClearApi);
+  webServer.on("/api/devices/file/name", HTTP_POST, handleIrDeviceRenameApi);
   webServer.on("/api/devices/file", HTTP_DELETE, handleFileBackedDeviceDelete);
   webServer.on("/api/devices/file", HTTP_POST, []() {
     if (!requestAuthorized()) webServer.send(403, "application/json", "{\"ok\":false}");
