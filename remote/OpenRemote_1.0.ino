@@ -1,6 +1,24 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.10 - 2026-09-13
+    - Backups now carry Wi-Fi and service credentials. Wi-Fi networks and
+      passwords, Homebridge address/username/password, MQTT host/user/password/
+      client id/port and the Home Assistant URL and token live only in NVS, and
+      NVS was in no backup at all - so a factory reset and restore brought back
+      every device, activity and theme and left the remote unable to reach the
+      Homebridge that half of them talk to. "My Homebridge devices no longer
+      work" was not lost devices, it was lost credentials.
+    - Written into settings.credentials, so both backup paths carry them with
+      no special handling - the same approach as espNowDevices and
+      irDeviceNames. A restore applies each field only if the backup actually
+      carries it, and the block only if it exists, so an older backup leaves a
+      working login alone rather than blanking it.
+    - They are stored in clear, beside everything else in runtime.json. That
+      file already sits unencrypted on a removable card, so it does not change
+      who can read a card they are holding - but it does put the passwords into
+      any backup copied to a computer, and into what WebConfig receives.
+
   5.09 - 2026-09-13
     - A dock that answers is reported as in range. "In range" is decided from
       lastSeenMs, which was set only when a dock returned an info packet in
@@ -6520,7 +6538,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.09"
+#define OPENREMOTE_VERSION_STRING "5.10"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -14442,6 +14460,53 @@ void copyDisplayTextAscii(const char *source, char *destination, size_t size) {
 void applySettingsJson(JsonVariantConst settings) {
   if (settings.isNull()) return;
   bool previousWifiOn = wifiOn;
+
+  /*
+    Credentials, if this config carries any.
+
+    Every field is applied only when the block actually contains it, and the
+    block only when it exists at all - so a backup written before 5.10, or a
+    sync from a WebConfig that does not model these, leaves what the remote
+    already has. Silently blanking a working Homebridge login because an older
+    file did not mention it would be a far worse failure than not restoring it.
+  */
+  JsonObjectConst credentials = settings["credentials"].as<JsonObjectConst>();
+  if (!credentials.isNull()) {
+    auto takeString = [&](const char *key, String &target) {
+      const char *value = credentials[key].as<const char *>();
+      if (value) target = value;
+    };
+    takeString("homebridgeAddress", homebridgeAddress);
+    takeString("homebridgeUsername", homebridgeUsername);
+    takeString("homebridgePassword", homebridgePassword);
+    takeString("mqttHost", mqttHost);
+    takeString("mqttUsername", mqttUsername);
+    takeString("mqttPassword", mqttPassword);
+    takeString("mqttClientId", mqttClientId);
+    takeString("homeAssistantUrl", haBaseUrl);
+    takeString("homeAssistantToken", haToken);
+    if (credentials["mqttPort"].is<uint16_t>()) {
+      mqttPort = credentials["mqttPort"] | mqttPort;
+    }
+    takeString("wifiSsid", selectedWifiSsid);
+    JsonArrayConst wifiIn = credentials["wifiProfiles"].as<JsonArrayConst>();
+    if (!wifiIn.isNull() && wifiIn.size()) {
+      wifiProfileCount = 0;
+      for (JsonObjectConst profile : wifiIn) {
+        if (wifiProfileCount >= MAX_WIFI_PROFILES) break;
+        const char *ssid = profile["ssid"].as<const char *>();
+        if (!ssid || !ssid[0]) continue;
+        wifiProfiles[wifiProfileCount].ssid = ssid;
+        wifiProfiles[wifiProfileCount].password = profile["password"].as<const char *>()
+          ? profile["password"].as<const char *>() : "";
+        wifiProfileCount++;
+      }
+      Serial.printf("Restore: %u Wi-Fi network(s) and service credentials restored\n",
+                    (unsigned)wifiProfileCount);
+    }
+    // Straight to NVS, which is where every one of these is read from at boot.
+    saveSettings();
+  }
   const char *configuredName = settings["remoteName"].as<const char *>();
   if (configuredName && configuredName[0]) remoteName = configuredName;
   wifiOn = settings["wifiEnabled"] | wifiOn;
@@ -17867,6 +17932,45 @@ bool persistSettingsToRuntimeConfig() {
     currentRemoteSettings() in a WebConfig one - so the two backup paths behave
     identically without either needing to know about this key.
   */
+  /*
+    Credentials, which nothing used to back up at all.
+
+    Wi-Fi, Homebridge, MQTT and Home Assistant secrets live only in NVS, and
+    NVS is not in any backup - so a factory reset and restore brought back
+    every device, activity and theme and left the remote unable to reach the
+    Homebridge that half of them talk to. That is what "my Homebridge devices
+    no longer work" was: not lost devices, lost credentials.
+
+    Written here so both backup paths carry them with no special handling, the
+    same trick used for espNowDevices and irDeviceNames - the LCD backup embeds
+    runtime.json whole, and a WebConfig backup is built from what the remote
+    reports.
+
+    They are stored in clear, alongside everything else in runtime.json. That
+    file already sits unencrypted on a removable card, so this does not change
+    who can read a card they are holding - but it does put the passwords into
+    any backup copied to a computer, and into what WebConfig receives. Said
+    plainly because it is a real change in where those secrets travel.
+  */
+  JsonObject credentials = settings["credentials"].to<JsonObject>();
+  credentials["wifiSsid"] = selectedWifiSsid;
+  JsonArray wifiOut = credentials["wifiProfiles"].to<JsonArray>();
+  for (uint8_t i = 0; i < wifiProfileCount; i++) {
+    JsonObject profile = wifiOut.add<JsonObject>();
+    profile["ssid"] = wifiProfiles[i].ssid;
+    profile["password"] = wifiProfiles[i].password;
+  }
+  credentials["homebridgeAddress"] = homebridgeAddress;
+  credentials["homebridgeUsername"] = homebridgeUsername;
+  credentials["homebridgePassword"] = homebridgePassword;
+  credentials["mqttHost"] = mqttHost;
+  credentials["mqttUsername"] = mqttUsername;
+  credentials["mqttPassword"] = mqttPassword;
+  credentials["mqttClientId"] = mqttClientId;
+  credentials["mqttPort"] = mqttPort;
+  credentials["homeAssistantUrl"] = haBaseUrl;
+  credentials["homeAssistantToken"] = haToken;
+
   if (irNameOverrideCount) {
     JsonObject irNamesOut = settings["irDeviceNames"].to<JsonObject>();
     for (uint8_t i = 0; i < irNameOverrideCount; i++) {
