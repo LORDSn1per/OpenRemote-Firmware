@@ -4,7 +4,7 @@ import contextlib, datetime as dt, glob, hashlib, io, json, os, re, select, shut
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-APP_VERSION="2.84"
+APP_VERSION="2.85"
 SERIAL_BAUD=460800
 # 2.68 adds Linux as a third supported platform. Until now every non-Windows
 # branch in this file assumed macOS outright - AppleScript dialogs, diskutil,
@@ -1890,20 +1890,37 @@ def send_recovery_file(port,remote_path,payload,label,ir_filename=None):
         except Exception: pass
 
 def usb_restore_backup(port,name):
-    """Asks the remote to apply a backup already sitting in /backups."""
+    """Asks the remote to apply a backup already sitting in /backups.
+
+    Firmware 5.37+ queues the restore on its loop - which is what raises the
+    LCD's restoring overlay and progress bar - and answers "started" at once,
+    so Studio then asks ORUSB BACKUPSTATUS until the job has finished. Older
+    firmware restores inline and its first reply is already the result.
+    """
+    def read_json(timeout):
+        reply=serial_readline(port_obj,fd,timeout=timeout)
+        if not reply.startswith("{"):
+            raise RuntimeError("Unexpected remote response: "+reply[:80])
+        return json.loads(reply)
     port_obj=None
     try:
         with USB_LOCK:
             port_obj,fd=open_serial_port(normalize_usb_port(port))
             usb_handshake(port_obj,fd,timeout=30)
             serial_write(port_obj,("ORUSB RESTORE %s\n"%name).encode("ascii"))
-            reply=serial_readline(port_obj,fd,timeout=90)
-            if not reply.startswith("{"):
-                raise RuntimeError("Unexpected remote response: "+reply[:80])
-            result=json.loads(reply)
+            result=read_json(90)
             if not result.get("ok"):
                 raise RuntimeError(result.get("error","The remote rejected the restore."))
-            return result
+            deadline=time.time()+600
+            while result.get("started") or result.get("running"):
+                if time.time()>deadline:
+                    raise RuntimeError("The remote did not finish restoring within ten minutes.")
+                time.sleep(1)
+                serial_write(port_obj,b"ORUSB BACKUPSTATUS\n")
+                result=read_json(180)
+            if result.get("error"):
+                raise RuntimeError(result["error"])
+            return {"ok":True,"name":result.get("name") or name}
     except Exception as e:
         return {"error":str(e)}
     finally:

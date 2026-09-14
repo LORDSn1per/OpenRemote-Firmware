@@ -342,7 +342,7 @@ input:focus,textarea:focus{border-color:rgba(47,140,255,.8); box-shadow:0 0 0 3p
               <input type="file" id="recoveryFirmwareFile" accept=".bin" hidden onchange="flashFirmwareOverUsb(this)">
               <div class="setupStep"><span class="stepNumber">2</span><div><b>Install WebConfig</b><small>Writes a WebConfig .html to the SD card as <b>www/index.html</b>. Use this when a WebConfig installed incompletely - the remote's own web page cannot replace itself once it is broken.</small></div><button id="webConfigUsbBtn" class="primary setupAction" style="padding:12px 16px" onclick="document.getElementById('webConfigUsbFile').click()">Choose WebConfig</button></div>
               <div class="setupStep"><span class="stepNumber">3</span><div><b>Prepare SD Card</b><small>Creates any missing folders and installs WebConfig, Default icons and Default themes onto the card inside the remote. Existing files are skipped and your data is left alone. Choose a firmware and WebConfig on Remote Config first. Useful if setup step 3 could not finish - for example the card had to be reformatted to FAT32 on a computer.</small></div><button id="recoveryPrepareSd" class="primary setupAction" style="padding:12px 16px" onclick="prepareRemoteSdCard(recoveryPortValue(),true)">Prepare over USB</button></div>
-              <div class="setupStep"><span class="stepNumber">4</span><div><b>Load Backup</b><small>Copies an OpenRemote backup to <b>/backups</b> on the card and offers to apply it. Full backups replace the configuration; single-category exports (devices, learned, activities, macros, icons, themes) and WebConfig's per-device learned <b>.ir</b> exports merge into it, leaving everything else alone. Anything unrecognised is rejected before sending.</small></div><button id="recoveryLoadBackupBtn" class="secondary setupAction" onclick="document.getElementById('recoveryBackupFile').click()">Choose Backup</button></div>
+              <div class="setupStep"><span class="stepNumber">4</span><div><b>Load Backup</b><small>Copies an OpenRemote backup to <b>/backups</b> on the card and applies it straight away, while the remote shows its progress on screen. Full backups replace the configuration; single-category exports (devices, learned, activities, macros, icons, themes) and WebConfig's per-device learned <b>.ir</b> exports merge into it, leaving everything else alone. Anything unrecognised is rejected before sending.</small></div><button id="recoveryLoadBackupBtn" class="secondary setupAction" onclick="document.getElementById('recoveryBackupFile').click()">Choose Backup</button></div>
               <input type="file" id="recoveryBackupFile" accept=".json,.ir,application/json" hidden onchange="loadBackupOverUsb(this)">
               <div class="setupStep"><span class="stepNumber">5</span><div><b>Load .IR File</b><small>Copies a Flipper-format <b>.ir</b> signals file straight into <b>/devices</b>, where the remote picks it up as a device. You are warned before overwriting a file of the same name. A WebConfig-exported learned device is OpenRemote JSON rather than a Flipper file, so it is sent to <b>/backups</b> and applied instead - either slot accepts either kind.</small></div><button id="recoveryLoadIrBtn" class="secondary setupAction" onclick="document.getElementById('recoveryIrFile').click()">Choose .IR File</button></div>
               <input type="file" id="recoveryIrFile" accept=".ir,.json,application/json" hidden onchange="loadIrFileOverUsb(this)">
@@ -906,7 +906,7 @@ async function pollWebConfigUsb(){
       setWebConfigUsbProgress(st.total,st.total,st.status||'Installed.','ok');
       if(pendingBackupInstall && !st.error){
         var job=pendingBackupInstall; pendingBackupInstall=null;
-        maybeInstallBackup(job);
+        installBackup(job);
       }else{ pendingBackupInstall=null; }
       ['webConfigUsbBtn','recoveryLoadBackupBtn','recoveryLoadIrBtn'].forEach(function(id){
         var b=document.getElementById(id); if(b)b.disabled=false; });
@@ -1117,7 +1117,7 @@ function setViewMessage(view,message,type){
 /*
   Both Recovery file slots share this. The server decides from the contents
   whether a file is a Flipper signals file (-> /devices) or OpenRemote JSON
-  (-> /backups, then offer to apply it), so the only difference between the
+  (-> /backups, then apply it), so the only difference between the
   two slots is which button to re-enable and what to call the failure.
 */
 async function sendRecoveryFile(input,options){
@@ -1164,27 +1164,18 @@ function loadIrFileOverUsb(input){
 }
 
 let pendingBackupInstall=null;
-async function maybeInstallBackup(job){
-  /*
-    A full backup replaces the configuration; every other category merges into
-    it. Describing a merge as a replacement scared people off applying a
-    single learned device, which is the common case.
-  */
-  var isFull=/^Full backup/.test(job.summary||'');
-  var effect=isFull
-    ? 'This replaces the current devices, activities, macros, icons and themes.'
-    : 'This merges into the configuration already on the remote - matching items are updated, new ones are added, and every other category is left alone.';
-  if(!confirm('Copied to the SD card.\n\n'+job.summary+'\n\nApply it to the remote now?\n\n'+effect+' Choose Cancel to leave the file on the card and apply it later.')) {
-    setRecoveryMessage('Copied '+job.name+' to /backups. Not applied.','ok');
-    return;
-  }
-  setRecoveryMessage('Applying '+job.name+' on the remote…');
+/*
+  Loading a backup means applying it: no confirmation, no "applied" dialog.
+  The remote shows the restoring overlay and progress bar on its own screen
+  while Studio waits here for the result.
+*/
+async function installBackup(job){
+  setRecoveryMessage('Restoring '+job.name+' on the remote - follow the progress on its screen…');
   try{
     var res=await fetch('/usb/restore-backup',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({port:job.port,name:job.name})}).then(r=>r.json());
     if(res.error){ setRecoveryMessage('Restore failed: '+res.error,'err'); alert('Restore failed\n\n'+res.error); }
-    else{ setRecoveryMessage('Restored '+job.name+'. The remote is reloading its configuration.','ok');
-          alert('Backup applied.\n\nThe remote is reloading its configuration now.'); }
+    else setRecoveryMessage('Restored '+job.name+'. The remote is reloading its configuration.','ok');
   }catch(e){ setRecoveryMessage('Restore failed: '+e.message,'err'); }
 }
 </script>
