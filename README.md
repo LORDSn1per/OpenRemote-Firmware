@@ -62,9 +62,9 @@ Studio installs these for you, so you only need them for a manual update.
 
 <img src="docs/images/openremote-studio.jpg" alt="OpenRemote Studio" width="100%">
 
-Sets up a new remote from a blank board, holds a 100 MB infrared database you
-can search for your equipment, and repairs a remote that will not start. This
-is the tool that turns a bare circuit board into a working remote.
+Sets up a new remote from a blank board, builds the infrared database, and
+repairs a remote that will not start. This is the tool that turns a bare
+circuit board into a working remote.
 
 [Read more →](studio/README.md)
 
@@ -76,6 +76,19 @@ Served by the remote itself over your Wi-Fi. Open its address on a laptop or
 phone and design screens, build activities and macros, assign the physical
 buttons, and change icons and themes — with the remote updating live as you
 work. Nothing to install, and it works on any device with a browser.
+
+**The whole infrared database lives on the remote's own SD card.** Copy it
+across from the browser, then search all 14,000-plus devices straight from
+WebConfig — no computer and no Studio needed. The searching happens on the
+remote and only the matching devices come back over Wi-Fi, so a brand with
+hundreds of models is a list you scroll, not a download. Click any command to
+fire the real infrared through the remote or the dock, so you can confirm a
+code set before you keep it.
+
+Also in the browser: a file manager for the SD card, complete backups written
+by the remote itself and restored the same way, and a one-file export for any
+single device — infrared, RF433, Homebridge, MQTT or Bluetooth — that can be
+imported into another remote.
 
 [Read more →](webconfig/README.md)
 
