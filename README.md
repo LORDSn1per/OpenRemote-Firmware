@@ -80,8 +80,8 @@ work. Nothing to install, and it works on any device with a browser.
 **The whole infrared database lives on the remote's own SD card.** Copy it
 across from the browser, then search all 14,000-plus devices straight from
 WebConfig — no computer and no Studio needed. The searching happens on the
-remote and only the matching devices come back over Wi-Fi, so a brand with
-hundreds of models is a list you scroll, not a download. Click any command to
+remote and the matching devices come straight from its SD card, with no Wi-Fi
+needed, so a brand with hundreds of models is a list you scroll, not a download. Click any command to
 fire the real infrared through the remote or the dock, so you can confirm a
 code set before you keep it.
 

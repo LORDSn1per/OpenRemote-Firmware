@@ -45,7 +45,8 @@ codes from the infrared database. Assign anything to the physical buttons.
 
 The database lives on the remote's own SD card, so searching 14,000-plus
 devices needs nothing but this page — no computer and no Studio. The search
-runs on the remote and only the matching devices come back over Wi-Fi. Click
+runs on the remote and the matching devices come straight from its SD card, with
+no Wi-Fi needed. Click
 any command to fire the real infrared through the remote or the dock, so a code
 set can be confirmed before you keep it.
 
