@@ -35,9 +35,9 @@ change, so they are safe to bookmark.
 
 | | Download |
 |---|---|
-| **macOS** — Intel and Apple Silicon | [**OpenRemote Studio for macOS**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-Studio-2.84-macOS.zip) |
-| **Windows** — 10 and 11 | [**OpenRemote Studio for Windows**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-Studio-2.84-Windows.zip) |
-| **Linux** — x86_64 | [**OpenRemote Studio for Linux**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-Studio-2.84-Linux.AppImage) |
+| **macOS** — Intel and Apple Silicon | [**OpenRemote Studio for macOS**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-Studio-2.85-macOS.zip) |
+| **Windows** — 10 and 11 | [**OpenRemote Studio for Windows**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-Studio-2.85-Windows.zip) |
+| **Linux** — x86_64 | [**OpenRemote Studio for Linux**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-Studio-2.85-Linux.AppImage) |
 
 > On Windows, unzip the **whole folder** and run the `.exe` from inside it — the
 > app and runtime folders must stay beside it.
@@ -48,7 +48,7 @@ Studio installs these for you, so you only need them for a manual update.
 
 | | Download |
 |---|---|
-| Remote firmware — ESP32-S3 | [**OpenRemote-Remote-Firmware-5.35.bin**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-Remote-Firmware-5.35.bin) |
+| Remote firmware — ESP32-S3 | [**OpenRemote-Remote-Firmware-5.38.bin**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-Remote-Firmware-5.38.bin) |
 | Dock firmware — ESP32-C3 | [**OpenRemote-Dock-Firmware-1.82.bin**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-Dock-Firmware-1.82.bin) |
 | WebConfig — browser configurator | [**OpenRemote-WebConfig-3.33.html**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-WebConfig-3.33.html) |
 
