@@ -1,6 +1,16 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.37 - 2026-09-14
+    - A restore started from Studio shows the "Restoring backup" overlay with
+      its progress bar and animated ring, the same as one started from
+      WebConfig, labelled "Started from Studio". ORUSB RESTORE used to call
+      restoreLcdFullBackup() inline, so the LCD showed nothing at all while
+      the configuration was replaced. It now queues the job for the loop and
+      answers {"ok":true,"started":true} at once.
+    - New ORUSB BACKUPSTATUS reports {running, phase, name, error} for the
+      queued job, so Studio can report the result.
+
   5.36 - 2026-09-14
     - Studio's Load Backup works for a full backup. Every USB write outside the
       IR database was capped at 4MB, and a full backup with its themes,
@@ -6794,7 +6804,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.36"
+#define OPENREMOTE_VERSION_STRING "5.37"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -9052,6 +9062,9 @@ volatile bool backupRequestRunning = false;
 volatile bool restoreRequestPending = false;
 char restoreRequestName[64] = "";
 char backupRequestName[64] = "";
+// Shown under the overlay title. Studio sets it for ORUSB RESTORE and
+// serviceQueuedBackup() puts it back afterwards.
+const char *backupRequestOrigin = "Started from WebConfig";
 char backupRequestError[128] = "";
 volatile bool pendingRuntimeReload = false;
 volatile bool runtimeReloadCanRollback = false;
@@ -19404,10 +19417,28 @@ void handleUsbCommand(Stream &port, UsbSerialSession &session, String command) {
     usbImportReply(port, String("{\"ok\":true,\"requested\":\"") +
                    (on ? "on" : "off") + "\",\"token\":\"" + setupToken +
                    "\"}");
+  } else if (command == "ORUSB BACKUPSTATUS") {
+    // The queued job's state, with the same fields as /api/backups/progress.
+    bool busy = backupRequestPending || backupRequestRunning || restoreRequestPending;
+    JsonDocument doc;
+    doc["ok"] = true;
+    doc["running"] = busy;
+    doc["phase"] = busy ? lcdBackupPhase : "";
+    doc["name"] = backupRequestName;
+    doc["error"] = backupRequestError;
+    String body;
+    serializeJson(doc, body);
+    usbImportReply(port, body);
   } else if (command.startsWith("ORUSB RESTORE ")) {
     // Applies a backup already sitting in /backups, so Studio can copy a
-    // backup over USB and then have the remote actually install it - the
-    // same restoreLcdFullBackup() the LCD menu and WebConfig both use.
+    // backup over USB and have the remote install it straight away.
+    //
+    // Queued for the loop exactly like POST /api/backups/restore rather than
+    // run here. Calling restoreLcdFullBackup() inline restored correctly but
+    // drew nothing: the "Restoring backup" overlay, its progress bar and ring
+    // are raised by serviceQueuedBackup(), so a Studio restore ran with the
+    // LCD sitting on whatever page it was on. Studio follows this with
+    // ORUSB BACKUPSTATUS until the job is finished.
     String name = command.substring(14);
     name.trim();
     if (!sdReady) {
@@ -19419,14 +19450,17 @@ void handleUsbCommand(Stream &port, UsbSerialSession &session, String command) {
       usbImportReply(port, "{\"ok\":false,\"error\":\"Invalid backup filename\"}");
       return;
     }
-    String error;
-    // reloadNow=false: the runtime model belongs to the main loop on core 1.
-    bool ok = restoreLcdFullBackup(clean.c_str(), error, false);
-    Serial.printf("USB restore: %s %s\n", clean.c_str(), ok ? "ok" : error.c_str());
-    usbImportReply(port, ok
-      ? String("{\"ok\":true,\"name\":\"") + clean + "\"}"
-      : String("{\"ok\":false,\"error\":\"") + error + "\"}");
-    if (ok) scheduleRuntimeReloadAfterSync();
+    if (backupRequestPending || backupRequestRunning || restoreRequestPending) {
+      usbImportReply(port, "{\"ok\":false,\"error\":\"The remote is already busy with a backup\"}");
+      return;
+    }
+    strlcpy(restoreRequestName, clean.c_str(), sizeof(restoreRequestName));
+    backupRequestName[0] = '\0';
+    backupRequestError[0] = '\0';
+    backupRequestOrigin = "Started from Studio";
+    restoreRequestPending = true;
+    Serial.printf("USB restore: %s queued for the Arduino loop\n", clean.c_str());
+    usbImportReply(port, String("{\"ok\":true,\"started\":true,\"name\":\"") + clean + "\"}");
   } else if (command == "ORUSB FACTORYRESET") {
     // Recovery path for a remote that cannot be reached over Wi-Fi at all.
     if (!sdReady) {
@@ -22592,7 +22626,7 @@ void serviceQueuedBackup() {
     backup ran with the bar hidden and stepLcdBackupAnim() returning early: the
     percentages were being computed and drawn nowhere.
   */
-  showBackupOverlay(restoring, "Started from WebConfig");
+  showBackupOverlay(restoring, backupRequestOrigin);
   setLcdBackupStatus(restoring ? "Restoring full backup..." : "Creating full backup...");
   String createdName;
   String error;
@@ -22614,13 +22648,14 @@ void serviceQueuedBackup() {
   }
   setLcdBackupStatus(ok ? (restoring ? "Restore complete" : "Backup created successfully")
                         : error);
-  Serial.printf("%s (WebConfig): %s %s took=%ums\n",
-                restoring ? "SD restore" : "Backup create",
+  Serial.printf("%s (%s): %s %s took=%ums\n",
+                restoring ? "SD restore" : "Backup create", backupRequestOrigin,
                 ok ? createdName.c_str() : "-", ok ? "ok" : error.c_str(),
                 (unsigned)(millis() - startedMs));
   lv_refr_now(nullptr);
   vTaskDelay(pdMS_TO_TICKS(1200));   // let the finished message be read
   hideBackupOverlay();
+  backupRequestOrigin = "Started from WebConfig";
   backupRequestRunning = false;
   if (restoring && ok) scheduleRuntimeReloadAfterSync();
   pendingUiRefresh = true;
