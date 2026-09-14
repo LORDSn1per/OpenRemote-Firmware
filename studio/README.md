@@ -46,9 +46,13 @@ the remote and lets you edit it: devices, activities, macros, screen layouts,
 icons and themes.
 
 ### IRDB Builder & Browser
-A searchable infrared database — around 100 MB of codes — so you can pick your
+Builds the infrared database — around 100 MB of codes — so you can pick your
 TV, amplifier or set-top box by make and model instead of teaching every button
 by hand. Build your own database file, or browse the bundled one.
+
+Copying it to a remote is no longer done here: WebConfig sends it straight to
+the SD card far faster, and the remote then searches it on its own. Studio
+remains the place the database is built.
 
 ### Setup New Remote
 Writes firmware, partition table and a complete SD card to a blank board in one

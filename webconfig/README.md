@@ -43,6 +43,16 @@ of commands on a single button.
 Add equipment and its commands, learn a signal from an original remote, or pull
 codes from the infrared database. Assign anything to the physical buttons.
 
+The database lives on the remote's own SD card, so searching 14,000-plus
+devices needs nothing but this page — no computer and no Studio. The search
+runs on the remote and only the matching devices come back over Wi-Fi. Click
+any command to fire the real infrared through the remote or the dock, so a code
+set can be confirmed before you keep it.
+
+Any single device can also be saved as one file — infrared, RF433, Homebridge,
+MQTT or Bluetooth — and imported into another remote from
+**Add device > Import a device file**.
+
 ### Icons & Themes
 Upload your own icons and switch themes. What you choose appears on the remote
 immediately.
@@ -50,6 +60,14 @@ immediately.
 ### Backup & Restore
 Save the whole configuration to a file and restore it later — useful before
 changing something large, or to copy a setup to a second remote.
+
+The remote writes the backup itself and restores it the same way, so a file is
+identical whether it was made here or from the remote's own screen, and either
+one can restore the other. Backups can be kept on the computer or on the SD
+card, and progress is shown on both the page and the remote's display.
+
+There is also a file manager for the SD card, with guards that refuse to delete
+anything the remote needs to start.
 
 ### Settings
 Wi-Fi, Bluetooth pairing for Android TV and Chromecast, display and sleep
