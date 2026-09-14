@@ -1,6 +1,15 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.38 - 2026-09-14
+    - Restoring a backup fills the LCD progress bar once, 0-100%, instead of
+      four times. Each restoreEmbeddedFiles() call - icons, theme assets,
+      widget wallpapers, device files - claimed the whole bar for itself. The
+      restore is now one bar in three stages: reading the backup 0-30% (by
+      bytes parsed, which used to show no progress at all), restoring files
+      30-95% shared between the four arrays by their size and advancing within
+      large files, then saving the configuration 95-100%.
+
   5.37 - 2026-09-14
     - A restore started from Studio shows the "Restoring backup" overlay with
       its progress bar and animated ring, the same as one started from
@@ -6804,7 +6813,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.37"
+#define OPENREMOTE_VERSION_STRING "5.38"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -18812,6 +18821,12 @@ class BufferedSdJsonStream : public Stream {
   size_t write(uint8_t) override { return 0; }
   void flush() override {}
   size_t consumed() const { return consumed_; }
+  // Drives the LCD bar from the bytes handed to the parser, across [low..high].
+  void reportProgress(size_t total, float low, float high) {
+    progressTotal_ = total;
+    progressLow_ = low;
+    progressHigh_ = high;
+  }
 
  private:
   bool refill() {
@@ -18825,7 +18840,13 @@ class BufferedSdJsonStream : public Stream {
     // One yield per 16 KB read rather than per buffer: enough to keep the idle
     // task and the watchdog fed through a multi-megabyte parse without adding
     // a tick of latency to every kilobyte.
-    if (++refills_ % 16 == 0) vTaskDelay(1);
+    if (++refills_ % 16 == 0) {
+      vTaskDelay(1);
+      if (progressTotal_) {
+        setLcdBackupPhaseFraction("Reading backup",
+          (float)consumed_ / (float)progressTotal_, progressLow_, progressHigh_);
+      }
+    }
     return true;
   }
   File &file_;
@@ -18834,6 +18855,9 @@ class BufferedSdJsonStream : public Stream {
   size_t pos_ = 0;
   size_t consumed_ = 0;
   uint32_t refills_ = 0;
+  size_t progressTotal_ = 0;
+  float progressLow_ = 0.0f;
+  float progressHigh_ = 1.0f;
 };
 
 // Confirms a JSON file on the card parses end to end, and says why when it
@@ -20554,9 +20578,31 @@ void embedSdFilesAsBase64(JsonArray target, const String &directory) {
   root.close();
 }
 
-bool restoreEmbeddedFiles(JsonArrayConst files, String &error) {
-  // Exact, and free: the array is already parsed.
-  beginLcdBackupProgress((uint16_t)files.size());
+// The base64 payload of one embedded-files array, in bytes. Shares the
+// restore's progress bar between arrays by how much work each really is: one
+// expanded wallpaper outweighs every icon in the backup put together.
+size_t embeddedFilesBytes(JsonArrayConst files) {
+  size_t total = 0;
+  for (JsonObjectConst fileEntry : files) {
+    const char *data = fileEntry["data"] | "";
+    if (!data[0]) data = fileEntry["src"] | "";
+    total += strlen(data);
+  }
+  return total;
+}
+
+// Reports across [bandLow..bandHigh] of the one restore bar, never 0-100% of
+// its own. A full backup calls this four times - icons, theme assets, widget
+// wallpapers, device files - and each call used to restart the bar from zero.
+bool restoreEmbeddedFiles(JsonArrayConst files, String &error,
+                          float bandLow, float bandHigh) {
+  const size_t totalBytes = embeddedFilesBytes(files);
+  size_t doneBytes = 0;
+  auto reportRestoreProgress = [&](size_t extra) {
+    float within = totalBytes ? (float)(doneBytes + extra) / (float)totalBytes : 1.0f;
+    setLcdBackupPhaseFraction("Restoring files", within, bandLow, bandHigh);
+  };
+  reportRestoreProgress(0);
   /*
     One scratch buffer for the whole call, on the heap.
 
@@ -20656,6 +20702,8 @@ bool restoreEmbeddedFiles(JsonArrayConst files, String &error) {
       // for the Arduino loop to touch the same SD card with no lock between
       // them, so they are kept as sparse as the timeout allows.
       if ((++blockCount & 7) == 0) vTaskDelay(1);
+      // Within the file too: a 2 MB wallpaper is several seconds on its own.
+      if ((blockCount & 15) == 0) reportRestoreProgress(offset);
     }
     if (out) out.close();
     }
@@ -20664,7 +20712,8 @@ bool restoreEmbeddedFiles(JsonArrayConst files, String &error) {
       error = String("Could not restore ") + path + " after 3 attempts";
       return false;
     }
-    advanceLcdBackupProgress();
+    doneBytes += dataLen;
+    reportRestoreProgress(0);
   }
   free(decodeBuffer);
   return true;
@@ -20749,20 +20798,36 @@ bool convertWebBackupToRuntime(JsonDocument &backup, String &error) {
   // embedded custom icons/theme wallpapers before rebuilding runtime.json,
   // since normaliseRuntimeItemIcons()/runtimeThemePathForId() below just
   // reference their paths and expect the actual files to already exist.
-  if (data["icons"].is<JsonArrayConst>()) {
-    if (!restoreEmbeddedFiles(data["icons"].as<JsonArrayConst>(), error)) return false;
+  //
+  // One bar for the whole restore. Reading the file took 0-30%; these four
+  // arrays share 30-95% by size, so the bar moves at the pace of the real work
+  // and never restarts; rebuilding and saving runtime.json takes the rest.
+  JsonArrayConst restoreArrays[] = {
+    data["icons"].as<JsonArrayConst>(),
+    backup["themeAssets"].as<JsonArrayConst>(),
+    backup["widgetWallpaperAssets"].as<JsonArrayConst>(),
+    // /devices/*.ir (and its index.txt) for file-backed Studio/IRDB devices,
+    // which have no representation in runtime.json at all.
+    backup["deviceFiles"].as<JsonArrayConst>(),
+  };
+  const uint8_t restoreArrayCount = sizeof(restoreArrays) / sizeof(restoreArrays[0]);
+  size_t restoreBytes[4] = {0};
+  size_t restoreTotal = 0;
+  for (uint8_t i = 0; i < restoreArrayCount; i++) {
+    if (!restoreArrays[i].isNull()) restoreBytes[i] = embeddedFilesBytes(restoreArrays[i]);
+    restoreTotal += restoreBytes[i];
   }
-  if (backup["themeAssets"].is<JsonArrayConst>()) {
-    if (!restoreEmbeddedFiles(backup["themeAssets"].as<JsonArrayConst>(), error)) return false;
+  float bandStart = 0.30f;
+  size_t bytesBefore = 0;
+  for (uint8_t i = 0; i < restoreArrayCount; i++) {
+    if (restoreArrays[i].isNull()) continue;
+    bytesBefore += restoreBytes[i];
+    float bandEnd = restoreTotal
+      ? 0.30f + 0.65f * (float)bytesBefore / (float)restoreTotal : 0.95f;
+    if (!restoreEmbeddedFiles(restoreArrays[i], error, bandStart, bandEnd)) return false;
+    bandStart = bandEnd;
   }
-  if (backup["widgetWallpaperAssets"].is<JsonArrayConst>()) {
-    if (!restoreEmbeddedFiles(backup["widgetWallpaperAssets"].as<JsonArrayConst>(), error)) return false;
-  }
-  // Restores /devices/*.ir (and its index.txt) for file-backed Studio/IRDB
-  // devices, which have no representation in runtime.json at all.
-  if (backup["deviceFiles"].is<JsonArrayConst>()) {
-    if (!restoreEmbeddedFiles(backup["deviceFiles"].as<JsonArrayConst>(), error)) return false;
-  }
+  setLcdBackupPhaseFraction("Saving configuration", 0.0f, 0.95f, 1.0f);
 
   JsonDocument runtime(&psramJsonAllocator);
   if (SD.exists(RUNTIME_CONFIG_PATH)) {
@@ -20862,7 +20927,9 @@ bool convertWebBackupToRuntime(JsonDocument &backup, String &error) {
                              systemThemes["settings"] | "simple",
                              systemThemes["activities"] | "simple");
 
-  return saveRuntimeConfigDocument(runtime, error);
+  bool saved = saveRuntimeConfigDocument(runtime, error);
+  if (saved) setLcdBackupPhaseFraction("Saving configuration", 1.0f, 0.95f, 1.0f);
+  return saved;
 }
 
 // WebConfig can export one category on its own ("Your Devices", "Learned",
@@ -21016,7 +21083,7 @@ bool restoreCategoryBackup(JsonDocument &backup, String &error) {
   if (category == "icons") {
     // Icons are pure files - they have no runtime.json representation, so
     // writing them back into /icons/Custom is the whole job.
-    if (!restoreEmbeddedFiles(items, error)) return false;
+    if (!restoreEmbeddedFiles(items, error, 0.30f, 0.95f)) return false;
     merged = items.size();
   } else if (category == "widgets") {
     JsonObject settings = runtime["widgets"].to<JsonObject>();
@@ -21416,6 +21483,8 @@ bool restoreLcdFullBackup(const char *name, String &error, bool reloadNow) {
   const size_t rawSize = file.size();
   JsonDocument backup(&psramJsonAllocator);
   BufferedSdJsonStream backupStream(file);
+  // First 30% of the single restore bar; the parse of a 7 MB backup is seconds.
+  backupStream.reportProgress(rawSize, 0.0f, 0.30f);
   DeserializationError parseError = deserializeJson(backup, backupStream);
   const size_t consumed = backupStream.consumed();
   file.close();
@@ -21437,6 +21506,7 @@ bool restoreLcdFullBackup(const char *name, String &error, bool reloadNow) {
                   (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
     return false;
   }
+  setLcdBackupPhaseFraction("Reading backup", 1.0f, 0.0f, 0.30f);
   const char *category = backup["category"] | "";
   // Single-category exports merge on top of the current configuration instead
   // of replacing it. Dispatching here rather than at each caller means the LCD
