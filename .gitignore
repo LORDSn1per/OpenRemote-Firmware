@@ -49,3 +49,6 @@ Handoffs/
 # Device-specific ADB authentication identity. This private key remains only
 # on Phillip's local dock build machine and must never be published.
 dock/firmware/pio_src/openremote_dock_adb_identity.h
+
+# Private project notes - never publish
+AGENTS.md
