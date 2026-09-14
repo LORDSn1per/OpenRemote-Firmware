@@ -1,6 +1,17 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.36 - 2026-09-14
+    - Studio's Load Backup works for a full backup. Every USB write outside the
+      IR database was capped at 4MB, and a full backup with its themes,
+      wallpapers and icons embedded is 7MB or more, so it was refused with
+      "USB payload is empty or too large - 7455819 bytes offered, limit
+      4194304". /backups now has its own 64MB ceiling.
+    - USB uploads survive an SD card glitch. The USB writer was the last path
+      still calling file.write() unguarded; it now goes through
+      writeUploadChunkToSd() like every HTTP upload, so a transient card error
+      reopens the handle instead of failing the transfer.
+
   5.35 - 2026-09-14
     - Deleting a backup accepts .ir as well as .json. A single-device export is
       named "<Device> (IR).ir", and /backups already accepted it on upload and
@@ -6783,7 +6794,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.35"
+#define OPENREMOTE_VERSION_STRING "5.36"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -7023,6 +7034,11 @@ static const size_t USB_IMPORT_MAX_BYTES = 4UL * 1024UL * 1024UL;
 // Still bounded: this refuses a file larger than any database Studio builds,
 // rather than trusting whatever length arrives.
 static const size_t USB_IRDB_MAX_BYTES = 512UL * 1024UL * 1024UL;
+// A full backup embeds every theme, wallpaper and icon as base64 and is
+// routinely 7MB or more, so the 4MB sanity cap refused Studio's Load Backup
+// before a byte moved. 64MB is well past any backup the remote or WebConfig
+// writes while still refusing a mis-picked file.
+static const size_t USB_BACKUP_MAX_BYTES = 64UL * 1024UL * 1024UL;
 static const size_t USB_IO_CHUNK_BYTES = 192;
 static const size_t USB_UPLOAD_WINDOW_BYTES = 1024;
 static const uint16_t USB_IO_BUDGET_BYTES = USB_UPLOAD_WINDOW_BYTES;
@@ -18701,7 +18717,9 @@ bool beginUsbFileUpload(Stream &port, UsbSerialSession &session,
     usbImportReply(port, "{\"ok\":false,\"error\":\"SD card unavailable\"}");
     return false;
   }
-  size_t limit = (finalPath == IRDB_PATH) ? USB_IRDB_MAX_BYTES : USB_IMPORT_MAX_BYTES;
+  size_t limit = (finalPath == IRDB_PATH) ? USB_IRDB_MAX_BYTES
+               : finalPath.startsWith("/backups/") ? USB_BACKUP_MAX_BYTES
+               : USB_IMPORT_MAX_BYTES;
   if (length == 0 || length > limit) {
     // Says which limit and what was offered, because "too large" alone sent
     // someone hunting through Studio for a fault that was a constant here.
@@ -19158,6 +19176,9 @@ void finishUsbFileUpload(Stream &port, UsbSerialSession &session) {
   usbImportReply(port, response);
 }
 
+bool writeUploadChunkToSd(File &file, size_t confirmed,
+                          const uint8_t *data, size_t length);
+
 bool serviceUsbUpload(Stream &port, UsbSerialSession &session) {
   if (session.uploadExpected == 0) return false;
   if ((uint32_t)(millis() - session.uploadLastDataMs) > USB_UPLOAD_IDLE_TIMEOUT_MS) {
@@ -19185,7 +19206,10 @@ bool serviceUsbUpload(Stream &port, UsbSerialSession &session) {
       buffer[got++] = (uint8_t)value;
     }
     if (!got) break;
-    if (session.uploadFile.write(buffer, got) != got) {
+    // Guarded like every HTTP upload: the card glitches about once per 800KB
+    // and FatFs then refuses every later write on that handle, so a plain
+    // write() failed a multi-megabyte backup or database part way through.
+    if (!writeUploadChunkToSd(session.uploadFile, session.uploadReceived, buffer, got)) {
       failUsbUpload(port, session, "SD write failed during USB upload");
       return false;
     }
