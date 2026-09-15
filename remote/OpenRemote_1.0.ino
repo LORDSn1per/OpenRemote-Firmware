@@ -1,6 +1,14 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.62 - 2026-09-15
+    - The OpenRemote style's Settings home shows the page dots again, like
+      OMOTE: on the home level only, with every settings sub-page still using
+      the whole screen. Instead of the list stopping short to make room, the
+      dots float over the full-height list on a small dark pill that keeps
+      them readable against the cards. OMOTE and the other pages keep their
+      dots exactly as before.
+
   5.61 - 2026-09-15
     - The OMOTE Settings home has a battery card above Wi-Fi, matching the one
       in the OpenRemote style: percentage, a CHARGING / ON BATTERY chip and a
@@ -7058,7 +7066,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.61"
+#define OPENREMOTE_VERSION_STRING "5.62"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -30673,27 +30681,41 @@ void rebuildPages() {
 
 void drawDots() {
   if (!dots) return;
-  // Stormy hides them on the settings home as well: every pixel of the 240x320
-  // screen goes to the page instead, the way the settings sub-pages already
-  // work in every style.
-  if (currentPage == 0 && (settingsView != SETTINGS_HOME || menuStyle == 0)) {
+  // On the settings page, dots only at the top (home) level; every sub-page
+  // uses the whole screen. Same in both menu styles.
+  if (currentPage == 0 && settingsView != SETTINGS_HOME) {
     lv_obj_add_flag(dots, LV_OBJ_FLAG_HIDDEN);
     return;
   }
   lv_obj_clear_flag(dots, LV_OBJ_FLAG_HIDDEN);
   lv_obj_clean(dots);
 
+  // OpenRemote style's settings home runs its list the full height of the
+  // screen, so the dots float over it on a small dark pill that keeps them
+  // legible against the cards. Everywhere else they sit bare as before.
+  bool floating = currentPage == 0 && menuStyle == 0;
+  const int inset = floating ? 5 : 0;
+  lv_obj_set_style_bg_color(dots, lv_color_black(), 0);
+  lv_obj_set_style_bg_opa(dots, floating ? (lv_opa_t)150 : LV_OPA_TRANSP, 0);
+  lv_obj_set_style_radius(dots, LV_RADIUS_CIRCLE, 0);
+
   for (uint8_t i = 0; i < pageCount; i++) {
     lv_obj_t *dot = lv_obj_create(dots);
     lv_obj_set_size(dot, 8, 8);
-    lv_obj_set_pos(dot, i * 16, 0);
+    lv_obj_set_pos(dot, inset + i * 16, inset);
     lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_border_width(dot, 0, 0);
     lv_obj_set_style_bg_color(dot, (i == currentPage) ? lv_color_white() : lvRgb(125, 125, 135), 0);
     lv_obj_set_style_bg_opa(dot, (i == currentPage) ? LV_OPA_90 : LV_OPA_50, 0);
   }
-  lv_obj_set_width(dots, pageCount * 16);
-  lv_obj_align(dots, LV_ALIGN_BOTTOM_MID, 0, -8);
+  if (floating) {
+    lv_obj_set_size(dots, (pageCount - 1) * 16 + 8 + 2 * inset, 8 + 2 * inset);
+    lv_obj_align(dots, LV_ALIGN_BOTTOM_MID, 0, -6);
+    lv_obj_move_foreground(dots);   // over the full-height list
+  } else {
+    lv_obj_set_size(dots, pageCount * 16, 12);
+    lv_obj_align(dots, LV_ALIGN_BOTTOM_MID, 0, -8);
+  }
 }
 
 void setCinematicBackground(bool enabled) {
@@ -31489,8 +31511,8 @@ lv_obj_t *makeStormyDropdownRow(lv_obj_t *card, const char *name, int y, int hei
 }
 
 void renderSettingsHomeStormy() {
-  // No page dots in Stormy (drawDots()), so the list runs to the bottom edge
-  // instead of stopping at the 250px the other styles leave for them.
+  // The page dots float over the list on a small pill here (drawDots()), so
+  // the list runs to the bottom edge instead of stopping short of them.
   lv_obj_set_height(content, LCD_H - 42);
   applyStormyBackground();
   const int rowH = 44;
