@@ -1,6 +1,10 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.46 - 2026-09-15
+    - The brightness panel's readout tile has the battery on the left and the
+      brightness on the right, next to the slider that changes it.
+
   5.45 - 2026-09-15
     - ORUSB SCREENSHOT writes the image. 5.44 wrote an empty file and reported
       "bytes":0: LVGL 8.3's lv_snapshot_take() fills in the width and height
@@ -6897,7 +6901,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.45"
+#define OPENREMOTE_VERSION_STRING "5.46"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -37745,19 +37749,21 @@ void toggleBrightnessPanel() {
   lv_obj_set_style_bg_color(divider, lv_color_white(), 0);
   lv_obj_set_style_bg_opa(divider, LV_OPA_20, 0);
 
-  // Brightness: the weather widget's sun, drawn from shapes.
-  makeWeatherGlyph(tile, (half - 34) / 2, 14, 34, 0);
+  // Brightness on the right half, beside the slider that changes it: the
+  // weather widget's sun, drawn from shapes.
+  makeWeatherGlyph(tile, half + (half - 34) / 2, 14, 34, 0);
   char brightnessText[8];
   snprintf(brightnessText, sizeof(brightnessText), "%d%%", (int)brightness);
-  brightnessValueLabel = makeLabel(tile, brightnessText, 0, 54, &lv_font_montserrat_24, textPrimary());
+  brightnessValueLabel = makeLabel(tile, brightnessText, half, 54, &lv_font_montserrat_24, textPrimary());
   lv_obj_set_width(brightnessValueLabel, half);
   lv_obj_set_style_text_align(brightnessValueLabel, LV_TEXT_ALIGN_CENTER, 0);
-  lv_obj_t *brightnessCaption = makeLabel(tile, "Brightness", 0, 86, &lv_font_montserrat_10, muted);
+  lv_obj_t *brightnessCaption = makeLabel(tile, "Brightness", half, 86, &lv_font_montserrat_10, muted);
   lv_obj_set_width(brightnessCaption, half);
   lv_obj_set_style_text_align(brightnessCaption, LV_TEXT_ALIGN_CENTER, 0);
 
-  // Battery: a rounded cell with its level filled in green, and its cap.
-  const int cellW = 34, cellH = 18, cellX = half + (half - cellW - 4) / 2, cellY = 22;
+  // Battery on the left half: a rounded cell with its level filled in green,
+  // and its cap.
+  const int cellW = 34, cellH = 18, cellX = (half - cellW - 4) / 2, cellY = 22;
   lv_obj_t *cell = lv_obj_create(tile);
   lv_obj_remove_style_all(cell);
   lv_obj_set_size(cell, cellW, cellH);
@@ -37783,10 +37789,10 @@ void toggleBrightnessPanel() {
   lv_obj_set_style_radius(cellCap, 1, 0);
   lv_obj_set_style_bg_color(cellCap, lv_color_white(), 0);
   lv_obj_set_style_bg_opa(cellCap, LV_OPA_80, 0);
-  lv_obj_t *batteryValue = makeLabel(tile, batteryText, half, 54, &lv_font_montserrat_24, textPrimary());
+  lv_obj_t *batteryValue = makeLabel(tile, batteryText, 0, 54, &lv_font_montserrat_24, textPrimary());
   lv_obj_set_width(batteryValue, half);
   lv_obj_set_style_text_align(batteryValue, LV_TEXT_ALIGN_CENTER, 0);
-  lv_obj_t *batteryCaption = makeLabel(tile, "Battery", half, 86, &lv_font_montserrat_10, muted);
+  lv_obj_t *batteryCaption = makeLabel(tile, "Battery", 0, 86, &lv_font_montserrat_10, muted);
   lv_obj_set_width(batteryCaption, half);
   lv_obj_set_style_text_align(batteryCaption, LV_TEXT_ALIGN_CENTER, 0);
 
