@@ -1,6 +1,10 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.42 - 2026-09-15
+    - The charging overlay stays up for seven seconds instead of four. A tap
+      still closes it at once.
+
   5.41 - 2026-09-15
     - The charging overlay no longer flashes its green charge black while it
       breathes. The breathing faded the fill's opacity, and every translucent
@@ -6864,7 +6868,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.41"
+#define OPENREMOTE_VERSION_STRING "5.42"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -22724,7 +22728,7 @@ bool sdBusyWithBackupJob() {
   Built on lv_layer_top() like the backup overlay: it belongs to no page, so it
   needs no navigation and leaves the page underneath exactly as it was.
 */
-static const uint32_t CHARGE_OVERLAY_SHOW_MS = 4000UL;
+static const uint32_t CHARGE_OVERLAY_SHOW_MS = 7000UL;
 static const uint32_t CHARGE_OVERLAY_POLL_MS = 100UL;
 static const uint32_t CHARGE_WAKE_CONFIRM_MS = 1000UL;
 unsigned long chargeOverlayShownMs = 0;
