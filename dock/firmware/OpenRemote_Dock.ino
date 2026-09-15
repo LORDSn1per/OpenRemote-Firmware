@@ -1,6 +1,14 @@
 /*
   OpenRemote Dock firmware change log (newest first)
 
+  1.83 - 2026-09-16
+    - The status LED has a brightness, 5-100%, set in WebConfig and sent by the
+      remote (5.67 or later) in the dock settings packet's spare byte. The LED
+      is now driven by LEDC PWM at 5 kHz with a gamma-corrected duty, so every
+      state it shows - linked, blinking, flashing on transmit - dims together.
+      The level is saved in NVS and applied at once when it changes. A remote
+      older than 5.67 sends 0 there, which is treated as full brightness.
+
   1.82 - 2026-09-12
     - Scales artwork into the transfer frame instead of cropping it. JPEGDEC
       only decodes at 1/1, 1/2, 1/4 or 1/8, so the decoded image almost never
@@ -1228,7 +1236,7 @@ static inline bool serialHostAttached() {
 }
 
 
-#define OPENREMOTE_DOCK_VERSION_STRING "1.82"
+#define OPENREMOTE_DOCK_VERSION_STRING "1.83"
 
 // A literal in the built image, so a tool holding the .bin can tell what it is
 // without running it. The remote firmware carries the same idea under
@@ -1608,7 +1616,10 @@ struct __attribute__((packed)) EspNowDockSettingsPacket {
   uint32_t magic;
   uint8_t rfEnabled;
   uint8_t ledOnTransmit;
-  uint8_t reserved[2];
+  // Status LED brightness, 5-100%. 0 comes from a remote older than 5.67 and
+  // means full brightness.
+  uint8_t ledBrightness;
+  uint8_t reserved;
 };
 static_assert(sizeof(EspNowDockSettingsPacket) == 8, "dock settings layout drifted from the remote");
 
@@ -2010,6 +2021,7 @@ bool rfTransmitRaw(const uint16_t *timings, uint16_t count);
 void rfDumpTimings(const char *label, const uint16_t *timings, uint16_t count);
 #endif
 bool dockLedOnTransmit = true;
+uint8_t dockLedBrightness = 100;   // Status LED, percent, 5-100, set by the remote.
 
 bool remoteKnown = false;
 // Set from the receive callback on any packet from the paired remote, and
@@ -2081,6 +2093,7 @@ unsigned long ledTxUntilMs = 0;
 volatile bool pendingSettings = false;
 volatile bool pendingSettingsRf = true;
 volatile bool pendingSettingsLed = true;
+volatile uint8_t pendingSettingsBrightness = 100;
 uint8_t otaFrame[250];
 volatile uint16_t otaFrameLen = 0;
 
@@ -2104,27 +2117,48 @@ String macToString(const uint8_t mac[6]);
 // LED
 // ---------------------------------------------------------------------------
 
+/*
+  The status LED is driven by LEDC PWM so the remote can set its brightness.
+  Lit means the brightness duty, dark means fully off, and every existing
+  caller - resting state, blinks, the IR envelope flash - dims with it.
+
+  8-bit duty, where 256 is "always on". The level is gamma-corrected, so 50%
+  looks like half brightness instead of barely dimmer than full.
+*/
+#include "esp32-hal-periman.h"
+
+static const uint32_t DOCK_LED_PWM_HZ = 5000;
+static const uint8_t DOCK_LED_PWM_BITS = 8;
+static const uint32_t DOCK_LED_PWM_FULL = 1UL << DOCK_LED_PWM_BITS;
+
+uint32_t ledDutyForBrightness() {
+  if (dockLedBrightness >= 100) return DOCK_LED_PWM_FULL;
+  float level = pow(dockLedBrightness / 100.0f, 2.2f);
+  uint32_t duty = (uint32_t)lroundf(level * (float)DOCK_LED_PWM_FULL);
+  return duty < 1 ? 1 : duty;
+}
+
+void ledDrivePin(int pin, bool on, bool activeLow) {
+  // Re-attached whenever the pin is not LEDC any more rather than trusted from
+  // startup. Any library that reconfigures this pin behind our back - IRremote's
+  // feedback LED did exactly that - would otherwise swallow every write for the
+  // rest of the run, with the LED code correct and never reaching the pin.
+  if (perimanGetPinBusType(pin) != ESP32_BUS_TYPE_LEDC) {
+    ledcAttach(pin, DOCK_LED_PWM_HZ, DOCK_LED_PWM_BITS);
+  }
+  uint32_t duty = on ? ledDutyForBrightness() : 0;
+  ledcWrite(pin, activeLow ? DOCK_LED_PWM_FULL - duty : duty);
+}
+
 void ledWrite(bool on) {
   ledOn = on;
-  // Re-asserted every time rather than once at startup. Any library that
-  // reconfigures this pin behind our back - IRremote's feedback LED did
-  // exactly that - would otherwise silently swallow every write for the rest
-  // of the run. It costs a register write and removes a whole class of
-  // failure where the LED code is correct and simply never reaches the pin.
-  pinMode(DOCK_LED_PIN, OUTPUT);
-  digitalWrite(DOCK_LED_PIN, (on != (bool)DOCK_LED_ACTIVE_LOW) ? HIGH : LOW);
+  ledDrivePin(DOCK_LED_PIN, on, (bool)DOCK_LED_ACTIVE_LOW);
 #if DOCK_AUX_LED_PIN >= 0
-  pinMode(DOCK_AUX_LED_PIN, OUTPUT);
-  digitalWrite(DOCK_AUX_LED_PIN,
-               (on != (bool)DOCK_AUX_LED_ACTIVE_LOW) ? HIGH : LOW);
+  ledDrivePin(DOCK_AUX_LED_PIN, on, (bool)DOCK_AUX_LED_ACTIVE_LOW);
 #endif
 }
 
 void ledSetup() {
-  pinMode(DOCK_LED_PIN, OUTPUT);
-#if DOCK_AUX_LED_PIN >= 0
-  pinMode(DOCK_AUX_LED_PIN, OUTPUT);
-#endif
   ledWrite(false);
 }
 
@@ -3220,6 +3254,8 @@ void loadRemote() {
   lockedChannel = prefs.getUChar("channel", 0);
   dockRfEnabled = prefs.getBool("rf", true);
   dockLedOnTransmit = prefs.getBool("ledTx", true);
+  dockLedBrightness = prefs.getUChar("ledBri", 100);
+  if (dockLedBrightness < 5 || dockLedBrightness > 100) dockLedBrightness = 100;
   hbSsid = prefs.getString("wifiSsid", "");
   hbPassword = prefs.getString("wifiPass", "");
   hbAddress = prefs.getString("hbAddr", "");
@@ -3515,6 +3551,8 @@ void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len)
     memcpy(&packet, data, sizeof(packet));
     pendingSettingsRf = packet.rfEnabled != 0;
     pendingSettingsLed = packet.ledOnTransmit != 0;
+    pendingSettingsBrightness = packet.ledBrightness == 0 ? 100
+      : (packet.ledBrightness < 5 ? 5 : (packet.ledBrightness > 100 ? 100 : packet.ledBrightness));
     pendingSettings = true;
     return;
   }
@@ -3914,15 +3952,23 @@ void serviceSettings() {
   if (!pendingSettings) return;
   pendingSettings = false;
   bool rf = pendingSettingsRf, led = pendingSettingsLed;
-  if (rf == dockRfEnabled && led == dockLedOnTransmit) return;
+  uint8_t brightness = pendingSettingsBrightness;
+  if (rf == dockRfEnabled && led == dockLedOnTransmit &&
+      brightness == dockLedBrightness) return;
+  bool brightnessChanged = brightness != dockLedBrightness;
   dockRfEnabled = rf;
   dockLedOnTransmit = led;
+  dockLedBrightness = brightness;
   prefs.begin("dock", false);
   prefs.putBool("rf", dockRfEnabled);
   prefs.putBool("ledTx", dockLedOnTransmit);
+  prefs.putUChar("ledBri", dockLedBrightness);
   prefs.end();
-  Serial.printf("Dock: settings from remote - RF %s, LED on transmit %s\n",
-                dockRfEnabled ? "on" : "off", dockLedOnTransmit ? "on" : "off");
+  // Redraw a lit LED at the new level now rather than at its next change.
+  if (brightnessChanged) ledWrite(ledOn);
+  Serial.printf("Dock: settings from remote - RF %s, LED on transmit %s, LED brightness %u%%\n",
+                dockRfEnabled ? "on" : "off", dockLedOnTransmit ? "on" : "off",
+                (unsigned)dockLedBrightness);
 }
 
 void rfSendLearnResult(bool ok, const uint16_t *timings, uint16_t count) {
