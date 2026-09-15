@@ -100,6 +100,21 @@ Runs on the remote: a colour touchscreen, physical buttons, infrared, Bluetooth
 for Android TV and Chromecast — including voice search through the built-in
 microphone — plus Wi-Fi for Home Assistant, MQTT and Homebridge.
 
+#### On the screen
+
+<table>
+  <tr>
+    <td align="center" width="33%"><img src="docs/images/screen-settings-home.png" alt="Settings home with the battery card and connection switches" width="100%"><br><sub><b>Settings</b> — battery at a glance, then every connection one tap away</sub></td>
+    <td align="center" width="33%"><img src="docs/images/screen-display-settings.png" alt="Display settings with sliders, switches and dropdowns" width="100%"><br><sub><b>Display</b> — large slider knobs that are easy to grab</sub></td>
+    <td align="center" width="33%"><img src="docs/images/screen-brightness-panel.png" alt="Brightness panel over the Activities page" width="100%"><br><sub><b>Brightness panel</b> — tap the status pill from any page</sub></td>
+  </tr>
+  <tr>
+    <td align="center"><img src="docs/images/screen-charging.png" alt="Charging animation showing 100 percent" width="100%"><br><sub><b>Charging</b> — shown for a few seconds when you plug in</sub></td>
+    <td align="center"><img src="docs/images/screen-backup-restore.png" alt="Backup and Restore page listing saved backups" width="100%"><br><sub><b>Backup / Restore</b> — full backups saved to the SD card, restored with one tap</sub></td>
+    <td align="center"><img src="docs/images/screen-backup-progress.png" alt="Backup progress started from Studio" width="100%"><br><sub><b>Progress</b> — shown on the remote, whether started from Studio, WebConfig or the remote itself</sub></td>
+  </tr>
+</table>
+
 #### Button shortcuts
 
 Two button combinations work from anywhere, whatever page the remote is showing
