@@ -1,6 +1,14 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.49 - 2026-09-15
+    - The brightness panel's fade no longer darkens the title bar. 5.48 faded
+      the panel's full-screen tap-to-close layer, which dimmed the page title
+      and the time and battery pill along with the page. The fade is now its
+      own layer starting below the 42px title bar, beneath the slider panel,
+      and it does not take taps, so tapping outside the slider still closes
+      the panel.
+
   5.48 - 2026-09-15
     - Opening the brightness panel fades the page behind it about 40% darker
       (black at 100 of 255, eased in over 180 ms), so the readout tile and the
@@ -6913,7 +6921,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.48"
+#define OPENREMOTE_VERSION_STRING "5.49"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -37695,21 +37703,33 @@ void toggleBrightnessPanel() {
   lv_obj_remove_style_all(brightnessOverlay);
   lv_obj_set_pos(brightnessOverlay, 0, 0);
   lv_obj_set_size(brightnessOverlay, LCD_W, LCD_H);
+  lv_obj_set_style_bg_opa(brightnessOverlay, LV_OPA_TRANSP, 0);
+
   // Fades the page behind to about 40% darker (black at 100 of 255) so the
   // tile and slider stand off busy artwork. Kept light on purpose: the page
   // still has to show through, because it is what the brightness is judged
-  // by. A flat full-screen fill with no radius or gradient, so fading its
-  // opacity is a plain blend.
-  lv_obj_set_style_bg_color(brightnessOverlay, lv_color_black(), 0);
-  lv_obj_set_style_bg_opa(brightnessOverlay, LV_OPA_TRANSP, 0);
-  lv_anim_t scrim;
-  lv_anim_init(&scrim);
-  lv_anim_set_var(&scrim, brightnessOverlay);
-  lv_anim_set_exec_cb(&scrim, brightnessScrimOpaAnim);
-  lv_anim_set_values(&scrim, LV_OPA_TRANSP, 100);
-  lv_anim_set_time(&scrim, 180);
-  lv_anim_set_path_cb(&scrim, lv_anim_path_ease_out);
-  lv_anim_start(&scrim);
+  // by. It starts below the 42px title bar, so the title and the time and
+  // battery pill stay at full brightness. Created before the slider panel so
+  // it draws beneath it, and not clickable, so a tap on it still reaches the
+  // overlay and closes the panel. A flat fill with no radius or gradient, so
+  // fading its opacity is a plain blend.
+  const int titleBarH = 42;
+  lv_obj_t *scrim = lv_obj_create(brightnessOverlay);
+  lv_obj_remove_style_all(scrim);
+  lv_obj_set_pos(scrim, 0, titleBarH);
+  lv_obj_set_size(scrim, LCD_W, LCD_H - titleBarH);
+  lv_obj_set_style_bg_color(scrim, lv_color_black(), 0);
+  lv_obj_set_style_bg_opa(scrim, LV_OPA_TRANSP, 0);
+  lv_obj_clear_flag(scrim, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_clear_flag(scrim, LV_OBJ_FLAG_SCROLLABLE);
+  lv_anim_t scrimIn;
+  lv_anim_init(&scrimIn);
+  lv_anim_set_var(&scrimIn, scrim);
+  lv_anim_set_exec_cb(&scrimIn, brightnessScrimOpaAnim);
+  lv_anim_set_values(&scrimIn, LV_OPA_TRANSP, 100);
+  lv_anim_set_time(&scrimIn, 180);
+  lv_anim_set_path_cb(&scrimIn, lv_anim_path_ease_out);
+  lv_anim_start(&scrimIn);
   lv_obj_add_flag(brightnessOverlay, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_clear_flag(brightnessOverlay, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_event_cb(brightnessOverlay, brightnessOverlayEvent, LV_EVENT_CLICKED, nullptr);
