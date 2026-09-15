@@ -1,6 +1,15 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.67 - 2026-09-16
+    - Dock LED brightness. The dock's status LED brightness (5-100%) is set in
+      WebConfig, saved on the remote (NVS and runtime.json, so backups and
+      restores carry it), reported in /api/status and sent to the dock with
+      the RF and LED switches over ESP-NOW. It rides in the dock settings
+      packet's spare byte, so the packet stays eight bytes: a dock older than
+      1.83 ignores it, and a 1.83 dock reading 0 from an older remote lights
+      the LED fully.
+
   5.66 - 2026-09-16
     - Custom widgets. A widget built in WebConfig shows up to three elements -
       time and date, weather, battery and media - under a name of its own, on
@@ -7125,7 +7134,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.66"
+#define OPENREMOTE_VERSION_STRING "5.67"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -8163,7 +8172,10 @@ struct __attribute__((packed)) EspNowDockSettingsPacket {
   uint32_t magic;
   uint8_t rfEnabled;       // RF433 receiver/transmitter on the dock.
   uint8_t ledOnTransmit;   // Blink the dock's LED when it transmits.
-  uint8_t reserved[2];
+  // Status LED brightness, 5-100%. A dock older than 1.83 ignores it, and a
+  // dock reading 0 from an older remote lights the LED fully.
+  uint8_t ledBrightness;
+  uint8_t reserved;
 };
 static_assert(sizeof(EspNowDockSettingsPacket) == 8, "dock settings layout drifted from the dock");
 
@@ -8674,6 +8686,7 @@ String remoteName = "OpenRemote";
 uint8_t irRoute = IR_ROUTE_REMOTE;
 bool dockRfEnabled = true;
 bool dockLedOnTransmit = true;
+uint8_t dockLedBrightness = 100;   // The dock's status LED, percent, 5-100.
 
 // Send Homebridge commands through the dock rather than from here. Off by
 // default: it only works once the dock has the Wi-Fi and Homebridge details,
@@ -12207,6 +12220,7 @@ void loadSettings() {
   espNowChannel = preferences.getUChar("enChan", 0);
   dockRfEnabled = preferences.getBool("dockRf", true);
   dockLedOnTransmit = preferences.getBool("dockLed", true);
+  dockLedBrightness = (uint8_t)constrain((int)preferences.getUChar("dockLedBri", 100), 5, 100);
   homebridgeViaDock = preferences.getBool("hbViaDock", false);
   mqttEnabled = preferences.getBool("mqEn", false);
   mqttViaDock = preferences.getBool("mqViaDock", true);
@@ -12398,6 +12412,7 @@ void saveSettings() {
   preferences.putUChar("irRoute", irRoute);
   preferences.putBool("dockRf", dockRfEnabled);
   preferences.putBool("dockLed", dockLedOnTransmit);
+  preferences.putUChar("dockLedBri", dockLedBrightness);
   preferences.putBool("hbViaDock", homebridgeViaDock);
   preferences.putUChar("enTxPwr", espNowTxPower);
   preferences.putBool("clock", clockEnabled);
@@ -14908,6 +14923,7 @@ String buildStatusJson() {
   doc["irRoute"] = irRoute;
   doc["dockRfEnabled"] = dockRfEnabled;
   doc["dockLedOnTransmit"] = dockLedOnTransmit;
+  doc["dockLedBrightness"] = dockLedBrightness;
   doc["homebridgeViaDock"] = homebridgeViaDock;
   doc["dockConnected"] = dockConnected();
   if (espNowDeviceCount > 0) {
@@ -15335,8 +15351,11 @@ void applySettingsJson(JsonVariantConst settings) {
   irRoute = settings["irRoute"] | irRoute;
   if (irRoute > IR_ROUTE_SEQUENTIAL) irRoute = IR_ROUTE_REMOTE;
   bool previousRf = dockRfEnabled, previousLed = dockLedOnTransmit;
+  uint8_t previousLedBrightness = dockLedBrightness;
   dockRfEnabled = settings["dockRfEnabled"] | dockRfEnabled;
   dockLedOnTransmit = settings["dockLedOnTransmit"] | dockLedOnTransmit;
+  dockLedBrightness = (uint8_t)constrain(
+    (int)(settings["dockLedBrightness"] | (int)dockLedBrightness), 5, 100);
   homebridgeViaDock = settings["homebridgeViaDock"] | homebridgeViaDock;
   /* Host and port are not secret and ride in runtime.json so a restore puts
      them back; the username and password stay in NVS. */
@@ -15359,7 +15378,10 @@ void applySettingsJson(JsonVariantConst settings) {
   }
   // Push straight to the dock when either changed, so WebConfig's switches
   // take effect immediately rather than at the next reboot.
-  if (previousRf != dockRfEnabled || previousLed != dockLedOnTransmit) sendDockSettings();
+  if (previousRf != dockRfEnabled || previousLed != dockLedOnTransmit ||
+      previousLedBrightness != dockLedBrightness) {
+    sendDockSettings();
+  }
   JsonArrayConst espNowDevicesIn = settings["espNowDevices"].as<JsonArrayConst>();
   if (!espNowDevicesIn.isNull()) {
     espNowDeviceCount = 0;
@@ -18830,6 +18852,7 @@ bool persistSettingsToRuntimeConfig() {
   settings["irRoute"] = irRoute;
   settings["dockRfEnabled"] = dockRfEnabled;
   settings["dockLedOnTransmit"] = dockLedOnTransmit;
+  settings["dockLedBrightness"] = dockLedBrightness;
   settings["homebridgeViaDock"] = homebridgeViaDock;
   JsonArray espNowDevicesOut = settings["espNowDevices"].to<JsonArray>();
   for (uint8_t i = 0; i < espNowDeviceCount; i++) {
@@ -28237,10 +28260,12 @@ void sendDockSettings() {
   packet.magic = ESPNOW_DOCK_SETTINGS_MAGIC;
   packet.rfEnabled = dockRfEnabled ? 1 : 0;
   packet.ledOnTransmit = dockLedOnTransmit ? 1 : 0;
+  packet.ledBrightness = dockLedBrightness;
   sendEspNowWithRetry(espNowDevices[0].mac,
                       (const uint8_t *)&packet, sizeof(packet));
-  Serial.printf("Dock settings sent: RF=%s LED=%s\n",
-                dockRfEnabled ? "on" : "off", dockLedOnTransmit ? "on" : "off");
+  Serial.printf("Dock settings sent: RF=%s LED=%s brightness=%u%%\n",
+                dockRfEnabled ? "on" : "off", dockLedOnTransmit ? "on" : "off",
+                (unsigned)dockLedBrightness);
 }
 
 // A four byte nudge whose only job is to draw a MAC-layer ack, so the link
@@ -34356,18 +34381,22 @@ void irRouteDropdownEvent(lv_event_t *e) {
 void serviceDockSettingsSync() {
   static bool lastRf = true;
   static bool lastLed = true;
+  static uint8_t lastLedBrightness = 100;
   static bool primed = false;
   if (!primed) {
     primed = true;
     lastRf = dockRfEnabled; lastLed = dockLedOnTransmit;
+    lastLedBrightness = dockLedBrightness;
     return;
   }
   static bool lastHbViaDock = false;
-  bool dockSideChanged = dockRfEnabled != lastRf || dockLedOnTransmit != lastLed;
+  bool dockSideChanged = dockRfEnabled != lastRf || dockLedOnTransmit != lastLed ||
+                         dockLedBrightness != lastLedBrightness;
   bool relayChanged = homebridgeViaDock != lastHbViaDock;
   if (!dockSideChanged && !relayChanged) return;
   lastRf = dockRfEnabled;
   lastLed = dockLedOnTransmit;
+  lastLedBrightness = dockLedBrightness;
   lastHbViaDock = homebridgeViaDock;
   // Turning the relay on is the moment the dock needs the credentials, and the
   // moment the user will try it. Pushing here means it works on the first
