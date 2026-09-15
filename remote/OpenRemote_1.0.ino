@@ -8363,7 +8363,8 @@ struct Tile {
    Widgets
 
    A widget is a page item that occupies six grid slots - three columns wide
-   and two rows deep - and draws its own face from live data instead of an
+   and two rows deep - or, when slim, three slots in a single row, and draws
+   its own face from live data instead of an
    icon and a label. Tapping one expands it to the whole screen.
 
    Configuration is global per widget kind rather than per placement: two
@@ -35576,7 +35577,7 @@ void renderActivitiesPage() {
   // configureContent() clears LV_OBJ_FLAG_SCROLLABLE, and unlike
   // renderActivityPage()/renderDevicePage() this function never put it back -
   // so the Activities list simply could not scroll, at any length. Add enough
-  // activities (or a widget, which eats two rows before the first card) and
+  // activities (or a widget, which eats one or two rows before the first card) and
   // everything past the bottom of the screen was unreachable. Scrolling is
   // switched back off at the end by finaliseActivitiesPageScrolling() when the
   // page fits, so a short list still behaves as a fixed screen.
@@ -35627,8 +35628,9 @@ void renderActivitiesPage() {
     : (104 - ACTIVITIES_CONTENT_TOP);
 
   /*
-    Widgets first, then the sliders flow into whatever rows are left. A
-    widget covers two rows, so an activity never lands underneath one -
+    Widgets first, then the sliders flow into whatever rows are left. A large
+    widget covers two rows and a slim one a single row, so an activity never
+    lands underneath one -
     which is what the designer draws.
   */
   bool rowTaken[24] = {};
