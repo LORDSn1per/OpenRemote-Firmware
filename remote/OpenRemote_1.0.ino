@@ -1,6 +1,24 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.69 - 2026-09-16
+    - A custom widget's media element can follow playback. With media beside
+      other elements, two options come from WebConfig (mediaWhenPlaying and
+      mediaTakeover on the custom widget): show the media only while
+      something is playing, so the other elements share the widget until
+      then; and let the media take over the whole widget while it plays, with
+      artwork on a large tile. Every change animates over 380ms with an
+      ease-in-out: cells glide to their new shares, and a takeover pushes the
+      shared cells out to the left as the full media face slides in from the
+      right, reversing when playback stops. Only position and size move -
+      nothing fades - so no translucent layer has to be blended. The expanded
+      view follows the same rules with its rows.
+    - A page can hold 24 live widget elements, up from 18, to allow for the
+      takeover face.
+    - A custom widget's time element can put the date first (dateFirst): left
+      of the time on a slim widget, above it on a large tile and in the
+      expanded view.
+
   5.68 - 2026-09-16
     - With a dock paired, weather and time come from the dock instead of this
       remote's Wi-Fi. The remote asks over ESP-NOW (ORDQ) only when something
@@ -7154,7 +7172,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.68"
+#define OPENREMOTE_VERSION_STRING "5.69"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -8429,6 +8447,13 @@ struct CustomWidget {
   char wallpaper[96];
   char expandedWallpaper[96];
   WidgetContentPanelStyle panel;
+  // With media beside other elements: media shows only while something is
+  // playing, and/or takes over the whole widget while playing.
+  bool mediaWhenPlaying;
+  bool mediaTakeover;
+  // The time element puts its date first: left of the time on a slim widget,
+  // above it on a large one.
+  bool dateFirst;
 };
 
 CustomWidget customWidgets[MAX_CUSTOM_WIDGETS] = {};
@@ -18068,6 +18093,9 @@ void applyCustomWidgetsJson(JsonArrayConst rows, JsonArrayConst wallpapers) {
       widget.elements[widget.elementCount++] = parsed;
     }
     if (!widget.elementCount) continue;
+    widget.mediaWhenPlaying = row["mediaWhenPlaying"] | false;
+    widget.mediaTakeover = row["mediaTakeover"] | false;
+    widget.dateFirst = row["dateFirst"] | false;
     strlcpy(widget.id, id, sizeof(widget.id));
     copyDisplayTextAscii(row["name"] | "Widget", widget.name, sizeof(widget.name));
     resolveWidgetWallpaperPaths(row["background"] | "theme", wallpapers,
@@ -20132,6 +20160,20 @@ void handleUsbCommand(Stream &port, UsbSerialSession &session, String command) {
   } else if (command == "ORUSB DEVICEPICKER") {
     usbDevicePickerRequest = true;
     usbImportReply(port, "{\"ok\":true,\"requested\":\"device picker\"}");
+  } else if (command == "ORUSB MEDIADEMO ON" || command == "ORUSB MEDIADEMO OFF") {
+    // Pretends something is (or is not) playing, so media widgets can be
+    // captured in both states. The dock's next real report replaces it.
+    bool on = command.endsWith(" ON");
+    nowPlaying.valid = on;
+    nowPlaying.playing = on;
+    strlcpy(nowPlaying.title, on ? "Demo Title - Sample Track" : "", sizeof(nowPlaying.title));
+    strlcpy(nowPlaying.subtitle, on ? "Demo Artist" : "", sizeof(nowPlaying.subtitle));
+    strlcpy(nowPlaying.source, on ? "Demo App" : "", sizeof(nowPlaying.source));
+    nowPlaying.position = on ? 42 : 0;
+    nowPlaying.duration = on ? 213 : 0;
+    nowPlaying.positionAtMs = millis();
+    nowPlayingDirty = true;
+    usbImportReply(port, String("{\"ok\":true,\"media\":\"") + (on ? "playing" : "idle") + "\"}");
   } else if (command.startsWith("ORUSB WIDGETOPEN ")) {
     int index = command.substring(17).toInt();
     if (index < 0 || index > 20) {
@@ -36040,12 +36082,52 @@ struct WidgetInstance {
   uint8_t custom;
 };
 
-// A page of custom widgets holds up to three live elements per widget.
-static const uint8_t MAX_LIVE_WIDGETS = 18;
+// A page of custom widgets holds up to three live elements per widget, plus a
+// full media face for a widget whose media can take it over.
+static const uint8_t MAX_LIVE_WIDGETS = 24;
 WidgetInstance widgetInstances[MAX_LIVE_WIDGETS];
 uint8_t widgetInstanceCount = 0;
-WidgetInstance widgetExpandedInstances[CUSTOM_WIDGET_MAX_ELEMENTS] = {};
+static const uint8_t WIDGET_EXPANDED_CAPACITY = CUSTOM_WIDGET_MAX_ELEMENTS + 1;
+WidgetInstance widgetExpandedInstances[WIDGET_EXPANDED_CAPACITY] = {};
 uint8_t widgetExpandedInstanceCount = 0;
+
+/*
+  The moving parts of a custom widget whose media element comes and goes or
+  takes the widget over - see buildAnimatedWidgetContents().
+*/
+struct WidgetMotion {
+  lv_obj_t *card;
+  lv_obj_t *stage;        // the cells the elements share
+  lv_obj_t *takeover;     // the full media face, parked off to the right
+  lv_obj_t *cells[CUSTOM_WIDGET_MAX_ELEMENTS];
+  lv_obj_t *dividers[CUSTOM_WIDGET_MAX_ELEMENTS];   // before cell i, for i > 0
+  uint8_t count;
+  uint8_t mediaIndex;
+  uint8_t custom;
+  bool expanded;          // rows down the view rather than columns across
+  int16_t width;
+  int16_t height;
+  int16_t top;            // where rows start in the expanded view
+  int16_t length;         // what the cells share: width, or height when expanded
+  int16_t share;          // 0 media hidden .. 256 media sharing equally
+  int16_t push;           // 0 cells in view .. 256 media has taken over
+  bool mediaShown;
+  bool takenOver;
+};
+static const uint8_t MAX_WIDGET_MOTIONS = 6;
+WidgetMotion widgetMotions[MAX_WIDGET_MOTIONS] = {};
+uint8_t widgetMotionCount = 0;
+WidgetMotion widgetExpandedMotion = {};
+
+void clearWidgetMotion(WidgetMotion &motion) {
+  lv_anim_del(&motion, nullptr);
+  memset(&motion, 0, sizeof(motion));
+}
+
+void clearWidgetMotions() {
+  for (uint8_t i = 0; i < MAX_WIDGET_MOTIONS; i++) clearWidgetMotion(widgetMotions[i]);
+  widgetMotionCount = 0;
+}
 
 lv_obj_t *widgetExpandedOverlay = nullptr;
 uint8_t widgetExpandedKind = 0;
@@ -36821,6 +36903,10 @@ enum WidgetCellStyle : uint8_t {
   CELL_ROW           // one of the rows of an expanded custom widget
 };
 
+// Whether the widget being built puts its date before its time. Set by
+// buildWidgetContents() for the one widget it is building.
+bool widgetBuildDateFirst = false;
+
 void initWidgetInstance(WidgetInstance &instance, lv_obj_t *parent, uint8_t kind,
                         int width, int height, bool expanded) {
   memset(&instance, 0, sizeof(instance));
@@ -36977,6 +37063,7 @@ void buildWidgetClockFace(WidgetInstance &instance, lv_obj_t *parent,
   instance.secondary = makeWidgetLabel(stack, "", 0, 0,
     expanded ? &lv_font_montserrat_16 : &lv_font_montserrat_14, widgetMutedColour(),
     width - 16, LV_TEXT_ALIGN_CENTER);
+  if (widgetBuildDateFirst) lv_obj_move_to_index(instance.secondary, 0);
 }
 
 /*
@@ -37011,7 +37098,8 @@ void buildWidgetCell(WidgetInstance &instance, lv_obj_t *cell, uint8_t element,
       setFlow(LV_FLEX_FLOW_ROW, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER);
       makeWidgetTime(instance, cell, &lv_font_montserrat_24, &lv_font_montserrat_12);
       instance.secondary = makeWidgetLabel(cell, "", 0, 0, &lv_font_montserrat_12,
-        widgetMutedColour(), 96, LV_TEXT_ALIGN_RIGHT);
+        widgetMutedColour(), 96, widgetBuildDateFirst ? LV_TEXT_ALIGN_LEFT : LV_TEXT_ALIGN_RIGHT);
+      if (widgetBuildDateFirst) lv_obj_move_to_index(instance.secondary, 0);
     } else if (style == CELL_SLIM) {
       setFlow(LV_FLEX_FLOW_ROW, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
       makeWidgetTime(instance, cell,
@@ -37024,6 +37112,7 @@ void buildWidgetCell(WidgetInstance &instance, lv_obj_t *cell, uint8_t element,
         style == CELL_ROW ? &lv_font_montserrat_16 : &lv_font_montserrat_10);
       instance.secondary = makeWidgetLabel(cell, "", 0, 0, small, widgetMutedColour(),
         textWidth, LV_TEXT_ALIGN_CENTER);
+      if (widgetBuildDateFirst) lv_obj_move_to_index(instance.secondary, 0);
     }
     return;
   }
@@ -37147,6 +37236,240 @@ void makeWidgetDivider(lv_obj_t *parent, int x, int y, int width, int height) {
   lv_obj_set_style_bg_opa(line, LV_OPA_20, 0);
 }
 
+/* ------------------------------------------------ animated media element *
+   A custom widget with media beside other elements can show the media only
+   while something is playing, and can let the media take over the whole
+   widget while it plays. Both follow playback, so both animate: the cells
+   glide to their new shares, and a takeover pushes the shared cells out to
+   the left while the full media face slides in from the right, reversing
+   when playback stops. Only position and size move - nothing fades - so the
+   panel never has to blend a translucent layer, which is what made the
+   charging overlay flicker.
+ * ---------------------------------------------------------------------- */
+static const uint16_t WIDGET_MOTION_MS = 380;
+
+bool widgetMediaHasData() {
+  return nowPlaying.valid && nowPlaying.title[0];
+}
+
+// The media element's index in a custom widget whose media animates, or -1.
+int8_t animatedMediaIndex(uint8_t kind, uint8_t custom) {
+  if (kind != WIDGET_CUSTOM || custom >= customWidgetCount) return -1;
+  const CustomWidget &widget = customWidgets[custom];
+  if (widget.elementCount < 2 || !(widget.mediaWhenPlaying || widget.mediaTakeover)) return -1;
+  for (uint8_t i = 0; i < widget.elementCount; i++) {
+    if (widget.elements[i] == WIDGET_MEDIA) return (int8_t)i;
+  }
+  return -1;
+}
+
+uint8_t widgetInstancesNeeded(uint8_t kind, uint8_t custom) {
+  uint8_t elements[CUSTOM_WIDGET_MAX_ELEMENTS];
+  uint8_t count = widgetElementsFor(kind, custom, elements);
+  if (count && animatedMediaIndex(kind, custom) >= 0 && customWidgets[custom].mediaTakeover) {
+    count++;
+  }
+  return count;
+}
+
+bool widgetMotionValid(const WidgetMotion *motion) {
+  return motion && motion->card && lv_obj_is_valid(motion->card);
+}
+
+// Places the cells for the current share: media from nothing to an equal part.
+void layoutWidgetMotion(WidgetMotion *motion) {
+  if (!widgetMotionValid(motion) || !motion->count) return;
+  int length = motion->length;
+  int equal = length / motion->count;
+  int mediaLength = (motion->share * equal) / 256;
+  int others = motion->count - 1;
+  int otherLength = others ? (length - mediaLength) / others : length;
+  int position = 0;
+  for (uint8_t i = 0; i < motion->count; i++) {
+    int size = i == motion->mediaIndex ? mediaLength : otherLength;
+    if (i == motion->count - 1) size = length - position;
+    if (size < 0) size = 0;
+    lv_obj_t *cell = motion->cells[i];
+    if (cell && lv_obj_is_valid(cell)) {
+      if (motion->expanded) {
+        lv_obj_set_pos(cell, 0, motion->top + position);
+        lv_obj_set_size(cell, motion->width, size);
+      } else {
+        lv_obj_set_pos(cell, position, 0);
+        lv_obj_set_size(cell, size, motion->height);
+      }
+    }
+    lv_obj_t *divider = i ? motion->dividers[i] : nullptr;
+    if (divider && lv_obj_is_valid(divider)) {
+      // A divider on the very edge would be a stray line beside a hidden cell.
+      if (position <= 2 || position >= length - 2) lv_obj_add_flag(divider, LV_OBJ_FLAG_HIDDEN);
+      else lv_obj_clear_flag(divider, LV_OBJ_FLAG_HIDDEN);
+      if (motion->expanded) lv_obj_set_y(divider, motion->top + position);
+      else lv_obj_set_x(divider, position);
+    }
+    position += size;
+  }
+}
+
+void positionWidgetTakeover(WidgetMotion *motion) {
+  if (!widgetMotionValid(motion)) return;
+  int offset = (motion->push * motion->width) / 256;
+  if (motion->stage && lv_obj_is_valid(motion->stage)) lv_obj_set_x(motion->stage, -offset);
+  if (motion->takeover && lv_obj_is_valid(motion->takeover)) {
+    lv_obj_set_x(motion->takeover, motion->width - offset);
+  }
+}
+
+void widgetShareAnimExec(void *var, int32_t value) {
+  WidgetMotion *motion = static_cast<WidgetMotion *>(var);
+  motion->share = (int16_t)value;
+  layoutWidgetMotion(motion);
+}
+
+void widgetPushAnimExec(void *var, int32_t value) {
+  WidgetMotion *motion = static_cast<WidgetMotion *>(var);
+  motion->push = (int16_t)value;
+  positionWidgetTakeover(motion);
+}
+
+void startWidgetMotionAnim(WidgetMotion *motion, lv_anim_exec_xcb_t exec,
+                           int32_t from, int32_t to) {
+  lv_anim_del(motion, exec);
+  if (from == to) {
+    exec(motion, to);
+    return;
+  }
+  lv_anim_t animation;
+  lv_anim_init(&animation);
+  lv_anim_set_var(&animation, motion);
+  lv_anim_set_exec_cb(&animation, exec);
+  lv_anim_set_values(&animation, from, to);
+  lv_anim_set_time(&animation, WIDGET_MOTION_MS);
+  lv_anim_set_path_cb(&animation, lv_anim_path_ease_in_out);
+  lv_anim_start(&animation);
+}
+
+// Moves a widget towards what playback now calls for, animating the change.
+void updateWidgetMotion(WidgetMotion *motion) {
+  if (!widgetMotionValid(motion) || motion->custom >= customWidgetCount) return;
+  const CustomWidget &widget = customWidgets[motion->custom];
+  bool data = widgetMediaHasData();
+  bool wantShown = !widget.mediaWhenPlaying || data;
+  bool wantTakeover = widget.mediaTakeover && data && motion->takeover;
+
+  if (wantTakeover != motion->takenOver) {
+    motion->takenOver = wantTakeover;
+    if (!wantTakeover && wantShown != motion->mediaShown) {
+      // Coming back: the cells are still out of view to the left, so settle
+      // their shares before they slide back in.
+      lv_anim_del(motion, widgetShareAnimExec);
+      motion->mediaShown = wantShown;
+      motion->share = wantShown ? 256 : 0;
+      layoutWidgetMotion(motion);
+    }
+    startWidgetMotionAnim(motion, widgetPushAnimExec, motion->push, wantTakeover ? 256 : 0);
+    return;
+  }
+  if (wantShown == motion->mediaShown) return;
+  if (motion->takenOver) {
+    // Behind the media: change it unseen, once the push has finished.
+    if (lv_anim_get(motion, widgetPushAnimExec)) return;
+    motion->mediaShown = wantShown;
+    motion->share = wantShown ? 256 : 0;
+    layoutWidgetMotion(motion);
+    return;
+  }
+  motion->mediaShown = wantShown;
+  startWidgetMotionAnim(motion, widgetShareAnimExec, motion->share, wantShown ? 256 : 0);
+}
+
+void updateWidgetMotions() {
+  for (uint8_t i = 0; i < widgetMotionCount; i++) updateWidgetMotion(&widgetMotions[i]);
+  if (widgetExpandedOverlay && !widgetExpandedClosing) updateWidgetMotion(&widgetExpandedMotion);
+}
+
+/*
+  Builds a custom widget whose media element animates, or returns 0 to leave
+  the widget to the ordinary layout. Every cell is built at its narrowest
+  share, so it only ever grows; a flex cell re-centres its content as it
+  widens, and anything wider than a shrinking cell is clipped by it.
+*/
+uint8_t buildAnimatedWidgetContents(lv_obj_t *card, uint8_t kind, uint8_t custom,
+                                    int width, int height, bool expanded, bool slim,
+                                    WidgetInstance *instances, uint8_t capacity) {
+  int8_t mediaIndex = animatedMediaIndex(kind, custom);
+  if (mediaIndex < 0) return 0;
+  const CustomWidget &widget = customWidgets[custom];
+  uint8_t needed = widget.elementCount + (widget.mediaTakeover ? 1 : 0);
+  if (needed > capacity) return 0;
+  WidgetMotion *motion = nullptr;
+  if (expanded) {
+    clearWidgetMotion(widgetExpandedMotion);
+    motion = &widgetExpandedMotion;
+  } else if (widgetMotionCount < MAX_WIDGET_MOTIONS) {
+    motion = &widgetMotions[widgetMotionCount];
+    clearWidgetMotion(*motion);
+  }
+  if (!motion) return 0;
+
+  motion->card = card;
+  motion->count = widget.elementCount;
+  motion->mediaIndex = (uint8_t)mediaIndex;
+  motion->custom = custom;
+  motion->expanded = expanded;
+  motion->width = (int16_t)width;
+  motion->height = (int16_t)height;
+  motion->top = expanded ? 6 : 0;
+  motion->length = (int16_t)(expanded ? height - 6 - 28 : width);
+
+  motion->stage = makeWidgetCellBox(card, 0, 0, width, height);
+  int equal = motion->length / motion->count;
+  WidgetCellStyle style = expanded ? CELL_ROW : (slim ? CELL_SLIM : CELL_COLUMN);
+  for (uint8_t i = 0; i < motion->count; i++) {
+    if (i) {
+      motion->dividers[i] = expanded
+        ? glyphBar(motion->stage, 18, 0, width - 36, 1, 0, lv_color_white())
+        : glyphBar(motion->stage, 0, slim ? 9 : 14, 1, height - (slim ? 18 : 28), 0,
+                   lv_color_white());
+      lv_obj_set_style_bg_opa(motion->dividers[i], LV_OPA_20, 0);
+    }
+    int cellWidth = expanded ? width : equal;
+    int cellHeight = expanded ? equal : height;
+    motion->cells[i] = makeWidgetCellBox(motion->stage, 0, 0, cellWidth, cellHeight);
+    buildWidgetCell(instances[i], motion->cells[i], widget.elements[i],
+                    cellWidth, cellHeight, style);
+  }
+
+  uint8_t used = motion->count;
+  if (widget.mediaTakeover) {
+    // The whole widget's worth of media - artwork and all on a large tile.
+    motion->takeover = makeWidgetCellBox(card, width, 0, width, height);
+    if (slim && !expanded) {
+      buildWidgetCell(instances[used], motion->takeover, WIDGET_MEDIA, width, height,
+                      CELL_SLIM_SINGLE);
+    } else {
+      buildWidgetFace(instances[used], motion->takeover, WIDGET_MEDIA, width, height, expanded);
+    }
+    used++;
+  }
+
+  // Drawn straight in its current state; only later changes animate.
+  bool data = widgetMediaHasData();
+  motion->mediaShown = !widget.mediaWhenPlaying || data;
+  motion->share = motion->mediaShown ? 256 : 0;
+  motion->takenOver = widget.mediaTakeover && data;
+  motion->push = motion->takenOver ? 256 : 0;
+  layoutWidgetMotion(motion);
+  positionWidgetTakeover(motion);
+  for (uint8_t i = 0; i < used; i++) {
+    instances[i].tile = card;
+    instances[i].ownerKind = kind;
+    instances[i].custom = custom;
+  }
+  if (!expanded) widgetMotionCount++;
+  return used;
+}
+
 /*
   Builds a widget's contents into `card` and records every live instance in
   `instances`, returning how many it used. The card is already styled.
@@ -37158,6 +37481,12 @@ uint8_t buildWidgetContents(lv_obj_t *card, uint8_t kind, uint8_t custom, int wi
   uint8_t count = widgetElementsFor(kind, custom, elements);
   if (count > capacity) count = capacity;
   if (!count) return 0;
+
+  widgetBuildDateFirst = kind == WIDGET_CUSTOM && custom < customWidgetCount &&
+                         customWidgets[custom].dateFirst;
+  uint8_t animated = buildAnimatedWidgetContents(card, kind, custom, width, height,
+                                                 expanded, slim, instances, capacity);
+  if (animated) return animated;
 
   if (count == 1 && (!slim || expanded)) {
     buildWidgetFace(instances[0], card, elements[0], width, height, expanded);
@@ -37376,6 +37705,7 @@ void widgetCollapseReady(lv_anim_t *animation) {
   widgetExpandedClosing = false;
   memset(widgetExpandedInstances, 0, sizeof(widgetExpandedInstances));
   widgetExpandedInstanceCount = 0;
+  clearWidgetMotion(widgetExpandedMotion);
 }
 
 void closeWidgetFullScreen() {
@@ -37383,6 +37713,7 @@ void closeWidgetFullScreen() {
   widgetExpandedClosing = true;
   // Nothing inside is worth touching once it starts shrinking, and the
   // pointers go stale the moment the ready callback deletes the overlay.
+  clearWidgetMotion(widgetExpandedMotion);
   memset(widgetExpandedInstances, 0, sizeof(widgetExpandedInstances));
   widgetExpandedInstanceCount = 0;
 
@@ -37405,6 +37736,7 @@ void dismissWidgetFullScreen() {
   widgetExpandedClosing = false;
   memset(widgetExpandedInstances, 0, sizeof(widgetExpandedInstances));
   widgetExpandedInstanceCount = 0;
+  clearWidgetMotion(widgetExpandedMotion);
 }
 
 void widgetOverlayEvent(lv_event_t *event) {
@@ -37521,7 +37853,7 @@ void openWidgetFullScreen(lv_obj_t *sourceTile, uint8_t kind, uint8_t custom) {
   widgetExpandedKind = kind;
   widgetExpandedInstanceCount = buildWidgetContents(widgetExpandedOverlay, kind, custom,
     finalWidth, finalHeight, true, false, widgetExpandedInstances,
-    CUSTOM_WIDGET_MAX_ELEMENTS);
+    WIDGET_EXPANDED_CAPACITY);
   for (uint8_t i = 0; i < widgetExpandedInstanceCount; i++) {
     refreshWidgetInstance(widgetExpandedInstances[i]);
   }
@@ -37578,8 +37910,7 @@ bool openLiveWidgetForUsb(uint8_t index) {
   lands on top of the first activity.
 */
 void makeWidgetTile(uint8_t slot, uint8_t kind, uint8_t custom, bool slim, int originY) {
-  uint8_t elements[CUSTOM_WIDGET_MAX_ELEMENTS];
-  uint8_t needed = widgetElementsFor(kind, custom, elements);
+  uint8_t needed = widgetInstancesNeeded(kind, custom);
   if (!needed || widgetInstanceCount + needed > MAX_LIVE_WIDGETS) return;
   uint8_t row = slot / 3;
   notePopulatedRemoteRow(row);
@@ -38521,12 +38852,14 @@ void serviceWidgets(uint32_t now) {
     nowPlayingDirty = false;
     for (uint8_t i = 0; i < widgetInstanceCount; i++) refreshWidgetInstance(widgetInstances[i]);
     refreshExpandedWidgetInstances();
+    updateWidgetMotions();
     autoExpandPlayingMedia();
   }
   if (now - widgetLastServiceMs < 1000UL) return;
   widgetLastServiceMs = now;
   for (uint8_t i = 0; i < widgetInstanceCount; i++) refreshWidgetInstance(widgetInstances[i]);
   refreshExpandedWidgetInstances();
+  updateWidgetMotions();
 }
 
 void renderActivityPage() {
@@ -38868,6 +39201,7 @@ void renderCurrentPage() {
   dismissWidgetFullScreen();
   widgetInstanceCount = 0;
   memset(widgetInstances, 0, sizeof(widgetInstances));
+  clearWidgetMotions();
   liveTileBindingCount = 0;
   memset(liveTileBindings, 0, sizeof(liveTileBindings));
   memset(batteryMetricNameLabels, 0, sizeof(batteryMetricNameLabels));
