@@ -1,6 +1,13 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.58 - 2026-09-15
+    - Stormy sliders are easier to grab. The knob is one plain white circle
+      26px across, up from a 20px knob ringed in blue, and every Stormy slider
+      has a 12px extended touch area, so a press just above, below or beside
+      the track still takes hold of it. On the Display page the track sits 2px
+      lower so the larger knob clears its label.
+
   5.57 - 2026-09-15
     - Settings > Battery and Settings > About have a back button again in the
       OMOTE and Stormy styles. Their card layouts started at y=4 and y=34, on
@@ -7018,7 +7025,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.57"
+#define OPENREMOTE_VERSION_STRING "5.58"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -31256,14 +31263,17 @@ void styleStormySlider(lv_obj_t *sl) {
   lv_obj_set_style_bg_grad_color(sl, lvRgb(90, 162, 255), LV_PART_INDICATOR);
   lv_obj_set_style_bg_grad_dir(sl, LV_GRAD_DIR_HOR, LV_PART_INDICATOR);
   lv_obj_set_style_bg_opa(sl, LV_OPA_COVER, LV_PART_INDICATOR);
-  // A white knob ringed in the accent blue.
+  // One large plain white knob: 26px across on the 8px track (9px knob pad
+  // each side). The first version ringed a 20px knob in blue, which was both
+  // disliked and hard to catch with a finger.
   lv_obj_set_style_radius(sl, LV_RADIUS_CIRCLE, LV_PART_KNOB);
   lv_obj_set_style_bg_color(sl, lv_color_white(), LV_PART_KNOB);
   lv_obj_set_style_bg_opa(sl, LV_OPA_COVER, LV_PART_KNOB);
-  lv_obj_set_style_border_width(sl, 3, LV_PART_KNOB);
-  lv_obj_set_style_border_color(sl, lvRgb(43, 123, 255), LV_PART_KNOB);
-  lv_obj_set_style_border_opa(sl, LV_OPA_COVER, LV_PART_KNOB);
-  lv_obj_set_style_pad_all(sl, 6, LV_PART_KNOB);
+  lv_obj_set_style_border_width(sl, 0, LV_PART_KNOB);
+  lv_obj_set_style_pad_all(sl, 9, LV_PART_KNOB);
+  // And a generous touch target around the whole slider, so a press a little
+  // above, below or beside the track still takes hold of it.
+  lv_obj_set_ext_click_area(sl, 12);
 }
 
 void styleStormyDropdown(lv_obj_t *dropdown) {
@@ -33159,7 +33169,8 @@ void makeDisplaySlider(const char *label, int y, int minValue, int maxValue, int
   lv_obj_set_width(number, 38);
   lv_obj_set_style_text_align(number, LV_TEXT_ALIGN_RIGHT, 0);
   lv_obj_t *slider = lv_slider_create(parent);
-  lv_obj_set_pos(slider, x, y + 23);
+  // Two pixels lower in Stormy, so its 26px knob clears the label above.
+  lv_obj_set_pos(slider, x, y + (stormy ? 25 : 23));
   // OpenRemote_2.0's sliders are 10px tall (lv_obj_set_size(slider, lv_pct(66), 10));
   // the OpenRemote-style page keeps its own 12px.
   lv_obj_set_size(slider, width, stormy ? 8 : (omoteStyle ? 10 : 12));
@@ -33238,9 +33249,9 @@ void renderDisplayPageOmote() {
 
 void renderDisplayPageStormy() {
   applyStormyBackground();
-  // Same slider stride as the OMOTE page. The Stormy knob is 20px (8px track
-  // plus 6px knob pad each side), so its bottom edge sits 37px below the row
-  // start; dividers go below that so they never slice the knob.
+  // Same slider stride as the OMOTE page. The Stormy knob is 26px (8px track
+  // plus 9px knob pad each side) on a track 25px below the row start, so its
+  // bottom edge sits 42px down; dividers go below that so they never slice it.
   const int sliderH = 50;
   const int sliderKnobBottom = 42;
   const int rowH = 48;
