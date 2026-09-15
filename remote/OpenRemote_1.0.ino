@@ -1,6 +1,14 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.54 - 2026-09-15
+    - Stormy Display page: the LCD dropdown is 164px wide, up from 150, so
+      "BuyDisplay-ILI9341" no longer runs into the chevron inside the pill's
+      wider padding.
+    - ORUSB SETTINGS display-bottom scrolls to the Panel card with every
+      control closed, so the switch there can be captured; display-panel still
+      opens the Wake dropdown.
+
   5.53 - 2026-09-15
     - New settings menu style, "Stormy" (Menu Style value 2, beside OpenRemote
       and OMOTE). Settings pages only; Activities and device pages are the same
@@ -6974,7 +6982,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.53"
+#define OPENREMOTE_VERSION_STRING "5.54"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -19675,7 +19683,11 @@ void handleUsbCommand(Stream &port, UsbSerialSession &session, String command) {
   } else if (command.startsWith("ORUSB SETTINGS ")) {
     String target = command.substring(15);
     target.trim();
-    usbSettingsNavTarget = target == "display" ? 1 : (target == "display-panel" ? 2 : 0);
+    // display-panel scrolls to the Panel card and opens Wake; display-bottom
+    // scrolls there with every control closed.
+    usbSettingsNavTarget = target == "display" ? 1
+                         : target == "display-panel" ? 2
+                         : target == "display-bottom" ? 3 : 0;
     usbSettingsNavRequest = true;
     usbImportReply(port, String("{\"ok\":true,\"settings\":\"") + target + "\"}");
   } else if (command == "ORUSB SCREENSHOT") {
@@ -23205,7 +23217,7 @@ void serviceUsbWebConfigRequest() {
     if (displaySleeping) wakeDisplay();
     lastWakeMs = millis();
     jumpToSettingsView(usbSettingsNavTarget == 0 ? SETTINGS_HOME : SETTINGS_DISPLAY);
-    usbSettingsNavFollowUpMs = usbSettingsNavTarget == 2 ? millis() + 700UL : 0;
+    usbSettingsNavFollowUpMs = usbSettingsNavTarget >= 2 ? millis() + 700UL : 0;
   }
   // After the page has rendered: scroll to the bottom card and open Wake.
   if (usbSettingsNavFollowUpMs && (int32_t)(millis() - usbSettingsNavFollowUpMs) >= 0) {
@@ -23213,7 +23225,7 @@ void serviceUsbWebConfigRequest() {
     if (content && stormyWakeDropdown && lv_obj_is_valid(stormyWakeDropdown)) {
       lv_obj_scroll_to_y(content, lv_obj_get_scroll_y(content) + lv_obj_get_scroll_bottom(content),
                          LV_ANIM_OFF);
-      lv_dropdown_open(stormyWakeDropdown);
+      if (usbSettingsNavTarget == 2) lv_dropdown_open(stormyWakeDropdown);
       lastWakeMs = millis();
     }
   }
@@ -33120,7 +33132,9 @@ void renderDisplayPageStormy() {
   makeStormyRow(panelCard, "Colour Depth", displayRgb666 ? "RGB666 panel transfer" : "RGB565 panel transfer",
                 nullptr, rowH + 1, rowH, &displayRgb666, nullptr);
   makeStormyDivider(panelCard, 2 * rowH + 1);
-  lv_obj_t *panelDropdown = makeStormyDropdownRow(panelCard, "LCD", 2 * rowH + 2, rowH, 150);
+  // 164, not OMOTE's 150: the pill's wider padding otherwise runs
+  // "BuyDisplay-ILI9341" into the chevron.
+  lv_obj_t *panelDropdown = makeStormyDropdownRow(panelCard, "LCD", 2 * rowH + 2, rowH, 164);
   lv_dropdown_set_options(panelDropdown, "Adafruit\nBuyDisplay-ILI9341\nBuyDisplay-ST7789V");
   lv_dropdown_set_selected(panelDropdown, lcdPanelDropdownSelection());
   lv_obj_add_event_cb(panelDropdown, lcdPanelDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
