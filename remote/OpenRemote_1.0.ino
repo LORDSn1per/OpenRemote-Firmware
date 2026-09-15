@@ -1,6 +1,22 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.65 - 2026-09-15
+    - Device pages with no theme of their own get a background in the selected
+      menu style instead of plain black: near-black fading into storm blue for
+      OpenRemote, near-black fading into a soft grey for OMOTE. The dark tone
+      holds through the upper part of the screen before the colour gathers
+      towards the bottom. The page is still a screen full of buttons, a device
+      with its own theme keeps that theme, and every other page starts from
+      plain black as before.
+    - Settings > About has the Soft reboot and Hard reboot buttons at the
+      bottom, the same two as Settings > Debug, which keeps them.
+    - The menu style option moved from Settings > Debug to the bottom of
+      Settings > Display, in both styles. Its label is now just "Menu", giving
+      the dropdown more room; the explanation above it is unchanged.
+    - ORUSB DEVICE <index> opens a device page, and ORUSB SETTINGS <page>-bottom
+      scrolls any settings page to its end, for screenshots.
+
   5.64 - 2026-09-15
     - The Devices picker (tap a page title) follows the menu style. It was a
       cyan-bordered panel of flat grey rectangles in small text, the same in
@@ -7092,7 +7108,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.64"
+#define OPENREMOTE_VERSION_STRING "5.65"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -10457,6 +10473,9 @@ lv_obj_t *makeStormyRowEx(lv_obj_t *card, const char *name, const char *sub,
 lv_obj_t *makeStormyDropdownRow(lv_obj_t *card, const char *name, int y, int height,
                                 int dropdownWidth);
 void applyStormyBackground();
+// Defined with Settings > Debug, used earlier by Settings > Display, where the
+// Menu option now lives.
+void menuStyleDropdownEvent(lv_event_t *e);
 // Also used by serviceQueuedBackup(), which runs well before this is defined.
 void setLcdBackupStatus(const String &message);
 void hideBackupOverlay();
@@ -19820,9 +19839,10 @@ void handleUsbCommand(Stream &port, UsbSerialSession &session, String command) {
     target.trim();
     // display-panel scrolls to the Panel card and opens Wake; display-bottom
     // scrolls there with every control closed.
+    // "<page>-bottom" scrolls any page to its end once rendered.
     usbSettingsNavTarget = target == "display" ? 1
                          : target == "display-panel" ? 2
-                         : target == "display-bottom" ? 3 : 0;
+                         : target.endsWith("-bottom") ? 3 : 0;
     // Any settings page by name, so each one can be captured.
     SettingsView view = SETTINGS_HOME;
     if (target.startsWith("display")) view = SETTINGS_DISPLAY;
@@ -19833,11 +19853,21 @@ void handleUsbCommand(Stream &port, UsbSerialSession &session, String command) {
     else if (target == "dock") view = SETTINGS_DOCK;
     else if (target == "battery") view = SETTINGS_BATTERY;
     else if (target == "backup") view = SETTINGS_BACKUP;
-    else if (target == "about") view = SETTINGS_ABOUT;
+    else if (target.startsWith("about")) view = SETTINGS_ABOUT;
     else if (target == "debug") view = SETTINGS_DEBUG;
     usbSettingsNavView = (uint8_t)view;
     usbSettingsNavRequest = true;
     usbImportReply(port, String("{\"ok\":true,\"settings\":\"") + target + "\"}");
+  } else if (command.startsWith("ORUSB DEVICE ")) {
+    // Opens device <index>'s page the way the Devices picker does, for
+    // screenshots; the loop builds the page once the UI is settled.
+    int index = command.substring(13).toInt();
+    if (index < 0 || index >= DEVICE_COUNT) {
+      usbImportReply(port, "{\"ok\":false,\"error\":\"No device at that index\"}");
+      return;
+    }
+    pendingDeviceOpen = (int8_t)index;
+    usbImportReply(port, String("{\"ok\":true,\"device\":\"") + devices[index].name + "\"}");
   } else if (command == "ORUSB DEVICEPICKER") {
     usbDevicePickerRequest = true;
     usbImportReply(port, "{\"ok\":true,\"requested\":\"device picker\"}");
@@ -23376,10 +23406,12 @@ void serviceUsbWebConfigRequest() {
   // After the page has rendered: scroll to the bottom card and open Wake.
   if (usbSettingsNavFollowUpMs && (int32_t)(millis() - usbSettingsNavFollowUpMs) >= 0) {
     usbSettingsNavFollowUpMs = 0;
-    if (content && stormyWakeDropdown && lv_obj_is_valid(stormyWakeDropdown)) {
+    if (content) {
       lv_obj_scroll_to_y(content, lv_obj_get_scroll_y(content) + lv_obj_get_scroll_bottom(content),
                          LV_ANIM_OFF);
-      if (usbSettingsNavTarget == 2) lv_dropdown_open(stormyWakeDropdown);
+      if (usbSettingsNavTarget == 2 && stormyWakeDropdown && lv_obj_is_valid(stormyWakeDropdown)) {
+        lv_dropdown_open(stormyWakeDropdown);
+      }
       lastWakeMs = millis();
     }
   }
@@ -33238,6 +33270,19 @@ void renderDisplayPageOmote() {
                           "Adafruit\nBuyDisplay-ILI9341\nBuyDisplay-ST7789V");
   lv_dropdown_set_selected(panelDropdown, lcdPanelDropdownSelection());
   lv_obj_add_event_cb(panelDropdown, lcdPanelDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
+  y += 3 * rowH + 2 + 12;
+
+  // Menu style, moved here from Settings > Debug in 5.65. Labelled just
+  // "Menu" so the dropdown has room; the explanation above is unchanged.
+  lv_obj_t *menuLabel = makeLabel(content, "Menu style (applies immediately)", 8, y,
+                                  &lv_font_montserrat_12, textPrimary());
+  lv_obj_set_style_text_opa(menuLabel, LV_OPA_60, 0);
+  y += 22;
+  lv_obj_t *menuCard = makeOmoteCard(content, y, rowH);
+  lv_obj_t *menuDropdown = makeOmoteDropdownRow(menuCard, "Menu", 0, rowH, 150);
+  lv_dropdown_set_options(menuDropdown, "OpenRemote\nOMOTE");
+  lv_dropdown_set_selected(menuDropdown, menuStyle == 1 ? 1 : 0);
+  lv_obj_add_event_cb(menuDropdown, menuStyleDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
 }
 
 void renderDisplayPageStormy() {
@@ -33288,6 +33333,18 @@ void renderDisplayPageStormy() {
   lv_dropdown_set_options(panelDropdown, "Adafruit\nBuyDisplay-ILI9341\nBuyDisplay-ST7789V");
   lv_dropdown_set_selected(panelDropdown, lcdPanelDropdownSelection());
   lv_obj_add_event_cb(panelDropdown, lcdPanelDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
+  y += 3 * rowH + 2 + 12;
+
+  // Menu style, moved here from Settings > Debug in 5.65. Labelled just
+  // "Menu" so the dropdown has room; the explanation above is unchanged.
+  makeLabel(content, "Menu style (applies immediately)", 12, y, &lv_font_montserrat_12,
+            lvRgb(142, 155, 180));
+  y += 20;
+  lv_obj_t *menuCard = makeStormyCard(content, y, rowH);
+  lv_obj_t *menuDropdown = makeStormyDropdownRow(menuCard, "Menu", 0, rowH, 150);
+  lv_dropdown_set_options(menuDropdown, "OpenRemote\nOMOTE");
+  lv_dropdown_set_selected(menuDropdown, menuStyle == 1 ? 1 : 0);
+  lv_obj_add_event_cb(menuDropdown, menuStyleDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
 }
 
 void renderDisplayPage() {
@@ -34073,16 +34130,8 @@ void renderDebugPageOmote() {
   lv_obj_add_event_cb(pwmDropdown, backlightPwmDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
   y += calibRowH + 12;
 
-  lv_obj_t *menuLabel = makeLabel(content, "Menu style (applies immediately)", 8, y,
-                                  &lv_font_montserrat_12, textPrimary());
-  lv_obj_set_style_text_opa(menuLabel, LV_OPA_60, 0);
-  y += 22;
-  lv_obj_t *menuCard = makeOmoteCard(content, y, calibRowH);
-  lv_obj_t *menuDropdown = makeOmoteDropdownRow(menuCard, "Menu Style", 0, calibRowH, 112);
-  lv_dropdown_set_options(menuDropdown, "OpenRemote\nOMOTE");
-  lv_dropdown_set_selected(menuDropdown, menuStyle == 1 ? 1 : 0);
-  lv_obj_add_event_cb(menuDropdown, menuStyleDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
-  y += calibRowH + 20;
+  // The menu style choice moved to Settings > Display in 5.65.
+  y += 8;
 
   lv_obj_t *softButton = makeOmoteButton(content, "Soft reboot", 8, y, 108, 42, lvRgb(0x50, 0x50, 0x50));
   lv_obj_t *hardButton = makeOmoteButton(content, "Hard reboot", 124, y, 108, 42, lvRgb(115, 38, 45));
@@ -34711,6 +34760,16 @@ void renderAboutPageOmote() {
                5 * rowH + 5, rowH, &debugMenuVisible);
   // No battery section here any more: the battery card at the top of Settings
   // opens Settings > Battery, which has the same figures.
+
+  // The same two restart buttons as the bottom of Settings > Debug, so a
+  // restart does not need the hidden Debug menu switched on first.
+  int rebootY = 74 + 6 * rowH + 5 + 20;
+  lv_obj_t *softButton = makeOmoteButton(content, "Soft reboot", 8, rebootY, 108, 42, lvRgb(0x50, 0x50, 0x50));
+  lv_obj_t *hardButton = makeOmoteButton(content, "Hard reboot", 124, rebootY, 108, 42, lvRgb(115, 38, 45));
+  lv_obj_add_event_cb(softButton, debugRebootButtonEvent, LV_EVENT_CLICKED, (void *)(uintptr_t)false);
+  lv_obj_add_event_cb(hardButton, debugRebootButtonEvent, LV_EVENT_CLICKED, (void *)(uintptr_t)true);
+  addPhysicalNavFocusable(softButton);
+  addPhysicalNavFocusable(hardButton);
 }
 
 void renderAboutPage() {
@@ -37540,8 +37599,31 @@ void renderActivityPage() {
   finaliseRemotePageScrolling();
 }
 
+/*
+  The background of a device page with no theme of its own: a fade in the
+  selected menu style instead of plain black. OpenRemote runs from near-black
+  into storm blue, OMOTE from near-black into a soft grey. The dark tone holds
+  through the upper part of the screen (bg_main_stop) and only then fades, so
+  the title and the upper buttons sit on near-black and the colour gathers
+  towards the bottom. Painted on the page slot's root, behind the transparent
+  button grid; renderCurrentPage() resets it before every page renders.
+*/
+void applyDevicePageBackground() {
+  if (!screenRoot) return;
+  const bool openRemoteStyle = menuStyle == 0;
+  lv_obj_set_style_bg_color(screenRoot, openRemoteStyle ? lvRgb(5, 9, 18) : lvRgb(6, 6, 8), 0);
+  lv_obj_set_style_bg_grad_color(screenRoot,
+                                 openRemoteStyle ? lvRgb(20, 60, 142) : lvRgb(66, 66, 72), 0);
+  lv_obj_set_style_bg_grad_dir(screenRoot, LV_GRAD_DIR_VER, 0);
+  lv_obj_set_style_bg_main_stop(screenRoot, 70, 0);
+  lv_obj_set_style_bg_grad_stop(screenRoot, 255, 0);
+  lv_obj_set_style_bg_opa(screenRoot, LV_OPA_COVER, 0);
+}
+
 void renderDevicePage() {
-  applyRuntimeTheme(devices[activeDevice].themePath);
+  // A device with its own theme keeps it; otherwise the page takes the menu
+  // style's background rather than plain black.
+  if (!applyRuntimeTheme(devices[activeDevice].themePath)) applyDevicePageBackground();
   remotePageRowCount = 0;
   configureContent(42, LCD_H - 62, true);
   uiCommandBindingCount = 0;
@@ -37823,6 +37905,14 @@ void renderCurrentPage() {
   setupApStatusLabel = nullptr;
   resetSplitDiagnosticAnchor();
 
+  // Every page starts from the plain black slot root; only a themeless device
+  // page paints its fade over it (applyDevicePageBackground()), and the slot
+  // is reused by whatever page renders next.
+  if (screenRoot) {
+    lv_obj_set_style_bg_color(screenRoot, lv_color_black(), 0);
+    lv_obj_set_style_bg_grad_dir(screenRoot, LV_GRAD_DIR_NONE, 0);
+    lv_obj_set_style_bg_opa(screenRoot, LV_OPA_COVER, 0);
+  }
   switch (pages[currentPage].kind) {
     case PAGE_REMOTE_SETTINGS: renderSettingsPage(); break;
     case PAGE_ACTIVITIES: renderActivitiesPage(); break;
