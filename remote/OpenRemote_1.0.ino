@@ -1,6 +1,26 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.68 - 2026-09-16
+    - With a dock paired, weather and time come from the dock instead of this
+      remote's Wi-Fi. The remote asks over ESP-NOW (ORDQ) only when something
+      is needed - a weather widget coming on screen, again two minutes into a
+      new schedule slot while one stays on screen, or a clock sync falling due
+      at boot or 3am - and the dock answers at once (ORDU) with the time and
+      its newest cached reading. The weather is kept only on the dock; the
+      remote no longer restores or saves a forecast of its own while a dock is
+      paired. Each request carries the weather location, interval and time
+      zone, and a dock that reports no Wi-Fi details is sent them.
+    - A clock sync the dock has not answered stays owed and is asked again
+      after a minute (three times), then every five minutes (three times),
+      then every half hour, so a dock that was away at boot still sets the
+      clock soon after it returns.
+    - A dock that does not answer is asked again a minute later. Only after a
+      whole day without an answer (counted in NVS across sleeps) does a due
+      job use this remote's Wi-Fi, once, before the dock is tried again. A
+      time sync while this remote's Wi-Fi is already connected still uses NTP,
+      since it costs nothing.
+
   5.67 - 2026-09-16
     - Dock LED brightness. The dock's status LED brightness (5-100%) is set in
       WebConfig, saved on the remote (NVS and runtime.json, so backups and
@@ -7134,7 +7154,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.67"
+#define OPENREMOTE_VERSION_STRING "5.68"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -8178,6 +8198,43 @@ struct __attribute__((packed)) EspNowDockSettingsPacket {
   uint8_t reserved;
 };
 static_assert(sizeof(EspNowDockSettingsPacket) == 8, "dock settings layout drifted from the dock");
+
+/*
+  Weather and time through the dock - see requestDockData(). The remote asks
+  (ORDQ) when it needs something; the dock answers (ORDU) from what it keeps.
+*/
+static const uint32_t ESPNOW_DOCK_DATA_REQ_MAGIC = 0x4F524451UL;  // "ORDQ"
+static const uint32_t ESPNOW_DOCK_DATA_MAGIC     = 0x4F524455UL;  // "ORDU"
+static const uint8_t DOCK_DATA_WANT_TIME = 0x01;
+static const uint8_t DOCK_DATA_WANT_WEATHER = 0x02;
+static const uint8_t DOCK_DATA_TIME_VALID = 0x01;
+static const uint8_t DOCK_DATA_WEATHER_VALID = 0x02;
+static const uint8_t DOCK_DATA_RANGE_VALID = 0x04;
+static const uint8_t DOCK_DATA_WIFI_CONFIGURED = 0x08;
+
+struct __attribute__((packed)) EspNowDockDataRequestPacket {
+  uint32_t magic;
+  uint8_t wants;
+  uint8_t intervalHours;
+  uint8_t locationValid;
+  uint8_t reserved;
+  float latitude;
+  float longitude;
+  char timezone[48];     // POSIX TZ rule, for the 2am-anchored weather slots
+};
+static_assert(sizeof(EspNowDockDataRequestPacket) == 64, "dock data request layout drifted from the dock");
+
+struct __attribute__((packed)) EspNowDockDataPacket {
+  uint32_t magic;
+  uint8_t flags;
+  uint32_t epoch;                // UTC seconds, as the dock sends the frame
+  uint32_t weatherFetchedEpoch;  // UTC seconds the reading was fetched, 0 unknown
+  float temperatureC;
+  float highC;
+  float lowC;
+  int16_t code;                  // WMO weather code; worded here
+};
+static_assert(sizeof(EspNowDockDataPacket) == 27, "dock data layout drifted from the dock");
 
 struct __attribute__((packed)) EspNowAdbControlPacket {
   uint32_t magic;
@@ -10452,6 +10509,20 @@ volatile bool nowPlayingDirty = false;
 // competes with the same UART the loop uses and has garbled output before.
 volatile bool nowPlayingLogWanted = false;
 volatile bool nowPlayingReplyPending = false;
+// Weather and time from the dock - see requestDockData().
+volatile bool dockDataArrived = false;
+EspNowDockDataPacket dockDataIncoming = {};
+bool dockDataRequestPending = false;
+uint8_t dockDataRequestWants = 0;
+uint32_t dockDataRequestDeadlineMs = 0;
+uint32_t dockDataRetryAfterMs = 0;
+bool timeSyncUseOwnWifi = false;   // set only after a day with no dock answer
+bool dockTimeSyncWanted = false;   // a due clock sync the dock has not answered yet
+uint8_t dockDataFailures = 0;      // consecutive unanswered requests, for the backoff
+bool weatherUseOwnWifi = false;
+bool dockDataPreferred();
+bool weatherWidgetOnScreen();
+void requestDockData(uint8_t wants);
 volatile uint32_t nowPlayingReplyDeadlineMs = 0;
 volatile bool espNowProbePending = false;
 volatile bool commandFeedbackWanted = false;
@@ -12579,7 +12650,18 @@ void applyClockMode() {
 }
 
 void requestInternetTimeSync() {
-  if (!clockUseInternetTime || !hasAnyWifiProfile()) return;
+  if (!clockUseInternetTime) return;
+  // With a dock paired the dock keeps the time. This remote's Wi-Fi is used
+  // only when it is already up, which makes the sync free, or once the dock
+  // has gone a day without answering (handleDockDataFailure sets the flag).
+  if (dockDataPreferred() && !timeSyncUseOwnWifi && WiFi.status() != WL_CONNECTED) {
+    // Kept wanted until the dock answers, so a dock that was not there at
+    // boot is asked again rather than leaving the clock unsynced until 3am.
+    dockTimeSyncWanted = true;
+    requestDockData(DOCK_DATA_WANT_TIME);
+    return;
+  }
+  if (!hasAnyWifiProfile()) return;
   // Internet time manages its own brief Wi-Fi use (the Clock page's own
   // copy promises "Wi-Fi turns on only while time syncs"), so grant it here
   // rather than requiring the user's separate Wi-Fi toggle to already be on
@@ -12604,6 +12686,7 @@ void serviceInternetTime(unsigned long now) {
     if ((uint32_t)(now - ntpSyncStartedMs) > NTP_SYNC_TIMEOUT_MS) {
       Serial.println("NTP: sync timed out");
       ntpSyncPending = false;
+      timeSyncUseOwnWifi = false;
       scheduleNetworkShutdown();
       return;
     }
@@ -12621,6 +12704,8 @@ void serviceInternetTime(unsigned long now) {
       ntpSyncPending = false;
       serviceBatteryHistory(now, true);
       scheduleNetworkShutdown();
+      timeSyncUseOwnWifi = false;
+      dockTimeSyncWanted = false;
       Serial.println("NTP: time updated");
     }
     return;
@@ -18082,9 +18167,11 @@ void applyWidgetSettingsJson(JsonObjectConst widgets, JsonArrayConst wallpapers)
     do. Only re-read from storage when nothing is held, so a sync partway
     through a session does not discard a fresher reading for an identical one.
   */
-  if (!weatherReading.valid) loadWeatherReading();
+  // With a dock paired the weather lives on the dock and is asked for when a
+  // widget shows it, so nothing is restored or fetched from here.
+  if (!weatherReading.valid && !dockDataPreferred()) loadWeatherReading();
   if (weatherWidgetPlaced && widgetSettings.weatherValidLocation &&
-      !weatherReading.valid) {
+      !weatherReading.valid && !dockDataPreferred()) {
     weatherFetchWanted = true;
   }
 
@@ -27840,6 +27927,13 @@ void onEspNowDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int 
     }
   }
 
+  if (fromPairedDock && incomingMagic == ESPNOW_DOCK_DATA_MAGIC &&
+      (size_t)len >= sizeof(EspNowDockDataPacket)) {
+    memcpy(&dockDataIncoming, data, sizeof(dockDataIncoming));
+    dockDataArrived = true;   // Applied from loop(): it sets the clock and repaints.
+    return;
+  }
+
   // From any paired dock, not just the first. A second dock's reply used to be
   // discarded here, so it could never report its firmware or prove it was in
   // range - it simply looked like a name on a list.
@@ -28452,6 +28546,7 @@ bool espNowOperationBusy() {
          dockOtaBusy() || dockPairAckRetriesLeft ||
          (heldRepeatCommand && irRoute != IR_ROUTE_REMOTE) ||
          homebridgeDockPending || mqttDockPending || haDockPending ||
+         dockDataRequestPending ||
          espNowProbePending || castListRequestPending || adbControlPending ||
          nowPlayingReplyPending || mediaArtUrlChanged ||
          mediaArtRequestAwaitingDock || mediaArtTransferActive ||
@@ -37666,6 +37761,32 @@ void serviceWeatherWidget(uint32_t now) {
     return;
   }
 
+  /*
+    With a dock paired, ask the dock - and only when the weather is actually
+    needed: when a weather widget comes on screen, and again shortly after a
+    new schedule slot begins while one stays on screen, by which time the dock
+    has fetched it. No reading is kept on this remote beyond the one shown.
+  */
+  if (dockDataPreferred() && !weatherUseOwnWifi) {
+    releaseWeatherRadio();
+    static bool wasOnScreen = false;
+    static time_t requestedSlot = 0;
+    if (!weatherWidgetOnScreen()) {
+      wasOnScreen = false;
+      return;
+    }
+    time_t nowEpoch = time(nullptr);
+    time_t currentSlot = nowEpoch > 1700000000
+      ? weatherSlotStart(nowEpoch, widgetSettings.weatherIntervalHours) : 0;
+    bool appeared = !wasOnScreen;
+    bool newSlot = currentSlot && currentSlot != requestedSlot && nowEpoch - currentSlot >= 120;
+    wasOnScreen = true;
+    if (!(appeared || newSlot) || dockDataRequestPending) return;
+    requestedSlot = currentSlot;
+    requestDockData(DOCK_DATA_WANT_WEATHER);
+    return;
+  }
+
   time_t epoch = time(nullptr);
   bool clockUsable = epoch > 1700000000;
   time_t slot = clockUsable
@@ -37836,6 +37957,7 @@ void serviceWeatherWidget(uint32_t now) {
   if (clockUsable) weatherLastSlotEpoch = slot;
   saveWeatherReading();
   releaseWeatherRadio();
+  weatherUseOwnWifi = false;   // A day-without-dock fallback is one fetch, then the dock again.
   Serial.printf("Weather: %s %.1fC (%.1f/%.1f) for %s, next slot in %u hour(s)\n",
                 weatherReading.condition, weatherReading.temperatureC,
                 weatherReading.highC, weatherReading.lowC,
@@ -38138,6 +38260,189 @@ void requestNowPlaying() {
                                 (const uint8_t *)&packet, sizeof(packet));
   }
   if (!sent) nowPlayingReplyPending = false;
+}
+
+/*
+  Weather and time through the dock.
+
+  With a dock paired this remote does not bring its own Wi-Fi up for these. It
+  asks the dock over ESP-NOW, which comes up in milliseconds without joining a
+  network, and only when something is needed: a weather widget on screen or a
+  clock sync falling due. The dock answers from what it keeps - it holds the
+  weather, fetched on this remote's schedule - and the reply also says whether
+  the dock has Wi-Fi details, which are sent to it if not.
+
+  A dock that does not answer is asked again later. Only once it has gone a
+  whole day without answering does a due job use this remote's own Wi-Fi, and
+  then just that once before the dock is tried again.
+*/
+static const uint32_t DOCK_DATA_REPLY_TIMEOUT_MS = 8000UL;
+static const uint32_t DOCK_DATA_RETRY_MS = 60000UL;
+static const time_t DOCK_DATA_FALLBACK_SECONDS = 24L * 60L * 60L;
+time_t dockDataFailingSinceEpoch = 0;
+bool dockDataFailingSinceLoaded = false;
+
+bool dockDataPreferred() {
+  return espNowEnabled && espNowDeviceCount > 0;
+}
+
+bool weatherWidgetOnScreen() {
+  if (displaySleeping) return false;
+  for (uint8_t i = 0; i < widgetInstanceCount; i++) {
+    if (widgetInstances[i].kind == WIDGET_WEATHER) return true;
+  }
+  if (widgetExpandedOverlay) {
+    for (uint8_t i = 0; i < widgetExpandedInstanceCount; i++) {
+      if (widgetExpandedInstances[i].kind == WIDGET_WEATHER) return true;
+    }
+  }
+  return false;
+}
+
+// Kept in NVS so a day without the dock is counted across sleeps and reboots.
+void setDockDataFailingSince(time_t value) {
+  dockDataFailingSinceEpoch = value;
+  preferences.begin(PREFERENCES_NAMESPACE, false);
+  preferences.putULong64("dkDataFail", (uint64_t)value);
+  preferences.end();
+}
+
+void loadDockDataFailingSince() {
+  if (dockDataFailingSinceLoaded) return;
+  dockDataFailingSinceLoaded = true;
+  preferences.begin(PREFERENCES_NAMESPACE, true);
+  dockDataFailingSinceEpoch = (time_t)preferences.getULong64("dkDataFail", 0);
+  preferences.end();
+}
+
+void sendDockWifiDetails() {
+  int profile = findWifiProfile(selectedWifiSsid);
+  if (!selectedWifiSsid.length() || !ensureEspNowLink()) return;
+  EspNowDockWifiPacket wifi = {};
+  wifi.magic = ESPNOW_DOCK_WIFI_MAGIC;
+  strlcpy(wifi.ssid, selectedWifiSsid.c_str(), sizeof(wifi.ssid));
+  strlcpy(wifi.password, profile >= 0 ? wifiProfiles[profile].password.c_str() : "",
+          sizeof(wifi.password));
+  sendEspNowWithRetry(espNowDevices[0].mac, (const uint8_t *)&wifi, sizeof(wifi));
+  Serial.printf("Dock data: the dock had no Wi-Fi details - sent '%s'\n", wifi.ssid);
+}
+
+void handleDockDataFailure(uint8_t wants) {
+  dockDataRequestPending = false;
+  // A minute, then five, then half an hour: prompt when the dock was only
+  // briefly away, and not raising the radio every minute for one that is gone.
+  if (dockDataFailures < 255) dockDataFailures++;
+  uint32_t retryMs = dockDataFailures <= 3 ? DOCK_DATA_RETRY_MS
+                   : (dockDataFailures <= 6 ? 5UL * 60000UL : 30UL * 60000UL);
+  dockDataRetryAfterMs = millis() + retryMs;
+  loadDockDataFailingSince();
+  time_t now = time(nullptr);
+  if (!dockDataFailingSinceEpoch && now > 1700000000) setDockDataFailingSince(now);
+  bool fallback = dockDataFailingSinceEpoch && now > 1700000000 &&
+                  now - dockDataFailingSinceEpoch >= DOCK_DATA_FALLBACK_SECONDS;
+  Serial.printf("Dock data: no answer from the dock%s\n",
+                fallback ? " for a day - using this remote's Wi-Fi once" : "");
+  if (!fallback) return;
+  if (wants & DOCK_DATA_WANT_TIME) {
+    timeSyncUseOwnWifi = true;
+    requestInternetTimeSync();
+  }
+  if (wants & DOCK_DATA_WANT_WEATHER) {
+    weatherUseOwnWifi = true;
+    weatherFetchWanted = true;
+    weatherNextAttemptMs = 0;
+  }
+}
+
+void requestDockData(uint8_t wants) {
+  if (!dockDataPreferred()) return;
+  if (dockDataRequestPending) {
+    // One request at a time; what is asked for meanwhile rides on the reply.
+    dockDataRequestWants |= wants;
+    return;
+  }
+  if (dockDataRetryAfterMs && (int32_t)(millis() - dockDataRetryAfterMs) < 0) return;
+  dockDataRetryAfterMs = 0;
+  if (!ensureEspNowLink()) {
+    handleDockDataFailure(wants);
+    return;
+  }
+  EspNowDockDataRequestPacket packet = {};
+  packet.magic = ESPNOW_DOCK_DATA_REQ_MAGIC;
+  packet.wants = wants;
+  packet.intervalHours = widgetSettings.weatherIntervalHours;
+  packet.locationValid = widgetSettings.weatherValidLocation ? 1 : 0;
+  packet.latitude = widgetSettings.weatherLatitude;
+  packet.longitude = widgetSettings.weatherLongitude;
+  strlcpy(packet.timezone, clockTimezoneRule().c_str(), sizeof(packet.timezone));
+  if (!sendEspNowWithRetry(espNowDevices[0].mac, (const uint8_t *)&packet, sizeof(packet))) {
+    handleDockDataFailure(wants);
+    return;
+  }
+  dockDataRequestPending = true;
+  dockDataRequestWants = wants;
+  dockDataRequestDeadlineMs = millis() + DOCK_DATA_REPLY_TIMEOUT_MS;
+  Serial.printf("Dock data: asked the dock for%s%s\n",
+                (wants & DOCK_DATA_WANT_TIME) ? " the time" : "",
+                (wants & DOCK_DATA_WANT_WEATHER) ? " the weather" : "");
+}
+
+void serviceDockData(uint32_t now) {
+  if (dockDataArrived) {
+    dockDataArrived = false;
+    EspNowDockDataPacket packet;
+    memcpy(&packet, &dockDataIncoming, sizeof(packet));
+    uint8_t wants = dockDataRequestWants;
+    dockDataRequestPending = false;
+    dockDataRetryAfterMs = 0;
+    dockDataFailures = 0;
+    loadDockDataFailingSince();
+    if (dockDataFailingSinceEpoch) setDockDataFailingSince(0);
+
+    if ((packet.flags & DOCK_DATA_TIME_VALID) && clockUseInternetTime) {
+      time_t before = time(nullptr);
+      timeval tv = {(time_t)packet.epoch, 0};
+      settimeofday(&tv, nullptr);
+      time_t epoch = (time_t)packet.epoch;
+      tm local = {};
+      localtime_r(&epoch, &local);
+      lastNtpSyncYDay = local.tm_yday;
+      dockTimeSyncWanted = false;
+      if (wants & DOCK_DATA_WANT_TIME) serviceBatteryHistory(now, true);
+      Serial.printf("Dock data: clock set from the dock (%+lds)\n", (long)(epoch - before));
+    }
+
+    if (packet.flags & DOCK_DATA_WEATHER_VALID) {
+      weatherReading.temperatureC = packet.temperatureC;
+      weatherReading.code = packet.code;
+      strlcpy(weatherReading.condition, weatherConditionText(packet.code),
+              sizeof(weatherReading.condition));
+      weatherReading.rangeValid = (packet.flags & DOCK_DATA_RANGE_VALID) != 0;
+      weatherReading.highC = packet.highC;
+      weatherReading.lowC = packet.lowC;
+      weatherReading.valid = true;
+      weatherReading.fetchedAtMs = now;
+      weatherReading.fetchedThisSession = true;
+      Serial.printf("Dock data: weather %s %.1fC from the dock\n",
+                    weatherReading.condition, weatherReading.temperatureC);
+      for (uint8_t i = 0; i < widgetInstanceCount; i++) refreshWidgetInstance(widgetInstances[i]);
+      refreshExpandedWidgetInstances();
+    } else if (wants & DOCK_DATA_WANT_WEATHER) {
+      Serial.println("Dock data: the dock has no weather yet");
+    }
+
+    if (!(packet.flags & DOCK_DATA_WIFI_CONFIGURED)) sendDockWifiDetails();
+    return;
+  }
+  if (dockDataRequestPending && (int32_t)(now - dockDataRequestDeadlineMs) >= 0) {
+    handleDockDataFailure(dockDataRequestWants);
+    return;
+  }
+  // A clock sync still owed: asked again once the backoff allows.
+  if (dockTimeSyncWanted && !dockDataRequestPending && !timeSyncUseOwnWifi &&
+      dockDataPreferred()) {
+    requestDockData(DOCK_DATA_WANT_TIME);
+  }
 }
 
 void serviceMediaRadio(uint32_t now) {
@@ -40464,6 +40769,7 @@ void loop() {
   serviceMediaTarget(now);
   serviceMediaRadio(now);
   serviceWeatherWidget(now);
+  serviceDockData(now);
   serviceMqtt(now);
   serviceHomeAssistantLive(now);
   if (liveStateDirty && !displaySleeping) {
