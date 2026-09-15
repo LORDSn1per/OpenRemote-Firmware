@@ -1,6 +1,11 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.47 - 2026-09-15
+    - The brightness panel's readout tile is less see-through: background
+      opacity 230 of 255 (about 90%), up from 190 (about 75%), so busy page
+      artwork behind it no longer competes with the numbers.
+
   5.46 - 2026-09-15
     - The brightness panel's readout tile has the battery on the left and the
       brightness on the right, next to the slider that changes it.
@@ -6901,7 +6906,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.46"
+#define OPENREMOTE_VERSION_STRING "5.47"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -37735,7 +37740,8 @@ void toggleBrightnessPanel() {
   lv_obj_remove_style_all(tile);
   lv_obj_set_size(tile, tileW, tileH);
   lv_obj_set_pos(tile, (192 - tileW) / 2, (LCD_H - tileH) / 2);
-  stylePanel(tile, lvRgb(18, 22, 30), lv_color_white(), (lv_opa_t)190);
+  // 230 of 255 (~90%). 190 let busy page art compete with the numbers.
+  stylePanel(tile, lvRgb(18, 22, 30), lv_color_white(), (lv_opa_t)230);
   lv_obj_set_style_radius(tile, 20, 0);
   lv_obj_set_style_border_opa(tile, LV_OPA_30, 0);
   lv_obj_set_style_pad_all(tile, 0, 0);
