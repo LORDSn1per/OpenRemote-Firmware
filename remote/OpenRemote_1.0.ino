@@ -1,6 +1,19 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.64 - 2026-09-15
+    - The Devices picker (tap a page title) follows the menu style. It was a
+      cyan-bordered panel of flat grey rectangles in small text, the same in
+      both styles. It is now a card over a dimmed backdrop - tap the backdrop
+      to close it - with a "Devices" heading, a device count, and one 36px pill
+      button per device in 14pt text with a chevron. OpenRemote style: navy
+      card with the hairline border and navy pills; OMOTE: 0x303030 card and
+      0x505050 pills. The device you are on is filled with the style's accent
+      blue. The list scrolls when there are more devices than fit, the card
+      stops above the page dots, and the dots hide while it is open.
+    - New ORUSB DEVICEPICKER goes to Activities and opens the picker, for
+      screenshots.
+
   5.63 - 2026-09-15
     - The page dots stay still while pages swipe. Every page used to carry its
       own dots, so they slid away with it; there is now one dots bar on the UI
@@ -7079,7 +7092,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.63"
+#define OPENREMOTE_VERSION_STRING "5.64"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -9342,6 +9355,9 @@ volatile bool usbOverlayDemoRequest = false;
 // connected, for screenshots - a real plug-in cannot be captured, because
 // opening the USB port to take the screenshot resets the remote.
 volatile bool usbChargeDemoRequest = false;
+// ORUSB DEVICEPICKER: goes to Activities and opens the Devices picker, for
+// screenshots.
+volatile bool usbDevicePickerRequest = false;
 uint8_t usbOverlayDemoMode = 0;
 uint8_t usbOverlayDemoPercent = 50;
 unsigned long usbOverlayDemoUntilMs = 0;
@@ -19822,6 +19838,9 @@ void handleUsbCommand(Stream &port, UsbSerialSession &session, String command) {
     usbSettingsNavView = (uint8_t)view;
     usbSettingsNavRequest = true;
     usbImportReply(port, String("{\"ok\":true,\"settings\":\"") + target + "\"}");
+  } else if (command == "ORUSB DEVICEPICKER") {
+    usbDevicePickerRequest = true;
+    usbImportReply(port, "{\"ok\":true,\"requested\":\"device picker\"}");
   } else if (command == "ORUSB CHARGEDEMO") {
     usbChargeDemoRequest = true;
     usbImportReply(port, "{\"ok\":true,\"requested\":\"charging overlay\"}");
@@ -23362,6 +23381,19 @@ void serviceUsbWebConfigRequest() {
                          LV_ANIM_OFF);
       if (usbSettingsNavTarget == 2) lv_dropdown_open(stormyWakeDropdown);
       lastWakeMs = millis();
+    }
+  }
+  if (usbDevicePickerRequest) {
+    usbDevicePickerRequest = false;
+    if (displaySleeping) wakeDisplay();
+    lastWakeMs = millis();
+    // Activities is always page 1 of the strip, and its title opens the picker.
+    if (pageCount > 1 && pageStrip) {
+      currentPage = 1;
+      bindPageUi(currentPage);
+      lv_obj_set_tile(pageStrip, pageUi[currentPage].tile, LV_ANIM_OFF);
+      configurePageStripDirections();
+      if (!deviceModal) showDevicePicker();
     }
   }
   if (usbChargeDemoRequest) {
@@ -30728,7 +30760,7 @@ void drawDots() {
   // would otherwise have the dots sitting bright on top of it.
   bool hide = pageCount < 2 ||
               (currentPage == 0 && settingsView != SETTINGS_HOME) ||
-              brightnessOverlay != nullptr;
+              brightnessOverlay != nullptr || deviceModal != nullptr;
   if (hide) {
     lv_obj_add_flag(pageDotsBar, LV_OBJ_FLAG_HIDDEN);
     return;
@@ -37965,47 +37997,157 @@ void deviceChoiceEvent(lv_event_t *e) {
   if (deviceModal) lv_obj_add_flag(deviceModal, LV_OBJ_FLAG_HIDDEN);
 }
 
+void closeDevicePicker() {
+  if (!deviceModal) return;
+  // Async: this runs from events on objects inside the picker itself.
+  lv_obj_del_async(deviceModal);
+  deviceModal = nullptr;
+  drawDots();
+}
+
+void devicePickerBackdropEvent(lv_event_t *e) {
+  // Only a tap on the dimmed backdrop itself closes the picker; taps on the
+  // card or a row are handled by those.
+  if (lv_event_get_target(e) != lv_event_get_current_target(e)) return;
+  lv_indev_t *indev = lv_indev_get_act();
+  if (indev) lv_indev_wait_release(indev);
+  closeDevicePicker();
+}
+
+/*
+  One device in the picker: a pill button with the device name and a chevron,
+  drawn in the selected menu style. The device already open is filled with the
+  style's accent so it is obvious which one you are on.
+*/
+lv_obj_t *makeDevicePickerRow(lv_obj_t *list, const char *name, int y, int width,
+                              bool current, bool openRemoteStyle) {
+  const int height = 36;
+  lv_obj_t *row = lv_obj_create(list);
+  lv_obj_remove_style_all(row);
+  lv_obj_set_pos(row, 0, y);
+  lv_obj_set_size(row, width, height);
+  lv_obj_set_style_radius(row, height / 2, 0);
+  lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+  lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_flag(row, LV_OBJ_FLAG_SCROLL_ON_FOCUS);
+  if (openRemoteStyle) {
+    if (current) {
+      lv_obj_set_style_bg_color(row, lvRgb(58, 139, 255), 0);
+      lv_obj_set_style_bg_grad_color(row, lvRgb(31, 99, 232), 0);
+      lv_obj_set_style_bg_grad_dir(row, LV_GRAD_DIR_VER, 0);
+    } else {
+      lv_obj_set_style_bg_color(row, lvRgb(20, 34, 62), 0);
+      lv_obj_set_style_border_width(row, 1, 0);
+      lv_obj_set_style_border_color(row, lvRgb(52, 88, 150), 0);
+      lv_obj_set_style_border_opa(row, LV_OPA_COVER, 0);
+    }
+    lv_obj_set_style_bg_color(row, lvRgb(43, 123, 255), LV_STATE_PRESSED);
+    lv_obj_set_style_bg_grad_dir(row, LV_GRAD_DIR_NONE, LV_STATE_PRESSED);
+  } else {
+    lv_obj_set_style_bg_color(row, current ? lvRgb(0x21, 0x96, 0xF3) : lvRgb(0x50, 0x50, 0x50), 0);
+    lv_obj_set_style_bg_color(row, lvRgb(0x21, 0x96, 0xF3), LV_STATE_PRESSED);
+  }
+
+  lv_obj_t *label = makeLabel(row, name, 16, (height - 17) / 2, &lv_font_montserrat_14,
+                              lv_color_white());
+  lv_obj_set_size(label, width - 48, 17);
+  lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
+  lv_obj_clear_flag(label, LV_OBJ_FLAG_CLICKABLE);
+
+  lv_color_t chevronColour = current ? lv_color_white()
+                           : (openRemoteStyle ? lvRgb(90, 162, 255) : lvRgb(0xAC, 0xAC, 0xAC));
+  lv_obj_t *chevron = makeLabel(row, LV_SYMBOL_RIGHT, width - 26, (height - 15) / 2,
+                                &lv_font_montserrat_12, chevronColour);
+  lv_obj_clear_flag(chevron, LV_OBJ_FLAG_CLICKABLE);
+  return row;
+}
+
+/*
+  The Devices picker, opened from the page title.
+
+  A dimmed backdrop over the page (tap it to close) holding a card in the
+  selected menu style, with one readable pill button per device. It used to be
+  a cyan-bordered panel of flat grey rectangles in 12pt text, the same in both
+  styles.
+*/
 void showDevicePicker() {
   if (deviceModal) {
-    lv_obj_del(deviceModal);
-    deviceModal = nullptr;
+    closeDevicePicker();
     return;
   }
-
-  const int modalY = 44;
-  const int pageDotsTop = 292;
-  const int rowHeight = 32;
-  const int pickerCount = DEVICE_COUNT;
-  const int desiredHeight = 44 + pickerCount * rowHeight;
-  const int modalHeight = min(pageDotsTop - modalY, desiredHeight);
+  const bool openRemoteStyle = menuStyle == 0;
+  const int cardX = 8, cardY = 44, cardW = 224;
+  const int rowPitch = 42;      // 36px pill + 6px gap
+  const int listTop = 42;
+  // Stops above the floating page dots at the bottom of the screen.
+  const int maxCardH = LCD_H - cardY - 36;
+  const int wantCardH = listTop + (DEVICE_COUNT ? DEVICE_COUNT * rowPitch - 6 : 20) + 12;
+  const int cardH = min(maxCardH, wantCardH);
 
   deviceModal = lv_obj_create(screenRoot);
-  lv_obj_set_pos(deviceModal, 8, modalY);
-  lv_obj_set_size(deviceModal, 224, modalHeight);
-  stylePanel(deviceModal, lvRgb(18, 22, 30), lvRgb(60, 180, 220), LV_OPA_COVER);
+  lv_obj_remove_style_all(deviceModal);
+  lv_obj_set_pos(deviceModal, 0, 0);
+  lv_obj_set_size(deviceModal, LCD_W, LCD_H);
+  lv_obj_set_style_bg_color(deviceModal, lv_color_black(), 0);
+  lv_obj_set_style_bg_opa(deviceModal, (lv_opa_t)110, 0);
+  lv_obj_add_flag(deviceModal, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_clear_flag(deviceModal, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_set_scroll_dir(deviceModal, LV_DIR_NONE);
-  makeLabel(deviceModal, "Devices", 8, 4, &lv_font_montserrat_16, textPrimary());
+  lv_obj_add_event_cb(deviceModal, devicePickerBackdropEvent, LV_EVENT_CLICKED, nullptr);
 
-  lv_obj_t *list = lv_obj_create(deviceModal);
+  lv_obj_t *card = lv_obj_create(deviceModal);
+  lv_obj_remove_style_all(card);
+  lv_obj_set_pos(card, cardX, cardY);
+  lv_obj_set_size(card, cardW, cardH);
+  lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+  if (openRemoteStyle) {
+    lv_obj_set_style_bg_color(card, lvRgb(13, 22, 42), 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_border_color(card, lvRgb(34, 54, 92), 0);
+    lv_obj_set_style_border_opa(card, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(card, 18, 0);
+  } else {
+    lv_obj_set_style_bg_color(card, lvRgb(0x30, 0x30, 0x30), 0);
+    lv_obj_set_style_radius(card, 12, 0);
+  }
+  lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);   // taps on the card never close it
+  lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+  makeLabel(card, "Devices", 14, 11, &lv_font_montserrat_16, textPrimary());
+  char countText[16];
+  snprintf(countText, sizeof(countText), "%u device%s", (unsigned)DEVICE_COUNT,
+           DEVICE_COUNT == 1 ? "" : "s");
+  lv_obj_t *count = makeLabel(card, countText, cardW - 14 - 90, 15, &lv_font_montserrat_10,
+                              openRemoteStyle ? lvRgb(142, 155, 180) : lvRgb(0xAC, 0xAC, 0xAC));
+  lv_obj_set_width(count, 90);
+  lv_obj_set_style_text_align(count, LV_TEXT_ALIGN_RIGHT, 0);
+
+  const int listW = cardW - 16;
+  lv_obj_t *list = lv_obj_create(card);
   lv_obj_remove_style_all(list);
-  lv_obj_set_pos(list, 8, 30);
-  lv_obj_set_size(list, 204, modalHeight - 42);
+  lv_obj_set_pos(list, 8, listTop);
+  lv_obj_set_size(list, listW, cardH - listTop - 8);
   lv_obj_set_scroll_dir(list, LV_DIR_VER);
-  lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_AUTO);
-  lv_obj_set_style_pad_all(list, 0, 0);
-  if (pickerCount * rowHeight > modalHeight - 42) {
+  lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_OFF);
+  lv_obj_set_style_pad_bottom(list, 4, 0);
+  if (DEVICE_COUNT * rowPitch - 6 > cardH - listTop - 8) {
     lv_obj_add_flag(list, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(list, LV_OBJ_FLAG_SCROLL_MOMENTUM);
   } else {
     lv_obj_clear_flag(list, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_OFF);
   }
 
+  if (!DEVICE_COUNT) {
+    makeLabel(list, "No devices yet", 8, 0, &lv_font_montserrat_12,
+              openRemoteStyle ? lvRgb(142, 155, 180) : lvRgb(0xAC, 0xAC, 0xAC));
+  }
   for (uint8_t i = 0; i < DEVICE_COUNT; i++) {
-    lv_obj_t *btn = makeButton(list, devices[i].name, 0, i * rowHeight, 204, 28, lvRgb(34, 42, 56));
-    lv_obj_add_event_cb(btn, deviceChoiceEvent, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+    lv_obj_t *row = makeDevicePickerRow(list, devices[i].name, i * rowPitch, listW,
+                                        (int)i == activeDevice, openRemoteStyle);
+    lv_obj_add_event_cb(row, deviceChoiceEvent, LV_EVENT_CLICKED, (void *)(intptr_t)i);
   }
   lv_obj_move_foreground(deviceModal);
+  drawDots();   // hidden while the picker is open
 }
 
 // ---------------------------------------------------------------------------
