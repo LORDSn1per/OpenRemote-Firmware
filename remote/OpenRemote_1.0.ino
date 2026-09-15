@@ -1,6 +1,23 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.66 - 2026-09-16
+    - Custom widgets. A widget built in WebConfig shows up to three elements -
+      time and date, weather, battery and media - under a name of its own, on
+      a Widget Wallpaper like the library widgets. One element on a large
+      tile draws the same face as its library widget; two or three share the
+      tile in columns, each dropping detail to fit. Tapping one expands it
+      with its elements in rows down the screen. They are read from
+      customWidgets in runtime.json, and backups and restores carry them as
+      "custom" rows among the widget settings.
+    - Any widget can be slim: three columns and one row, the height of a
+      button, instead of three columns and two rows. A slim widget keeps the
+      headline value of each element, shows the middle band of its
+      wallpaper, and never shows media artwork.
+    - A page can hold six widgets, up from three.
+    - ORUSB WIDGETOPEN <n> expands the n-th widget on the current page, as a
+      tap would, for screenshots.
+
   5.65 - 2026-09-15
     - Device pages with no theme of their own get a background in the selected
       menu style instead of plain black: near-black fading into storm blue for
@@ -7108,7 +7125,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.65"
+#define OPENREMOTE_VERSION_STRING "5.66"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -8180,11 +8197,13 @@ struct ActivityStep {
   bool delayWhenDevicePoweredOn;
 };
 
-static const uint8_t MAX_DEVICE_WIDGETS = 3;
+static const uint8_t MAX_DEVICE_WIDGETS = 6;
 
 struct DeviceWidget {
   uint8_t kind;
   uint8_t slot;
+  uint8_t custom;   // index into customWidgets when kind is WIDGET_CUSTOM
+  bool slim;        // one grid row instead of two
 };
 
 struct Device {
@@ -8226,6 +8245,8 @@ struct Macro {
 struct Tile {
   enum Kind : uint8_t { COMMAND, ACTIVITY, MACRO, WIDGET } kind;
   uint8_t widgetKind;
+  uint8_t widgetCustom;
+  bool widgetSlim;
   char label[28];
   char targetActivityId[48];
   char targetMacroId[48];
@@ -8254,13 +8275,21 @@ enum WidgetKind : uint8_t {
   WIDGET_MEDIA = 0,
   WIDGET_WEATHER = 1,
   WIDGET_BATTERY = 2,
-  WIDGET_KIND_COUNT = 3
+  WIDGET_KIND_COUNT = 3,
+  // The time and date. Not a library widget of its own - it only appears as
+  // an element of a custom widget.
+  WIDGET_CLOCK = 3,
+  // A widget the user built; which one travels beside it as a custom index.
+  WIDGET_CUSTOM = 4
 };
 
 static const int WIDGET_TILE_WIDTH = 224;
 // Two 44px grid rows plus the 8px gap between them, matching makeTile()'s
 // 52px row pitch: a widget ends exactly where the row below it would start.
 static const int WIDGET_TILE_HEIGHT = 96;
+// A slim widget covers a single grid row, the height of a button.
+static const int WIDGET_SLIM_HEIGHT = 44;
+static const uint8_t WIDGET_NO_CUSTOM = 0xFF;
 
 struct WidgetSettings {
   bool weatherSolidBackground;
@@ -8313,6 +8342,28 @@ struct WidgetContentPanelStyle {
 };
 
 WidgetContentPanelStyle widgetContentPanels[WIDGET_KIND_COUNT] = {};
+
+/*
+  Custom widgets: up to three elements - time and date, weather, battery and
+  media - chosen, named and given a background in WebConfig. The elements
+  share the library widgets' settings (units, warn level, media source), so a
+  custom widget only records which elements it shows and what it sits on.
+*/
+static const uint8_t MAX_CUSTOM_WIDGETS = 16;
+static const uint8_t CUSTOM_WIDGET_MAX_ELEMENTS = 3;
+
+struct CustomWidget {
+  char id[40];
+  char name[32];
+  uint8_t elements[CUSTOM_WIDGET_MAX_ELEMENTS];
+  uint8_t elementCount;
+  char wallpaper[96];
+  char expandedWallpaper[96];
+  WidgetContentPanelStyle panel;
+};
+
+CustomWidget customWidgets[MAX_CUSTOM_WIDGETS] = {};
+uint8_t customWidgetCount = 0;
 
 struct WeatherReading {
   bool valid;
@@ -8461,9 +8512,11 @@ char activitiesThemePath[72] = "";
 */
 struct ActivitiesWidget {
   uint8_t kind;
-  uint8_t row;      // top row it occupies; it covers this row and the next
+  uint8_t row;      // top row it occupies; a large widget covers the next too
+  uint8_t custom;
+  bool slim;
 };
-static const uint8_t MAX_ACTIVITIES_WIDGETS = 3;
+static const uint8_t MAX_ACTIVITIES_WIDGETS = 6;
 ActivitiesWidget activitiesWidgets[MAX_ACTIVITIES_WIDGETS];
 uint8_t activitiesWidgetCount = 0;
 RuntimeThemeStyle runtimeThemes[MAX_RUNTIME_THEMES] = {};
@@ -9374,6 +9427,10 @@ volatile bool usbChargeDemoRequest = false;
 // ORUSB DEVICEPICKER: goes to Activities and opens the Devices picker, for
 // screenshots.
 volatile bool usbDevicePickerRequest = false;
+// ORUSB WIDGETOPEN <n>: expands the n-th widget on the current page, as a tap
+// would, for screenshots. -1 when nothing is asked for.
+volatile int8_t usbWidgetOpenRequest = -1;
+bool openLiveWidgetForUsb(uint8_t index);
 uint8_t usbOverlayDemoMode = 0;
 uint8_t usbOverlayDemoPercent = 50;
 unsigned long usbOverlayDemoUntilMs = 0;
@@ -10492,7 +10549,7 @@ uint8_t *readSdFileToPsramBuffer(File &file, size_t &outSize);
 bool i2cDevicePresent(uint8_t address);
 bool transmitIrCommand(const DeviceCommand &command);
 // Defined with the rest of the widget drawing, far below renderActivitiesPage.
-void makeWidgetTile(uint8_t slot, uint8_t kind, int originY);
+void makeWidgetTile(uint8_t slot, uint8_t kind, uint8_t custom, bool slim, int originY);
 bool isVoiceSearchCommand(const DeviceCommand *command);
 bool beginVoiceSearchHold(const DeviceCommand *command, bool fromTouch = false);
 void endVoiceSearchHold(const DeviceCommand *command = nullptr);
@@ -17803,6 +17860,51 @@ const char *widgetKindName(uint8_t kind) {
   return "media";
 }
 
+// A custom widget's element names, as WebConfig writes them.
+uint8_t widgetElementFromName(const char *name) {
+  if (!name) return 0xFF;
+  if (strcmp(name, "time") == 0) return WIDGET_CLOCK;
+  if (strcmp(name, "weather") == 0) return WIDGET_WEATHER;
+  if (strcmp(name, "battery") == 0) return WIDGET_BATTERY;
+  if (strcmp(name, "media") == 0) return WIDGET_MEDIA;
+  return 0xFF;
+}
+
+uint8_t findCustomWidgetIndex(const char *id) {
+  if (!id || !id[0]) return WIDGET_NO_CUSTOM;
+  for (uint8_t i = 0; i < customWidgetCount; i++) {
+    if (strcmp(customWidgets[i].id, id) == 0) return i;
+  }
+  return WIDGET_NO_CUSTOM;
+}
+
+/*
+  Reads a widget page item. A custom widget whose definition has gone -
+  deleted from WebConfig on another computer, say - comes back as
+  WIDGET_NO_CUSTOM and is left off the page rather than drawn empty.
+*/
+void parseWidgetItem(JsonObjectConst item, uint8_t &kind, uint8_t &custom, bool &slim) {
+  slim = strcmp(item["size"] | "large", "slim") == 0;
+  custom = WIDGET_NO_CUSTOM;
+  const char *name = item["widget"] | "media";
+  if (strcmp(name, "custom") == 0) {
+    kind = WIDGET_CUSTOM;
+    custom = findCustomWidgetIndex(item["customId"] | "");
+  } else {
+    kind = widgetKindFromName(name);
+  }
+}
+
+// Element numbers match the library kinds, so a library widget "shows" itself.
+bool widgetShowsElement(uint8_t kind, uint8_t custom, uint8_t element) {
+  if (kind != WIDGET_CUSTOM) return kind == element;
+  if (custom >= customWidgetCount) return false;
+  for (uint8_t i = 0; i < customWidgets[custom].elementCount; i++) {
+    if (customWidgets[custom].elements[i] == element) return true;
+  }
+  return false;
+}
+
 /*
   Absent on a config written by a WebConfig older than 2.61, in which case
   every field keeps its compiled default rather than being zeroed - a remote
@@ -17841,6 +17943,30 @@ void resolveWidgetWallpaperPaths(const char *backgroundId,
     int transparency = constrain((int)(wallpaper["contentBoxTransparency"] | 50), 0, 100);
     panel.opacity = (uint8_t)(((100 - transparency) * 255 + 50) / 100);
     return;
+  }
+}
+
+void applyCustomWidgetsJson(JsonArrayConst rows, JsonArrayConst wallpapers) {
+  customWidgetCount = 0;
+  memset(customWidgets, 0, sizeof(customWidgets));
+  for (JsonObjectConst row : rows) {
+    if (customWidgetCount >= MAX_CUSTOM_WIDGETS) break;
+    const char *id = row["id"] | "";
+    if (!id[0]) continue;
+    CustomWidget &widget = customWidgets[customWidgetCount];
+    widget.elementCount = 0;
+    for (JsonVariantConst element : row["elements"].as<JsonArrayConst>()) {
+      uint8_t parsed = widgetElementFromName(element | "");
+      if (parsed == 0xFF || widget.elementCount >= CUSTOM_WIDGET_MAX_ELEMENTS) continue;
+      widget.elements[widget.elementCount++] = parsed;
+    }
+    if (!widget.elementCount) continue;
+    strlcpy(widget.id, id, sizeof(widget.id));
+    copyDisplayTextAscii(row["name"] | "Widget", widget.name, sizeof(widget.name));
+    resolveWidgetWallpaperPaths(row["background"] | "theme", wallpapers,
+      widget.wallpaper, sizeof(widget.wallpaper),
+      widget.expandedWallpaper, sizeof(widget.expandedWallpaper), widget.panel);
+    customWidgetCount++;
   }
 }
 
@@ -18018,6 +18144,9 @@ void loadRuntimeModel(JsonDocument &doc) {
   DEVICE_COUNT = 0;
   weatherWidgetPlaced = false;
   activitiesWidgetCount = 0;
+  // Before the pages, which name custom widgets by id.
+  applyCustomWidgetsJson(doc["customWidgets"].as<JsonArrayConst>(),
+                         doc["widgetWallpapers"].as<JsonArrayConst>());
   ACTIVITY_COUNT = 0;
   MACRO_COUNT = 0;
   memset(devices, 0, sizeof(Device) * MAX_RUNTIME_DEVICES);
@@ -18310,13 +18439,19 @@ void loadRuntimeModel(JsonDocument &doc) {
       tile.kind = strcmp(itemType, "activity") == 0 ? Tile::ACTIVITY :
         (strcmp(itemType, "macro") == 0 ? Tile::MACRO :
          (strcmp(itemType, "widget") == 0 ? Tile::WIDGET : Tile::COMMAND));
-      tile.widgetKind = widgetKindFromName(item["widget"] | "media");
+      tile.widgetKind = WIDGET_MEDIA;
+      tile.widgetCustom = WIDGET_NO_CUSTOM;
+      tile.widgetSlim = false;
+      if (tile.kind == Tile::WIDGET) {
+        parseWidgetItem(item, tile.widgetKind, tile.widgetCustom, tile.widgetSlim);
+      }
       tile.slot = constrain((int)(item["slot"] | slotCursor), 0, 254);
       if (tile.kind == Tile::WIDGET || tile.kind == Tile::ACTIVITY) {
         tile.slot = alignSlotToRow(tile.slot);
       }
       int nextSlot = (int)tile.slot +
-        (tile.kind == Tile::WIDGET ? 6 : (tile.kind == Tile::ACTIVITY ? 3 : 1));
+        (tile.kind == Tile::WIDGET ? (tile.widgetSlim ? 3 : 6)
+                                   : (tile.kind == Tile::ACTIVITY ? 3 : 1));
       slotCursor = (uint8_t)constrain(max((int)slotCursor, nextSlot), 0, 254);
       const char *label = item["name"] | "";
       if (!label[0]) label = item["label"] |
@@ -18325,7 +18460,9 @@ void loadRuntimeModel(JsonDocument &doc) {
           (tile.kind == Tile::WIDGET ? "Widget" : "Button")));
       copyDisplayTextAscii(label, tile.label, sizeof(tile.label));
       if (tile.kind == Tile::WIDGET) {
-        if (tile.widgetKind == WIDGET_WEATHER) weatherWidgetPlaced = true;
+        if (widgetShowsElement(tile.widgetKind, tile.widgetCustom, WIDGET_WEATHER)) {
+          weatherWidgetPlaced = true;
+        }
         // Nothing else on a widget is configurable - it draws its own face.
         tile.iconPath = nullptr;
         tile.showText = false;
@@ -18398,12 +18535,19 @@ void loadRuntimeModel(JsonDocument &doc) {
         if (strcmp(item["type"] | "", "widget") == 0) {
           uint8_t widgetSlot = alignSlotToRow(
             constrain((int)(item["slot"] | activitiesSlotCursor), 0, 254));
-          activitiesSlotCursor = (uint8_t)constrain((int)widgetSlot + 6, 0, 254);
+          uint8_t widgetKind = WIDGET_MEDIA;
+          uint8_t widgetCustom = WIDGET_NO_CUSTOM;
+          bool widgetSlim = false;
+          parseWidgetItem(item, widgetKind, widgetCustom, widgetSlim);
+          activitiesSlotCursor = (uint8_t)constrain((int)widgetSlot + (widgetSlim ? 3 : 6), 0, 254);
           if (activitiesWidgetCount >= MAX_ACTIVITIES_WIDGETS) continue;
+          if (widgetKind == WIDGET_CUSTOM && widgetCustom == WIDGET_NO_CUSTOM) continue;
           ActivitiesWidget &placement = activitiesWidgets[activitiesWidgetCount++];
-          placement.kind = widgetKindFromName(item["widget"] | "media");
+          placement.kind = widgetKind;
+          placement.custom = widgetCustom;
+          placement.slim = widgetSlim;
           placement.row = (uint8_t)(widgetSlot / 3);
-          if (placement.kind == WIDGET_WEATHER) weatherWidgetPlaced = true;
+          if (widgetShowsElement(widgetKind, widgetCustom, WIDGET_WEATHER)) weatherWidgetPlaced = true;
           continue;
         }
         if (strcmp(item["type"] | "", "activity") == 0 && activitiesSlotCursor < 252) {
@@ -18463,12 +18607,19 @@ void loadRuntimeModel(JsonDocument &doc) {
       */
       if (strcmp(item["type"] | "", "widget") == 0) {
         uint8_t widgetSlot = alignSlotToRow(constrain((int)(item["slot"] | slotCursor), 0, 254));
-        slotCursor = (uint8_t)constrain((int)widgetSlot + 6, 0, 254);
+        uint8_t widgetKind = WIDGET_MEDIA;
+        uint8_t widgetCustom = WIDGET_NO_CUSTOM;
+        bool widgetSlim = false;
+        parseWidgetItem(item, widgetKind, widgetCustom, widgetSlim);
+        slotCursor = (uint8_t)constrain((int)widgetSlot + (widgetSlim ? 3 : 6), 0, 254);
         if (device->widgetCount >= MAX_DEVICE_WIDGETS) continue;
+        if (widgetKind == WIDGET_CUSTOM && widgetCustom == WIDGET_NO_CUSTOM) continue;
         DeviceWidget &placement = device->widgets[device->widgetCount++];
-        placement.kind = widgetKindFromName(item["widget"] | "media");
+        placement.kind = widgetKind;
+        placement.custom = widgetCustom;
+        placement.slim = widgetSlim;
         placement.slot = widgetSlot;
-        if (placement.kind == WIDGET_WEATHER) weatherWidgetPlaced = true;
+        if (widgetShowsElement(widgetKind, widgetCustom, WIDGET_WEATHER)) weatherWidgetPlaced = true;
         continue;
       }
       DeviceCommand *command = findRuntimeCommand(device, item["commandId"] | "");
@@ -19871,6 +20022,14 @@ void handleUsbCommand(Stream &port, UsbSerialSession &session, String command) {
   } else if (command == "ORUSB DEVICEPICKER") {
     usbDevicePickerRequest = true;
     usbImportReply(port, "{\"ok\":true,\"requested\":\"device picker\"}");
+  } else if (command.startsWith("ORUSB WIDGETOPEN ")) {
+    int index = command.substring(17).toInt();
+    if (index < 0 || index > 20) {
+      usbImportReply(port, "{\"ok\":false,\"error\":\"Widget index must be 0 to 20\"}");
+      return;
+    }
+    usbWidgetOpenRequest = (int8_t)index;
+    usbImportReply(port, String("{\"ok\":true,\"widget\":") + String(index) + "}");
   } else if (command == "ORUSB CHARGEDEMO") {
     usbChargeDemoRequest = true;
     usbImportReply(port, "{\"ok\":true,\"requested\":\"charging overlay\"}");
@@ -21329,10 +21488,15 @@ bool convertWebBackupToRuntime(JsonDocument &backup, String &error) {
   if (data["widgets"].is<JsonArrayConst>()) {
     JsonObject runtimeWidgets = runtime["widgets"].to<JsonObject>();
     JsonArray runtimeWallpapers = runtime["widgetWallpapers"].to<JsonArray>();
+    JsonArray runtimeCustomWidgets = runtime["customWidgets"].to<JsonArray>();
     for (JsonObjectConst row : data["widgets"].as<JsonArrayConst>()) {
       const char *kind = row["kind"] | "";
       if (strcmp(kind, "wallpaper") == 0) {
         JsonObject target = runtimeWallpapers.add<JsonObject>();
+        target.set(row);
+        target.remove("kind");
+      } else if (strcmp(kind, "custom") == 0) {
+        JsonObject target = runtimeCustomWidgets.add<JsonObject>();
         target.set(row);
         target.remove("kind");
       } else if (strcmp(kind, "weather") == 0 ||
@@ -21524,6 +21688,7 @@ bool restoreCategoryBackup(JsonDocument &backup, String &error) {
   } else if (category == "widgets") {
     JsonObject settings = runtime["widgets"].to<JsonObject>();
     JsonArray wallpapers = runtime["widgetWallpapers"].to<JsonArray>();
+    bool restoredCustomWidgets = false;
     for (JsonObjectConst item : items) {
       const char *kind = item["kind"] | "";
       if (strcmp(kind, "wallpaper") == 0) {
@@ -21536,6 +21701,16 @@ bool restoreCategoryBackup(JsonDocument &backup, String &error) {
           }
         }
         if (destination.isNull()) destination = wallpapers.add<JsonObject>();
+        destination.set(item);
+        destination.remove("kind");
+        merged++;
+      } else if (strcmp(kind, "custom") == 0) {
+        // Replaced as a set, the same as the wallpapers above.
+        if (!restoredCustomWidgets) {
+          runtime["customWidgets"].to<JsonArray>();
+          restoredCustomWidgets = true;
+        }
+        JsonObject destination = runtime["customWidgets"].as<JsonArray>().add<JsonObject>();
         destination.set(item);
         destination.remove("kind");
         merged++;
@@ -21746,6 +21921,11 @@ bool createLcdFullBackup(String &createdName, String &error) {
     JsonObject row = widgetRows.add<JsonObject>();
     row.set(wallpaper);
     row["kind"] = "wallpaper";
+  }
+  for (JsonObjectConst customWidget : runtime["customWidgets"].as<JsonArrayConst>()) {
+    JsonObject row = widgetRows.add<JsonObject>();
+    row.set(customWidget);
+    row["kind"] = "custom";
   }
   JsonArray learned = data["learned"].to<JsonArray>();
   for (JsonObjectConst device : runtime["devices"].as<JsonArrayConst>()) {
@@ -23427,6 +23607,13 @@ void serviceUsbWebConfigRequest() {
       configurePageStripDirections();
       if (!deviceModal) showDevicePicker();
     }
+  }
+  if (usbWidgetOpenRequest >= 0) {
+    uint8_t index = (uint8_t)usbWidgetOpenRequest;
+    usbWidgetOpenRequest = -1;
+    if (displaySleeping) wakeDisplay();
+    lastWakeMs = millis();
+    openLiveWidgetForUsb(index);
   }
   if (usbChargeDemoRequest) {
     usbChargeDemoRequest = false;
@@ -35263,8 +35450,9 @@ void renderActivitiesPage() {
     uint8_t row = activitiesWidgets[w].row;
     if (row + 1 >= (uint8_t)(sizeof(rowTaken) / sizeof(rowTaken[0]))) continue;
     rowTaken[row] = true;
-    rowTaken[row + 1] = true;
-    makeWidgetTile((uint8_t)(row * 3), activitiesWidgets[w].kind, activitiesOrigin);
+    if (!activitiesWidgets[w].slim) rowTaken[row + 1] = true;
+    makeWidgetTile((uint8_t)(row * 3), activitiesWidgets[w].kind,
+                   activitiesWidgets[w].custom, activitiesWidgets[w].slim, activitiesOrigin);
   }
 
   uint8_t activityRow = 0;
@@ -35718,12 +35906,22 @@ struct WidgetInstance {
   uint8_t kind;
   bool expanded;
   bool mediaVisualLayout;
+  // A compact cell inside a custom or slim widget rather than a library face.
+  // Cells lay themselves out once, so a refresh must not reposition them.
+  bool cell;
+  // The tile this instance belongs to and what that tile is, so a media cell
+  // can expand the whole custom widget it sits in.
+  lv_obj_t *tile;
+  uint8_t ownerKind;
+  uint8_t custom;
 };
 
-static const uint8_t MAX_LIVE_WIDGETS = 6;
+// A page of custom widgets holds up to three live elements per widget.
+static const uint8_t MAX_LIVE_WIDGETS = 18;
 WidgetInstance widgetInstances[MAX_LIVE_WIDGETS];
 uint8_t widgetInstanceCount = 0;
-WidgetInstance widgetExpandedInstance = {};
+WidgetInstance widgetExpandedInstances[CUSTOM_WIDGET_MAX_ELEMENTS] = {};
+uint8_t widgetExpandedInstanceCount = 0;
 
 lv_obj_t *widgetExpandedOverlay = nullptr;
 uint8_t widgetExpandedKind = 0;
@@ -35743,7 +35941,8 @@ struct WidgetWallpaperCacheEntry {
 // without rebuilding the page. Keep all three compact and all three expanded
 // assets available so the second and third full-screen views do not fall back
 // to the page theme after the first expanded image consumes the last slot.
-static const uint8_t WIDGET_WALLPAPER_CACHE_COUNT = 6;
+// Custom widgets bring wallpapers of their own, so leave room beyond those.
+static const uint8_t WIDGET_WALLPAPER_CACHE_COUNT = 12;
 WidgetWallpaperCacheEntry widgetWallpaperCache[WIDGET_WALLPAPER_CACHE_COUNT] = {};
 
 void clearWidgetWallpaperCache() {
@@ -36477,31 +36676,402 @@ void buildWidgetBatteryFace(WidgetInstance &instance, lv_obj_t *parent,
                   widgetMutedColour(), width - pad * 2, LV_TEXT_ALIGN_CENTER);
 }
 
+/* ------------------------------------------------------ custom widgets *
+   A custom widget is up to three elements sharing one tile. One element on
+   a large tile draws exactly the face its library widget draws. Otherwise
+   the tile is split into equal cells - columns across a tile, rows down the
+   expanded view - and each element draws a compact version of itself sized
+   to its cell. Every cell is a WidgetInstance of its element's kind, so
+   refreshWidgetInstance() keeps it live exactly as it does a library widget.
+   A slim tile is one grid row, and never has room for media artwork.
+ * ---------------------------------------------------------------------- */
+LV_FONT_DECLARE(lv_font_openremote_12);
+
 void buildWidgetFace(WidgetInstance &instance, lv_obj_t *parent, uint8_t kind,
-                     int width, int height, bool expanded) {
+                     int width, int height, bool expanded);
+
+enum WidgetCellStyle : uint8_t {
+  CELL_COLUMN,       // one of two or three columns on a large tile
+  CELL_SLIM,         // one of two or three columns on a slim tile
+  CELL_SLIM_SINGLE,  // the only element on a slim tile
+  CELL_ROW           // one of the rows of an expanded custom widget
+};
+
+void initWidgetInstance(WidgetInstance &instance, lv_obj_t *parent, uint8_t kind,
+                        int width, int height, bool expanded) {
+  memset(&instance, 0, sizeof(instance));
   instance.card = parent;
+  instance.tile = parent;
   instance.kind = kind;
+  instance.ownerKind = kind;
+  instance.custom = WIDGET_NO_CUSTOM;
   instance.expanded = expanded;
-  instance.primary = nullptr;
-  instance.secondary = nullptr;
-  instance.mediaArtBox = nullptr;
-  instance.mediaArt = nullptr;
-  instance.mediaPlaceholder = nullptr;
-  instance.mediaYoutubeLogo = nullptr;
-  instance.mediaTrack = nullptr;
-  instance.fill = nullptr;
-  instance.left = nullptr;
-  instance.right = nullptr;
-  instance.unit = nullptr;
-  instance.unitOffsetY = 0;
-  instance.glyph = nullptr;
   instance.glyphCode = -32768;
-  instance.glyphSize = 0;
-  instance.fillTrackWidth = 0;
   instance.faceWidth = width;
   instance.faceHeight = height;
+}
+
+/*
+  The time as "10:51" with "PM" kept apart, and the date - "Tue 16 Sep", or
+  spelt out where there is room. Twelve-hour, matching the status bar clock.
+*/
+void formatWidgetClockText(char *timeText, size_t timeSize, char *ampm, size_t ampmSize,
+                           char *dateText, size_t dateSize, bool longDate) {
+  struct tm timeInfo;
+  if (!getLocalTime(&timeInfo, 5)) {
+    snprintf(timeText, timeSize, "--:--");
+    if (ampmSize) ampm[0] = '\0';
+    snprintf(dateText, dateSize, "Clock not set");
+    return;
+  }
+  strftime(timeText, timeSize, "%l:%M", &timeInfo);
+  if (timeText[0] == ' ') memmove(timeText, timeText + 1, strlen(timeText));
+  strftime(ampm, ampmSize, "%p", &timeInfo);
+  strftime(dateText, dateSize, longDate ? "%A %e %B" : "%a %e %b", &timeInfo);
+  // %e pads a single-digit day with a space, leaving "Tue  6 Sep".
+  char *gap = strstr(dateText, "  ");
+  if (gap) memmove(gap, gap + 1, strlen(gap));
+}
+
+// A transparent box that sizes itself to its children and lays them out.
+lv_obj_t *makeWidgetFlex(lv_obj_t *parent, lv_flex_flow_t flow, lv_flex_align_t main,
+                         lv_flex_align_t cross, int gap) {
+  lv_obj_t *box = lv_obj_create(parent);
+  lv_obj_remove_style_all(box);
+  lv_obj_set_size(box, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+  lv_obj_set_flex_flow(box, flow);
+  lv_obj_set_flex_align(box, main, cross, cross);
+  lv_obj_set_style_pad_row(box, gap, 0);
+  lv_obj_set_style_pad_column(box, gap, 0);
+  lv_obj_clear_flag(box, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+  return box;
+}
+
+// "10:51" with a smaller "PM" sitting on the same baseline.
+lv_obj_t *makeWidgetTime(WidgetInstance &instance, lv_obj_t *parent,
+                         const lv_font_t *font, const lv_font_t *ampmFont) {
+  lv_obj_t *row = makeWidgetFlex(parent, LV_FLEX_FLOW_ROW, LV_FLEX_ALIGN_START,
+                                 LV_FLEX_ALIGN_END, 3);
+  instance.primary = makeLabel(row, "--:--", 0, 0, font, textPrimary());
+  instance.unit = makeLabel(row, "", 0, 0, ampmFont, widgetMutedColour());
+  lv_obj_set_style_pad_bottom(instance.unit,
+    max(0, (int)font->base_line - (int)ampmFont->base_line), 0);
+  return row;
+}
+
+/*
+  "24" with its degree sign. The sign is left out of the instance, so the
+  refresh changes the number without trying to re-align what the flex row
+  already places.
+*/
+lv_obj_t *makeWidgetTemperature(WidgetInstance &instance, lv_obj_t *parent,
+                                const lv_font_t *font, const lv_font_t *unitFont) {
+  lv_obj_t *row = makeWidgetFlex(parent, LV_FLEX_FLOW_ROW, LV_FLEX_ALIGN_START,
+                                 LV_FLEX_ALIGN_START, 2);
+  instance.primary = makeLabel(row, "--", 0, 0, font, textPrimary());
+  makeLabel(row, widgetTemperatureUnit(), 0, 0, unitFont, widgetMutedColour());
+  return row;
+}
+
+// A small battery - outline, fill and nub - whose fill the refresh keeps level.
+lv_obj_t *makeWidgetBatteryGlyph(WidgetInstance &instance, lv_obj_t *parent,
+                                 int width, int height) {
+  int nub = max(3, height / 5);
+  lv_obj_t *box = lv_obj_create(parent);
+  lv_obj_remove_style_all(box);
+  lv_obj_set_size(box, width + nub, height);
+  lv_obj_clear_flag(box, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+
+  int border = height >= 24 ? 2 : 1;
+  int inset = border + (height >= 24 ? 2 : 1);
+  lv_obj_t *outline = lv_obj_create(box);
+  lv_obj_remove_style_all(outline);
+  lv_obj_set_pos(outline, 0, 0);
+  lv_obj_set_size(outline, width, height);
+  lv_obj_set_style_radius(outline, max(3, height / 4), 0);
+  lv_obj_set_style_border_color(outline, lv_color_white(), 0);
+  lv_obj_set_style_border_opa(outline, LV_OPA_40, 0);
+  lv_obj_set_style_border_width(outline, border, 0);
+  lv_obj_clear_flag(outline, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_clear_flag(outline, LV_OBJ_FLAG_SCROLLABLE);
+
+  instance.fillTrackWidth = width - inset * 2;
+  instance.fill = lv_obj_create(box);
+  lv_obj_remove_style_all(instance.fill);
+  lv_obj_set_pos(instance.fill, inset, inset);
+  lv_obj_set_size(instance.fill, 0, height - inset * 2);
+  lv_obj_set_style_radius(instance.fill, max(2, height / 6), 0);
+  lv_obj_set_style_bg_color(instance.fill, lvRgb(48, 209, 88), 0);
+  lv_obj_set_style_bg_opa(instance.fill, LV_OPA_COVER, 0);
+  lv_obj_clear_flag(instance.fill, LV_OBJ_FLAG_CLICKABLE);
+
+  lv_obj_t *tip = lv_obj_create(box);
+  lv_obj_remove_style_all(tip);
+  lv_obj_set_pos(tip, width, height / 4);
+  lv_obj_set_size(tip, nub, height / 2);
+  lv_obj_set_style_radius(tip, 2, 0);
+  lv_obj_set_style_bg_color(tip, lv_color_white(), 0);
+  lv_obj_set_style_bg_opa(tip, LV_OPA_40, 0);
+  lv_obj_clear_flag(tip, LV_OBJ_FLAG_CLICKABLE);
+  return box;
+}
+
+// A playback progress bar whose fill the refresh advances.
+void makeWidgetTrack(WidgetInstance &instance, lv_obj_t *parent, int width, int height) {
+  lv_obj_t *track = lv_obj_create(parent);
+  instance.mediaTrack = track;
+  lv_obj_remove_style_all(track);
+  lv_obj_set_size(track, width, height);
+  lv_obj_set_style_radius(track, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_color(track, lv_color_white(), 0);
+  lv_obj_set_style_bg_opa(track, LV_OPA_20, 0);
+  lv_obj_clear_flag(track, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_clear_flag(track, LV_OBJ_FLAG_SCROLLABLE);
+  instance.fill = lv_obj_create(track);
+  lv_obj_remove_style_all(instance.fill);
+  lv_obj_set_pos(instance.fill, 0, 0);
+  lv_obj_set_size(instance.fill, 0, height);
+  lv_obj_set_style_radius(instance.fill, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_color(instance.fill, lv_color_white(), 0);
+  lv_obj_set_style_bg_opa(instance.fill, LV_OPA_COVER, 0);
+  lv_obj_clear_flag(instance.fill, LV_OBJ_FLAG_CLICKABLE);
+  instance.fillTrackWidth = width;
+}
+
+/* The time and date on its own large tile, or filling the expanded view. */
+void buildWidgetClockFace(WidgetInstance &instance, lv_obj_t *parent,
+                          int width, int height, bool expanded) {
+  // The expanded view keeps its bottom line for "Tap to close".
+  lv_obj_t *stack = makeWidgetFlex(parent, LV_FLEX_FLOW_COLUMN, LV_FLEX_ALIGN_CENTER,
+                                   LV_FLEX_ALIGN_CENTER, expanded ? 8 : 0);
+  lv_obj_set_size(stack, width, expanded ? height - 28 : height);
+  makeWidgetTime(instance, stack, &lv_font_montserrat_48,
+                 expanded ? &lv_font_montserrat_20 : &lv_font_montserrat_16);
+  // 16px rather than 18: "Wednesday 16 September" has to fit the full width.
+  instance.secondary = makeWidgetLabel(stack, "", 0, 0,
+    expanded ? &lv_font_montserrat_16 : &lv_font_montserrat_14, widgetMutedColour(),
+    width - 16, LV_TEXT_ALIGN_CENTER);
+}
+
+/*
+  One element drawn compactly into `cell`, a box of width x height. Details
+  are dropped as the cell shrinks: a narrow column keeps the headline value
+  and one line under it, and a slim column keeps only the headline.
+*/
+void buildWidgetCell(WidgetInstance &instance, lv_obj_t *cell, uint8_t element,
+                     int width, int height, WidgetCellStyle style) {
+  initWidgetInstance(instance, cell, element, width, height, style == CELL_ROW);
+  instance.cell = true;
+  bool roomy = height >= 110;       // an expanded widget with only two rows
+  bool wideColumn = width >= 100;   // two columns rather than three
+  bool slim = style == CELL_SLIM || style == CELL_SLIM_SINGLE;
+  const lv_font_t *small = style == CELL_ROW ? &lv_font_montserrat_16
+                         : style == CELL_SLIM ? &lv_font_montserrat_10
+                         : &lv_font_montserrat_12;
+  int sidePad = style == CELL_SLIM_SINGLE ? 12 : (wideColumn ? 6 : 2);
+  lv_obj_set_style_pad_left(cell, sidePad, 0);
+  lv_obj_set_style_pad_right(cell, sidePad, 0);
+  lv_obj_set_style_pad_row(cell, style == CELL_ROW ? 4 : 2, 0);
+  lv_obj_set_style_pad_column(cell, style == CELL_ROW ? 14 : 6, 0);
+  int textWidth = width - sidePad * 2;
+
+  auto setFlow = [cell](lv_flex_flow_t flow, lv_flex_align_t main, lv_flex_align_t cross) {
+    lv_obj_set_flex_flow(cell, flow);
+    lv_obj_set_flex_align(cell, main, cross, cross);
+  };
+
+  if (element == WIDGET_CLOCK) {
+    if (style == CELL_SLIM_SINGLE) {
+      setFlow(LV_FLEX_FLOW_ROW, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER);
+      makeWidgetTime(instance, cell, &lv_font_montserrat_24, &lv_font_montserrat_12);
+      instance.secondary = makeWidgetLabel(cell, "", 0, 0, &lv_font_montserrat_12,
+        widgetMutedColour(), 96, LV_TEXT_ALIGN_RIGHT);
+    } else if (style == CELL_SLIM) {
+      setFlow(LV_FLEX_FLOW_ROW, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+      makeWidgetTime(instance, cell,
+        wideColumn ? &lv_font_montserrat_20 : &lv_font_montserrat_16, &lv_font_montserrat_10);
+    } else {
+      setFlow(LV_FLEX_FLOW_COLUMN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+      makeWidgetTime(instance, cell,
+        style == CELL_ROW ? (roomy ? &lv_font_montserrat_48 : &lv_font_montserrat_24)
+                          : (wideColumn ? &lv_font_montserrat_24 : &lv_font_montserrat_18),
+        style == CELL_ROW ? &lv_font_montserrat_16 : &lv_font_montserrat_10);
+      instance.secondary = makeWidgetLabel(cell, "", 0, 0, small, widgetMutedColour(),
+        textWidth, LV_TEXT_ALIGN_CENTER);
+    }
+    return;
+  }
+
+  if (element == WIDGET_WEATHER) {
+    int glyphSize = style == CELL_ROW ? (roomy ? 64 : 44)
+                  : style == CELL_COLUMN ? (wideColumn ? 34 : 28)
+                  : style == CELL_SLIM_SINGLE ? 30 : 20;
+    instance.glyphSize = glyphSize;
+    instance.glyphCode = weatherReading.valid ? weatherReading.code : -1;
+    const lv_font_t *tempFont = style == CELL_ROW
+      ? (roomy ? &lv_font_montserrat_48 : &lv_font_montserrat_24)
+      : (style == CELL_SLIM ? &lv_font_montserrat_16 : &lv_font_montserrat_20);
+    const lv_font_t *unitFont = style == CELL_ROW ? &lv_font_openremote_20
+      : (style == CELL_SLIM ? &lv_font_openremote_12 : &lv_font_openremote_16);
+    // What the library face says until the first forecast; a reading replaces it.
+    const char *waiting = weatherReading.valid && weatherReading.condition[0]
+      ? weatherReading.condition
+      : (widgetSettings.weatherValidLocation ? "Waiting for Wi-Fi" : "No location set");
+    if (style == CELL_COLUMN) {
+      setFlow(LV_FLEX_FLOW_COLUMN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+      instance.glyph = makeWeatherGlyph(cell, 0, 0, glyphSize, instance.glyphCode);
+      makeWidgetTemperature(instance, cell, tempFont, unitFont);
+      instance.secondary = makeWidgetLabel(cell, waiting, 0, 0, &lv_font_montserrat_10,
+        widgetMutedColour(), textWidth, LV_TEXT_ALIGN_CENTER);
+    } else if (style == CELL_SLIM) {
+      setFlow(LV_FLEX_FLOW_ROW, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+      instance.glyph = makeWeatherGlyph(cell, 0, 0, glyphSize, instance.glyphCode);
+      makeWidgetTemperature(instance, cell, tempFont, unitFont);
+    } else {
+      // The icon beside the temperature, with the conditions under it.
+      setFlow(LV_FLEX_FLOW_ROW,
+              style == CELL_ROW ? LV_FLEX_ALIGN_CENTER : LV_FLEX_ALIGN_START,
+              LV_FLEX_ALIGN_CENTER);
+      instance.glyph = makeWeatherGlyph(cell, 0, 0, glyphSize, instance.glyphCode);
+      lv_obj_t *text = makeWidgetFlex(cell, LV_FLEX_FLOW_COLUMN, LV_FLEX_ALIGN_CENTER,
+                                      LV_FLEX_ALIGN_START, 0);
+      makeWidgetTemperature(instance, text, tempFont, unitFont);
+      instance.secondary = makeWidgetLabel(text, waiting, 0, 0, small, widgetMutedColour(),
+        max(60, textWidth - glyphSize - 34), LV_TEXT_ALIGN_LEFT);
+    }
+    return;
+  }
+
+  if (element == WIDGET_BATTERY) {
+    // "100%" beside the glyph only just fits a slim third, so it drops a size there.
+    const lv_font_t *percentFont = style == CELL_ROW
+      ? (roomy ? &lv_font_montserrat_48 : &lv_font_montserrat_24)
+      : (style == CELL_SLIM ? (wideColumn ? &lv_font_montserrat_16 : &lv_font_montserrat_14)
+                            : &lv_font_montserrat_20);
+    if (style == CELL_COLUMN) {
+      setFlow(LV_FLEX_FLOW_COLUMN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+      makeWidgetBatteryGlyph(instance, cell, wideColumn ? 46 : 40, wideColumn ? 22 : 19);
+      instance.primary = makeLabel(cell, "--%", 0, 0, percentFont, textPrimary());
+      instance.secondary = makeWidgetLabel(cell, "", 0, 0, &lv_font_montserrat_10,
+        widgetMutedColour(), textWidth, LV_TEXT_ALIGN_CENTER);
+    } else if (style == CELL_SLIM) {
+      setFlow(LV_FLEX_FLOW_ROW, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+      makeWidgetBatteryGlyph(instance, cell, 24, 12);
+      instance.primary = makeLabel(cell, "--%", 0, 0, percentFont, textPrimary());
+    } else {
+      bool big = style == CELL_ROW;
+      setFlow(LV_FLEX_FLOW_ROW, big ? LV_FLEX_ALIGN_CENTER : LV_FLEX_ALIGN_START,
+              LV_FLEX_ALIGN_CENTER);
+      makeWidgetBatteryGlyph(instance, cell, big ? (roomy ? 84 : 60) : 40,
+                             big ? (roomy ? 38 : 28) : 19);
+      lv_obj_t *text = makeWidgetFlex(cell, LV_FLEX_FLOW_COLUMN, LV_FLEX_ALIGN_CENTER,
+                                      LV_FLEX_ALIGN_START, 0);
+      instance.primary = makeLabel(text, "--%", 0, 0, percentFont, textPrimary());
+      instance.secondary = makeWidgetLabel(text, "", 0, 0, small, widgetMutedColour(),
+        big ? 110 : 120, LV_TEXT_ALIGN_LEFT);
+    }
+    return;
+  }
+
+  // Media: the title and a progress bar. Never artwork - there is no room.
+  setFlow(LV_FLEX_FLOW_COLUMN, LV_FLEX_ALIGN_CENTER,
+          style == CELL_SLIM_SINGLE ? LV_FLEX_ALIGN_START : LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_row(cell, slim ? 4 : (style == CELL_ROW ? 6 : 4), 0);
+  const lv_font_t *titleFont = style == CELL_ROW ? &lv_font_montserrat_20
+                             : style == CELL_SLIM ? &lv_font_montserrat_12
+                             : style == CELL_SLIM_SINGLE ? &lv_font_montserrat_16
+                             : &lv_font_montserrat_14;
+  lv_text_align_t align = style == CELL_SLIM_SINGLE ? LV_TEXT_ALIGN_LEFT : LV_TEXT_ALIGN_CENTER;
+  instance.primary = makeWidgetLabel(cell, "Nothing playing", 0, 0, titleFont,
+                                     textPrimary(), textWidth, align);
+  lv_label_set_long_mode(instance.primary, LV_LABEL_LONG_SCROLL_CIRCULAR);
+  lv_obj_set_style_anim_speed(instance.primary, 22, 0);
+  if (!slim) {
+    instance.secondary = makeWidgetLabel(cell, "", 0, 0, small, widgetMutedColour(),
+                                         textWidth, align);
+  }
+  makeWidgetTrack(instance, cell, style == CELL_SLIM_SINGLE ? textWidth : textWidth - 8,
+                  style == CELL_ROW ? 6 : (style == CELL_SLIM ? 3 : 4));
+}
+
+// Which elements a widget draws: its own kind, or a custom widget's list.
+uint8_t widgetElementsFor(uint8_t kind, uint8_t custom, uint8_t *elements) {
+  if (kind == WIDGET_CUSTOM) {
+    if (custom >= customWidgetCount) return 0;
+    const CustomWidget &widget = customWidgets[custom];
+    for (uint8_t i = 0; i < widget.elementCount; i++) elements[i] = widget.elements[i];
+    return widget.elementCount;
+  }
+  elements[0] = kind;
+  return 1;
+}
+
+lv_obj_t *makeWidgetCellBox(lv_obj_t *parent, int x, int y, int width, int height) {
+  lv_obj_t *cell = lv_obj_create(parent);
+  lv_obj_remove_style_all(cell);
+  lv_obj_set_pos(cell, x, y);
+  lv_obj_set_size(cell, width, height);
+  lv_obj_clear_flag(cell, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_clear_flag(cell, LV_OBJ_FLAG_SCROLLABLE);
+  return cell;
+}
+
+void makeWidgetDivider(lv_obj_t *parent, int x, int y, int width, int height) {
+  lv_obj_t *line = glyphBar(parent, x, y, width, height, 0, lv_color_white());
+  lv_obj_set_style_bg_opa(line, LV_OPA_20, 0);
+}
+
+/*
+  Builds a widget's contents into `card` and records every live instance in
+  `instances`, returning how many it used. The card is already styled.
+*/
+uint8_t buildWidgetContents(lv_obj_t *card, uint8_t kind, uint8_t custom, int width,
+                            int height, bool expanded, bool slim,
+                            WidgetInstance *instances, uint8_t capacity) {
+  uint8_t elements[CUSTOM_WIDGET_MAX_ELEMENTS];
+  uint8_t count = widgetElementsFor(kind, custom, elements);
+  if (count > capacity) count = capacity;
+  if (!count) return 0;
+
+  if (count == 1 && (!slim || expanded)) {
+    buildWidgetFace(instances[0], card, elements[0], width, height, expanded);
+  } else if (expanded) {
+    // Rows down the screen, above the "Tap to close" line.
+    const int top = 6;
+    int rowHeight = (height - top - 28) / count;
+    for (uint8_t i = 0; i < count; i++) {
+      int y = top + rowHeight * i;
+      if (i) makeWidgetDivider(card, 18, y, width - 36, 1);
+      lv_obj_t *cell = makeWidgetCellBox(card, 0, y, width, rowHeight);
+      buildWidgetCell(instances[i], cell, elements[i], width, rowHeight, CELL_ROW);
+    }
+  } else {
+    int cellWidth = width / count;
+    WidgetCellStyle style = slim ? (count == 1 ? CELL_SLIM_SINGLE : CELL_SLIM) : CELL_COLUMN;
+    for (uint8_t i = 0; i < count; i++) {
+      int x = cellWidth * i;
+      int cellW = i == count - 1 ? width - x : cellWidth;
+      if (i) makeWidgetDivider(card, x, slim ? 9 : 14, 1, height - (slim ? 18 : 28));
+      lv_obj_t *cell = makeWidgetCellBox(card, x, 0, cellW, height);
+      buildWidgetCell(instances[i], cell, elements[i], cellW, height, style);
+    }
+  }
+  for (uint8_t i = 0; i < count; i++) {
+    instances[i].tile = card;
+    instances[i].ownerKind = kind;
+    instances[i].custom = custom;
+  }
+  return count;
+}
+
+void buildWidgetFace(WidgetInstance &instance, lv_obj_t *parent, uint8_t kind,
+                     int width, int height, bool expanded) {
+  initWidgetInstance(instance, parent, kind, width, height, expanded);
   if (kind == WIDGET_WEATHER) buildWidgetWeatherFace(instance, parent, width, height, expanded);
   else if (kind == WIDGET_BATTERY) buildWidgetBatteryFace(instance, parent, width, height, expanded);
+  else if (kind == WIDGET_CLOCK) buildWidgetClockFace(instance, parent, width, height, expanded);
   else buildWidgetMediaFace(instance, parent, width, height, expanded);
 }
 
@@ -36514,6 +37084,19 @@ void buildWidgetFace(WidgetInstance &instance, lv_obj_t *parent, uint8_t kind,
 void refreshWidgetInstance(WidgetInstance &instance) {
   if (!instance.card || !lv_obj_is_valid(instance.card)) return;
 
+  if (instance.kind == WIDGET_CLOCK) {
+    char timeText[8];
+    char ampm[4];
+    char dateText[32];
+    formatWidgetClockText(timeText, sizeof(timeText), ampm, sizeof(ampm),
+                          dateText, sizeof(dateText),
+                          instance.faceWidth >= 180 && instance.faceHeight >= 70);
+    setWidgetLabelText(instance.primary, timeText);
+    setWidgetLabelText(instance.unit, ampm);
+    setWidgetLabelText(instance.secondary, dateText);
+    return;
+  }
+
   if (instance.kind == WIDGET_BATTERY) {
     float percent = readBatteryPercent();
     if (percent < 0.0f) return;
@@ -36525,7 +37108,7 @@ void refreshWidgetInstance(WidgetInstance &instance) {
         low ? lvRgb(255, 69, 58) : lvRgb(48, 209, 88), 0);
     }
     if (instance.primary && lv_obj_is_valid(instance.primary) &&
-        widgetSettings.batteryShowPercent) {
+        (widgetSettings.batteryShowPercent || instance.cell)) {
       char headline[16];
       snprintf(headline, sizeof(headline), "%d%%", level);
       lv_label_set_text(instance.primary, headline);
@@ -36581,7 +37164,7 @@ void refreshWidgetInstance(WidgetInstance &instance) {
       else lv_obj_add_flag(instance.mediaYoutubeLogo, LV_OBJ_FLAG_HIDDEN);
     }
     bool showVisual = showArt || showYoutube;
-    if (instance.mediaVisualLayout != showVisual) {
+    if (!instance.cell && instance.mediaVisualLayout != showVisual) {
       applyWidgetMediaLayout(instance, showVisual);
     }
     uint32_t position = widgetMediaPosition();
@@ -36633,6 +37216,13 @@ void refreshWidgetInstance(WidgetInstance &instance) {
   }
 }
 
+void refreshExpandedWidgetInstances() {
+  if (!widgetExpandedOverlay || widgetExpandedClosing) return;
+  for (uint8_t i = 0; i < widgetExpandedInstanceCount; i++) {
+    refreshWidgetInstance(widgetExpandedInstances[i]);
+  }
+}
+
 /* ------------------------------------------------------- expand/collapse */
 void widgetExpandAnimExec(void *target, int32_t value) {
   lv_obj_t *overlay = static_cast<lv_obj_t *>(target);
@@ -36660,7 +37250,8 @@ void widgetCollapseReady(lv_anim_t *animation) {
   }
   widgetExpandedOverlay = nullptr;
   widgetExpandedClosing = false;
-  memset(&widgetExpandedInstance, 0, sizeof(widgetExpandedInstance));
+  memset(widgetExpandedInstances, 0, sizeof(widgetExpandedInstances));
+  widgetExpandedInstanceCount = 0;
 }
 
 void closeWidgetFullScreen() {
@@ -36668,7 +37259,8 @@ void closeWidgetFullScreen() {
   widgetExpandedClosing = true;
   // Nothing inside is worth touching once it starts shrinking, and the
   // pointers go stale the moment the ready callback deletes the overlay.
-  memset(&widgetExpandedInstance, 0, sizeof(widgetExpandedInstance));
+  memset(widgetExpandedInstances, 0, sizeof(widgetExpandedInstances));
+  widgetExpandedInstanceCount = 0;
 
   lv_anim_t animation;
   lv_anim_init(&animation);
@@ -36687,7 +37279,8 @@ void dismissWidgetFullScreen() {
   if (lv_obj_is_valid(widgetExpandedOverlay)) lv_obj_del(widgetExpandedOverlay);
   widgetExpandedOverlay = nullptr;
   widgetExpandedClosing = false;
-  memset(&widgetExpandedInstance, 0, sizeof(widgetExpandedInstance));
+  memset(widgetExpandedInstances, 0, sizeof(widgetExpandedInstances));
+  widgetExpandedInstanceCount = 0;
 }
 
 void widgetOverlayEvent(lv_event_t *event) {
@@ -36695,9 +37288,26 @@ void widgetOverlayEvent(lv_event_t *event) {
   closeWidgetFullScreen();
 }
 
-void styleWidgetContainer(lv_obj_t *card, uint8_t kind, bool expanded) {
+/*
+  cardHeight is the tile's own height. A slim tile is shorter than its
+  wallpaper and shows the wallpaper's middle band; the expanded view and a
+  large tile show all of it.
+*/
+void styleWidgetContainer(lv_obj_t *card, uint8_t kind, uint8_t custom, bool expanded,
+                          int cardHeight) {
   if (!card) return;
-  const char *wallpaperPath = widgetWallpaperPath(kind, expanded);
+  const char *wallpaperPath = nullptr;
+  WidgetContentPanelStyle panelStyle = {false, 0x303844, 128};
+  if (kind == WIDGET_CUSTOM) {
+    if (custom < customWidgetCount) {
+      wallpaperPath = expanded ? customWidgets[custom].expandedWallpaper
+                               : customWidgets[custom].wallpaper;
+      panelStyle = customWidgets[custom].panel;
+    }
+  } else if (kind < WIDGET_KIND_COUNT) {
+    wallpaperPath = widgetWallpaperPath(kind, expanded);
+    panelStyle = widgetContentPanels[kind];
+  }
   uint16_t wallpaperWidth = expanded ? 228 : WIDGET_TILE_WIDTH;
   uint16_t wallpaperHeight = expanded ? 268 : WIDGET_TILE_HEIGHT;
   const void *wallpaperSource = widgetWallpaperSource(
@@ -36723,21 +37333,21 @@ void styleWidgetContainer(lv_obj_t *card, uint8_t kind, bool expanded) {
   if (wallpaperSource) {
     lv_obj_t *background = lv_img_create(card);
     lv_img_set_src(background, wallpaperSource);
-    lv_obj_set_pos(background, 0, 0);
+    lv_obj_set_pos(background, 0, (cardHeight - (int)wallpaperHeight) / 2);
     lv_obj_set_size(background, wallpaperWidth, wallpaperHeight);
     lv_obj_clear_flag(background, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_clear_flag(background, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_move_background(background);
   }
-  WidgetContentPanelStyle &panelStyle = widgetContentPanels[kind];
   if (wallpaperPath && wallpaperPath[0] && panelStyle.enabled) {
-    int inset = expanded ? 8 : 5;
+    bool slim = !expanded && cardHeight < WIDGET_TILE_HEIGHT;
+    int inset = expanded ? 8 : (slim ? 4 : 5);
     lv_obj_t *panel = lv_obj_create(card);
     lv_obj_remove_style_all(panel);
     lv_obj_set_pos(panel, inset, inset);
     lv_obj_set_size(panel, wallpaperWidth - inset * 2,
-                    wallpaperHeight - inset * 2);
-    lv_obj_set_style_radius(panel, expanded ? 18 : 11, 0);
+                    cardHeight - inset * 2);
+    lv_obj_set_style_radius(panel, expanded ? 18 : (slim ? 9 : 11), 0);
     lv_obj_set_style_bg_color(panel, lv_color_hex(panelStyle.colour), 0);
     lv_obj_set_style_bg_opa(panel, (lv_opa_t)panelStyle.opacity, 0);
     lv_obj_set_style_border_opa(panel, LV_OPA_TRANSP, 0);
@@ -36753,7 +37363,7 @@ void styleWidgetContainer(lv_obj_t *card, uint8_t kind, bool expanded) {
   container's geometry is animated - LVGL clips children to their parent, so
   the page is revealed as the box grows without a single relayout per frame.
 */
-void openWidgetFullScreen(lv_obj_t *sourceTile, uint8_t kind) {
+void openWidgetFullScreen(lv_obj_t *sourceTile, uint8_t kind, uint8_t custom) {
   if (widgetExpandedOverlay) {
     closeWidgetFullScreen();
     return;
@@ -36779,14 +37389,18 @@ void openWidgetFullScreen(lv_obj_t *sourceTile, uint8_t kind) {
   lv_obj_set_pos(widgetExpandedOverlay, source.x1, source.y1);
   lv_obj_set_size(widgetExpandedOverlay, lv_area_get_width(&source),
                   lv_area_get_height(&source));
-  styleWidgetContainer(widgetExpandedOverlay, kind, true);
+  styleWidgetContainer(widgetExpandedOverlay, kind, custom, true, finalHeight);
   lv_obj_clear_flag(widgetExpandedOverlay, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_flag(widgetExpandedOverlay, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_add_event_cb(widgetExpandedOverlay, widgetOverlayEvent, LV_EVENT_CLICKED, nullptr);
 
   widgetExpandedKind = kind;
-  buildWidgetFace(widgetExpandedInstance, widgetExpandedOverlay, kind,
-                  finalWidth, finalHeight, true);
+  widgetExpandedInstanceCount = buildWidgetContents(widgetExpandedOverlay, kind, custom,
+    finalWidth, finalHeight, true, false, widgetExpandedInstances,
+    CUSTOM_WIDGET_MAX_ELEMENTS);
+  for (uint8_t i = 0; i < widgetExpandedInstanceCount; i++) {
+    refreshWidgetInstance(widgetExpandedInstances[i]);
+  }
 
   makeWidgetLabel(widgetExpandedOverlay, "Tap to close", 0, finalHeight - 24,
                   &lv_font_montserrat_10, widgetMutedColour(), finalWidth,
@@ -36805,9 +37419,28 @@ void openWidgetFullScreen(lv_obj_t *sourceTile, uint8_t kind) {
 void widgetTileEvent(lv_event_t *event) {
   if (lv_event_get_code(event) != LV_EVENT_CLICKED) return;
   lv_obj_t *tile = lv_event_get_target(event);
-  uint8_t kind = (uint8_t)(uintptr_t)lv_event_get_user_data(event);
+  // The kind in the low byte, the custom widget index above it.
+  uintptr_t data = (uintptr_t)lv_event_get_user_data(event);
   lastWakeMs = millis();
-  openWidgetFullScreen(tile, kind);
+  openWidgetFullScreen(tile, (uint8_t)(data & 0xFF), (uint8_t)((data >> 8) & 0xFF));
+}
+
+// The index counts widget tiles, not live instances - a custom widget is one
+// tile holding up to three.
+bool openLiveWidgetForUsb(uint8_t index) {
+  lv_obj_t *lastTile = nullptr;
+  int16_t tileIndex = -1;
+  for (uint8_t i = 0; i < widgetInstanceCount; i++) {
+    WidgetInstance &instance = widgetInstances[i];
+    if (!instance.tile || instance.tile == lastTile) continue;
+    lastTile = instance.tile;
+    if (++tileIndex != index) continue;
+    if (!lv_obj_is_valid(instance.tile)) return false;
+    if (widgetExpandedOverlay) dismissWidgetFullScreen();
+    openWidgetFullScreen(instance.tile, instance.ownerKind, instance.custom);
+    return true;
+  }
+  return false;
 }
 
 /*
@@ -36820,27 +37453,34 @@ void widgetTileEvent(lv_event_t *event) {
   themeGridStartY() - the two differ, and a widget placed at the wrong origin
   lands on top of the first activity.
 */
-void makeWidgetTile(uint8_t slot, uint8_t kind, int originY) {
-  if (widgetInstanceCount >= MAX_LIVE_WIDGETS) return;
+void makeWidgetTile(uint8_t slot, uint8_t kind, uint8_t custom, bool slim, int originY) {
+  uint8_t elements[CUSTOM_WIDGET_MAX_ELEMENTS];
+  uint8_t needed = widgetElementsFor(kind, custom, elements);
+  if (!needed || widgetInstanceCount + needed > MAX_LIVE_WIDGETS) return;
   uint8_t row = slot / 3;
   notePopulatedRemoteRow(row);
-  notePopulatedRemoteRow(row + 1);
+  if (!slim) notePopulatedRemoteRow(row + 1);
+  int height = slim ? WIDGET_SLIM_HEIGHT : WIDGET_TILE_HEIGHT;
 
   lv_obj_t *card = lv_obj_create(content);
   lv_obj_remove_style_all(card);
   lv_obj_set_pos(card, 8, (originY >= 0 ? originY : themeGridStartY()) + row * 52);
-  lv_obj_set_size(card, WIDGET_TILE_WIDTH, WIDGET_TILE_HEIGHT);
+  lv_obj_set_size(card, WIDGET_TILE_WIDTH, height);
   registerSplitDiagnosticAnchor(card);
-  styleWidgetContainer(card, kind, false);
+  styleWidgetContainer(card, kind, custom, false, height);
   lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_add_flag(card, LV_OBJ_FLAG_GESTURE_BUBBLE);
   lv_obj_add_event_cb(card, widgetTileEvent, LV_EVENT_CLICKED,
-                      (void *)(uintptr_t)kind);
+                      (void *)(((uintptr_t)custom << 8) | kind));
 
-  WidgetInstance &instance = widgetInstances[widgetInstanceCount++];
-  buildWidgetFace(instance, card, kind, WIDGET_TILE_WIDTH, WIDGET_TILE_HEIGHT, false);
-  refreshWidgetInstance(instance);
+  uint8_t built = buildWidgetContents(card, kind, custom, WIDGET_TILE_WIDTH, height,
+    false, slim, &widgetInstances[widgetInstanceCount],
+    (uint8_t)(MAX_LIVE_WIDGETS - widgetInstanceCount));
+  for (uint8_t i = 0; i < built; i++) {
+    refreshWidgetInstance(widgetInstances[widgetInstanceCount + i]);
+  }
+  widgetInstanceCount += built;
 }
 
 /*
@@ -37174,9 +37814,7 @@ void serviceWeatherWidget(uint32_t now) {
                 widgetSettings.weatherIntervalHours);
 
   for (uint8_t i = 0; i < widgetInstanceCount; i++) refreshWidgetInstance(widgetInstances[i]);
-  if (widgetExpandedOverlay && !widgetExpandedClosing) {
-    refreshWidgetInstance(widgetExpandedInstance);
-  }
+  refreshExpandedWidgetInstances();
 }
 
 /*
@@ -37413,7 +38051,11 @@ void serviceMediaArtwork(uint32_t now) {
 
 bool mediaWidgetOnScreen() {
   if (displaySleeping) return false;
-  if (widgetExpandedOverlay && widgetExpandedKind == WIDGET_MEDIA) return true;
+  if (widgetExpandedOverlay) {
+    for (uint8_t i = 0; i < widgetExpandedInstanceCount; i++) {
+      if (widgetExpandedInstances[i].kind == WIDGET_MEDIA) return true;
+    }
+  }
   for (uint8_t i = 0; i < widgetInstanceCount; i++) {
     if (widgetInstances[i].kind == WIDGET_MEDIA) return true;
   }
@@ -37439,7 +38081,10 @@ void autoExpandPlayingMedia() {
     // the title after its wake request returns.
     strlcpy(mediaLastAutoExpandedTitle, nowPlaying.title,
             sizeof(mediaLastAutoExpandedTitle));
-    openWidgetFullScreen(instance.card, WIDGET_MEDIA);
+    // The whole widget the media sits in, which for a custom widget is more
+    // than the media cell itself.
+    openWidgetFullScreen(instance.tile ? instance.tile : instance.card,
+                         instance.ownerKind, instance.custom);
     return;
   }
 }
@@ -37541,17 +38186,13 @@ void serviceWidgets(uint32_t now) {
   if (nowPlayingDirty) {
     nowPlayingDirty = false;
     for (uint8_t i = 0; i < widgetInstanceCount; i++) refreshWidgetInstance(widgetInstances[i]);
-    if (widgetExpandedOverlay && !widgetExpandedClosing) {
-      refreshWidgetInstance(widgetExpandedInstance);
-    }
+    refreshExpandedWidgetInstances();
     autoExpandPlayingMedia();
   }
   if (now - widgetLastServiceMs < 1000UL) return;
   widgetLastServiceMs = now;
   for (uint8_t i = 0; i < widgetInstanceCount; i++) refreshWidgetInstance(widgetInstances[i]);
-  if (widgetExpandedOverlay && !widgetExpandedClosing) {
-    refreshWidgetInstance(widgetExpandedInstance);
-  }
+  refreshExpandedWidgetInstances();
 }
 
 void renderActivityPage() {
@@ -37572,7 +38213,8 @@ void renderActivityPage() {
   const Tile *tiles = currentActivityTiles(count);
   for (uint8_t i = 0; i < count && i < MAX_ACTIVITY_TILES; i++) {
     if (tiles[i].kind == Tile::WIDGET) {
-      makeWidgetTile(tiles[i].slot, tiles[i].widgetKind, -1);
+      makeWidgetTile(tiles[i].slot, tiles[i].widgetKind, tiles[i].widgetCustom,
+                     tiles[i].widgetSlim, -1);
       continue;
     }
     if (tiles[i].kind == Tile::ACTIVITY) {
@@ -37638,7 +38280,9 @@ void renderDevicePage() {
 
   for (uint8_t i = 0; i < devices[activeDevice].widgetCount; i++) {
     makeWidgetTile(devices[activeDevice].widgets[i].slot,
-                   devices[activeDevice].widgets[i].kind, -1);
+                   devices[activeDevice].widgets[i].kind,
+                   devices[activeDevice].widgets[i].custom,
+                   devices[activeDevice].widgets[i].slim, -1);
   }
 
   uint8_t count = devices[activeDevice].commandCount;
