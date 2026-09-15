@@ -1,6 +1,13 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.45 - 2026-09-15
+    - ORUSB SCREENSHOT writes the image. 5.44 wrote an empty file and reported
+      "bytes":0: LVGL 8.3's lv_snapshot_take() fills in the width and height
+      but leaves data_size at zero, and the write loop trusted it. The size is
+      now computed from the header with lv_img_buf_get_img_size(), and a
+      zero-byte snapshot is refused rather than saved.
+
   5.44 - 2026-09-15
     - The brightness panel (tap the status pill) says what it is doing. A
       translucent readout tile in the middle of the screen shows a sun with the
@@ -6890,7 +6897,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.44"
+#define OPENREMOTE_VERSION_STRING "5.45"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -22995,7 +23002,11 @@ bool saveLcdScreenshot(String &error, size_t &bytes, uint16_t &width, uint16_t &
   SD.remove(LCD_SCREENSHOT_PATH);
   File out = SD.open(LCD_SCREENSHOT_PATH, FILE_WRITE);
   bool ok = (bool)out;
-  const size_t total = shot->data_size;
+  // Computed from the header, not shot->data_size: LVGL 8.3's snapshot fills
+  // in width and height but leaves data_size at zero, which wrote an empty file.
+  const size_t total = lv_img_buf_get_img_size(shot->header.w, shot->header.h,
+                                               LV_IMG_CF_TRUE_COLOR);
+  if (!total) ok = false;
   size_t offset = 0;
   while (ok && offset < total) {
     size_t take = min((size_t)4096, total - offset);
