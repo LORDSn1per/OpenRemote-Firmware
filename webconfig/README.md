@@ -34,6 +34,27 @@ and keeps working when your internet does not.
 Build the pages the remote shows and watch them update live on the device as
 you edit. Drag activities, buttons and macros onto a page, and set its theme.
 
+### Widgets
+
+Place the **Weather**, **Battery** and **Media** widgets, or build your own on
+the **Widgets** page: up to three elements — time and date, weather, battery and
+media — under a name of your choosing, on a Widget Wallpaper. Any widget can be
+**large** (three columns, two rows) or **slim** (one row, the height of a
+button).
+
+- A media element can show **only while something is playing**, and can **take
+  over the whole widget** while it plays, with artwork on a large widget. Both
+  changes animate on the remote.
+- The time element can show the **date first** — left of the time on a slim
+  widget, above it on a large one.
+- A media-only widget can **auto hide**: it takes no rows until playback starts,
+  then grows into place and pushes the rest of the page down. The designer shows
+  it at full size.
+
+The editor previews every widget large and slim, and switches between *Nothing
+playing* and *Playing* so you can see the animation before saving. Custom
+widgets are included in backups and restores.
+
 ### Activities & Macros
 An activity turns several devices on, switches the right inputs and hands you a
 matching screen — one slide to start watching something. A macro is a sequence
@@ -88,7 +109,7 @@ itself. The upload is checksummed on arrival **and read back off the SD card
 afterwards**, so a card that drops bytes is caught rather than leaving you with
 a half-written configurator you would need a cable to fix.
 
-[**Download the latest WebConfig →**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-WebConfig-3.33.html)
+[**Download the latest WebConfig →**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-WebConfig-3.37.html)
 
 ---
 
@@ -99,7 +120,8 @@ If a [dock](../dock/README.md) is paired, WebConfig gains its controls:
 - **Transmit IR from** — this remote, the dock, or both at once.
 - **Dock RF433** — enable the 433 MHz transmitter, and **learn** a signal from
   an existing gate, garage or socket remote.
-- **Dock LED** and **Tx Power** — brightness and range behaviour.
+- **Dock LED**, **Dock LED brightness** and **Tx Power** — whether the LED
+  flashes on transmit, how brightly it glows (5–100%), and range behaviour.
 - **Homebridge via dock** — let the dock send your Homebridge commands instead
   of the remote. It is mains powered, so it stays on Wi-Fi permanently and the
   command goes out on a connection that is already open; the remote has to wake
@@ -119,8 +141,8 @@ Every released version is kept here, newest last. They are plain single-file
 HTML with no build step and no external dependencies — open one in a browser
 and it runs.
 
-    webconfig/WebConfig 3.33.html    current
-    webconfig/WebConfig 3.32.html    previous, and so on
+    webconfig/WebConfig 3.37.html    current
+    webconfig/WebConfig 3.36.html    previous, and so on
 
 The whole page — markup, styles, scripts and images — is one file because the
 remote serves it from an SD card over a small embedded web server, where each

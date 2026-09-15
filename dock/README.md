@@ -13,9 +13,9 @@ It is a real ESP-NOW peer, not a stand-in: it speaks the wire format the remote
 firmware implements, so it pairs and takes commands through the remote's
 existing **Settings → Dock** screens and through WebConfig.
 
-Current firmware: **1.82**. Source in [`firmware/`](firmware/).
+Current firmware: **1.84**. Source in [`firmware/`](firmware/).
 
-[**Download the latest dock firmware →**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-Dock-Firmware-1.82.bin)
+[**Download the latest dock firmware →**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-Dock-Firmware-1.84.bin)
 
 You do not need to build it. There are two ways to install it, and either is
 fine: send it to a paired dock **wirelessly from WebConfig**, or flash it
@@ -139,6 +139,23 @@ until a capture silently returns nothing.
 
 ---
 
+## Weather and time for the remote
+
+With a dock paired, the remote does not turn its own Wi-Fi on for the weather or
+the clock. The dock keeps the time from the internet on its always-on connection
+and fetches the weather on the remote's schedule, keeping only the newest
+reading — each fetch replaces the last, so a remote that sleeps for a day wakes
+to the latest one. The weather is stored on the dock, not the remote.
+
+The remote asks only when it needs something: a weather widget coming on screen,
+or its clock sync at boot and 3am. The request carries the remote's location,
+refresh interval and time zone, so the dock always fetches for the right place.
+If the dock cannot be reached, the remote keeps asking; only after a whole day
+without an answer does it fetch once over its own Wi-Fi, then go back to the
+dock.
+
+---
+
 ## Pairing and the LED
 
 Hold the button **5 seconds**. The dock broadcasts itself on channels 1–13 for
@@ -155,6 +172,9 @@ Hold the button **5 seconds**. The dock broadcasts itself on channels 1–13 for
 | Brief flash | Transmitting IR or RF |
 
 Hold the button **10 seconds** to forget the remote and unpair.
+
+The LED's brightness, 5–100%, is set in WebConfig and applies to every state
+above. The dock drives it with PWM and remembers the level across restarts.
 
 The LED mirrors the remote's status pill: both light on a confirmed link and
 both go dark on the same event, because the remote sends an explicit link-down
@@ -181,7 +201,9 @@ seconds after the last use, so an idle remote is not paying to hold a link open.
 | remote → dock | `ORCM` | IR or RF command |
 | remote → dock | `ORPG` | keepalive ping, carries the remote's channel |
 | dock → remote | `ORDI` | dock info: firmware version |
-| remote → dock | `ORDS` | dock settings: RF on/off, LED on transmit |
+| remote → dock | `ORDS` | dock settings: RF on/off, LED on transmit, LED brightness |
+| remote → dock | `ORDQ` | ask for the time and weather; carries location, interval and time zone |
+| dock → remote | `ORDU` | the time and the newest cached weather reading |
 | remote → dock | `ORWC` | Wi-Fi credentials for the dock |
 | remote → dock | `ORHC` | Homebridge address and login |
 | remote → dock | `ORHB` | one Homebridge command |

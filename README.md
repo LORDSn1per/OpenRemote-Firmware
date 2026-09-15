@@ -48,9 +48,9 @@ Studio installs these for you, so you only need them for a manual update.
 
 | | Download |
 |---|---|
-| Remote firmware — ESP32-S3 | [**OpenRemote-Remote-Firmware-5.65.bin**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-Remote-Firmware-5.65.bin) |
-| Dock firmware — ESP32-C3 | [**OpenRemote-Dock-Firmware-1.82.bin**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-Dock-Firmware-1.82.bin) |
-| WebConfig — browser configurator | [**OpenRemote-WebConfig-3.33.html**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-WebConfig-3.33.html) |
+| Remote firmware — ESP32-S3 | [**OpenRemote-Remote-Firmware-5.70.bin**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-Remote-Firmware-5.70.bin) |
+| Dock firmware — ESP32-C3 | [**OpenRemote-Dock-Firmware-1.84.bin**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-Dock-Firmware-1.84.bin) |
+| WebConfig — browser configurator | [**OpenRemote-WebConfig-3.37.html**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-WebConfig-3.37.html) |
 
 **[See all downloads and version numbers →](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest)**
 
@@ -115,6 +115,45 @@ microphone — plus Wi-Fi for Home Assistant, MQTT and Homebridge.
   </tr>
 </table>
 
+#### Widgets
+
+Live tiles that redraw themselves from real data: **Weather**, **Battery** and
+**Media** from the library, or widgets you build yourself. Every widget comes in
+two sizes — **large**, three columns and two rows, or **slim**, a single row the
+height of a button. A slim widget keeps each element's headline value and leaves
+out media artwork. Tap any widget to open it full screen.
+
+**Custom widgets.** Combine up to three elements — **time and date**,
+**weather**, **battery** and **media** — into one widget, give it a name and a
+Widget Wallpaper, and place it large or slim. The time element can put the date
+before or after the time. A media element that shares a widget can:
+
+- **show only while something is playing** — the other elements fill the widget
+  until playback starts, then the media slides in beside them;
+- **take over the whole widget while playing** — the media slides across to show
+  the title, progress and artwork, and hands back when playback stops.
+
+**Auto hiding.** A media-only widget can take up no rows at all while nothing is
+playing. When playback starts it grows into place from its top edge and smoothly
+pushes everything below it down by its one or two rows; when playback stops the
+page closes up again. The screen designer always shows it at full size.
+
+With a dock paired, the weather is fetched and kept by the dock, and the remote
+only asks for it while a weather widget is on screen — so the remote's own Wi-Fi
+stays off.
+
+<table>
+  <tr>
+    <td align="center" width="33%"><img src="docs/images/screen-custom-widgets.png" alt="Custom widgets for time, weather and battery, large and slim" width="100%"><br><sub><b>Custom widgets</b> — time, weather and battery, large and slim</sub></td>
+    <td align="center" width="33%"><img src="docs/images/screen-widget-media-idle.png" alt="A widget with media hidden while nothing plays" width="100%"><br><sub><b>Nothing playing</b> — weather and battery fill the widget</sub></td>
+    <td align="center" width="33%"><img src="docs/images/screen-widget-media-playing.png" alt="Media taking over the widget while playing" width="100%"><br><sub><b>Playing</b> — media slides in and takes the widget over</sub></td>
+  </tr>
+</table>
+
+<img src="docs/images/webconfig-custom-widget-editor.png" alt="The custom widget editor in WebConfig" width="100%">
+
+<sub><b>Built in WebConfig</b> — pick the elements, name and wallpaper, and preview <i>Nothing playing</i> and <i>Playing</i> before you save.</sub>
+
 #### Button shortcuts
 
 Two button combinations work from anywhere, whatever page the remote is showing
@@ -160,6 +199,12 @@ That permanent connection buys something the remote cannot do alone: the dock
 holds a Home Assistant WebSocket and an MQTT subscription open, so a tile
 showing whether a light is on stays right even while the remote sleeps. All of
 it is optional and off until you turn it on.
+
+It also keeps the **time and weather** for the remote. The dock syncs the clock
+and fetches the forecast on its always-on connection, holding only the newest
+reading, and the remote asks for it only when it is needed — a weather widget on
+screen, or its daily clock sync — so the remote's Wi-Fi stays off. The status
+LED's **brightness** is set from WebConfig.
 
 Update it whichever way suits: **wirelessly from WebConfig**, or **over USB
 from Studio**.
@@ -250,9 +295,9 @@ infrared database. **WebConfig** does everything else, wirelessly. The
 
 | Component | Version | Source |
 |---|---|---|
-| Remote firmware — ESP32-S3 | 5.65 | [`remote/`](remote/) |
-| Dock firmware — ESP32-C3 | 1.82 | [`dock/`](dock/) |
-| WebConfig | 3.33 | [`webconfig/`](webconfig/) |
+| Remote firmware — ESP32-S3 | 5.70 | [`remote/`](remote/) |
+| Dock firmware — ESP32-C3 | 1.84 | [`dock/`](dock/) |
+| WebConfig | 3.37 | [`webconfig/`](webconfig/) |
 | OpenRemote Studio | 2.85 | [`studio/`](studio/) |
 
     remote/       ESP32-S3 remote firmware (PlatformIO)
