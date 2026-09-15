@@ -1,6 +1,15 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.43 - 2026-09-15
+    - Removed 5.41's charger diagnostic from Settings > Battery's Voltage row,
+      and 5.40's USB-line check. Measured unplugged, the row read "chg high,
+      usb high": the ESP32's TXD back-powers the CH340C through its RXD, so
+      RXD0 stays high without USB and is not a usable VBUS signal. Charging
+      detection is back to the 5.39 behaviour - a full battery can show as
+      charging for a minute or so after unplugging, until the fuel gauge's
+      rate turns negative - which is accepted as it is.
+
   5.42 - 2026-09-15
     - The charging overlay stays up for seven seconds instead of four. A tap
       still closes it at once.
@@ -6868,7 +6877,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.42"
+#define OPENREMOTE_VERSION_STRING "5.43"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -30356,53 +30365,27 @@ void serviceDebugOverlay(unsigned long now) {
 }
 
 /*
-  Whether USB power is present, read from the serial receive line.
+  Rev 6 has no pin that reports USB power, so a completed charge and an
+  unplugged cable look the same on CRG_STAT and a full battery is held at
+  "charging" by the fuel gauge until its rate turns negative - which can take a
+  minute or so after unplugging, and is accepted as it is.
 
-  CRG_STAT alone cannot say. The TP4056 releases it both when the cable is
-  pulled and when a charge completes, so "charging" was kept on a full battery
-  by a guess from the fuel gauge - and the gauge's rate can sit near zero for
-  minutes after unplugging, leaving the status bar animating a charge on a
-  remote running from its battery.
-
-  On Rev 6 the CH340C runs from its own AP2112K fed only by VUSB_RAW, and its
-  TXD drives the ESP32's RXD0, which idles high whenever the bridge has power.
-  With the cable out the bridge is unpowered and the line falls low. Serial data
-  pulls it low only a bit at a time, so "present" means the line was seen high
-  within the last half second. This only reads the pad; the pin stays UART0's.
+  Do not use RXD0 as a VBUS signal. The USB bridge is powered only from USB, so
+  it looked like one, but measured unplugged the line stays high: the ESP32's
+  TXD back-powers the CH340C through its RXD.
 */
-static const uint8_t USB_BRIDGE_RX_PIN = 44;   // RXD0, driven by the CH340C's TXD
-unsigned long usbBridgeLastHighMs = 0;
-
-bool usbPowerPresent() {
-  unsigned long now = millis();
-  if (gpio_get_level((gpio_num_t)USB_BRIDGE_RX_PIN)) usbBridgeLastHighMs = now;
-  return usbBridgeLastHighMs && (uint32_t)(now - usbBridgeLastHighMs) < 500UL;
-}
-
 bool updateChargingState() {
   unsigned long now = millis();
   bool rawCharging = digitalRead(PIN_CHARGE_STATUS) == LOW;
   bool chargerConnected = rawCharging;
-  // Logged on a CRG_STAT change only - the USB line itself toggles with every
-  // byte Studio sends, and logging that would bury everything else.
-  static int8_t loggedRawCharging = -1;
-  if ((int8_t)rawCharging != loggedRawCharging) {
-    loggedRawCharging = (int8_t)rawCharging;
-    Serial.printf("Charger signals: CRG_STAT=%s usb line=%s\n",
-                  rawCharging ? "low (charging)" : "high",
-                  gpio_get_level((gpio_num_t)USB_BRIDGE_RX_PIN) ? "high" : "low");
-  }
 
   // CRG_STAT becomes high-impedance both when USB is removed and when the
   // TP4056 completes a charge. Retain the connected state at a full, stable
-  // battery - but only while the USB bridge still has power. A dead bridge is
-  // proof the cable is out and releases it at once, instead of waiting minutes
-  // for the MAX17048's rate to turn negative. The fuel-gauge test still has to
-  // pass as well, so nothing is held that was not held before.
+  // battery; after unplugging, the MAX17048 negative rate releases it.
   if (!rawCharging && (chargingState || batteryPowerModeCharging)) {
     float percent = readBatteryPercent();
     float rate = readBatteryRatePerHour();
-    chargerConnected = usbPowerPresent() && percent >= 99.0f &&
+    chargerConnected = percent >= 99.0f &&
       (isnan(rate) || rate >= -0.02f);
   }
 
@@ -30414,10 +30397,7 @@ bool updateChargingState() {
   if (chargingCandidate != chargingState &&
       (uint32_t)(now - chargingCandidateSinceMs) >= CHARGE_STATE_DEBOUNCE_MS) {
     chargingState = chargingCandidate;
-    Serial.printf("Charging state: %s (CRG_STAT=%s usb line=%s)\n",
-                  chargingState ? "charging" : "not charging",
-                  rawCharging ? "low" : "high",
-                  gpio_get_level((gpio_num_t)USB_BRIDGE_RX_PIN) ? "high" : "low");
+    Serial.printf("Charging state: %s\n", chargingState ? "charging" : "not charging");
     if (chargingState) chargingAnimationStartMs = now;
     resetBatteryMeasurementWindow(chargingState);
   }
@@ -30430,9 +30410,7 @@ void initialiseChargingState() {
   float rate = readBatteryRatePerHour();
   bool chargerConnected = rawCharging;
   if (!rawCharging && batteryPowerModeKnown && batteryPowerModeCharging) {
-    // The saved mode survives a reboot, so an unplugged remote booting on a
-    // full battery was restored straight into "charging". See usbPowerPresent().
-    chargerConnected = usbPowerPresent() && percent >= 99.0f &&
+    chargerConnected = percent >= 99.0f &&
       (isnan(rate) || rate >= -0.02f);
   }
   chargingState = chargerConnected;
@@ -33671,16 +33649,10 @@ String batteryEstimateText(const BatteryMetrics &metrics) {
 }
 
 void updateBatteryMetricLabels(BatteryMetrics metrics) {
-  char voltage[48];
+  char voltage[20];
   char level[20];
-  // Raw charger signals beside the voltage, so the unplugged state - which
-  // no serial log can see - can be read straight off the screen.
-  snprintf(voltage, sizeof(voltage),
-           metrics.voltage >= 0.0f ? "%.2f V \xE2\x80\xA2 chg %s \xE2\x80\xA2 usb %s"
-                                   : "Unavailable \xE2\x80\xA2 chg %s \xE2\x80\xA2 usb %s",
-           metrics.voltage >= 0.0f ? metrics.voltage : 0.0f,
-           digitalRead(PIN_CHARGE_STATUS) == LOW ? "low" : "high",
-           gpio_get_level((gpio_num_t)USB_BRIDGE_RX_PIN) ? "high" : "low");
+  snprintf(voltage, sizeof(voltage), metrics.voltage >= 0.0f ? "%.2f V" : "Unavailable",
+           metrics.voltage);
   snprintf(level, sizeof(level), metrics.percent >= 0.0f ? "%.2f%%" : "Unavailable",
            metrics.percent);
   String values[6] = {
@@ -33704,16 +33676,10 @@ void updateBatteryMetricLabels(BatteryMetrics metrics) {
 void makeBatteryMetricRows(int firstY, bool omoteStyle = false) {
   BatteryMetrics metrics = currentBatteryMetrics();
 
-  char voltage[48];
+  char voltage[20];
   char level[20];
-  // Raw charger signals beside the voltage, so the unplugged state - which
-  // no serial log can see - can be read straight off the screen.
-  snprintf(voltage, sizeof(voltage),
-           metrics.voltage >= 0.0f ? "%.2f V \xE2\x80\xA2 chg %s \xE2\x80\xA2 usb %s"
-                                   : "Unavailable \xE2\x80\xA2 chg %s \xE2\x80\xA2 usb %s",
-           metrics.voltage >= 0.0f ? metrics.voltage : 0.0f,
-           digitalRead(PIN_CHARGE_STATUS) == LOW ? "low" : "high",
-           gpio_get_level((gpio_num_t)USB_BRIDGE_RX_PIN) ? "high" : "low");
+  snprintf(voltage, sizeof(voltage), metrics.voltage >= 0.0f ? "%.2f V" : "Unavailable",
+           metrics.voltage);
   snprintf(level, sizeof(level), metrics.percent >= 0.0f ? "%.2f%%" : "Unavailable",
            metrics.percent);
   String values[6] = {
