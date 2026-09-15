@@ -1,6 +1,11 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.51 - 2026-09-15
+    - The brightness panel's readout tile is back to its original 190 of 255
+      (about 75%) opacity, down from 5.47's 230. The white wash behind it
+      now does the work of separating it from busy page artwork.
+
   5.50 - 2026-09-15
     - The brightness panel's fade covers the whole screen again, title bar
       included, and is white at 100 of 255 (about 40%) instead of black, so
@@ -6928,7 +6933,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.50"
+#define OPENREMOTE_VERSION_STRING "5.51"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -37790,8 +37795,9 @@ void toggleBrightnessPanel() {
   lv_obj_remove_style_all(tile);
   lv_obj_set_size(tile, tileW, tileH);
   lv_obj_set_pos(tile, (192 - tileW) / 2, (LCD_H - tileH) / 2);
-  // 230 of 255 (~90%). 190 let busy page art compete with the numbers.
-  stylePanel(tile, lvRgb(18, 22, 30), lv_color_white(), (lv_opa_t)230);
+  // 190 of 255 (~75%). With the white wash behind it, busy page art no longer
+  // competes with the numbers at this opacity, so it does not need to be solid.
+  stylePanel(tile, lvRgb(18, 22, 30), lv_color_white(), (lv_opa_t)190);
   lv_obj_set_style_radius(tile, 20, 0);
   lv_obj_set_style_border_opa(tile, LV_OPA_30, 0);
   lv_obj_set_style_pad_all(tile, 0, 0);
