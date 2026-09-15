@@ -1,6 +1,17 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.70 - 2026-09-16
+    - Auto hiding for media-only widgets (the Media widget, or a custom widget
+      whose only element is media), set per placement with autoHide on the
+      page item. While nothing is playing the widget takes no rows and
+      everything below it moves up by its one or two rows. When media data
+      arrives it grows from its top edge to full height over 420ms while
+      everything below slides back down, and the reverse when playback stops.
+      The page is recorded as built with everything shown, and each move is an
+      offset from that, so nothing drifts; scroll travel is re-measured once a
+      move finishes. Device, activity and Activities pages all support it.
+
   5.69 - 2026-09-16
     - A custom widget's media element can follow playback. With media beside
       other elements, two options come from WebConfig (mediaWhenPlaying and
@@ -7172,7 +7183,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.69"
+#define OPENREMOTE_VERSION_STRING "5.70"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -8291,6 +8302,7 @@ struct DeviceWidget {
   uint8_t slot;
   uint8_t custom;   // index into customWidgets when kind is WIDGET_CUSTOM
   bool slim;        // one grid row instead of two
+  bool autoHide;    // media-only: takes no rows while nothing is playing
 };
 
 struct Device {
@@ -8334,6 +8346,7 @@ struct Tile {
   uint8_t widgetKind;
   uint8_t widgetCustom;
   bool widgetSlim;
+  bool widgetAutoHide;   // media-only widget that takes no rows while idle
   char label[28];
   char targetActivityId[48];
   char targetMacroId[48];
@@ -8609,6 +8622,7 @@ struct ActivitiesWidget {
   uint8_t row;      // top row it occupies; a large widget covers the next too
   uint8_t custom;
   bool slim;
+  bool autoHide;
 };
 static const uint8_t MAX_ACTIVITIES_WIDGETS = 6;
 ActivitiesWidget activitiesWidgets[MAX_ACTIVITIES_WIDGETS];
@@ -10658,7 +10672,9 @@ uint8_t *readSdFileToPsramBuffer(File &file, size_t &outSize);
 bool i2cDevicePresent(uint8_t address);
 bool transmitIrCommand(const DeviceCommand &command);
 // Defined with the rest of the widget drawing, far below renderActivitiesPage.
-void makeWidgetTile(uint8_t slot, uint8_t kind, uint8_t custom, bool slim, int originY);
+void makeWidgetTile(uint8_t slot, uint8_t kind, uint8_t custom, bool slim, int originY,
+                    bool autoHide = false);
+void captureAutoHideLayout();
 bool isVoiceSearchCommand(const DeviceCommand *command);
 bool beginVoiceSearchHold(const DeviceCommand *command, bool fromTouch = false);
 void endVoiceSearchHold(const DeviceCommand *command = nullptr);
@@ -18579,8 +18595,10 @@ void loadRuntimeModel(JsonDocument &doc) {
       tile.widgetKind = WIDGET_MEDIA;
       tile.widgetCustom = WIDGET_NO_CUSTOM;
       tile.widgetSlim = false;
+      tile.widgetAutoHide = false;
       if (tile.kind == Tile::WIDGET) {
         parseWidgetItem(item, tile.widgetKind, tile.widgetCustom, tile.widgetSlim);
+        tile.widgetAutoHide = item["autoHide"] | false;
       }
       tile.slot = constrain((int)(item["slot"] | slotCursor), 0, 254);
       if (tile.kind == Tile::WIDGET || tile.kind == Tile::ACTIVITY) {
@@ -18683,6 +18701,7 @@ void loadRuntimeModel(JsonDocument &doc) {
           placement.kind = widgetKind;
           placement.custom = widgetCustom;
           placement.slim = widgetSlim;
+          placement.autoHide = item["autoHide"] | false;
           placement.row = (uint8_t)(widgetSlot / 3);
           if (widgetShowsElement(widgetKind, widgetCustom, WIDGET_WEATHER)) weatherWidgetPlaced = true;
           continue;
@@ -18755,6 +18774,7 @@ void loadRuntimeModel(JsonDocument &doc) {
         placement.kind = widgetKind;
         placement.custom = widgetCustom;
         placement.slim = widgetSlim;
+        placement.autoHide = item["autoHide"] | false;
         placement.slot = widgetSlot;
         if (widgetShowsElement(widgetKind, widgetCustom, WIDGET_WEATHER)) weatherWidgetPlaced = true;
         continue;
@@ -35618,7 +35638,8 @@ void renderActivitiesPage() {
     rowTaken[row] = true;
     if (!activitiesWidgets[w].slim) rowTaken[row + 1] = true;
     makeWidgetTile((uint8_t)(row * 3), activitiesWidgets[w].kind,
-                   activitiesWidgets[w].custom, activitiesWidgets[w].slim, activitiesOrigin);
+                   activitiesWidgets[w].custom, activitiesWidgets[w].slim, activitiesOrigin,
+                   activitiesWidgets[w].autoHide);
   }
 
   uint8_t activityRow = 0;
@@ -35736,6 +35757,7 @@ void renderActivitiesPage() {
     lv_obj_clear_flag(chevrons, LV_OBJ_FLAG_CLICKABLE);
   }
 
+  captureAutoHideLayout();   // before scrolling is measured, so it sees the collapsed page
   finaliseActivitiesPageScrolling();
 }
 
@@ -36118,6 +36140,59 @@ static const uint8_t MAX_WIDGET_MOTIONS = 6;
 WidgetMotion widgetMotions[MAX_WIDGET_MOTIONS] = {};
 uint8_t widgetMotionCount = 0;
 WidgetMotion widgetExpandedMotion = {};
+
+/*
+  Auto-hiding media widgets on the current page - see captureAutoHideLayout().
+  Positions are those of the finished page with everything shown; every move
+  is an offset from them, so nothing drifts however often media comes and goes.
+*/
+struct AutoHideWidget {
+  lv_obj_t *card;
+  int16_t y;          // where it sits with everything shown
+  int16_t height;
+  int16_t pitch;      // the rows it frees: one row, or two and the gap between
+  int16_t progress;   // 0 collapsed .. 256 shown
+  bool shown;
+};
+struct AutoHideChild {
+  lv_obj_t *obj;
+  int16_t y;
+};
+static const uint8_t MAX_AUTO_HIDE_WIDGETS = 6;
+static const uint8_t MAX_AUTO_HIDE_CHILDREN = 96;
+AutoHideWidget autoHideWidgets[MAX_AUTO_HIDE_WIDGETS] = {};
+uint8_t autoHideWidgetCount = 0;
+AutoHideChild autoHideChildren[MAX_AUTO_HIDE_CHILDREN] = {};
+uint8_t autoHideChildCount = 0;
+lv_obj_t *autoHideContent = nullptr;
+
+void clearAutoHideWidgets() {
+  for (uint8_t i = 0; i < MAX_AUTO_HIDE_WIDGETS; i++) lv_anim_del(&autoHideWidgets[i], nullptr);
+  memset(autoHideWidgets, 0, sizeof(autoHideWidgets));
+  memset(autoHideChildren, 0, sizeof(autoHideChildren));
+  autoHideWidgetCount = 0;
+  autoHideChildCount = 0;
+  autoHideContent = nullptr;
+}
+
+// Only a widget that is nothing but media can hide itself.
+bool widgetIsMediaOnly(uint8_t kind, uint8_t custom) {
+  if (kind == WIDGET_MEDIA) return true;
+  return kind == WIDGET_CUSTOM && custom < customWidgetCount &&
+         customWidgets[custom].elementCount == 1 &&
+         customWidgets[custom].elements[0] == WIDGET_MEDIA;
+}
+
+void registerAutoHideWidget(lv_obj_t *card, int height, int pitch) {
+  if (!card || autoHideWidgetCount >= MAX_AUTO_HIDE_WIDGETS) return;
+  AutoHideWidget &widget = autoHideWidgets[autoHideWidgetCount++];
+  widget.card = card;
+  widget.y = (int16_t)lv_obj_get_y(card);
+  widget.height = (int16_t)height;
+  widget.pitch = (int16_t)pitch;
+  widget.progress = 256;
+  widget.shown = true;
+}
 
 void clearWidgetMotion(WidgetMotion &motion) {
   lv_anim_del(&motion, nullptr);
@@ -37388,6 +37463,106 @@ void updateWidgetMotions() {
   if (widgetExpandedOverlay && !widgetExpandedClosing) updateWidgetMotion(&widgetExpandedMotion);
 }
 
+/* --------------------------------------------------- auto-hiding media *
+   A media-only widget placed with Auto hiding takes no rows while nothing is
+   playing: everything below it moves up by its one or two rows. When media
+   data arrives the widget grows from its top edge to full height while
+   everything below slides back down, and the reverse when playback stops.
+   The card clips its own contents, so growing reveals it top first.
+ * ---------------------------------------------------------------------- */
+static const uint16_t AUTO_HIDE_MOTION_MS = 420;
+
+void applyAutoHideLayout() {
+  if (!autoHideContent || !lv_obj_is_valid(autoHideContent)) return;
+  for (uint8_t i = 0; i < autoHideChildCount; i++) {
+    AutoHideChild &child = autoHideChildren[i];
+    if (!child.obj || !lv_obj_is_valid(child.obj)) continue;
+    int offset = 0;
+    AutoHideWidget *own = nullptr;
+    for (uint8_t w = 0; w < autoHideWidgetCount; w++) {
+      AutoHideWidget &widget = autoHideWidgets[w];
+      if (widget.card == child.obj) {
+        own = &widget;
+        continue;
+      }
+      // Widgets span the full width, so anything below one's top is below it.
+      if (child.y > widget.y) offset += ((256 - widget.progress) * widget.pitch) / 256;
+    }
+    lv_obj_set_y(child.obj, child.y - offset);
+    if (own) {
+      int height = (own->progress * own->height) / 256;
+      lv_obj_set_height(child.obj, height);
+      if (height <= 0) lv_obj_add_flag(child.obj, LV_OBJ_FLAG_HIDDEN);
+      else lv_obj_clear_flag(child.obj, LV_OBJ_FLAG_HIDDEN);
+    }
+  }
+}
+
+// Records the finished page, then draws it in the state playback calls for.
+void captureAutoHideLayout() {
+  if (!autoHideWidgetCount || !content) return;
+  autoHideContent = content;
+  autoHideChildCount = 0;
+  // A freshly placed object's coordinates are only worked out on the next
+  // layout pass; read before it, every child reports y = 0.
+  lv_obj_update_layout(content);
+  uint32_t children = lv_obj_get_child_cnt(content);
+  for (uint32_t i = 0; i < children && autoHideChildCount < MAX_AUTO_HIDE_CHILDREN; i++) {
+    lv_obj_t *obj = lv_obj_get_child(content, i);
+    autoHideChildren[autoHideChildCount].obj = obj;
+    autoHideChildren[autoHideChildCount].y = (int16_t)lv_obj_get_y(obj);
+    for (uint8_t w = 0; w < autoHideWidgetCount; w++) {
+      if (autoHideWidgets[w].card == obj) autoHideWidgets[w].y = autoHideChildren[autoHideChildCount].y;
+    }
+    autoHideChildCount++;
+  }
+  bool data = widgetMediaHasData();
+  for (uint8_t w = 0; w < autoHideWidgetCount; w++) {
+    autoHideWidgets[w].shown = data;
+    autoHideWidgets[w].progress = data ? 256 : 0;
+  }
+  applyAutoHideLayout();
+}
+
+// Scroll travel follows the page's new height once a move has finished.
+void autoHideAnimReady(lv_anim_t *animation) {
+  (void)animation;
+  if (!autoHideContent || autoHideContent != content || !lv_obj_is_valid(content)) return;
+  if (currentPage >= pageCount) return;
+  PageKind kind = pages[currentPage].kind;
+  if (kind != PAGE_DEVICE && kind != PAGE_ACTIVITY && kind != PAGE_ACTIVITIES) return;
+  lv_obj_add_flag(content, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_scrollbar_mode(content, LV_SCROLLBAR_MODE_ACTIVE);
+  if (kind == PAGE_ACTIVITIES) finaliseActivitiesPageScrolling();
+  else finaliseRemotePageScrolling();
+}
+
+void autoHideAnimExec(void *var, int32_t value) {
+  AutoHideWidget *widget = static_cast<AutoHideWidget *>(var);
+  widget->progress = (int16_t)value;
+  applyAutoHideLayout();
+}
+
+void updateAutoHideWidgets() {
+  if (!autoHideWidgetCount || autoHideContent != content) return;
+  bool data = widgetMediaHasData();
+  for (uint8_t w = 0; w < autoHideWidgetCount; w++) {
+    AutoHideWidget &widget = autoHideWidgets[w];
+    if (widget.shown == data || !widget.card || !lv_obj_is_valid(widget.card)) continue;
+    widget.shown = data;
+    lv_anim_del(&widget, autoHideAnimExec);
+    lv_anim_t animation;
+    lv_anim_init(&animation);
+    lv_anim_set_var(&animation, &widget);
+    lv_anim_set_exec_cb(&animation, autoHideAnimExec);
+    lv_anim_set_values(&animation, widget.progress, data ? 256 : 0);
+    lv_anim_set_time(&animation, AUTO_HIDE_MOTION_MS);
+    lv_anim_set_path_cb(&animation, lv_anim_path_ease_in_out);
+    lv_anim_set_ready_cb(&animation, autoHideAnimReady);
+    lv_anim_start(&animation);
+  }
+}
+
 /*
   Builds a custom widget whose media element animates, or returns 0 to leave
   the widget to the ordinary layout. Every cell is built at its narrowest
@@ -37909,7 +38084,8 @@ bool openLiveWidgetForUsb(uint8_t index) {
   themeGridStartY() - the two differ, and a widget placed at the wrong origin
   lands on top of the first activity.
 */
-void makeWidgetTile(uint8_t slot, uint8_t kind, uint8_t custom, bool slim, int originY) {
+void makeWidgetTile(uint8_t slot, uint8_t kind, uint8_t custom, bool slim, int originY,
+                    bool autoHide) {
   uint8_t needed = widgetInstancesNeeded(kind, custom);
   if (!needed || widgetInstanceCount + needed > MAX_LIVE_WIDGETS) return;
   uint8_t row = slot / 3;
@@ -37936,6 +38112,10 @@ void makeWidgetTile(uint8_t slot, uint8_t kind, uint8_t custom, bool slim, int o
     refreshWidgetInstance(widgetInstances[widgetInstanceCount + i]);
   }
   widgetInstanceCount += built;
+  // One row, or two plus the gap between them, freed while nothing plays.
+  if (autoHide && widgetIsMediaOnly(kind, custom)) {
+    registerAutoHideWidget(card, height, slim ? 52 : 104);
+  }
 }
 
 /*
@@ -38853,6 +39033,7 @@ void serviceWidgets(uint32_t now) {
     for (uint8_t i = 0; i < widgetInstanceCount; i++) refreshWidgetInstance(widgetInstances[i]);
     refreshExpandedWidgetInstances();
     updateWidgetMotions();
+    updateAutoHideWidgets();
     autoExpandPlayingMedia();
   }
   if (now - widgetLastServiceMs < 1000UL) return;
@@ -38860,6 +39041,7 @@ void serviceWidgets(uint32_t now) {
   for (uint8_t i = 0; i < widgetInstanceCount; i++) refreshWidgetInstance(widgetInstances[i]);
   refreshExpandedWidgetInstances();
   updateWidgetMotions();
+  updateAutoHideWidgets();
 }
 
 void renderActivityPage() {
@@ -38881,7 +39063,7 @@ void renderActivityPage() {
   for (uint8_t i = 0; i < count && i < MAX_ACTIVITY_TILES; i++) {
     if (tiles[i].kind == Tile::WIDGET) {
       makeWidgetTile(tiles[i].slot, tiles[i].widgetKind, tiles[i].widgetCustom,
-                     tiles[i].widgetSlim, -1);
+                     tiles[i].widgetSlim, -1, tiles[i].widgetAutoHide);
       continue;
     }
     if (tiles[i].kind == Tile::ACTIVITY) {
@@ -38905,6 +39087,7 @@ void renderActivityPage() {
     makeTile(tiles[i].slot, tiles[i].label, tiles[i].iconPath ? tiles[i].iconPath : "", tiles[i].showText,
              tiles[i].boxMode, tiles[i].repeat, command, macro);
   }
+  captureAutoHideLayout();   // before scrolling is measured, so it sees the collapsed page
   finaliseRemotePageScrolling();
 }
 
@@ -38949,7 +39132,8 @@ void renderDevicePage() {
     makeWidgetTile(devices[activeDevice].widgets[i].slot,
                    devices[activeDevice].widgets[i].kind,
                    devices[activeDevice].widgets[i].custom,
-                   devices[activeDevice].widgets[i].slim, -1);
+                   devices[activeDevice].widgets[i].slim, -1,
+                   devices[activeDevice].widgets[i].autoHide);
   }
 
   uint8_t count = devices[activeDevice].commandCount;
@@ -38961,6 +39145,7 @@ void renderDevicePage() {
              devices[activeDevice].commands[i].repeatDefault,
              &devices[activeDevice].commands[i], nullptr);
   }
+  captureAutoHideLayout();   // before scrolling is measured, so it sees the collapsed page
   finaliseRemotePageScrolling();
 }
 
@@ -39202,6 +39387,7 @@ void renderCurrentPage() {
   widgetInstanceCount = 0;
   memset(widgetInstances, 0, sizeof(widgetInstances));
   clearWidgetMotions();
+  clearAutoHideWidgets();
   liveTileBindingCount = 0;
   memset(liveTileBindings, 0, sizeof(liveTileBindings));
   memset(batteryMetricNameLabels, 0, sizeof(batteryMetricNameLabels));
