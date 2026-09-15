@@ -1,6 +1,19 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.61 - 2026-09-15
+    - The OMOTE Settings home has a battery card above Wi-Fi, matching the one
+      in the OpenRemote style: percentage, a CHARGING / ON BATTERY chip and a
+      level bar, in OMOTE's grey and 0x2196F3 blue (red and amber still mark a
+      low battery). Tapping it opens Settings > Battery.
+    - Settings > About no longer repeats the battery figures - the battery
+      card and Settings > Battery have them - and only the Battery page
+      refreshes them each second.
+    - OpenRemote is the menu style for a remote set up for the first time.
+      Since 5.59 it is value 0, the firmware default when NVS and runtime.json
+      hold no style, and no SD template, Studio setup file or WebConfig page
+      sets one. Restore Factory Settings still keeps the style already chosen.
+
   5.60 - 2026-09-15
     - New ORUSB CHARGEDEMO shows the charging overlay as if a charger had just
       been connected - animation, seven-second timeout and tap to close - so it
@@ -7045,7 +7058,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.60"
+#define OPENREMOTE_VERSION_STRING "5.61"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -31603,6 +31616,68 @@ void renderSettingsHomeStormy() {
     [](lv_event_t *e) { openSettingsView(SETTINGS_ABOUT); });
 }
 
+// The battery summary at the top of the OMOTE Settings home - the OMOTE
+// counterpart of the OpenRemote style's card: percentage, a state chip and a
+// level bar, in the OMOTE palette (0x303030 card, 0x2196F3 accent, 0x505050
+// track). Red and amber stay for a low battery because they carry meaning.
+// Tapping it opens Settings > Battery.
+void makeOmoteBatteryCard(int y) {
+  const lv_color_t accent = lvRgb(0x21, 0x96, 0xF3);
+  const lv_color_t grey = lvRgb(0x50, 0x50, 0x50);
+  float percent = readBatteryPercent();
+  int level = percent < 0.0f ? 0 : (int)roundf(percent);
+
+  lv_obj_t *card = makeOmoteCard(content, y, 58);
+  lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_flag(card, LV_OBJ_FLAG_GESTURE_BUBBLE);
+  lv_obj_set_style_bg_color(card, lvRgb(0x42, 0x42, 0x42), LV_STATE_PRESSED);
+  lv_obj_add_event_cb(card, [](lv_event_t *e) { openSettingsView(SETTINGS_BATTERY); },
+                      LV_EVENT_CLICKED, nullptr);
+  addPhysicalNavFocusable(card);
+
+  lv_obj_t *caption = makeLabel(card, "Remote battery", 14, 8, &lv_font_montserrat_10, textPrimary());
+  lv_obj_set_style_text_opa(caption, LV_OPA_60, 0);
+  char percentText[8];
+  if (percent < 0.0f) strlcpy(percentText, "--%", sizeof(percentText));
+  else snprintf(percentText, sizeof(percentText), "%d%%", level);
+  makeLabel(card, percentText, 14, 22, &lv_font_montserrat_24, textPrimary());
+
+  lv_color_t chipColour = chargingState ? accent : grey;
+  lv_obj_t *chip = lv_obj_create(card);
+  lv_obj_remove_style_all(chip);
+  lv_obj_set_size(chip, 78, 16);
+  lv_obj_set_pos(chip, 224 - 12 - 78, 8);
+  lv_obj_set_style_radius(chip, 8, 0);
+  lv_obj_set_style_bg_color(chip, chipColour, 0);
+  lv_obj_set_style_bg_opa(chip, LV_OPA_COVER, 0);
+  lv_obj_clear_flag(chip, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_clear_flag(chip, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_t *chipLabel = makeLabel(chip, chargingState ? "CHARGING" : "ON BATTERY", 0, 1,
+                                  &lv_font_montserrat_10, lv_color_white());
+  lv_obj_set_width(chipLabel, 78);
+  lv_obj_set_style_text_align(chipLabel, LV_TEXT_ALIGN_CENTER, 0);
+
+  lv_color_t barColour = level < 10 ? lvRgb(255, 69, 58)
+                       : level < 20 ? lvRgb(245, 165, 36)
+                                    : accent;
+  lv_obj_t *track = lv_obj_create(card);
+  lv_obj_remove_style_all(track);
+  lv_obj_set_pos(track, 96, 36);
+  lv_obj_set_size(track, 114, 6);
+  lv_obj_set_style_radius(track, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_color(track, grey, 0);
+  lv_obj_set_style_bg_opa(track, LV_OPA_COVER, 0);
+  lv_obj_clear_flag(track, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_t *fill = lv_obj_create(card);
+  lv_obj_remove_style_all(fill);
+  lv_obj_set_pos(fill, 96, 36);
+  lv_obj_set_size(fill, max(6, 114 * level / 100), 6);
+  lv_obj_set_style_radius(fill, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_color(fill, barColour, 0);
+  lv_obj_set_style_bg_opa(fill, LV_OPA_COVER, 0);
+  lv_obj_clear_flag(fill, LV_OBJ_FLAG_CLICKABLE);
+}
+
 void renderSettingsHomeOmote() {
   const int rowH = 48;
   // 10 rows, not 9: Wi-Fi, Bluetooth, Clock, Wi-Fi Config, Display, Buttons,
@@ -31611,7 +31686,9 @@ void renderSettingsHomeOmote() {
   // vanished from the menu. Keep this in step with the makeOmoteRow() calls
   // below - the card is a fixed height, so it cannot notice on its own.
   const int rowCount = 10;
-  lv_obj_t *card = makeOmoteCard(content, 8, rowCount * rowH + (rowCount - 1));
+  // Battery summary first, above Wi-Fi, as in the OpenRemote style.
+  makeOmoteBatteryCard(8);
+  lv_obj_t *card = makeOmoteCard(content, 74, rowCount * rowH + (rowCount - 1));
   int y = 0;
   String wifiState = !wifiOn ? "Off" : (WiFi.status() == WL_CONNECTED ? WiFi.SSID() : "Tap to scan networks");
   makeOmoteRow(card, "Wi-Fi", wifiState.c_str(), y, rowH, &wifiOn,
@@ -34526,10 +34603,8 @@ void renderAboutPageOmote() {
   // while looking for something else.
   makeOmoteRow(infoCard, "Debug Menu", "Show Debug in Settings",
                5 * rowH + 5, rowH, &debugMenuVisible);
-
-  int batteryY = 74 + 6 * rowH + 5 + 16;
-  makeLabel(content, "Battery", 8, batteryY, &lv_font_montserrat_16, textPrimary());
-  makeBatteryMetricRows(batteryY + 34, true);
+  // No battery section here any more: the battery card at the top of Settings
+  // opens Settings > Battery, which has the same figures.
 }
 
 void renderAboutPage() {
@@ -39669,9 +39744,9 @@ void loop() {
     nextStatusRefreshMs = now + STATUS_REFRESH_MS;
   }
 
+  // Only the Battery page shows these figures now that About no longer does.
   bool liveBatteryPage = pages[currentPage].kind == PAGE_REMOTE_SETTINGS &&
-                         (settingsView == SETTINGS_ABOUT ||
-                          settingsView == SETTINGS_BATTERY);
+                         settingsView == SETTINGS_BATTERY;
   if (liveBatteryPage && (int32_t)(now - nextBatteryPageRefreshMs) >= 0) {
     updateBatteryMetricLabels(currentBatteryMetrics());
     nextBatteryPageRefreshMs = now + 1000UL;
