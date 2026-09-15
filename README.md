@@ -48,7 +48,7 @@ Studio installs these for you, so you only need them for a manual update.
 
 | | Download |
 |---|---|
-| Remote firmware — ESP32-S3 | [**OpenRemote-Remote-Firmware-5.38.bin**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-Remote-Firmware-5.38.bin) |
+| Remote firmware — ESP32-S3 | [**OpenRemote-Remote-Firmware-5.65.bin**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-Remote-Firmware-5.65.bin) |
 | Dock firmware — ESP32-C3 | [**OpenRemote-Dock-Firmware-1.82.bin**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-Dock-Firmware-1.82.bin) |
 | WebConfig — browser configurator | [**OpenRemote-WebConfig-3.33.html**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-WebConfig-3.33.html) |
 
@@ -235,10 +235,10 @@ infrared database. **WebConfig** does everything else, wirelessly. The
 
 | Component | Version | Source |
 |---|---|---|
-| Remote firmware — ESP32-S3 | 4.02 | [`remote/`](remote/) |
-| Dock firmware — ESP32-C3 | 1.30 | [`dock/`](dock/) |
-| WebConfig | 2.56 | [`webconfig/`](webconfig/) |
-| OpenRemote Studio | 2.76 | [`studio/`](studio/) |
+| Remote firmware — ESP32-S3 | 5.65 | [`remote/`](remote/) |
+| Dock firmware — ESP32-C3 | 1.82 | [`dock/`](dock/) |
+| WebConfig | 3.33 | [`webconfig/`](webconfig/) |
+| OpenRemote Studio | 2.85 | [`studio/`](studio/) |
 
     remote/       ESP32-S3 remote firmware (PlatformIO)
     dock/         ESP32-C3 dock firmware (PlatformIO)
