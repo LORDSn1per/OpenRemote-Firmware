@@ -1,6 +1,13 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.50 - 2026-09-15
+    - The brightness panel's fade covers the whole screen again, title bar
+      included, and is white at 100 of 255 (about 40%) instead of black, so
+      it lightens the page behind the readout tile and slider rather than
+      darkening it. It is still its own layer beneath the slider and still
+      passes taps through, so tapping outside the slider closes the panel.
+
   5.49 - 2026-09-15
     - The brightness panel's fade no longer darkens the title bar. 5.48 faded
       the panel's full-screen tap-to-close layer, which dimmed the page title
@@ -6921,7 +6928,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.49"
+#define OPENREMOTE_VERSION_STRING "5.50"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -37705,20 +37712,18 @@ void toggleBrightnessPanel() {
   lv_obj_set_size(brightnessOverlay, LCD_W, LCD_H);
   lv_obj_set_style_bg_opa(brightnessOverlay, LV_OPA_TRANSP, 0);
 
-  // Fades the page behind to about 40% darker (black at 100 of 255) so the
-  // tile and slider stand off busy artwork. Kept light on purpose: the page
-  // still has to show through, because it is what the brightness is judged
-  // by. It starts below the 42px title bar, so the title and the time and
-  // battery pill stay at full brightness. Created before the slider panel so
-  // it draws beneath it, and not clickable, so a tap on it still reaches the
-  // overlay and closes the panel. A flat fill with no radius or gradient, so
-  // fading its opacity is a plain blend.
-  const int titleBarH = 42;
+  // Washes the whole screen, title bar included, with white at 100 of 255
+  // (about 40%) so the tile and slider stand off busy artwork. Kept light on
+  // purpose: the page still has to show through, because it is what the
+  // brightness is judged by. Created before the slider panel so it draws
+  // beneath it, and not clickable, so a tap on it still reaches the overlay
+  // and closes the panel. A flat fill with no radius or gradient, so fading
+  // its opacity is a plain blend.
   lv_obj_t *scrim = lv_obj_create(brightnessOverlay);
   lv_obj_remove_style_all(scrim);
-  lv_obj_set_pos(scrim, 0, titleBarH);
-  lv_obj_set_size(scrim, LCD_W, LCD_H - titleBarH);
-  lv_obj_set_style_bg_color(scrim, lv_color_black(), 0);
+  lv_obj_set_pos(scrim, 0, 0);
+  lv_obj_set_size(scrim, LCD_W, LCD_H);
+  lv_obj_set_style_bg_color(scrim, lv_color_white(), 0);
   lv_obj_set_style_bg_opa(scrim, LV_OPA_TRANSP, 0);
   lv_obj_clear_flag(scrim, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_clear_flag(scrim, LV_OBJ_FLAG_SCROLLABLE);
