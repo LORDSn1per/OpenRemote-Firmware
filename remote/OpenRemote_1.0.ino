@@ -1,6 +1,14 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.55 - 2026-09-15
+    - The menu style you choose survives a reboot. Settings > Debug's Menu
+      Style dropdown, and ORUSB MENUSTYLE, saved it to NVS only, but
+      applySettingsJson() reads settings{} from runtime.json at every boot and
+      writes it back over NVS - so the style reverted to whatever the SD copy
+      held (found when Stormy came back up as OMOTE after a reset). Both now
+      call saveSettings() and scheduleRuntimeSettingsSave().
+
   5.54 - 2026-09-15
     - Stormy Display page: the LCD dropdown is 164px wide, up from 150, so
       "BuyDisplay-ILI9341" no longer runs into the chevron inside the pill's
@@ -6982,7 +6990,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.54"
+#define OPENREMOTE_VERSION_STRING "5.55"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -19675,9 +19683,9 @@ void handleUsbCommand(Stream &port, UsbSerialSession &session, String command) {
       return;
     }
     menuStyle = (uint8_t)style;
-    preferences.begin(PREFERENCES_NAMESPACE, false);
-    preferences.putUChar("menuStyle", menuStyle);
-    preferences.end();
+    // Into runtime.json as well as NVS, or the next boot restores the old style.
+    saveSettings();
+    scheduleRuntimeSettingsSave();
     pendingUiRefresh = true;
     usbImportReply(port, String("{\"ok\":true,\"menuStyle\":") + String(style) + "}");
   } else if (command.startsWith("ORUSB SETTINGS ")) {
@@ -33856,9 +33864,11 @@ void menuStyleDropdownEvent(lv_event_t *e) {
   if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
   uint16_t selected = lv_dropdown_get_selected(lv_event_get_target(e));
   menuStyle = (uint8_t)selected;
-  preferences.begin(PREFERENCES_NAMESPACE, false);
-  preferences.putUChar("menuStyle", menuStyle);
-  preferences.end();
+  // NVS alone does not survive a reboot: applySettingsJson() reads settings{}
+  // from runtime.json at every boot and writes it back over NVS, so a style
+  // saved only to Preferences reverted to whatever the SD copy held.
+  saveSettings();
+  scheduleRuntimeSettingsSave();
   lastWakeMs = millis();
   pendingUiRefresh = true;
 }
