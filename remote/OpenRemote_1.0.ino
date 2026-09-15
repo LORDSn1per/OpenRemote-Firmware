@@ -1,6 +1,22 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.41 - 2026-09-15
+    - The charging overlay no longer flashes its green charge black while it
+      breathes. The breathing faded the fill's opacity, and every translucent
+      frame of a rounded gradient had to be alpha-blended through the shell's
+      corner clipping - frames that intermittently failed to draw at all. It
+      now breathes by colour at full cover, the shell no longer clips its
+      corners (the fill has its own radius), and the bolt fades in with text
+      opacity, which draws directly instead of through an off-screen layer.
+    - Diagnostic for the status bar battery staying on "charging" after
+      unplugging, which 5.40's USB-line check did not cure. Settings >
+      Battery's Voltage row now shows the two raw signals live - "chg" is
+      CRG_STAT (low means the TP4056 says it is charging) and "usb" is RXD0,
+      the CH340C's TXD - and serial logs both on every CRG_STAT change and
+      every committed charging-state change. With the cable out they say
+      whether CRG_STAT leaks low or the bridge line is back-powered high.
+
   5.40 - 2026-09-15
     - The charging overlay's green charge keeps the same gap from the battery
       shell at the top as at the bottom. LVGL 8 measures a container's content
@@ -6848,7 +6864,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.40"
+#define OPENREMOTE_VERSION_STRING "5.41"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -22722,12 +22738,24 @@ void chargeOverlayHeightAnim(void *obj, int32_t value) {
   lv_obj_set_height((lv_obj_t *)obj, (lv_coord_t)value);
 }
 
-void chargeOverlayBgOpaAnim(void *obj, int32_t value) {
-  lv_obj_set_style_bg_opa((lv_obj_t *)obj, (lv_opa_t)value, 0);
+/*
+  Breathes the fill between a bright and a softer green by colour, never by
+  opacity. The first version faded bg_opa, and every translucent frame of a
+  rounded gradient had to be alpha-blended through corner masks - frames that
+  intermittently failed to draw at all and flashed the whole fill black. Solid
+  colours at full cover draw straight to the buffer.
+*/
+void chargeOverlayBreatheAnim(void *obj, int32_t value) {
+  lv_color_t top = lv_color_mix(lvRgb(0x86, 0xEF, 0xAC), lvRgb(0x3F, 0xA8, 0x66), (uint8_t)value);
+  lv_color_t bottom = lv_color_mix(lvRgb(0x22, 0xC5, 0x5E), lvRgb(0x13, 0x7A, 0x38), (uint8_t)value);
+  lv_obj_set_style_bg_color((lv_obj_t *)obj, top, 0);
+  lv_obj_set_style_bg_grad_color((lv_obj_t *)obj, bottom, 0);
 }
 
-void chargeOverlayOpaAnim(void *obj, int32_t value) {
-  lv_obj_set_style_opa((lv_obj_t *)obj, (lv_opa_t)value, 0);
+// Text opacity, not the object's opa style: text alpha is drawn directly,
+// while opa on an object renders it through an off-screen layer.
+void chargeOverlayTextOpaAnim(void *obj, int32_t value) {
+  lv_obj_set_style_text_opa((lv_obj_t *)obj, (lv_opa_t)value, 0);
 }
 
 void chargeOverlayPressed(lv_event_t *e) {
@@ -22786,7 +22814,6 @@ void showChargeOverlay() {
   lv_obj_set_style_bg_opa(body, LV_OPA_COVER, 0);
   lv_obj_set_style_bg_color(body, ground, 0);
   lv_obj_set_style_pad_all(body, inset, 0);
-  lv_obj_set_style_clip_corner(body, true, 0);
   lv_obj_clear_flag(body, LV_OBJ_FLAG_SCROLLABLE);
 
   // Green charge, rising from empty to the real level and then breathing.
@@ -22819,8 +22846,8 @@ void showChargeOverlay() {
   lv_anim_t breathe;
   lv_anim_init(&breathe);
   lv_anim_set_var(&breathe, fill);
-  lv_anim_set_exec_cb(&breathe, chargeOverlayBgOpaAnim);
-  lv_anim_set_values(&breathe, LV_OPA_COVER, LV_OPA_60);
+  lv_anim_set_exec_cb(&breathe, chargeOverlayBreatheAnim);
+  lv_anim_set_values(&breathe, 255, 70);   // 255 = full brightness
   lv_anim_set_time(&breathe, 700);
   lv_anim_set_playback_time(&breathe, 700);
   lv_anim_set_delay(&breathe, 900);
@@ -22833,12 +22860,12 @@ void showChargeOverlay() {
   lv_label_set_text(bolt, LV_SYMBOL_CHARGE);
   lv_obj_set_style_text_font(bolt, &lv_font_montserrat_48, 0);
   lv_obj_set_style_text_color(bolt, lvRgb(0xFF, 0xFF, 0xFF), 0);
-  lv_obj_set_style_opa(bolt, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_text_opa(bolt, LV_OPA_TRANSP, 0);
   lv_obj_center(bolt);
   lv_anim_t boltIn;
   lv_anim_init(&boltIn);
   lv_anim_set_var(&boltIn, bolt);
-  lv_anim_set_exec_cb(&boltIn, chargeOverlayOpaAnim);
+  lv_anim_set_exec_cb(&boltIn, chargeOverlayTextOpaAnim);
   lv_anim_set_values(&boltIn, LV_OPA_TRANSP, LV_OPA_COVER);
   lv_anim_set_time(&boltIn, 500);
   lv_anim_set_delay(&boltIn, 250);
@@ -30352,6 +30379,15 @@ bool updateChargingState() {
   unsigned long now = millis();
   bool rawCharging = digitalRead(PIN_CHARGE_STATUS) == LOW;
   bool chargerConnected = rawCharging;
+  // Logged on a CRG_STAT change only - the USB line itself toggles with every
+  // byte Studio sends, and logging that would bury everything else.
+  static int8_t loggedRawCharging = -1;
+  if ((int8_t)rawCharging != loggedRawCharging) {
+    loggedRawCharging = (int8_t)rawCharging;
+    Serial.printf("Charger signals: CRG_STAT=%s usb line=%s\n",
+                  rawCharging ? "low (charging)" : "high",
+                  gpio_get_level((gpio_num_t)USB_BRIDGE_RX_PIN) ? "high" : "low");
+  }
 
   // CRG_STAT becomes high-impedance both when USB is removed and when the
   // TP4056 completes a charge. Retain the connected state at a full, stable
@@ -30374,6 +30410,10 @@ bool updateChargingState() {
   if (chargingCandidate != chargingState &&
       (uint32_t)(now - chargingCandidateSinceMs) >= CHARGE_STATE_DEBOUNCE_MS) {
     chargingState = chargingCandidate;
+    Serial.printf("Charging state: %s (CRG_STAT=%s usb line=%s)\n",
+                  chargingState ? "charging" : "not charging",
+                  rawCharging ? "low" : "high",
+                  gpio_get_level((gpio_num_t)USB_BRIDGE_RX_PIN) ? "high" : "low");
     if (chargingState) chargingAnimationStartMs = now;
     resetBatteryMeasurementWindow(chargingState);
   }
@@ -33627,10 +33667,16 @@ String batteryEstimateText(const BatteryMetrics &metrics) {
 }
 
 void updateBatteryMetricLabels(BatteryMetrics metrics) {
-  char voltage[20];
+  char voltage[48];
   char level[20];
-  snprintf(voltage, sizeof(voltage), metrics.voltage >= 0.0f ? "%.2f V" : "Unavailable",
-           metrics.voltage);
+  // Raw charger signals beside the voltage, so the unplugged state - which
+  // no serial log can see - can be read straight off the screen.
+  snprintf(voltage, sizeof(voltage),
+           metrics.voltage >= 0.0f ? "%.2f V \xE2\x80\xA2 chg %s \xE2\x80\xA2 usb %s"
+                                   : "Unavailable \xE2\x80\xA2 chg %s \xE2\x80\xA2 usb %s",
+           metrics.voltage >= 0.0f ? metrics.voltage : 0.0f,
+           digitalRead(PIN_CHARGE_STATUS) == LOW ? "low" : "high",
+           gpio_get_level((gpio_num_t)USB_BRIDGE_RX_PIN) ? "high" : "low");
   snprintf(level, sizeof(level), metrics.percent >= 0.0f ? "%.2f%%" : "Unavailable",
            metrics.percent);
   String values[6] = {
@@ -33654,10 +33700,16 @@ void updateBatteryMetricLabels(BatteryMetrics metrics) {
 void makeBatteryMetricRows(int firstY, bool omoteStyle = false) {
   BatteryMetrics metrics = currentBatteryMetrics();
 
-  char voltage[20];
+  char voltage[48];
   char level[20];
-  snprintf(voltage, sizeof(voltage), metrics.voltage >= 0.0f ? "%.2f V" : "Unavailable",
-           metrics.voltage);
+  // Raw charger signals beside the voltage, so the unplugged state - which
+  // no serial log can see - can be read straight off the screen.
+  snprintf(voltage, sizeof(voltage),
+           metrics.voltage >= 0.0f ? "%.2f V \xE2\x80\xA2 chg %s \xE2\x80\xA2 usb %s"
+                                   : "Unavailable \xE2\x80\xA2 chg %s \xE2\x80\xA2 usb %s",
+           metrics.voltage >= 0.0f ? metrics.voltage : 0.0f,
+           digitalRead(PIN_CHARGE_STATUS) == LOW ? "low" : "high",
+           gpio_get_level((gpio_num_t)USB_BRIDGE_RX_PIN) ? "high" : "low");
   snprintf(level, sizeof(level), metrics.percent >= 0.0f ? "%.2f%%" : "Unavailable",
            metrics.percent);
   String values[6] = {
