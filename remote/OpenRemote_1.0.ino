@@ -1,6 +1,23 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.52 - 2026-09-15
+    - The backup and restore overlay is a rounded box instead of a full-screen
+      sheet, in the brightness panel's style: black at 100 of 255 fades the
+      whole screen, title bar included, and the box (230 of 255, radius 22)
+      fills the screen below the 42px title bar. The title is 20pt, the note
+      14pt and the status line 16pt, up from 14/10/10pt. The progress bar is
+      WebConfig's: a rounded 10px track in 9% white with a #39a0ff fill that
+      never shrinks below a round dot. The Backup/Restore page's thin bar is
+      unchanged in layout and takes the same blue.
+    - Screenshots now show exactly what is on the LCD, overlays included.
+      lvFlush() keeps a PSRAM copy of every band it sends and ORUSB SCREENSHOT
+      saves that; lv_snapshot_take() rendered one object tree and could not
+      see lv_layer_top(), where the backup and charging overlays live.
+    - New ORUSB OVERLAYDEMO backup|restore <percent>|off shows that overlay at a
+      chosen percentage without running a job, for screenshots. It takes
+      itself down after 20 seconds and never touches a real job's overlay.
+
   5.51 - 2026-09-15
     - The brightness panel's readout tile is back to its original 190 of 255
       (about 75%) opacity, down from 5.47's 230. The white wash behind it
@@ -6933,7 +6950,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.51"
+#define OPENREMOTE_VERSION_STRING "5.52"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -9189,6 +9206,16 @@ volatile bool usbWebConfigStartRequest = false;
 volatile bool usbBrightnessPanelRequest = false;
 volatile bool usbScreenshotRequest = false;
 static const char *LCD_SCREENSHOT_PATH = "/tmp/screenshot.rgb565";
+// ORUSB OVERLAYDEMO: shows the backup (1) or restore (2) overlay at a given
+// percentage without a job, for screenshots; 0 hides it.
+volatile bool usbOverlayDemoRequest = false;
+uint8_t usbOverlayDemoMode = 0;
+uint8_t usbOverlayDemoPercent = 50;
+unsigned long usbOverlayDemoUntilMs = 0;
+// Every band lvFlush() sends to the LCD, kept as one LCD_W x LCD_H RGB565
+// frame so a screenshot shows what is actually on the panel - lv_layer_top()
+// included, which lv_snapshot_take() cannot see.
+uint16_t *lcdFrameMirror = nullptr;
 volatile bool usbWebConfigStopRequest = false;
 
 volatile bool backupRequestPending = false;
@@ -10256,6 +10283,9 @@ void beginLcdBackupPhase(const char *phase, uint16_t total, float low, float hig
 // page, which shows the same bar while a WebConfig-triggered backup runs.
 lv_obj_t *makeLcdBackupTrack(lv_obj_t *parent, int y);
 lv_obj_t *makeLcdBackupAnimBar(lv_obj_t *parent, int y);
+lv_obj_t *makeLcdProgressTrack(lv_obj_t *parent, int x, int y, int w, int h,
+                               lv_color_t colour, lv_opa_t opa);
+lv_obj_t *makeLcdProgressFill(lv_obj_t *parent, int x, int y, int h);
 // Also used by serviceQueuedBackup(), which runs well before this is defined.
 void setLcdBackupStatus(const String &message);
 void hideBackupOverlay();
@@ -19582,6 +19612,20 @@ void handleUsbCommand(Stream &port, UsbSerialSession &session, String command) {
     // Opens the brightness panel from the loop - for screenshots and tests.
     usbBrightnessPanelRequest = true;
     usbImportReply(port, "{\"ok\":true,\"requested\":\"brightness panel\"}");
+  } else if (command.startsWith("ORUSB OVERLAYDEMO")) {
+    // Shows the backup or restore overlay at a chosen percentage without
+    // running a job, for screenshots: "backup 35", "restore 62" or "off".
+    String args = command.substring(17);
+    args.trim();
+    int space = args.indexOf(' ');
+    String mode = space >= 0 ? args.substring(0, space) : args;
+    int percent = space >= 0 ? args.substring(space + 1).toInt() : 50;
+    usbOverlayDemoMode = mode == "restore" ? 2 : (mode == "backup" ? 1 : 0);
+    usbOverlayDemoPercent = (uint8_t)constrain(percent, 0, 100);
+    usbOverlayDemoRequest = true;
+    usbImportReply(port, String("{\"ok\":true,\"overlay\":\"") +
+      (usbOverlayDemoMode == 2 ? "restore" : (usbOverlayDemoMode == 1 ? "backup" : "off")) +
+      "\"}");
   } else if (command == "ORUSB SCREENSHOT") {
     // Answered from the loop once the snapshot is on the card.
     usbScreenshotRequest = true;
@@ -22727,19 +22771,40 @@ void stepBackupOverlayMark() {
 void showBackupOverlay(bool restoring, const char *note) {
   if (xPortGetCoreID() != 1) return;
   hideBackupOverlay();
+  /*
+    A rounded box over a faded page, in the brightness panel's style, rather
+    than a full-screen sheet. The fade is black at 100 of 255 over the whole
+    screen, title bar included; the box is 230 of 255 and fills the screen
+    below the 42px title bar. The fade is set rather than eased in: the loop
+    is inside the job, so no LVGL animation would ever tick.
+  */
   backupOverlay = lv_obj_create(lv_layer_top());
   lv_obj_remove_style_all(backupOverlay);
   lv_obj_set_pos(backupOverlay, 0, 0);
   lv_obj_set_size(backupOverlay, LCD_W, LCD_H);
-  lv_obj_set_style_bg_opa(backupOverlay, LV_OPA_COVER, 0);
-  lv_obj_set_style_bg_color(backupOverlay, lvRgb(0x0B, 0x10, 0x18), 0);
+  lv_obj_set_style_bg_color(backupOverlay, lv_color_black(), 0);
+  lv_obj_set_style_bg_opa(backupOverlay, (lv_opa_t)100, 0);
   lv_obj_clear_flag(backupOverlay, LV_OBJ_FLAG_SCROLLABLE);
 
-  // Centred on (120, 120), radius 34, so the ring sits well clear of the text.
-  const int cx = 120, cy = 120, radius = 34, dot = 9;
+  const int boxX = 8, boxY = 46, boxW = LCD_W - 16, boxH = LCD_H - boxY - 8;
+  lv_obj_t *box = lv_obj_create(backupOverlay);
+  lv_obj_remove_style_all(box);
+  lv_obj_set_pos(box, boxX, boxY);
+  lv_obj_set_size(box, boxW, boxH);
+  lv_obj_set_style_radius(box, 22, 0);
+  lv_obj_set_style_bg_color(box, lvRgb(18, 22, 30), 0);
+  lv_obj_set_style_bg_opa(box, (lv_opa_t)230, 0);
+  lv_obj_set_style_border_width(box, 1, 0);
+  lv_obj_set_style_border_color(box, lv_color_white(), 0);
+  lv_obj_set_style_border_opa(box, LV_OPA_30, 0);
+  lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(box, LV_OBJ_FLAG_CLICKABLE);
+
+  // The ring, centred near the top of the box and well clear of the text.
+  const int cx = boxW / 2, cy = 74, radius = 36, dot = 11;
   for (uint8_t i = 0; i < BACKUP_OVERLAY_DOTS; i++) {
     float angle = (float)i * (2.0f * 3.14159265f / (float)BACKUP_OVERLAY_DOTS) - 1.5707963f;
-    lv_obj_t *d = lv_obj_create(backupOverlay);
+    lv_obj_t *d = lv_obj_create(box);
     lv_obj_remove_style_all(d);
     lv_obj_set_size(d, dot, dot);
     lv_obj_set_pos(d, cx + (int)(cosf(angle) * radius) - dot / 2,
@@ -22753,14 +22818,27 @@ void showBackupOverlay(bool restoring, const char *note) {
   }
   stepBackupOverlayMark();
 
-  makeLabel(backupOverlay, restoring ? "Restoring backup" : "Creating backup",
-            12, 196, &lv_font_montserrat_14, textPrimary());
-  makeLabel(backupOverlay, note ? note : "", 12, 218,
-            &lv_font_montserrat_10, lvRgb(155, 165, 180));
-  lcdBackupTrack = makeLcdBackupTrack(backupOverlay, 248);
-  lcdBackupAnimBar = makeLcdBackupAnimBar(backupOverlay, 248);
-  lcdBackupStatusLabel = makeLabel(backupOverlay, "", 12, 258,
-                                   &lv_font_montserrat_10, lvRgb(155, 165, 180));
+  // Larger text than the old sheet's 14/10pt, which was hard to read at a
+  // glance while a job ran.
+  lv_obj_t *title = makeLabel(box, restoring ? "Restoring backup" : "Creating backup",
+                              0, 132, &lv_font_montserrat_20, textPrimary());
+  lv_obj_set_width(title, boxW);
+  lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_t *noteLabel = makeLabel(box, note ? note : "", 0, 162,
+                                  &lv_font_montserrat_14, lvRgb(155, 165, 180));
+  lv_obj_set_width(noteLabel, boxW);
+  lv_obj_set_style_text_align(noteLabel, LV_TEXT_ALIGN_CENTER, 0);
+
+  // WebConfig's progress bar: a faint white track (9%) with a rounded
+  // #39a0ff fill, here 10px tall so it reads on the LCD.
+  const int trackX = 20, trackY = 200, trackW = boxW - 40, trackH = 10;
+  lcdBackupTrack = makeLcdProgressTrack(box, trackX, trackY, trackW, trackH,
+                                        lv_color_white(), (lv_opa_t)23);
+  lcdBackupAnimBar = makeLcdProgressFill(box, trackX, trackY, trackH);
+  lcdBackupStatusLabel = makeLabel(box, "", 0, 224, &lv_font_montserrat_16,
+                                   lvRgb(169, 186, 209));
+  lv_obj_set_width(lcdBackupStatusLabel, boxW);
+  lv_obj_set_style_text_align(lcdBackupStatusLabel, LV_TEXT_ALIGN_CENTER, 0);
   lv_refr_now(nullptr);
 }
 
@@ -23025,34 +23103,32 @@ void serviceChargeOverlay(unsigned long now) {
 void jumpToWebConfigQr(lv_event_t *e);
 
 /*
-  Renders the active screen to PSRAM with lv_snapshot_take() and writes it to
-  the card as raw little-endian RGB565 for ORUSB READ. It is LVGL's image of
-  the screen, before the panel colour calibration lvFlush() applies.
+  Writes what is on the LCD to the card as raw little-endian RGB565 for ORUSB
+  READ. It saves lcdFrameMirror, which lvFlush() updates with every band it
+  sends, rather than using lv_snapshot_take(): a snapshot renders one object
+  tree and cannot see lv_layer_top(), where the backup and charging overlays
+  live. Colours are LVGL's, before the panel calibration lvFlush() applies.
 */
 bool saveLcdScreenshot(String &error, size_t &bytes, uint16_t &width, uint16_t &height) {
   if (displaySleeping) { error = "The screen is asleep"; return false; }
   if (!sdReady) { error = "SD card unavailable"; return false; }
-  lv_img_dsc_t *shot = lv_snapshot_take(lv_scr_act(), LV_IMG_CF_TRUE_COLOR);
-  if (!shot) { error = "Not enough memory for a snapshot"; return false; }
+  lv_refr_now(nullptr);   // flush anything still pending into the mirror
+  if (!lcdFrameMirror) { error = "No frame has been drawn yet"; return false; }
   if (!SD.exists("/tmp")) SD.mkdir("/tmp");
   SD.remove(LCD_SCREENSHOT_PATH);
   File out = SD.open(LCD_SCREENSHOT_PATH, FILE_WRITE);
   bool ok = (bool)out;
-  // Computed from the header, not shot->data_size: LVGL 8.3's snapshot fills
-  // in width and height but leaves data_size at zero, which wrote an empty file.
-  const size_t total = lv_img_buf_get_img_size(shot->header.w, shot->header.h,
-                                               LV_IMG_CF_TRUE_COLOR);
-  if (!total) ok = false;
+  const size_t total = (size_t)LCD_W * LCD_H * sizeof(uint16_t);
+  const uint8_t *pixels = reinterpret_cast<const uint8_t *>(lcdFrameMirror);
   size_t offset = 0;
   while (ok && offset < total) {
     size_t take = min((size_t)4096, total - offset);
-    ok = writeUploadChunkToSd(out, offset, shot->data + offset, take);
+    ok = writeUploadChunkToSd(out, offset, pixels + offset, take);
     offset += take;
   }
   if (out) out.close();
-  width = shot->header.w;
-  height = shot->header.h;
-  lv_snapshot_free(shot);
+  width = LCD_W;
+  height = LCD_H;
   if (!ok) {
     SD.remove(LCD_SCREENSHOT_PATH);
     error = "Could not write the screenshot to the card";
@@ -23070,6 +23146,28 @@ void serviceUsbWebConfigRequest() {
     if (displaySleeping) wakeDisplay();
     lastWakeMs = millis();
     if (!brightnessOverlay && !brightnessPanel) toggleBrightnessPanel();
+  }
+  if (usbOverlayDemoRequest) {
+    usbOverlayDemoRequest = false;
+    if (usbOverlayDemoMode == 0) {
+      usbOverlayDemoUntilMs = 0;
+      if (!sdBusyWithBackupJob()) hideBackupOverlay();
+    } else if (!sdBusyWithBackupJob()) {
+      if (displaySleeping) wakeDisplay();
+      bool restoring = usbOverlayDemoMode == 2;
+      // The same calls a real job makes, in the same order.
+      showBackupOverlay(restoring, "Started from Studio");
+      setLcdBackupStatus(restoring ? "Restoring full backup..." : "Creating full backup...");
+      setLcdBackupPhaseFraction(restoring ? "Restoring files" : "Writing backup",
+                                usbOverlayDemoPercent / 100.0f, 0.0f, 1.0f);
+      usbOverlayDemoUntilMs = millis() + 20000UL;
+      lastWakeMs = millis();
+    }
+  }
+  // A demo overlay takes itself down; a real job's overlay is never touched.
+  if (usbOverlayDemoUntilMs && (int32_t)(millis() - usbOverlayDemoUntilMs) >= 0) {
+    usbOverlayDemoUntilMs = 0;
+    if (!sdBusyWithBackupJob()) hideBackupOverlay();
   }
   if (usbScreenshotRequest) {
     usbScreenshotRequest = false;
@@ -28843,6 +28941,20 @@ void lvFlush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *colour) {
   const uint32_t pixelCount = (uint32_t)w * h;
   uint16_t *source = reinterpret_cast<uint16_t *>(colour);
 
+  // Keep the frame mirror in step for screenshots, before any colour
+  // calibration swaps the source for the corrected buffer.
+  if (!lcdFrameMirror) {
+    lcdFrameMirror = static_cast<uint16_t *>(ps_malloc((size_t)LCD_W * LCD_H * sizeof(uint16_t)));
+    if (lcdFrameMirror) memset(lcdFrameMirror, 0, (size_t)LCD_W * LCD_H * sizeof(uint16_t));
+  }
+  if (lcdFrameMirror && area->x1 >= 0 && area->y1 >= 0 &&
+      area->x2 < LCD_W && area->y2 < LCD_H) {
+    for (int32_t row = 0; row < h; row++) {
+      memcpy(lcdFrameMirror + (area->y1 + row) * LCD_W + area->x1,
+             source + row * w, (size_t)w * sizeof(uint16_t));
+    }
+  }
+
   if (displayDriverChoice == 1) {
     if (displayColourLutActive && ensureDisplayFlushBuffers(pixelCount)) {
       for (uint32_t i = 0; i < pixelCount; i++) displayFlush565[i] = displayColourLut[source[i]];
@@ -33870,12 +33982,16 @@ void stepLcdBackupAnim() {
   if (xPortGetCoreID() != 1) return;
   if (!lcdBackupAnimBar || lv_obj_has_flag(lcdBackupAnimBar, LV_OBJ_FLAG_HIDDEN)) return;
   stepBackupOverlayMark();
-  const int trackWidth = 204;
+  // The overlay's track is wider and thicker than the Backup/Restore page's,
+  // so position and size are read from the track rather than assumed.
+  const int trackX = lcdBackupTrack ? lv_obj_get_x(lcdBackupTrack) : 10;
+  const int trackWidth = lcdBackupTrack ? lv_obj_get_width(lcdBackupTrack) : 204;
+  const int barHeight = lv_obj_get_height(lcdBackupAnimBar);
   if (lcdBackupPhase[0]) {
     float f = lcdBackupFraction < 0.0f ? 0.0f : (lcdBackupFraction > 1.0f ? 1.0f : lcdBackupFraction);
     int width = (int)(trackWidth * f);
-    if (width < 2) width = 2;
-    lv_obj_set_x(lcdBackupAnimBar, 10);
+    if (width < barHeight) width = barHeight;   // a round dot, never a sliver
+    lv_obj_set_x(lcdBackupAnimBar, trackX);
     lv_obj_set_width(lcdBackupAnimBar, width);
     if (lcdBackupStatusLabel) {
       char text[48];
@@ -33889,7 +34005,7 @@ void stepLcdBackupAnim() {
     float ratio = (float)phase / (float)periodMs;
     float bounce = ratio < 0.5f ? (ratio * 2.0f) : (2.0f - ratio * 2.0f);
     lv_obj_set_width(lcdBackupAnimBar, barWidth);
-    lv_obj_set_x(lcdBackupAnimBar, 10 + (int)(bounce * (trackWidth - barWidth)));
+    lv_obj_set_x(lcdBackupAnimBar, trackX + (int)(bounce * (trackWidth - barWidth)));
   }
   lv_refr_now(nullptr);
 }
@@ -34052,32 +34168,45 @@ void chooseLcdBackup(lv_event_t *e) {
 // Thin bouncing bar shown under the backup/restore status line while a
 // backup or restore is in progress (see stepLcdBackupAnim()) - hidden the
 // rest of the time.
-lv_obj_t *makeLcdBackupTrack(lv_obj_t *parent, int y) {
+// A rounded progress track and its fill, hidden until a job shows them. The
+// fill is WebConfig's #39a0ff; stepLcdBackupAnim() reads the track's own
+// position and size, so any geometry works.
+lv_obj_t *makeLcdProgressTrack(lv_obj_t *parent, int x, int y, int w, int h,
+                               lv_color_t colour, lv_opa_t opa) {
   lv_obj_t *track = lv_obj_create(parent);
   lv_obj_remove_style_all(track);
-  lv_obj_set_size(track, 204, 3);
-  lv_obj_set_pos(track, 10, y);
+  lv_obj_set_size(track, w, h);
+  lv_obj_set_pos(track, x, y);
   lv_obj_set_style_radius(track, LV_RADIUS_CIRCLE, 0);
-  lv_obj_set_style_bg_color(track, lvRgb(0x33, 0x3A, 0x45), 0);
-  lv_obj_set_style_bg_opa(track, LV_OPA_COVER, 0);
+  lv_obj_set_style_bg_color(track, colour, 0);
+  lv_obj_set_style_bg_opa(track, opa, 0);
   lv_obj_clear_flag(track, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_clear_flag(track, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_add_flag(track, LV_OBJ_FLAG_HIDDEN);
   return track;
 }
 
-lv_obj_t *makeLcdBackupAnimBar(lv_obj_t *parent, int y) {
+lv_obj_t *makeLcdProgressFill(lv_obj_t *parent, int x, int y, int h) {
   lv_obj_t *bar = lv_obj_create(parent);
   lv_obj_remove_style_all(bar);
-  lv_obj_set_size(bar, 36, 3);
-  lv_obj_set_pos(bar, 10, y);
+  lv_obj_set_size(bar, 36, h);
+  lv_obj_set_pos(bar, x, y);
   lv_obj_set_style_radius(bar, LV_RADIUS_CIRCLE, 0);
-  lv_obj_set_style_bg_color(bar, lvRgb(0x21, 0x96, 0xF3), 0);
+  lv_obj_set_style_bg_color(bar, lvRgb(0x39, 0xA0, 0xFF), 0);
   lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
   lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_clear_flag(bar, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_add_flag(bar, LV_OBJ_FLAG_HIDDEN);
   return bar;
+}
+
+// The Backup/Restore page's thin bar under its status line.
+lv_obj_t *makeLcdBackupTrack(lv_obj_t *parent, int y) {
+  return makeLcdProgressTrack(parent, 10, y, 204, 3, lvRgb(0x33, 0x3A, 0x45), LV_OPA_COVER);
+}
+
+lv_obj_t *makeLcdBackupAnimBar(lv_obj_t *parent, int y) {
+  return makeLcdProgressFill(parent, 10, y, 3);
 }
 
 void renderBackupRestorePageOmote() {
