@@ -1,6 +1,19 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.63 - 2026-09-15
+    - The page dots stay still while pages swipe. Every page used to carry its
+      own dots, so they slid away with it; there is now one dots bar on the UI
+      root, above the page strip and below the charging and backup overlays,
+      shared by every page. The white dot follows the strip's scroll position
+      on each scroll event, so it glides from one dot to the next as the page
+      moves and settles on the new page. The bar is the small dark pill in both
+      menu styles, and it is hidden on settings sub-pages, as before, and
+      while the brightness panel is open.
+    - The OMOTE Settings home uses the full screen height too, like the
+      OpenRemote style: the list runs to the bottom edge with the dots
+      floating over it on their pill.
+
   5.62 - 2026-09-15
     - The OpenRemote style's Settings home shows the page dots again, like
       OMOTE: on the home level only, with every settings sub-page still using
@@ -7066,7 +7079,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.62"
+#define OPENREMOTE_VERSION_STRING "5.63"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -30679,43 +30692,80 @@ void rebuildPages() {
   configurePageStripDirections();
 }
 
+/*
+  The page dots.
+
+  One bar for the whole page strip, on uiRoot above the tiles, so it stays
+  still while the pages slide beneath it. Each tile used to carry its own
+  dots, which slid away with the page. The white dot is not recoloured when a
+  swipe lands: it follows the strip's scroll position on every scroll event,
+  so it glides from one dot to the next with the finger and settles on the new
+  page. In both menu styles the bar is a small dark pill that keeps the dots
+  readable over full-height content, such as the Settings home list.
+*/
+static const int PAGE_DOT_PITCH = 16;
+static const int PAGE_DOT_SIZE = 8;
+static const int PAGE_DOT_INSET = 5;
+lv_obj_t *pageDotsBar = nullptr;
+lv_obj_t *pageDotsActive = nullptr;
+
+void positionPageDotsActive() {
+  if (!pageDotsActive || !lv_obj_is_valid(pageDotsActive) || !pageStrip) return;
+  float position = (float)lv_obj_get_scroll_x(pageStrip) / (float)LCD_W;
+  if (position < 0.0f) position = 0.0f;
+  if (pageCount > 0 && position > (float)(pageCount - 1)) position = (float)(pageCount - 1);
+  lv_obj_set_x(pageDotsActive, PAGE_DOT_INSET + (int)roundf(position * PAGE_DOT_PITCH));
+}
+
+void pageStripScrollEvent(lv_event_t *e) {
+  (void)e;
+  positionPageDotsActive();
+}
+
 void drawDots() {
-  if (!dots) return;
-  // On the settings page, dots only at the top (home) level; every sub-page
-  // uses the whole screen. Same in both menu styles.
-  if (currentPage == 0 && settingsView != SETTINGS_HOME) {
-    lv_obj_add_flag(dots, LV_OBJ_FLAG_HIDDEN);
+  if (!pageDotsBar) return;
+  // Settings sub-pages use the whole screen, and the brightness panel's wash
+  // would otherwise have the dots sitting bright on top of it.
+  bool hide = pageCount < 2 ||
+              (currentPage == 0 && settingsView != SETTINGS_HOME) ||
+              brightnessOverlay != nullptr;
+  if (hide) {
+    lv_obj_add_flag(pageDotsBar, LV_OBJ_FLAG_HIDDEN);
     return;
   }
-  lv_obj_clear_flag(dots, LV_OBJ_FLAG_HIDDEN);
-  lv_obj_clean(dots);
+  lv_obj_clear_flag(pageDotsBar, LV_OBJ_FLAG_HIDDEN);
+  pageDotsActive = nullptr;   // deleted by the clean below
+  lv_obj_clean(pageDotsBar);
 
-  // OpenRemote style's settings home runs its list the full height of the
-  // screen, so the dots float over it on a small dark pill that keeps them
-  // legible against the cards. Everywhere else they sit bare as before.
-  bool floating = currentPage == 0 && menuStyle == 0;
-  const int inset = floating ? 5 : 0;
-  lv_obj_set_style_bg_color(dots, lv_color_black(), 0);
-  lv_obj_set_style_bg_opa(dots, floating ? (lv_opa_t)150 : LV_OPA_TRANSP, 0);
-  lv_obj_set_style_radius(dots, LV_RADIUS_CIRCLE, 0);
+  // The same small dark pill in both menu styles.
+  lv_obj_set_style_bg_color(pageDotsBar, lv_color_black(), 0);
+  lv_obj_set_style_bg_opa(pageDotsBar, (lv_opa_t)150, 0);
+  lv_obj_set_style_radius(pageDotsBar, LV_RADIUS_CIRCLE, 0);
 
   for (uint8_t i = 0; i < pageCount; i++) {
-    lv_obj_t *dot = lv_obj_create(dots);
-    lv_obj_set_size(dot, 8, 8);
-    lv_obj_set_pos(dot, inset + i * 16, inset);
+    lv_obj_t *dot = lv_obj_create(pageDotsBar);
+    lv_obj_remove_style_all(dot);
+    lv_obj_set_size(dot, PAGE_DOT_SIZE, PAGE_DOT_SIZE);
+    lv_obj_set_pos(dot, PAGE_DOT_INSET + i * PAGE_DOT_PITCH, PAGE_DOT_INSET);
     lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_border_width(dot, 0, 0);
-    lv_obj_set_style_bg_color(dot, (i == currentPage) ? lv_color_white() : lvRgb(125, 125, 135), 0);
-    lv_obj_set_style_bg_opa(dot, (i == currentPage) ? LV_OPA_90 : LV_OPA_50, 0);
+    lv_obj_set_style_bg_color(dot, lvRgb(125, 125, 135), 0);
+    lv_obj_set_style_bg_opa(dot, LV_OPA_50, 0);
+    lv_obj_clear_flag(dot, LV_OBJ_FLAG_CLICKABLE);
   }
-  if (floating) {
-    lv_obj_set_size(dots, (pageCount - 1) * 16 + 8 + 2 * inset, 8 + 2 * inset);
-    lv_obj_align(dots, LV_ALIGN_BOTTOM_MID, 0, -6);
-    lv_obj_move_foreground(dots);   // over the full-height list
-  } else {
-    lv_obj_set_size(dots, pageCount * 16, 12);
-    lv_obj_align(dots, LV_ALIGN_BOTTOM_MID, 0, -8);
-  }
+  pageDotsActive = lv_obj_create(pageDotsBar);
+  lv_obj_remove_style_all(pageDotsActive);
+  lv_obj_set_size(pageDotsActive, PAGE_DOT_SIZE, PAGE_DOT_SIZE);
+  lv_obj_set_y(pageDotsActive, PAGE_DOT_INSET);
+  lv_obj_set_style_radius(pageDotsActive, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_color(pageDotsActive, lv_color_white(), 0);
+  lv_obj_set_style_bg_opa(pageDotsActive, LV_OPA_90, 0);
+  lv_obj_clear_flag(pageDotsActive, LV_OBJ_FLAG_CLICKABLE);
+
+  lv_obj_set_size(pageDotsBar, (pageCount - 1) * PAGE_DOT_PITCH + PAGE_DOT_SIZE + 2 * PAGE_DOT_INSET,
+                  PAGE_DOT_SIZE + 2 * PAGE_DOT_INSET);
+  lv_obj_align(pageDotsBar, LV_ALIGN_BOTTOM_MID, 0, -6);
+  lv_obj_move_foreground(pageDotsBar);
+  positionPageDotsActive();
 }
 
 void setCinematicBackground(bool enabled) {
@@ -31871,7 +31921,9 @@ void renderSettingsBackButton() {
 
 void renderSettingsHome() {
   setCinematicBackground(false);
-  configureContent(42, 250, false);
+  // Full height in both menu styles: the page dots float over the list on
+  // their pill (drawDots()) instead of the list stopping short of them.
+  configureContent(42, LCD_H - 42, false);
   lv_obj_add_flag(content, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_flag(content, LV_OBJ_FLAG_SCROLL_MOMENTUM);
   lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLL_ELASTIC);
@@ -37894,6 +37946,7 @@ void servicePageStripChange() {
     currentPage = target;
     bindPageUi(currentPage);
     configurePageStripDirections();
+    drawDots();   // the new page may show or hide the bar
   }
   applyBluetoothState();
   lastWakeMs = millis();
@@ -38144,6 +38197,7 @@ void closeBrightnessPanel() {
   if (statusBattery) lv_obj_clear_flag(statusBattery, LV_OBJ_FLAG_HIDDEN);
   if (statusBatteryTerminal) lv_obj_clear_flag(statusBatteryTerminal, LV_OBJ_FLAG_HIDDEN);
   brightnessLastActivityMs = 0;
+  drawDots();   // back once the panel has closed
 }
 
 void brightnessScrimOpaAnim(void *obj, int32_t value) {
@@ -38309,6 +38363,7 @@ void toggleBrightnessPanel() {
 
   brightnessLastActivityMs = millis();
   lv_obj_move_foreground(brightnessOverlay);
+  drawDots();   // hidden while the panel's wash is up
 }
 
 // ---------------------------------------------------------------------------
@@ -39074,16 +39129,25 @@ void setupUiRoot() {
     lv_obj_set_style_bg_opa(slot.topBar, LV_OPA_TRANSP, 0);
     lv_obj_clear_flag(slot.topBar, LV_OBJ_FLAG_SCROLLABLE);
 
-    slot.dots = lv_obj_create(slot.root);
-    lv_obj_remove_style_all(slot.dots);
-    lv_obj_set_size(slot.dots, 80, 12);
-    lv_obj_clear_flag(slot.dots, LV_OBJ_FLAG_SCROLLABLE);
+    // No per-tile dots: one bar above the strip is shared by every page, so it
+    // stays still while the pages slide (see drawDots()).
+    slot.dots = nullptr;
   }
 
   // Resolve all tile x positions before the first call to lv_obj_set_tile().
   // This is essential because startup normally selects Activities (tile 1),
   // not the tile at the strip's initial x=0 position.
   lv_obj_update_layout(pageStrip);
+
+  // Created after the strip so it draws above the sliding tiles, and on uiRoot
+  // rather than lv_layer_top() so the charging and backup overlays still cover
+  // it. Not clickable, so taps pass through to the page underneath.
+  pageDotsBar = lv_obj_create(uiRoot);
+  lv_obj_remove_style_all(pageDotsBar);
+  lv_obj_clear_flag(pageDotsBar, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(pageDotsBar, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_flag(pageDotsBar, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_event_cb(pageStrip, pageStripScrollEvent, LV_EVENT_SCROLL, nullptr);
 
   bindPageUi(0);
 
