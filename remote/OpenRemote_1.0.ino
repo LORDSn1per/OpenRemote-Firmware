@@ -1,6 +1,17 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.57 - 2026-09-15
+    - Settings > Battery and Settings > About have a back button again in the
+      OMOTE and Stormy styles. Their card layouts started at y=4 and y=34, on
+      top of the back button's (8,6)-(50,36) footprint, so the card hid it -
+      Battery's completely. Both now start below it.
+    - Stormy row subtitles stay on one line and end in an ellipsis. LVGL only
+      truncates a label whose height is fixed, so long ones ("+0.00% in last
+      24 hours", "OMOTE Rev 5 / ESP32-S3") wrapped onto a second line and ran
+      through the divider below. Rows with neither a switch nor a value on the
+      right now give the subtitle the full width.
+
   5.56 - 2026-09-15
     - Stormy applies to every settings page, not just Settings home and
       Display. Stormy now renders through the OMOTE layouts - every settings
@@ -7007,7 +7018,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.56"
+#define OPENREMOTE_VERSION_STRING "5.57"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -31354,7 +31365,13 @@ lv_obj_t *makeStormyRowEx(lv_obj_t *card, const char *name, const char *sub,
   if (hasSub) {
     lv_obj_t *subLabel = makeLabel(row, sub, 14, height / 2 + 3, &lv_font_montserrat_10, muted);
     if (subLabelOut) *subLabelOut = subLabel;
-    lv_obj_set_width(subLabel, switchTarget ? 140 : 110);
+    // One line, cut short with an ellipsis. LONG_DOT only truncates a label
+    // whose height is fixed; left to size itself it wrapped onto a second line
+    // and ran through the divider below ("+0.00% in last 24 hours"). Rows with
+    // neither a switch nor a right-hand value get the full width.
+    bool hasValue = value && value[0];
+    lv_obj_set_width(subLabel, switchTarget ? 140 : (hasValue ? 100 : 190));
+    lv_obj_set_height(subLabel, 13);
     lv_label_set_long_mode(subLabel, LV_LABEL_LONG_DOT);
   }
   if (switchTarget) {
@@ -34564,7 +34581,9 @@ void renderBatteryPage() {
   renderTopBar("Battery", false);
   renderSettingsBackButton();
   if (menuStyle == 1 || menuStyle == 2) {   // OMOTE layouts, drawn Stormy in style 2
-    makeBatteryMetricRows(4, true);
+    // y=44, not 4: the card at 4 was drawn over the back button's (8,6)-(50,36)
+    // footprint and hid it, leaving no way back from this page.
+    makeBatteryMetricRows(44, true);
     return;
   }
 
@@ -34882,13 +34901,15 @@ void renderBackupRestorePage() {
 }
 
 void renderAboutPageOmote() {
-  lv_obj_t *nameLabel = makeLabel(content, "OpenRemote", 0, 4, &lv_font_montserrat_16, textPrimary());
+  // Everything starts below the back button's (8,6)-(50,36) footprint; the
+  // card used to sit at y=34 and cover its lower edge.
+  lv_obj_t *nameLabel = makeLabel(content, "OpenRemote", 0, 44, &lv_font_montserrat_16, textPrimary());
   lv_obj_set_width(nameLabel, LCD_W);
   lv_obj_set_style_text_align(nameLabel, LV_TEXT_ALIGN_CENTER, 0);
 
   const int rowH = 48;
   // Six rows now: the five information rows plus the Debug Menu switch.
-  lv_obj_t *infoCard = makeOmoteCard(content, 34, 6 * rowH + 5);
+  lv_obj_t *infoCard = makeOmoteCard(content, 74, 6 * rowH + 5);
   String webVersion = installedWebConfigVersion();
   makeOmoteRow(infoCard, "Firmware", OPENREMOTE_VERSION_TEXT, 0, rowH, nullptr);
   makeOmoteDivider(infoCard, rowH);
@@ -34907,7 +34928,7 @@ void renderAboutPageOmote() {
   makeOmoteRow(infoCard, "Debug Menu", "Show Debug in Settings",
                5 * rowH + 5, rowH, &debugMenuVisible);
 
-  int batteryY = 34 + 6 * rowH + 5 + 16;
+  int batteryY = 74 + 6 * rowH + 5 + 16;
   makeLabel(content, "Battery", 8, batteryY, &lv_font_montserrat_16, textPrimary());
   makeBatteryMetricRows(batteryY + 34, true);
 }
