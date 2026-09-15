@@ -1,6 +1,24 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.39 - 2026-09-15
+    - Plugging in the charger shows a charging overlay for three seconds, on
+      any page and even with the screen off: a large rounded battery whose
+      green charge rises to the current level and breathes, a bolt, the
+      battery percentage and "Charging". A tap anywhere closes it at once
+      without pressing anything underneath. If the screen was off it goes back
+      off afterwards; after a tap it stays on with a fresh sleep timer.
+      Charging is now watched from the loop whether or not the status bar is
+      drawn, and the charge pin wakes the remote from light sleep (armed only
+      while not already charging). Deep sleep is unchanged: its wake inputs
+      are still motion and the keypad only.
+    - The LCD no longer turns off the moment a backup or restore finishes. The
+      sleep timer counted from the last touch before a minute or more of
+      blocking work, so it had long expired when the job returned. It is now
+      ignored while a backup, restore or the charging overlay is on screen
+      (face-down sleep too) and starts when the job finishes - after the
+      configuration reload that follows a restore.
+
   5.38 - 2026-09-14
     - Restoring a backup fills the LCD progress bar once, 0-100%, instead of
       four times. Each restoreEmbeddedFiles() call - icons, theme assets,
@@ -6813,7 +6831,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.38"
+#define OPENREMOTE_VERSION_STRING "5.39"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -9621,6 +9639,14 @@ volatile unsigned long atvvNextAudioFrameMs = 0;
 bool touchFound = false;
 bool lis3dhReady = false;
 bool displaySleeping = false;
+// The charging overlay - see serviceChargeOverlay(). Declared this early
+// because the sleep paths consult it.
+lv_obj_t *chargeOverlay = nullptr;
+bool chargeWakePending = false;
+unsigned long chargeWakeStartedMs = 0;
+// Set when a queued restore finishes, so the configuration reload that follows
+// it restarts the sleep timer too - see serviceQueuedBackup().
+bool restoreReloadRestartsSleepTimer = false;
 bool lightSleepArmed = false;
 bool bleConnectedIdleActive = false;
 bool bleIdleAccelerometerWake = false;
@@ -11383,7 +11409,8 @@ void serviceFaceDownSleep(unsigned long now) {
     faceDownSinceMs = now;
     return;
   }
-  if (activitySequenceActive || usbSdTransferActive() || usbStudioLinkActive()) return;
+  if (activitySequenceActive || usbSdTransferActive() || usbStudioLinkActive() ||
+      chargeOverlay || sdBusyWithBackupJob()) return;
   if ((uint32_t)(now - faceDownSinceMs) >= FACE_DOWN_SLEEP_MS) {
     Serial.println("Face-down sleep: screen-down orientation held, sleeping now");
     enterDisplaySleep();
@@ -22649,6 +22676,218 @@ bool sdBusyWithBackupJob() {
 }
 
 /*
+  Charging overlay.
+
+  Plugging the remote in shows a large battery on its own full-screen layer for
+  three seconds, whatever page is up and even when the screen was off. A tap
+  anywhere closes it at once.
+
+  Detection lives here rather than in refreshStatusPill(), which only runs
+  while the status bar is being drawn - a charger connected with the screen off
+  was never noticed until the next wake. The edge is taken from chargingState,
+  which updateChargingState() already debounces, against the last value this
+  service saw, so it does not matter which caller last updated it.
+
+  Built on lv_layer_top() like the backup overlay: it belongs to no page, so it
+  needs no navigation and leaves the page underneath exactly as it was.
+*/
+static const uint32_t CHARGE_OVERLAY_SHOW_MS = 3000UL;
+static const uint32_t CHARGE_OVERLAY_POLL_MS = 100UL;
+static const uint32_t CHARGE_WAKE_CONFIRM_MS = 1000UL;
+unsigned long chargeOverlayShownMs = 0;
+unsigned long nextChargeOverlayPollMs = 0;
+bool chargeOverlaySeenCharging = false;
+bool chargeOverlayPrimed = false;
+bool chargeOverlayWasSleeping = false;
+bool chargeOverlayTouchDismissed = false;
+
+void chargeOverlayHeightAnim(void *obj, int32_t value) {
+  lv_obj_set_height((lv_obj_t *)obj, (lv_coord_t)value);
+}
+
+void chargeOverlayBgOpaAnim(void *obj, int32_t value) {
+  lv_obj_set_style_bg_opa((lv_obj_t *)obj, (lv_opa_t)value, 0);
+}
+
+void chargeOverlayOpaAnim(void *obj, int32_t value) {
+  lv_obj_set_style_opa((lv_obj_t *)obj, (lv_opa_t)value, 0);
+}
+
+void chargeOverlayPressed(lv_event_t *e) {
+  (void)e;
+  // Swallow the rest of this touch, so lifting the finger cannot click
+  // whatever sits underneath once the overlay has gone.
+  lv_indev_t *indev = lv_indev_get_act();
+  if (indev) lv_indev_wait_release(indev);
+  // Closed from serviceChargeOverlay(), never from inside the object's own
+  // event handler.
+  chargeOverlayTouchDismissed = true;
+}
+
+void hideChargeOverlay() {
+  if (chargeOverlay && lv_obj_is_valid(chargeOverlay)) lv_obj_del(chargeOverlay);
+  chargeOverlay = nullptr;
+}
+
+void showChargeOverlay() {
+  hideChargeOverlay();
+  float percent = readBatteryPercent();
+  const lv_color_t ground = lvRgb(0x0B, 0x10, 0x18);
+  const lv_color_t shell = lvRgb(0xE8, 0xEC, 0xF2);
+  const lv_color_t green = lvRgb(0x22, 0xC5, 0x5E);
+  const lv_color_t greenLight = lvRgb(0x86, 0xEF, 0xAC);
+
+  chargeOverlay = lv_obj_create(lv_layer_top());
+  lv_obj_remove_style_all(chargeOverlay);
+  lv_obj_set_pos(chargeOverlay, 0, 0);
+  lv_obj_set_size(chargeOverlay, LCD_W, LCD_H);
+  lv_obj_set_style_bg_opa(chargeOverlay, LV_OPA_COVER, 0);
+  lv_obj_set_style_bg_color(chargeOverlay, ground, 0);
+  lv_obj_clear_flag(chargeOverlay, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(chargeOverlay, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(chargeOverlay, chargeOverlayPressed, LV_EVENT_PRESSED, nullptr);
+
+  // The battery: a rounded terminal cap, then the rounded shell drawn over its
+  // lower edge so the two read as one piece.
+  const int bodyW = 104, bodyH = 172, bodyY = 44, inset = 9;
+  lv_obj_t *cap = lv_obj_create(chargeOverlay);
+  lv_obj_remove_style_all(cap);
+  lv_obj_set_size(cap, 40, 16);
+  lv_obj_set_pos(cap, (LCD_W - 40) / 2, bodyY - 11);
+  lv_obj_set_style_radius(cap, 6, 0);
+  lv_obj_set_style_bg_opa(cap, LV_OPA_COVER, 0);
+  lv_obj_set_style_bg_color(cap, shell, 0);
+
+  lv_obj_t *body = lv_obj_create(chargeOverlay);
+  lv_obj_remove_style_all(body);
+  lv_obj_set_size(body, bodyW, bodyH);
+  lv_obj_set_pos(body, (LCD_W - bodyW) / 2, bodyY);
+  lv_obj_set_style_radius(body, 24, 0);
+  lv_obj_set_style_border_width(body, 5, 0);
+  lv_obj_set_style_border_color(body, shell, 0);
+  lv_obj_set_style_border_opa(body, LV_OPA_COVER, 0);
+  lv_obj_set_style_bg_opa(body, LV_OPA_COVER, 0);
+  lv_obj_set_style_bg_color(body, ground, 0);
+  lv_obj_set_style_pad_all(body, inset, 0);
+  lv_obj_set_style_clip_corner(body, true, 0);
+  lv_obj_clear_flag(body, LV_OBJ_FLAG_SCROLLABLE);
+
+  // Green charge, rising from empty to the real level and then breathing.
+  const int innerH = bodyH - inset * 2;
+  int level = percent < 0.0f ? innerH : (int)((float)innerH * percent / 100.0f + 0.5f);
+  if (level < 16) level = 16;   // always a visible sliver of green
+  lv_obj_t *fill = lv_obj_create(body);
+  lv_obj_remove_style_all(fill);
+  lv_obj_set_width(fill, lv_pct(100));
+  lv_obj_set_height(fill, 0);
+  lv_obj_align(fill, LV_ALIGN_BOTTOM_MID, 0, 0);
+  lv_obj_set_style_radius(fill, 15, 0);
+  lv_obj_set_style_bg_opa(fill, LV_OPA_COVER, 0);
+  lv_obj_set_style_bg_color(fill, greenLight, 0);
+  lv_obj_set_style_bg_grad_color(fill, green, 0);
+  lv_obj_set_style_bg_grad_dir(fill, LV_GRAD_DIR_VER, 0);
+
+  lv_anim_t rise;
+  lv_anim_init(&rise);
+  lv_anim_set_var(&rise, fill);
+  lv_anim_set_exec_cb(&rise, chargeOverlayHeightAnim);
+  lv_anim_set_values(&rise, 0, level);
+  lv_anim_set_time(&rise, 900);
+  lv_anim_set_path_cb(&rise, lv_anim_path_ease_out);
+  lv_anim_start(&rise);
+
+  lv_anim_t breathe;
+  lv_anim_init(&breathe);
+  lv_anim_set_var(&breathe, fill);
+  lv_anim_set_exec_cb(&breathe, chargeOverlayBgOpaAnim);
+  lv_anim_set_values(&breathe, LV_OPA_COVER, LV_OPA_60);
+  lv_anim_set_time(&breathe, 700);
+  lv_anim_set_playback_time(&breathe, 700);
+  lv_anim_set_delay(&breathe, 900);
+  lv_anim_set_repeat_count(&breathe, LV_ANIM_REPEAT_INFINITE);
+  lv_anim_set_path_cb(&breathe, lv_anim_path_ease_in_out);
+  lv_anim_start(&breathe);
+
+  // The bolt fades in over the fill.
+  lv_obj_t *bolt = lv_label_create(body);
+  lv_label_set_text(bolt, LV_SYMBOL_CHARGE);
+  lv_obj_set_style_text_font(bolt, &lv_font_montserrat_48, 0);
+  lv_obj_set_style_text_color(bolt, lvRgb(0xFF, 0xFF, 0xFF), 0);
+  lv_obj_set_style_opa(bolt, LV_OPA_TRANSP, 0);
+  lv_obj_center(bolt);
+  lv_anim_t boltIn;
+  lv_anim_init(&boltIn);
+  lv_anim_set_var(&boltIn, bolt);
+  lv_anim_set_exec_cb(&boltIn, chargeOverlayOpaAnim);
+  lv_anim_set_values(&boltIn, LV_OPA_TRANSP, LV_OPA_COVER);
+  lv_anim_set_time(&boltIn, 500);
+  lv_anim_set_delay(&boltIn, 250);
+  lv_anim_start(&boltIn);
+
+  char text[8];
+  if (percent < 0.0f) strlcpy(text, "--%", sizeof(text));
+  else snprintf(text, sizeof(text), "%d%%", (int)(percent + 0.5f));
+  lv_obj_t *percentLabel = lv_label_create(chargeOverlay);
+  lv_label_set_text(percentLabel, text);
+  lv_obj_set_style_text_font(percentLabel, &lv_font_montserrat_48, 0);
+  lv_obj_set_style_text_color(percentLabel, lvRgb(0xFF, 0xFF, 0xFF), 0);
+  lv_obj_align(percentLabel, LV_ALIGN_TOP_MID, 0, bodyY + bodyH + 12);
+
+  lv_obj_t *caption = lv_label_create(chargeOverlay);
+  lv_label_set_text(caption, "Charging");
+  lv_obj_set_style_text_font(caption, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(caption, greenLight, 0);
+  lv_obj_align(caption, LV_ALIGN_TOP_MID, 0, bodyY + bodyH + 68);
+}
+
+void serviceChargeOverlay(unsigned long now) {
+  if (chargeOverlay) {
+    bool timedOut = (uint32_t)(now - chargeOverlayShownMs) >= CHARGE_OVERLAY_SHOW_MS;
+    if (chargeOverlayTouchDismissed || timedOut) {
+      bool touched = chargeOverlayTouchDismissed;
+      chargeOverlayTouchDismissed = false;
+      hideChargeOverlay();
+      // A tap is someone picking the remote up, so the screen stays on with a
+      // fresh sleep timer. Left alone, it goes back to how it was - dark if it
+      // was dark when the charger went in.
+      lastWakeMs = millis();
+      if (chargeOverlayWasSleeping && !touched) enterDisplaySleep();
+      else lv_obj_invalidate(lv_scr_act());
+    }
+  }
+
+  if (!chargeWakePending && (int32_t)(now - nextChargeOverlayPollMs) < 0) return;
+  nextChargeOverlayPollMs = now + CHARGE_OVERLAY_POLL_MS;
+  bool charging = updateChargingState();
+  if (!chargeOverlayPrimed) {
+    // Booting on the charger is not the charger being connected.
+    chargeOverlayPrimed = true;
+    chargeOverlaySeenCharging = charging;
+    chargeWakePending = false;
+    return;
+  }
+  bool connected = charging && !chargeOverlaySeenCharging;
+  chargeOverlaySeenCharging = charging;
+  if (!connected) {
+    // A charge-pin wake from light sleep holds the remote out of sleep until
+    // the debounce confirms it; a pin that never settles releases it again.
+    if (chargeWakePending &&
+        (uint32_t)(now - chargeWakeStartedMs) >= CHARGE_WAKE_CONFIRM_MS) {
+      chargeWakePending = false;
+    }
+    return;
+  }
+  chargeWakePending = false;
+  if (backupOverlay) return;   // a backup or restore owns the screen
+  chargeOverlayWasSleeping = displaySleeping;
+  if (displaySleeping) wakeDisplay();
+  showChargeOverlay();
+  chargeOverlayShownMs = millis();
+  lastWakeMs = chargeOverlayShownMs;
+  Serial.println("Charging: charger connected, showing the charging overlay");
+}
+
+/*
   Opens or closes the WebConfig page when USB asked for it. Runs from loop(),
   so openSettingsView() and the LVGL work it does are on the right core.
 */
@@ -22727,7 +22966,15 @@ void serviceQueuedBackup() {
   hideBackupOverlay();
   backupRequestOrigin = "Started from WebConfig";
   backupRequestRunning = false;
-  if (restoring && ok) scheduleRuntimeReloadAfterSync();
+  // The sleep timer starts now, not when the job began. It counted from the
+  // last touch before a minute or more of blocking work, so the first loop
+  // after the overlay closed found it long expired and put the LCD straight
+  // out the moment the job reached 100%.
+  lastWakeMs = millis();
+  if (restoring && ok) {
+    scheduleRuntimeReloadAfterSync();
+    restoreReloadRestartsSleepTimer = true;   // the reload is more seconds of work
+  }
   pendingUiRefresh = true;
 }
 
@@ -33544,6 +33791,7 @@ void createBackupFromLcd(lv_event_t *e) {
   lv_refr_now(nullptr);
   vTaskDelay(pdMS_TO_TICKS(1200));
   hideBackupOverlay();
+  lastWakeMs = millis();   // the sleep timer starts when the job finishes
   pendingUiRefresh = true;
 }
 
@@ -33568,6 +33816,7 @@ void confirmBackupRestore(lv_event_t *e) {
   lv_refr_now(nullptr);
   vTaskDelay(pdMS_TO_TICKS(1200));
   hideBackupOverlay();
+  lastWakeMs = millis();   // the sleep timer starts when the job finishes
   pendingUiRefresh = true;
 }
 
@@ -37686,7 +37935,7 @@ void enterLowPowerWait() {
   // of range - which it never was. A WebConfig transfer is already held out of
   // here for exactly this reason; a firmware push is the same kind of work and
   // lasts far longer.
-  if (!displaySleeping || webConfigQrPageActive() || webConfigTransferBusy() ||
+  if (!displaySleeping || chargeWakePending || webConfigQrPageActive() || webConfigTransferBusy() ||
       dockOtaBusy() ||
       usbSdTransferActive() || usbStudioLinkActive() || ntpSyncPending || wifiConnectPending ||
       bluetoothActivitySessionRequired()) return;
@@ -37724,6 +37973,11 @@ void enterLowPowerWait() {
     keypadPinResult = gpio_wakeup_enable(
       (gpio_num_t)PIN_TCA_INT, GPIO_INTR_LOW_LEVEL);
   }
+  // Plugging in a charger wakes the remote so the charging overlay can show.
+  // Level-triggered, so it is armed only while the pin reads "not charging":
+  // armed while already charging it would wake again at once, every time.
+  bool chargeWake = digitalRead(PIN_CHARGE_STATUS) == HIGH &&
+    gpio_wakeup_enable((gpio_num_t)PIN_CHARGE_STATUS, GPIO_INTR_LOW_LEVEL) == ESP_OK;
   if (accelerometerPinResult == ESP_OK && keypadPinResult == ESP_OK) {
     gpioWakeResult = esp_sleep_enable_gpio_wakeup();
   }
@@ -37740,6 +37994,7 @@ void enterLowPowerWait() {
       gpioWakeResult != ESP_OK) {
     if (accelerometerWake) gpio_wakeup_disable((gpio_num_t)PIN_ACC_INT);
     if (keypadWake) gpio_wakeup_disable((gpio_num_t)PIN_TCA_INT);
+    if (chargeWake) gpio_wakeup_disable((gpio_num_t)PIN_CHARGE_STATUS);
     esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_GPIO);
     configureLis3dhAwake();
     Serial.printf("Light sleep wake setup failed: motionPin=%d keypadPin=%d gpioWake=%d\n",
@@ -37790,6 +38045,7 @@ void enterLowPowerWait() {
 
   if (accelerometerWake) gpio_wakeup_disable((gpio_num_t)PIN_ACC_INT);
   if (keypadWake) gpio_wakeup_disable((gpio_num_t)PIN_TCA_INT);
+  if (chargeWake) gpio_wakeup_disable((gpio_num_t)PIN_CHARGE_STATUS);
   esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_GPIO);
   esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
   esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_UART);
@@ -37813,6 +38069,17 @@ void enterLowPowerWait() {
     return;
   }
   bool keypadTriggered = keypadWake && keypadLevel == LOW;
+  bool chargerTriggered = chargeWake && cause == ESP_SLEEP_WAKEUP_GPIO &&
+    digitalRead(PIN_CHARGE_STATUS) == LOW;
+  if (chargerTriggered && !keypadTriggered &&
+      !(accelerometerWake && accelerometerLevel == HIGH)) {
+    // Stay dark here. serviceChargeOverlay() confirms the charger through the
+    // normal debounce and lights the screen only for the overlay itself.
+    Serial.println("Light sleep wake: charger connected");
+    chargeWakePending = true;
+    chargeWakeStartedMs = millis();
+    return;
+  }
   bool motionOnlyTriggered = !keypadTriggered && accelerometerWake && accelerometerLevel == HIGH;
   if (motionOnlyTriggered && wakeMode == WAKE_MODE_BUTTON) {
     // Stay dark: hold the MCU awake (out of esp_light_sleep_start()) for a
@@ -38431,6 +38698,7 @@ void loop() {
   serviceEspNowSearchOverlay(now);
   servicePhysicalNavIdleHide(now);
   serviceFaceDownSleep(now);
+  serviceChargeOverlay(millis());
   now = millis();
   serviceAtvvVoice(now);
   if (microphoneStopPending && !atvvAudioStarted) {
@@ -38472,6 +38740,10 @@ void loop() {
     }
     runtimeReloadCanRollback = false;
     if (loaded && wasSleeping) wakeDisplay();
+    if (restoreReloadRestartsSleepTimer) {
+      restoreReloadRestartsSleepTimer = false;
+      lastWakeMs = millis();
+    }
     /*
       Write the firmware's own settings back into the file WebConfig just
       uploaded, because that file does not contain all of them.
@@ -38739,7 +39011,10 @@ void loop() {
   uint32_t activeSleepMs = (qrPageActive || bluetoothSettingsPageActive())
                              ? QR_PAGE_AWAKE_TIMEOUT_MS
                              : (uint32_t)timeoutSeconds * 1000UL;
+  // Never while a backup, restore or the charging overlay is on screen; each
+  // restarts the timer as it closes.
   if (!activitySequenceActive && !usbSdTransferActive() && !usbStudioLinkActive() &&
+      !sdBusyWithBackupJob() && !backupOverlay && !chargeOverlay &&
       (uint32_t)(now - lastWakeMs) > activeSleepMs) {
     enterDisplaySleep();
   }
