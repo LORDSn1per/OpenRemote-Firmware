@@ -83,8 +83,9 @@ time.sleep(6)                      # opening the port reset the remote
 p.reset_input_buffer()
 hello = json_reply(p, "ORUSB PING")
 print("remote firmware:", hello.get("firmwareVersion"))
-if SETUP:
-    print(json_reply(p, SETUP))
+# Several setup commands may be given, separated by ";".
+for step in [s.strip() for s in SETUP.split(";") if s.strip()]:
+    print(json_reply(p, step))
     time.sleep(1.5)                # let it draw
 shot = json_reply(p, "ORUSB SCREENSHOT", timeout=15, tries=1)
 print(shot)

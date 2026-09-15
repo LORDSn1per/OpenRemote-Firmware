@@ -1,6 +1,30 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.53 - 2026-09-15
+    - New settings menu style, "Stormy" (Menu Style value 2, beside OpenRemote
+      and OMOTE). Settings pages only; Activities and device pages are the same
+      in every style. A storm-blue gradient behind the page, solid navy cards
+      with a hairline blue border and 14px radius, section headings, one
+      electric blue for everything active, and no row icons.
+    - Settings home: a battery summary card (percentage, CHARGING / ON BATTERY
+      chip, level bar) that opens the Battery page, then Connections (Wi-Fi,
+      Bluetooth, Wi-Fi Config, Dock), Preferences (Display, Clock, Buttons)
+      and System (Debug when enabled, Backup / Restore, About) cards. Rows
+      show a title, a short status under it or a value on the right, and a
+      blue chevron or a switch.
+    - Display page: Screen, Sleep & wake and Panel cards. Stormy sliders are an
+      8px track with a blue gradient fill and a white knob ringed in blue;
+      switches keep their knob inside a blue gradient track; dropdowns are navy
+      pills with a blue hairline and chevron, and their open list is navy with
+      the selection in solid blue. The back button is a matching pill.
+    - Settings pages without a Stormy renderer yet use the OpenRemote layouts,
+      as any style other than OMOTE already did. configureContent() now clears
+      the gradient so no other page inherits it.
+    - New ORUSB MENUSTYLE <0-2> and ORUSB SETTINGS home|display|display-panel
+      for screenshots; display-panel scrolls to the Panel card and opens the
+      Wake dropdown.
+
   5.52 - 2026-09-15
     - The backup and restore overlay is a rounded box instead of a full-screen
       sheet, in the brightness panel's style: black at 100 of 255 fades the
@@ -6950,7 +6974,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.52"
+#define OPENREMOTE_VERSION_STRING "5.53"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -9212,6 +9236,13 @@ volatile bool usbOverlayDemoRequest = false;
 uint8_t usbOverlayDemoMode = 0;
 uint8_t usbOverlayDemoPercent = 50;
 unsigned long usbOverlayDemoUntilMs = 0;
+// ORUSB SETTINGS home|display|display-panel: jumps to a settings view for
+// screenshots. display-panel also scrolls to the Panel card and opens the Wake
+// dropdown once the page has rendered.
+volatile bool usbSettingsNavRequest = false;
+uint8_t usbSettingsNavTarget = 0;
+unsigned long usbSettingsNavFollowUpMs = 0;
+lv_obj_t *stormyWakeDropdown = nullptr;   // Stormy Display page's Wake dropdown
 // Every band lvFlush() sends to the LCD, kept as one LCD_W x LCD_H RGB565
 // frame so a screenshot shows what is actually on the panel - lv_layer_top()
 // included, which lv_snapshot_take() cannot see.
@@ -11996,6 +12027,7 @@ void loadSettings() {
   backlightPwmHz = preferences.getULong("blPwmHz", BACKLIGHT_PWM_HZ);
   if (!backlightPwmFrequencyValid(backlightPwmHz)) backlightPwmHz = BACKLIGHT_PWM_HZ;
   menuStyle = preferences.getUChar("menuStyle", 0);
+  if (menuStyle > 2) menuStyle = 0;   // 0 OpenRemote, 1 OMOTE, 2 Stormy
   physicalRepeatEnabled = preferences.getBool("btnRpt", true);
   physicalRepeatDelayMs = constrain(
     (int)preferences.getUShort("btnDelay", 400),
@@ -15169,7 +15201,7 @@ void applySettingsJson(JsonVariantConst settings) {
   for (const char *key : ownedSettingKeys) {
     if (settings[key].isNull()) { settingsIncomplete = true; break; }
   }
-  menuStyle = constrain((int)(settings["menuStyle"] | menuStyle), 0, 1);
+  menuStyle = constrain((int)(settings["menuStyle"] | menuStyle), 0, 2);
   displayModuleChoice = constrain(
     (int)(settings["displayModule"] | displayModuleChoice),
     (int)DISPLAY_MODULE_ADAFRUIT, (int)DISPLAY_MODULE_ST7789);
@@ -19626,6 +19658,26 @@ void handleUsbCommand(Stream &port, UsbSerialSession &session, String command) {
     usbImportReply(port, String("{\"ok\":true,\"overlay\":\"") +
       (usbOverlayDemoMode == 2 ? "restore" : (usbOverlayDemoMode == 1 ? "backup" : "off")) +
       "\"}");
+  } else if (command.startsWith("ORUSB MENUSTYLE ")) {
+    // 0 OpenRemote, 1 OMOTE, 2 Stormy - saved exactly as the Menu Style
+    // dropdown saves it.
+    int style = command.substring(16).toInt();
+    if (style < 0 || style > 2) {
+      usbImportReply(port, "{\"ok\":false,\"error\":\"Menu style must be 0, 1 or 2\"}");
+      return;
+    }
+    menuStyle = (uint8_t)style;
+    preferences.begin(PREFERENCES_NAMESPACE, false);
+    preferences.putUChar("menuStyle", menuStyle);
+    preferences.end();
+    pendingUiRefresh = true;
+    usbImportReply(port, String("{\"ok\":true,\"menuStyle\":") + String(style) + "}");
+  } else if (command.startsWith("ORUSB SETTINGS ")) {
+    String target = command.substring(15);
+    target.trim();
+    usbSettingsNavTarget = target == "display" ? 1 : (target == "display-panel" ? 2 : 0);
+    usbSettingsNavRequest = true;
+    usbImportReply(port, String("{\"ok\":true,\"settings\":\"") + target + "\"}");
   } else if (command == "ORUSB SCREENSHOT") {
     // Answered from the loop once the snapshot is on the card.
     usbScreenshotRequest = true;
@@ -23101,6 +23153,7 @@ void serviceChargeOverlay(unsigned long now) {
   so openSettingsView() and the LVGL work it does are on the right core.
 */
 void jumpToWebConfigQr(lv_event_t *e);
+void jumpToSettingsView(SettingsView view);
 
 /*
   Writes what is on the LCD to the card as raw little-endian RGB565 for ORUSB
@@ -23146,6 +23199,23 @@ void serviceUsbWebConfigRequest() {
     if (displaySleeping) wakeDisplay();
     lastWakeMs = millis();
     if (!brightnessOverlay && !brightnessPanel) toggleBrightnessPanel();
+  }
+  if (usbSettingsNavRequest) {
+    usbSettingsNavRequest = false;
+    if (displaySleeping) wakeDisplay();
+    lastWakeMs = millis();
+    jumpToSettingsView(usbSettingsNavTarget == 0 ? SETTINGS_HOME : SETTINGS_DISPLAY);
+    usbSettingsNavFollowUpMs = usbSettingsNavTarget == 2 ? millis() + 700UL : 0;
+  }
+  // After the page has rendered: scroll to the bottom card and open Wake.
+  if (usbSettingsNavFollowUpMs && (int32_t)(millis() - usbSettingsNavFollowUpMs) >= 0) {
+    usbSettingsNavFollowUpMs = 0;
+    if (content && stormyWakeDropdown && lv_obj_is_valid(stormyWakeDropdown)) {
+      lv_obj_scroll_to_y(content, lv_obj_get_scroll_y(content) + lv_obj_get_scroll_bottom(content),
+                         LV_ANIM_OFF);
+      lv_dropdown_open(stormyWakeDropdown);
+      lastWakeMs = millis();
+    }
   }
   if (usbOverlayDemoRequest) {
     usbOverlayDemoRequest = false;
@@ -30453,6 +30523,9 @@ void configureContent(int y, int height, bool transparent) {
   lv_obj_set_pos(content, 0, y);
   lv_obj_set_size(content, LCD_W, height);
   lv_obj_set_style_bg_color(content, lv_color_black(), 0);
+  // Cleared every time: a Stormy settings page gives content a gradient, and
+  // content is reused by whatever page is rendered next.
+  lv_obj_set_style_bg_grad_dir(content, LV_GRAD_DIR_NONE, 0);
   lv_obj_set_style_bg_opa(content, transparent ? LV_OPA_TRANSP : LV_OPA_COVER, 0);
 }
 
@@ -31009,6 +31082,318 @@ lv_obj_t *makeOmoteDropdownRow(lv_obj_t *card, const char *name, int y, int heig
   return dropdown;
 }
 
+// ---------------------------------------------------------------------------
+// Stormy settings style (menuStyle 2). Settings pages only - the Activities
+// and device pages are untouched in every style. Deep storm-blue gradient
+// behind the page, solid navy cards with a hairline blue border, one electric
+// blue for everything active, no row icons (the rows are too narrow for an
+// icon and a title). Pages without a Stormy renderer of their own fall back
+// to the OpenRemote renderers, which is what any menuStyle other than 1 does.
+// Cards are solid rather than translucent: they scroll over the gradient, and
+// every scroll frame would otherwise alpha-blend the whole list.
+// ---------------------------------------------------------------------------
+
+void styleStormySwitch(lv_obj_t *sw) {
+  lv_obj_set_style_radius(sw, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(sw, lvRgb(38, 50, 76), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(sw, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_radius(sw, LV_RADIUS_CIRCLE, LV_PART_INDICATOR);
+  lv_obj_set_style_bg_color(sw, lvRgb(38, 50, 76), LV_PART_INDICATOR);
+  lv_obj_set_style_bg_color(sw, lvRgb(58, 139, 255), LV_PART_INDICATOR | LV_STATE_CHECKED);
+  lv_obj_set_style_bg_grad_color(sw, lvRgb(31, 99, 232), LV_PART_INDICATOR | LV_STATE_CHECKED);
+  lv_obj_set_style_bg_grad_dir(sw, LV_GRAD_DIR_VER, LV_PART_INDICATOR | LV_STATE_CHECKED);
+  lv_obj_set_style_bg_opa(sw, LV_OPA_COVER, LV_PART_INDICATOR);
+  lv_obj_set_style_bg_color(sw, lv_color_white(), LV_PART_KNOB);
+  lv_obj_set_style_bg_opa(sw, LV_OPA_COVER, LV_PART_KNOB);
+  // Negative pad keeps the knob inside the track, like the reference toggles.
+  lv_obj_set_style_pad_all(sw, -3, LV_PART_KNOB);
+}
+
+void styleStormySlider(lv_obj_t *sl) {
+  lv_obj_set_style_radius(sl, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(sl, lvRgb(30, 42, 68), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(sl, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_radius(sl, LV_RADIUS_CIRCLE, LV_PART_INDICATOR);
+  lv_obj_set_style_bg_color(sl, lvRgb(31, 99, 232), LV_PART_INDICATOR);
+  lv_obj_set_style_bg_grad_color(sl, lvRgb(90, 162, 255), LV_PART_INDICATOR);
+  lv_obj_set_style_bg_grad_dir(sl, LV_GRAD_DIR_HOR, LV_PART_INDICATOR);
+  lv_obj_set_style_bg_opa(sl, LV_OPA_COVER, LV_PART_INDICATOR);
+  // A white knob ringed in the accent blue.
+  lv_obj_set_style_radius(sl, LV_RADIUS_CIRCLE, LV_PART_KNOB);
+  lv_obj_set_style_bg_color(sl, lv_color_white(), LV_PART_KNOB);
+  lv_obj_set_style_bg_opa(sl, LV_OPA_COVER, LV_PART_KNOB);
+  lv_obj_set_style_border_width(sl, 3, LV_PART_KNOB);
+  lv_obj_set_style_border_color(sl, lvRgb(43, 123, 255), LV_PART_KNOB);
+  lv_obj_set_style_border_opa(sl, LV_OPA_COVER, LV_PART_KNOB);
+  lv_obj_set_style_pad_all(sl, 6, LV_PART_KNOB);
+}
+
+void styleStormyDropdown(lv_obj_t *dropdown) {
+  lv_obj_set_style_text_font(dropdown, &lv_font_montserrat_12, 0);
+  lv_obj_set_style_text_color(dropdown, textPrimary(), 0);
+  lv_obj_set_style_bg_color(dropdown, lvRgb(20, 34, 62), 0);
+  lv_obj_set_style_bg_opa(dropdown, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(dropdown, 1, 0);
+  lv_obj_set_style_border_color(dropdown, lvRgb(52, 88, 150), 0);
+  lv_obj_set_style_border_opa(dropdown, LV_OPA_COVER, 0);
+  lv_obj_set_style_radius(dropdown, 15, 0);   // a pill at 30px tall
+  lv_obj_set_style_pad_left(dropdown, 12, 0);
+  lv_obj_set_style_pad_right(dropdown, 10, 0);
+  lv_obj_set_style_text_color(dropdown, lvRgb(90, 162, 255), LV_PART_INDICATOR);
+  lv_obj_add_flag(dropdown, LV_OBJ_FLAG_GESTURE_BUBBLE);
+  lv_dropdown_set_selected_highlight(dropdown, true);
+  lv_obj_t *list = lv_dropdown_get_list(dropdown);
+  lv_obj_set_style_bg_color(list, lvRgb(13, 22, 42), 0);
+  lv_obj_set_style_bg_opa(list, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(list, 1, 0);
+  lv_obj_set_style_border_color(list, lvRgb(52, 88, 150), 0);
+  lv_obj_set_style_radius(list, 12, 0);
+  lv_obj_set_style_text_font(list, &lv_font_montserrat_12, 0);
+  lv_obj_set_style_text_color(list, lvRgb(190, 202, 222), 0);
+  lv_obj_set_style_bg_color(list, lvRgb(43, 123, 255), LV_PART_SELECTED);
+  lv_obj_set_style_bg_opa(list, LV_OPA_COVER, LV_PART_SELECTED);
+  lv_obj_set_style_text_color(list, lv_color_white(), LV_PART_SELECTED);
+}
+
+// The storm gradient behind a Stormy settings page. configureContent() clears
+// the gradient again, so no other page inherits it.
+void applyStormyBackground() {
+  lv_obj_set_style_bg_color(content, lvRgb(9, 18, 36), 0);
+  lv_obj_set_style_bg_grad_color(content, lvRgb(18, 54, 127), 0);
+  lv_obj_set_style_bg_grad_dir(content, LV_GRAD_DIR_VER, 0);
+  lv_obj_set_style_bg_opa(content, LV_OPA_COVER, 0);
+}
+
+lv_obj_t *makeStormyCard(lv_obj_t *parent, int y, int height) {
+  lv_obj_t *card = lv_obj_create(parent);
+  lv_obj_remove_style_all(card);
+  lv_obj_set_pos(card, 8, y);
+  lv_obj_set_size(card, 224, height);
+  lv_obj_set_style_bg_color(card, lvRgb(13, 22, 42), 0);
+  lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(card, 1, 0);
+  lv_obj_set_style_border_color(card, lvRgb(34, 54, 92), 0);
+  lv_obj_set_style_border_opa(card, LV_OPA_COVER, 0);
+  lv_obj_set_style_radius(card, 14, 0);
+  lv_obj_set_style_clip_corner(card, false, 0);
+  lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(card, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_flag(card, LV_OBJ_FLAG_GESTURE_BUBBLE);
+  return card;
+}
+
+void makeStormyDivider(lv_obj_t *card, int y) {
+  lv_obj_t *line = lv_obj_create(card);
+  lv_obj_remove_style_all(line);
+  lv_obj_set_pos(line, 14, y);
+  lv_obj_set_size(line, 194, 1);
+  lv_obj_set_style_bg_color(line, lvRgb(27, 40, 66), 0);
+  lv_obj_set_style_bg_opa(line, LV_OPA_COVER, 0);
+  lv_obj_clear_flag(line, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(line, LV_OBJ_FLAG_CLICKABLE);
+}
+
+void makeStormySection(lv_obj_t *parent, const char *text, int y) {
+  makeLabel(parent, text, 12, y, &lv_font_montserrat_14, textPrimary());
+}
+
+// One row in a Stormy card: title, an optional muted subtitle under it, and on
+// the right either a switch, or a muted value plus a blue chevron when the row
+// opens a page.
+lv_obj_t *makeStormyRow(lv_obj_t *card, const char *name, const char *sub,
+                        const char *value, int y, int height, bool *switchTarget,
+                        lv_event_cb_t clickCallback) {
+  const lv_color_t muted = lvRgb(142, 155, 180);
+  lv_obj_t *row = lv_obj_create(card);
+  lv_obj_remove_style_all(row);
+  lv_obj_set_pos(row, 1, y);
+  lv_obj_set_size(row, 222, height);
+  lv_obj_set_style_radius(row, 13, 0);
+  lv_obj_set_style_bg_color(row, lvRgb(22, 36, 66), LV_STATE_PRESSED);
+  lv_obj_set_style_bg_opa(row, LV_OPA_COVER, LV_STATE_PRESSED);
+  lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(row, LV_OBJ_FLAG_GESTURE_BUBBLE);
+  if (clickCallback) {
+    lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(row, clickCallback, LV_EVENT_CLICKED, nullptr);
+  } else {
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_CLICKABLE);
+  }
+  bool hasSub = sub && sub[0];
+  makeLabel(row, name, 14, hasSub ? height / 2 - 17 : (height - 17) / 2,
+            &lv_font_montserrat_14, textPrimary());
+  if (hasSub) {
+    lv_obj_t *subLabel = makeLabel(row, sub, 14, height / 2 + 3, &lv_font_montserrat_10, muted);
+    lv_obj_set_width(subLabel, switchTarget ? 140 : 110);
+    lv_label_set_long_mode(subLabel, LV_LABEL_LONG_DOT);
+  }
+  if (switchTarget) {
+    lv_obj_t *sw = lv_switch_create(row);
+    lv_obj_set_size(sw, 40, 22);
+    lv_obj_align(sw, LV_ALIGN_RIGHT_MID, -12, 0);
+    styleStormySwitch(sw);
+    if (*switchTarget) lv_obj_add_state(sw, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(sw, switchEvent, LV_EVENT_VALUE_CHANGED, switchTarget);
+    addPhysicalNavFocusable(sw);
+  } else if (clickCallback) {
+    if (value && value[0]) {
+      lv_obj_t *valueLabel = makeLabel(row, value, 86, (height - 13) / 2,
+                                       &lv_font_montserrat_10, muted);
+      lv_obj_set_width(valueLabel, 104);
+      lv_obj_set_style_text_align(valueLabel, LV_TEXT_ALIGN_RIGHT, 0);
+      lv_label_set_long_mode(valueLabel, LV_LABEL_LONG_DOT);
+    }
+    makeLabel(row, LV_SYMBOL_RIGHT, 198, (height - 15) / 2, &lv_font_montserrat_12,
+              lvRgb(90, 162, 255));
+    addPhysicalNavFocusable(row);
+  }
+  return row;
+}
+
+// A Stormy row with a pill dropdown docked on the right. Returns the dropdown
+// unconfigured, so the caller sets its options, selection and event.
+lv_obj_t *makeStormyDropdownRow(lv_obj_t *card, const char *name, int y, int height,
+                                int dropdownWidth) {
+  lv_obj_t *row = lv_obj_create(card);
+  lv_obj_remove_style_all(row);
+  lv_obj_set_pos(row, 1, y);
+  lv_obj_set_size(row, 222, height);
+  lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(row, LV_OBJ_FLAG_GESTURE_BUBBLE);
+  makeLabel(row, name, 14, (height - 17) / 2, &lv_font_montserrat_14, textPrimary());
+  lv_obj_t *dropdown = lv_dropdown_create(row);
+  lv_obj_set_pos(dropdown, 222 - dropdownWidth - 10, (height - 30) / 2);
+  lv_obj_set_size(dropdown, dropdownWidth, 30);
+  styleStormyDropdown(dropdown);
+  addPhysicalNavFocusable(dropdown);
+  return dropdown;
+}
+
+void renderSettingsHomeStormy() {
+  applyStormyBackground();
+  const int rowH = 44;
+  const lv_color_t muted = lvRgb(142, 155, 180);
+
+  // Battery summary at the top, opening the Battery page.
+  float percent = readBatteryPercent();
+  int level = percent < 0.0f ? 0 : (int)roundf(percent);
+  lv_obj_t *hero = makeStormyCard(content, 8, 58);
+  lv_obj_set_style_bg_color(hero, lvRgb(20, 38, 80), 0);
+  lv_obj_set_style_bg_grad_color(hero, lvRgb(13, 22, 42), 0);
+  lv_obj_set_style_bg_grad_dir(hero, LV_GRAD_DIR_HOR, 0);
+  lv_obj_set_style_bg_color(hero, lvRgb(26, 48, 96), LV_STATE_PRESSED);
+  lv_obj_add_flag(hero, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(hero, [](lv_event_t *e) { openSettingsView(SETTINGS_BATTERY); },
+                      LV_EVENT_CLICKED, nullptr);
+  addPhysicalNavFocusable(hero);
+  makeLabel(hero, "Remote battery", 12, 8, &lv_font_montserrat_10, muted);
+  char percentText[8];
+  if (percent < 0.0f) strlcpy(percentText, "--%", sizeof(percentText));
+  else snprintf(percentText, sizeof(percentText), "%d%%", level);
+  makeLabel(hero, percentText, 12, 22, &lv_font_montserrat_24, textPrimary());
+
+  lv_color_t chipColour = chargingState ? lvRgb(61, 214, 140) : lvRgb(90, 162, 255);
+  lv_obj_t *chip = lv_obj_create(hero);
+  lv_obj_remove_style_all(chip);
+  lv_obj_set_size(chip, 78, 16);
+  lv_obj_set_pos(chip, 222 - 10 - 78, 8);
+  lv_obj_set_style_radius(chip, 8, 0);
+  lv_obj_set_style_bg_color(chip, chipColour, 0);
+  lv_obj_set_style_bg_opa(chip, (lv_opa_t)40, 0);
+  lv_obj_set_style_border_width(chip, 1, 0);
+  lv_obj_set_style_border_color(chip, chipColour, 0);
+  lv_obj_set_style_border_opa(chip, LV_OPA_70, 0);
+  lv_obj_clear_flag(chip, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_clear_flag(chip, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_t *chipLabel = makeLabel(chip, chargingState ? "CHARGING" : "ON BATTERY", 0, 1,
+                                  &lv_font_montserrat_10, chipColour);
+  lv_obj_set_width(chipLabel, 78);
+  lv_obj_set_style_text_align(chipLabel, LV_TEXT_ALIGN_CENTER, 0);
+
+  lv_color_t barColour = level < 10 ? lvRgb(255, 77, 94)
+                       : level < 20 ? lvRgb(245, 165, 36)
+                                    : lvRgb(61, 214, 140);
+  lv_obj_t *track = lv_obj_create(hero);
+  lv_obj_remove_style_all(track);
+  lv_obj_set_pos(track, 96, 36);
+  lv_obj_set_size(track, 114, 6);
+  lv_obj_set_style_radius(track, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_color(track, lvRgb(30, 42, 68), 0);
+  lv_obj_set_style_bg_opa(track, LV_OPA_COVER, 0);
+  lv_obj_clear_flag(track, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_t *fill = lv_obj_create(hero);
+  lv_obj_remove_style_all(fill);
+  lv_obj_set_pos(fill, 96, 36);
+  lv_obj_set_size(fill, max(6, 114 * level / 100), 6);
+  lv_obj_set_style_radius(fill, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_color(fill, barColour, 0);
+  lv_obj_set_style_bg_opa(fill, LV_OPA_COVER, 0);
+  lv_obj_clear_flag(fill, LV_OBJ_FLAG_CLICKABLE);
+
+  int y = 78;
+  makeStormySection(content, "Connections", y);
+  y += 20;
+  lv_obj_t *connections = makeStormyCard(content, y, 4 * rowH + 3);
+  int ry = 0;
+  String wifiState = !wifiOn ? "Off" : (WiFi.status() == WL_CONNECTED ? WiFi.SSID() : "Tap to scan networks");
+  makeStormyRow(connections, "Wi-Fi", wifiState.c_str(), nullptr, ry, rowH, &wifiOn,
+    [](lv_event_t *e) {
+      if (lv_event_get_target(e) == lv_event_get_current_target(e) && wifiOn) openSettingsView(SETTINGS_WIFI);
+    });
+  makeStormyDivider(connections, ry + rowH); ry += rowH + 1;
+  const char *bluetoothState = bleConnected ? "Connected" :
+    (blePairingMode ? "Pairing" : (bleBonded ? "Paired" : (bluetoothOn ? "Not paired" : "Off")));
+  makeStormyRow(connections, "Bluetooth", bluetoothState, nullptr, ry, rowH, &bluetoothOn,
+    [](lv_event_t *e) {
+      if (lv_event_get_target(e) == lv_event_get_current_target(e)) openSettingsView(SETTINGS_BLUETOOTH);
+    });
+  makeStormyDivider(connections, ry + rowH); ry += rowH + 1;
+  makeStormyRow(connections, "Wi-Fi Config", nullptr, "QR code", ry, rowH, nullptr,
+    [](lv_event_t *e) { openSettingsView(SETTINGS_WIFI_QR); });
+  makeStormyDivider(connections, ry + rowH); ry += rowH + 1;
+  const char *dockState = espNowDeviceCount ? (dockConnected() ? "Linked" : "Paired") : "Not paired";
+  makeStormyRow(connections, "Dock", nullptr, dockState, ry, rowH, nullptr,
+    [](lv_event_t *e) { openSettingsView(SETTINGS_DOCK); });
+  y += 4 * rowH + 3 + 12;
+
+  makeStormySection(content, "Preferences", y);
+  y += 20;
+  lv_obj_t *preferencesCard = makeStormyCard(content, y, 3 * rowH + 2);
+  char brightnessText[8];
+  snprintf(brightnessText, sizeof(brightnessText), "%u%%", (unsigned)brightness);
+  makeStormyRow(preferencesCard, "Display", nullptr, brightnessText, 0, rowH, nullptr,
+    [](lv_event_t *e) { openSettingsView(SETTINGS_DISPLAY); });
+  makeStormyDivider(preferencesCard, rowH);
+  makeStormyRow(preferencesCard, "Clock", clockUseInternetTime ? "Internet time" : "Manual time",
+    nullptr, rowH + 1, rowH, &clockEnabled,
+    [](lv_event_t *e) {
+      if (lv_event_get_target(e) == lv_event_get_current_target(e)) openSettingsView(SETTINGS_CLOCK);
+    });
+  makeStormyDivider(preferencesCard, 2 * rowH + 1);
+  makeStormyRow(preferencesCard, "Buttons", nullptr,
+    physicalRepeatEnabled ? "Repeat" : "Single press", 2 * rowH + 2, rowH, nullptr,
+    [](lv_event_t *e) { openSettingsView(SETTINGS_BUTTONS); });
+  y += 3 * rowH + 2 + 12;
+
+  makeStormySection(content, "System", y);
+  y += 20;
+  // Debug stays hidden unless About > Debug Menu is on, and the card is sized
+  // to match - a fixed height with a missing row would leave a hole.
+  int systemRows = debugMenuVisible ? 3 : 2;
+  lv_obj_t *systemCard = makeStormyCard(content, y, systemRows * rowH + systemRows - 1);
+  ry = 0;
+  if (debugMenuVisible) {
+    makeStormyRow(systemCard, "Debug", nullptr, nullptr, ry, rowH, nullptr,
+      [](lv_event_t *e) { openSettingsView(SETTINGS_DEBUG); });
+    makeStormyDivider(systemCard, ry + rowH); ry += rowH + 1;
+  }
+  makeStormyRow(systemCard, "Backup / Restore", nullptr, nullptr, ry, rowH, nullptr,
+    [](lv_event_t *e) { openSettingsView(SETTINGS_BACKUP); });
+  makeStormyDivider(systemCard, ry + rowH); ry += rowH + 1;
+  makeStormyRow(systemCard, "About", nullptr, "v" OPENREMOTE_VERSION_STRING, ry, rowH, nullptr,
+    [](lv_event_t *e) { openSettingsView(SETTINGS_ABOUT); });
+}
+
 void renderSettingsHomeOmote() {
   const int rowH = 48;
   // 10 rows, not 9: Wi-Fi, Bluetooth, Clock, Wi-Fi Config, Display, Buttons,
@@ -31159,6 +31544,16 @@ void renderSettingsBackButton() {
   // Omote pages must leave this (8,6)-(50,36) footprint clear - several of
   // them used to place their first card/button at y=4, which drew over this
   // button and hid it entirely rather than just recolouring it.
+  if (menuStyle == 2) {
+    // A navy pill with the accent-blue hairline, matching the Stormy cards.
+    lv_obj_t *back = makeButton(content, LV_SYMBOL_LEFT, 8, 6, 42, 30, lvRgb(20, 34, 62));
+    lv_obj_set_style_radius(back, 15, 0);
+    lv_obj_set_style_border_width(back, 1, 0);
+    lv_obj_set_style_border_color(back, lvRgb(52, 88, 150), 0);
+    lv_obj_set_style_border_opa(back, LV_OPA_COVER, 0);
+    lv_obj_add_event_cb(back, backToSettings, LV_EVENT_CLICKED, nullptr);
+    return;
+  }
   if (menuStyle == 1) {
     lv_obj_t *back = makeOmoteButton(content, LV_SYMBOL_LEFT, 8, 6, 42, 30, lvRgb(0x50, 0x50, 0x50));
     lv_obj_add_event_cb(back, backToSettings, LV_EVENT_CLICKED, nullptr);
@@ -31180,6 +31575,10 @@ void renderSettingsHome() {
   renderTopBar("Settings", false);
   if (menuStyle == 1) {
     renderSettingsHomeOmote();
+    return;
+  }
+  if (menuStyle == 2) {
+    renderSettingsHomeStormy();
     return;
   }
   String wifiState = !wifiOn ? "Off" : (WiFi.status() == WL_CONNECTED ? WiFi.SSID() : "Tap to scan networks");
@@ -32594,8 +32993,10 @@ void makeDisplaySlider(const char *label, int y, int minValue, int maxValue, int
   else snprintf(valueText, sizeof(valueText), "%d%s", value, setting == 1 ? "s" : "%");
   // OpenRemote_2.0's real accent colour (0x2196F3, LVGL default theme blue)
   // in Omote mode instead of the OpenRemote-style page's own lighter blue.
+  bool stormy = menuStyle == 2 && !omoteStyle;
   lv_obj_t *number = makeLabel(parent, valueText, x + width - 38, y, &lv_font_montserrat_12,
-                                omoteStyle ? lvRgb(0x21, 0x96, 0xF3) : lvRgb(95, 180, 255));
+                                omoteStyle ? lvRgb(0x21, 0x96, 0xF3)
+                                           : (stormy ? lvRgb(90, 162, 255) : lvRgb(95, 180, 255)));
   displayValueLabels[setting] = number;
   lv_obj_set_width(number, 38);
   lv_obj_set_style_text_align(number, LV_TEXT_ALIGN_RIGHT, 0);
@@ -32603,8 +33004,10 @@ void makeDisplaySlider(const char *label, int y, int minValue, int maxValue, int
   lv_obj_set_pos(slider, x, y + 23);
   // OpenRemote_2.0's sliders are 10px tall (lv_obj_set_size(slider, lv_pct(66), 10));
   // the OpenRemote-style page keeps its own 12px.
-  lv_obj_set_size(slider, width, omoteStyle ? 10 : 12);
-  if (omoteStyle) styleOmoteSlider(slider); else styleModernSlider(slider);
+  lv_obj_set_size(slider, width, omoteStyle ? 10 : (stormy ? 8 : 12));
+  if (omoteStyle) styleOmoteSlider(slider);
+  else if (stormy) styleStormySlider(slider);
+  else styleModernSlider(slider);
   addPhysicalNavFocusable(slider);
   if (setting == 2) {
     uint8_t index = deepSleepSliderIndex(value);
@@ -32675,6 +33078,54 @@ void renderDisplayPageOmote() {
   lv_obj_add_event_cb(panelDropdown, lcdPanelDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
 }
 
+void renderDisplayPageStormy() {
+  applyStormyBackground();
+  // Same slider stride as the OMOTE page. The Stormy knob is 20px (8px track
+  // plus 6px knob pad each side), so its bottom edge sits 37px below the row
+  // start; dividers go below that so they never slice the knob.
+  const int sliderH = 50;
+  const int sliderKnobBottom = 42;
+  const int rowH = 48;
+  int y = 44;   // clears the back button at (8,6)-(50,36)
+
+  makeStormySection(content, "Screen", y);
+  y += 20;
+  lv_obj_t *screenCard = makeStormyCard(content, y, 3 * sliderH + 2);
+  makeDisplaySlider("Brightness", 8, 5, 100, brightness, 0, screenCard, 14, 194, false);
+  makeStormyDivider(screenCard, 8 + sliderKnobBottom + 4);
+  makeDisplaySlider("Gamma", sliderH + 8, 50, 250, displayGamma, 4, screenCard, 14, 194, false);
+  makeStormyDivider(screenCard, sliderH + 8 + sliderKnobBottom + 4);
+  makeDisplaySlider("Saturation", sliderH * 2 + 8, 0, 200, displaySaturation, 5, screenCard, 14, 194, false);
+  y += 3 * sliderH + 2 + 12;
+
+  makeStormySection(content, "Sleep & wake", y);
+  y += 20;
+  lv_obj_t *sleepCard = makeStormyCard(content, y, 3 * sliderH + 2);
+  makeDisplaySlider("Sleep timer", 8, 5, 120, timeoutSeconds, 1, sleepCard, 14, 194, false);
+  makeStormyDivider(sleepCard, 8 + sliderKnobBottom + 4);
+  makeDisplaySlider("Deep Sleep", sliderH + 8, 1, 30, deepSleepMinutes, 2, sleepCard, 14, 194, false);
+  makeStormyDivider(sleepCard, sliderH + 8 + sliderKnobBottom + 4);
+  makeDisplaySlider("Motion sensitivity", sliderH * 2 + 8, 1, 100, wakeSensitivity, 3, sleepCard, 14, 194, false);
+  y += 3 * sliderH + 2 + 12;
+
+  makeStormySection(content, "Panel", y);
+  y += 20;
+  lv_obj_t *panelCard = makeStormyCard(content, y, 3 * rowH + 2);
+  lv_obj_t *wakeDropdown = makeStormyDropdownRow(panelCard, "Wake", 0, rowH, 108);
+  lv_dropdown_set_options(wakeDropdown, "Motion\nButton");
+  lv_dropdown_set_selected(wakeDropdown, wakeMode == WAKE_MODE_BUTTON ? 1 : 0);
+  lv_obj_add_event_cb(wakeDropdown, wakeModeDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
+  stormyWakeDropdown = wakeDropdown;
+  makeStormyDivider(panelCard, rowH);
+  makeStormyRow(panelCard, "Colour Depth", displayRgb666 ? "RGB666 panel transfer" : "RGB565 panel transfer",
+                nullptr, rowH + 1, rowH, &displayRgb666, nullptr);
+  makeStormyDivider(panelCard, 2 * rowH + 1);
+  lv_obj_t *panelDropdown = makeStormyDropdownRow(panelCard, "LCD", 2 * rowH + 2, rowH, 150);
+  lv_dropdown_set_options(panelDropdown, "Adafruit\nBuyDisplay-ILI9341\nBuyDisplay-ST7789V");
+  lv_dropdown_set_selected(panelDropdown, lcdPanelDropdownSelection());
+  lv_obj_add_event_cb(panelDropdown, lcdPanelDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
+}
+
 void renderDisplayPage() {
   setCinematicBackground(false);
   configureContent(42, 278, false);
@@ -32686,6 +33137,10 @@ void renderDisplayPage() {
   renderSettingsBackButton();
   if (menuStyle == 1) {
     renderDisplayPageOmote();
+    return;
+  }
+  if (menuStyle == 2) {
+    renderDisplayPageStormy();
     return;
   }
   makeDisplaySlider("Brightness", 46, 5, 100, brightness, 0);
@@ -33406,8 +33861,8 @@ void makeMenuStyleRow(int y) {
   lv_obj_set_pos(dropdown, 104, 1);
   lv_obj_set_size(dropdown, 112, 32);
   styleDebugDropdown(dropdown);
-  lv_dropdown_set_options(dropdown, "OpenRemote\nOMOTE");
-  lv_dropdown_set_selected(dropdown, menuStyle ? 1 : 0);
+  lv_dropdown_set_options(dropdown, "OpenRemote\nOMOTE\nStormy");
+  lv_dropdown_set_selected(dropdown, menuStyle <= 2 ? menuStyle : 0);
   lv_obj_add_event_cb(dropdown, menuStyleDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
   addPhysicalNavFocusable(dropdown);
 }
@@ -33526,8 +33981,8 @@ void renderDebugPageOmote() {
   y += 22;
   lv_obj_t *menuCard = makeOmoteCard(content, y, calibRowH);
   lv_obj_t *menuDropdown = makeOmoteDropdownRow(menuCard, "Menu Style", 0, calibRowH, 112);
-  lv_dropdown_set_options(menuDropdown, "OpenRemote\nOMOTE");
-  lv_dropdown_set_selected(menuDropdown, menuStyle ? 1 : 0);
+  lv_dropdown_set_options(menuDropdown, "OpenRemote\nOMOTE\nStormy");
+  lv_dropdown_set_selected(menuDropdown, menuStyle <= 2 ? menuStyle : 0);
   lv_obj_add_event_cb(menuDropdown, menuStyleDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
   y += calibRowH + 20;
 
@@ -34596,6 +35051,15 @@ void finaliseRemotePageScrolling() {
 // currentPage/pageUi at it directly (LV_ANIM_OFF - no slide, since this is
 // meant to load instantly) and lets openSettingsView()'s own
 // pendingUiRefresh flag render the QR page once currentPage is correct.
+// Same instant jump as jumpToWebConfigQr() below, to any settings view.
+void jumpToSettingsView(SettingsView view) {
+  openSettingsView(view);
+  currentPage = 0;
+  bindPageUi(currentPage);
+  if (pageStrip) lv_obj_set_tile(pageStrip, pageUi[currentPage].tile, LV_ANIM_OFF);
+  configurePageStripDirections();
+}
+
 void jumpToWebConfigQr(lv_event_t *e) {
   Serial.println("jumpToWebConfigQr: button tapped");
   openSettingsView(SETTINGS_WIFI_QR);
@@ -37397,6 +37861,7 @@ void renderCurrentPage() {
   lcdBackupTrack = nullptr;
   lcdBackupAnimBar = nullptr;
   lcdBackupStatusLabel = nullptr;
+  stormyWakeDropdown = nullptr;
   lv_obj_clean(content);
   // Every widget instance points into the objects just destroyed, and an
   // expanded widget hangs off uiRoot rather than content, so it would
