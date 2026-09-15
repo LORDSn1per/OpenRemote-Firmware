@@ -1,6 +1,12 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.60 - 2026-09-15
+    - New ORUSB CHARGEDEMO shows the charging overlay as if a charger had just
+      been connected - animation, seven-second timeout and tap to close - so it
+      can be screenshotted. A real plug-in cannot be captured, because opening
+      the USB port for the screenshot resets the remote.
+
   5.59 - 2026-09-15
     - The old OpenRemote settings menu style is gone, and the Stormy style
       takes its name: there are now two styles, OpenRemote (menuStyle 0, the
@@ -7039,7 +7045,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.59"
+#define OPENREMOTE_VERSION_STRING "5.60"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -9298,6 +9304,10 @@ static const char *LCD_SCREENSHOT_PATH = "/tmp/screenshot.rgb565";
 // ORUSB OVERLAYDEMO: shows the backup (1) or restore (2) overlay at a given
 // percentage without a job, for screenshots; 0 hides it.
 volatile bool usbOverlayDemoRequest = false;
+// ORUSB CHARGEDEMO: shows the charging overlay as if a charger had just been
+// connected, for screenshots - a real plug-in cannot be captured, because
+// opening the USB port to take the screenshot resets the remote.
+volatile bool usbChargeDemoRequest = false;
 uint8_t usbOverlayDemoMode = 0;
 uint8_t usbOverlayDemoPercent = 50;
 unsigned long usbOverlayDemoUntilMs = 0;
@@ -19778,6 +19788,9 @@ void handleUsbCommand(Stream &port, UsbSerialSession &session, String command) {
     usbSettingsNavView = (uint8_t)view;
     usbSettingsNavRequest = true;
     usbImportReply(port, String("{\"ok\":true,\"settings\":\"") + target + "\"}");
+  } else if (command == "ORUSB CHARGEDEMO") {
+    usbChargeDemoRequest = true;
+    usbImportReply(port, "{\"ok\":true,\"requested\":\"charging overlay\"}");
   } else if (command == "ORUSB SCREENSHOT") {
     // Answered from the loop once the snapshot is on the card.
     usbScreenshotRequest = true;
@@ -23315,6 +23328,18 @@ void serviceUsbWebConfigRequest() {
                          LV_ANIM_OFF);
       if (usbSettingsNavTarget == 2) lv_dropdown_open(stormyWakeDropdown);
       lastWakeMs = millis();
+    }
+  }
+  if (usbChargeDemoRequest) {
+    usbChargeDemoRequest = false;
+    if (displaySleeping) wakeDisplay();
+    // The same state serviceChargeOverlay() sets for a real connection, so the
+    // overlay animates, times out after its seven seconds and closes on a tap.
+    if (!backupOverlay) {
+      showChargeOverlay();
+      chargeOverlayWasSleeping = false;
+      chargeOverlayShownMs = millis();
+      lastWakeMs = chargeOverlayShownMs;
     }
   }
   if (usbOverlayDemoRequest) {
