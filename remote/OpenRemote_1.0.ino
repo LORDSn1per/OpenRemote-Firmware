@@ -1,6 +1,19 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.44 - 2026-09-15
+    - The brightness panel (tap the status pill) says what it is doing. A
+      translucent readout tile in the middle of the screen shows a sun with the
+      brightness percentage, which follows the slider as it moves, beside a
+      rounded battery with its level filled in and the battery percentage. It
+      covers only its contents, so the page behind stays visible for judging
+      the brightness. The battery percentage in the status pill gains a thin
+      green underline, green at any level, marking it as the battery number.
+    - New ORUSB BRIGHTNESSPANEL opens that panel, and ORUSB SCREENSHOT renders
+      the active screen with lv_snapshot_take() to /tmp/screenshot.rgb565
+      (little-endian RGB565, width and height in the reply), which ORUSB READ
+      can now fetch. Together they let a screen be captured over USB.
+
   5.43 - 2026-09-15
     - Removed 5.41's charger diagnostic from Settings > Battery's Voltage row,
       and 5.40's USB-line check. Measured unplugged, the row read "chg high,
@@ -6877,7 +6890,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.43"
+#define OPENREMOTE_VERSION_STRING "5.44"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -9128,6 +9141,11 @@ char lcdBackupPhase[24] = "";
   on core 1 while USB commands are parsed elsewhere.
 */
 volatile bool usbWebConfigStartRequest = false;
+// ORUSB BRIGHTNESSPANEL and ORUSB SCREENSHOT - flagged here, done on the loop,
+// which owns LVGL. The screenshot is raw little-endian RGB565 for ORUSB READ.
+volatile bool usbBrightnessPanelRequest = false;
+volatile bool usbScreenshotRequest = false;
+static const char *LCD_SCREENSHOT_PATH = "/tmp/screenshot.rgb565";
 volatile bool usbWebConfigStopRequest = false;
 
 volatile bool backupRequestPending = false;
@@ -9825,6 +9843,8 @@ lv_obj_t *statusPill = nullptr;
 lv_obj_t *statusBattery = nullptr;
 lv_obj_t *statusBatteryTerminal = nullptr;
 lv_obj_t *brightnessBatteryLabel = nullptr;
+lv_obj_t *brightnessBatteryUnderline = nullptr;   // in the status pill, like the label
+lv_obj_t *brightnessValueLabel = nullptr;         // in the panel's readout tile
 lv_obj_t *wifiPasswordArea = nullptr;
 /*
   What has been typed into the Wi-Fi password field.
@@ -19349,7 +19369,8 @@ void clearUsbDownload(UsbSerialSession &session) {
 
 void beginUsbSdFileDownload(Stream &port, UsbSerialSession &session, const String &path) {
   clearUsbDownload(session);
-  bool allowedPath = path == WEB_CONFIG_PATH || path == RUNTIME_CONFIG_PATH;
+  bool allowedPath = path == WEB_CONFIG_PATH || path == RUNTIME_CONFIG_PATH ||
+                     path == LCD_SCREENSHOT_PATH;
   if (!sdReady || !allowedPath || !SD.exists(path)) {
     usbImportReply(port, "{\"ok\":false,\"error\":\"Requested SD file is unavailable\"}");
     return;
@@ -19514,6 +19535,13 @@ void handleUsbCommand(Stream &port, UsbSerialSession &session, String command) {
     usbImportReply(port, String("{\"ok\":true,\"requested\":\"") +
                    (on ? "on" : "off") + "\",\"token\":\"" + setupToken +
                    "\"}");
+  } else if (command == "ORUSB BRIGHTNESSPANEL") {
+    // Opens the brightness panel from the loop - for screenshots and tests.
+    usbBrightnessPanelRequest = true;
+    usbImportReply(port, "{\"ok\":true,\"requested\":\"brightness panel\"}");
+  } else if (command == "ORUSB SCREENSHOT") {
+    // Answered from the loop once the snapshot is on the card.
+    usbScreenshotRequest = true;
   } else if (command == "ORUSB BACKUPSTATUS") {
     // The queued job's state, with the same fields as /api/backups/progress.
     bool busy = backupRequestPending || backupRequestRunning || restoreRequestPending;
@@ -22953,7 +22981,61 @@ void serviceChargeOverlay(unsigned long now) {
 */
 void jumpToWebConfigQr(lv_event_t *e);
 
+/*
+  Renders the active screen to PSRAM with lv_snapshot_take() and writes it to
+  the card as raw little-endian RGB565 for ORUSB READ. It is LVGL's image of
+  the screen, before the panel colour calibration lvFlush() applies.
+*/
+bool saveLcdScreenshot(String &error, size_t &bytes, uint16_t &width, uint16_t &height) {
+  if (displaySleeping) { error = "The screen is asleep"; return false; }
+  if (!sdReady) { error = "SD card unavailable"; return false; }
+  lv_img_dsc_t *shot = lv_snapshot_take(lv_scr_act(), LV_IMG_CF_TRUE_COLOR);
+  if (!shot) { error = "Not enough memory for a snapshot"; return false; }
+  if (!SD.exists("/tmp")) SD.mkdir("/tmp");
+  SD.remove(LCD_SCREENSHOT_PATH);
+  File out = SD.open(LCD_SCREENSHOT_PATH, FILE_WRITE);
+  bool ok = (bool)out;
+  const size_t total = shot->data_size;
+  size_t offset = 0;
+  while (ok && offset < total) {
+    size_t take = min((size_t)4096, total - offset);
+    ok = writeUploadChunkToSd(out, offset, shot->data + offset, take);
+    offset += take;
+  }
+  if (out) out.close();
+  width = shot->header.w;
+  height = shot->header.h;
+  lv_snapshot_free(shot);
+  if (!ok) {
+    SD.remove(LCD_SCREENSHOT_PATH);
+    error = "Could not write the screenshot to the card";
+    return false;
+  }
+  bytes = total;
+  Serial.printf("Screenshot: %ux%u, %u bytes to %s\n", (unsigned)width,
+                (unsigned)height, (unsigned)total, LCD_SCREENSHOT_PATH);
+  return true;
+}
+
 void serviceUsbWebConfigRequest() {
+  if (usbBrightnessPanelRequest) {
+    usbBrightnessPanelRequest = false;
+    if (displaySleeping) wakeDisplay();
+    lastWakeMs = millis();
+    if (!brightnessOverlay && !brightnessPanel) toggleBrightnessPanel();
+  }
+  if (usbScreenshotRequest) {
+    usbScreenshotRequest = false;
+    String error;
+    size_t bytes = 0;
+    uint16_t width = 0, height = 0;
+    bool ok = saveLcdScreenshot(error, bytes, width, height);
+    usbImportReply(Serial, ok
+      ? String("{\"ok\":true,\"path\":\"") + LCD_SCREENSHOT_PATH + "\",\"width\":" +
+        String(width) + ",\"height\":" + String(height) +
+        ",\"format\":\"rgb565le\",\"bytes\":" + String((unsigned long)bytes) + "}"
+      : String("{\"ok\":false,\"error\":\"") + error + "\"}");
+  }
   if (usbWebConfigStartRequest) {
     usbWebConfigStartRequest = false;
     if (!webConfigQrPageActive()) {
@@ -30477,6 +30559,7 @@ void refreshStatusPill() {
 void renderTopBar(const char *title, bool allowDevices) {
   lv_obj_clean(topBar);
   brightnessBatteryLabel = nullptr;
+  brightnessBatteryUnderline = nullptr;   // both lived in the pill just deleted
   lv_obj_set_style_bg_opa(topBar, LV_OPA_TRANSP, 0);
 
   int titleX = 8;
@@ -37531,6 +37614,11 @@ void serviceEspNowDevicesModal(unsigned long now) {
 void brightnessEvent(lv_event_t *e) {
   brightness = lv_slider_get_value(lv_event_get_target(e));
   applyBrightness();
+  if (brightnessValueLabel && lv_obj_is_valid(brightnessValueLabel)) {
+    char text[8];
+    snprintf(text, sizeof(text), "%d%%", (int)brightness);
+    lv_label_set_text(brightnessValueLabel, text);
+  }
   if (lv_event_get_code(e) == LV_EVENT_RELEASED) {
     saveSettings();
     scheduleRuntimeSettingsSave();
@@ -37540,6 +37628,11 @@ void brightnessEvent(lv_event_t *e) {
 }
 
 void closeBrightnessPanel() {
+  brightnessValueLabel = nullptr;   // a child of the overlay, deleted with it
+  if (brightnessBatteryUnderline) {
+    if (lv_obj_is_valid(brightnessBatteryUnderline)) lv_obj_del(brightnessBatteryUnderline);
+    brightnessBatteryUnderline = nullptr;
+  }
   if (brightnessOverlay) {
     lv_obj_del(brightnessOverlay);
     brightnessOverlay = nullptr;
@@ -37602,6 +37695,89 @@ void toggleBrightnessPanel() {
   styleModernSlider(slider, 5);
   lv_obj_add_event_cb(slider, brightnessEvent, LV_EVENT_VALUE_CHANGED, nullptr);
   lv_obj_add_event_cb(slider, brightnessEvent, LV_EVENT_RELEASED, nullptr);
+
+  // A thin green rule under the percentage marks it as the battery reading.
+  // Green whatever the level: it labels the number, it is not a warning.
+  brightnessBatteryUnderline = lv_obj_create(statusPill);
+  lv_obj_remove_style_all(brightnessBatteryUnderline);
+  lv_obj_set_size(brightnessBatteryUnderline, 20, 2);
+  lv_obj_set_pos(brightnessBatteryUnderline, (clockEnabled ? 59 : 4) + 6, 23);
+  lv_obj_set_style_radius(brightnessBatteryUnderline, 1, 0);
+  lv_obj_set_style_bg_color(brightnessBatteryUnderline, lvRgb(48, 209, 88), 0);
+  lv_obj_set_style_bg_opa(brightnessBatteryUnderline, LV_OPA_COVER, 0);
+  lv_obj_clear_flag(brightnessBatteryUnderline, LV_OBJ_FLAG_CLICKABLE);
+
+  /*
+    The readout tile: the brightness the slider is changing, beside the
+    battery, in the middle of the screen. It is translucent and only as big as
+    its contents on purpose - the page behind has to stay visible, because that
+    is what someone judges the brightness by. Not clickable, so a tap on it
+    closes the panel like a tap anywhere else outside the slider.
+  */
+  const int tileW = 164, tileH = 112, half = tileW / 2;
+  const lv_color_t muted = lvRgb(155, 165, 180);
+  lv_obj_t *tile = lv_obj_create(brightnessOverlay);
+  lv_obj_remove_style_all(tile);
+  lv_obj_set_size(tile, tileW, tileH);
+  lv_obj_set_pos(tile, (192 - tileW) / 2, (LCD_H - tileH) / 2);
+  stylePanel(tile, lvRgb(18, 22, 30), lv_color_white(), (lv_opa_t)190);
+  lv_obj_set_style_radius(tile, 20, 0);
+  lv_obj_set_style_border_opa(tile, LV_OPA_30, 0);
+  lv_obj_set_style_pad_all(tile, 0, 0);
+  lv_obj_clear_flag(tile, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(tile, LV_OBJ_FLAG_CLICKABLE);
+
+  lv_obj_t *divider = lv_obj_create(tile);
+  lv_obj_remove_style_all(divider);
+  lv_obj_set_size(divider, 1, tileH - 36);
+  lv_obj_set_pos(divider, half, 18);
+  lv_obj_set_style_bg_color(divider, lv_color_white(), 0);
+  lv_obj_set_style_bg_opa(divider, LV_OPA_20, 0);
+
+  // Brightness: the weather widget's sun, drawn from shapes.
+  makeWeatherGlyph(tile, (half - 34) / 2, 14, 34, 0);
+  char brightnessText[8];
+  snprintf(brightnessText, sizeof(brightnessText), "%d%%", (int)brightness);
+  brightnessValueLabel = makeLabel(tile, brightnessText, 0, 54, &lv_font_montserrat_24, textPrimary());
+  lv_obj_set_width(brightnessValueLabel, half);
+  lv_obj_set_style_text_align(brightnessValueLabel, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_t *brightnessCaption = makeLabel(tile, "Brightness", 0, 86, &lv_font_montserrat_10, muted);
+  lv_obj_set_width(brightnessCaption, half);
+  lv_obj_set_style_text_align(brightnessCaption, LV_TEXT_ALIGN_CENTER, 0);
+
+  // Battery: a rounded cell with its level filled in green, and its cap.
+  const int cellW = 34, cellH = 18, cellX = half + (half - cellW - 4) / 2, cellY = 22;
+  lv_obj_t *cell = lv_obj_create(tile);
+  lv_obj_remove_style_all(cell);
+  lv_obj_set_size(cell, cellW, cellH);
+  lv_obj_set_pos(cell, cellX, cellY);
+  lv_obj_set_style_radius(cell, 5, 0);
+  lv_obj_set_style_border_width(cell, 2, 0);
+  lv_obj_set_style_border_color(cell, lv_color_white(), 0);
+  lv_obj_set_style_border_opa(cell, LV_OPA_90, 0);
+  lv_obj_set_style_bg_opa(cell, LV_OPA_TRANSP, 0);
+  lv_obj_clear_flag(cell, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_t *cellFill = lv_obj_create(cell);
+  lv_obj_remove_style_all(cellFill);
+  int fillW = batteryPercent >= 0.0f ? (int)((cellW - 8) * batteryPercent / 100.0f + 0.5f) : 0;
+  lv_obj_set_size(cellFill, fillW < 3 ? 3 : fillW, cellH - 8);
+  lv_obj_set_pos(cellFill, 2, 2);
+  lv_obj_set_style_radius(cellFill, 2, 0);
+  lv_obj_set_style_bg_color(cellFill, lvRgb(48, 209, 88), 0);
+  lv_obj_set_style_bg_opa(cellFill, LV_OPA_COVER, 0);
+  lv_obj_t *cellCap = lv_obj_create(tile);
+  lv_obj_remove_style_all(cellCap);
+  lv_obj_set_size(cellCap, 3, 8);
+  lv_obj_set_pos(cellCap, cellX + cellW + 1, cellY + (cellH - 8) / 2);
+  lv_obj_set_style_radius(cellCap, 1, 0);
+  lv_obj_set_style_bg_color(cellCap, lv_color_white(), 0);
+  lv_obj_set_style_bg_opa(cellCap, LV_OPA_80, 0);
+  lv_obj_t *batteryValue = makeLabel(tile, batteryText, half, 54, &lv_font_montserrat_24, textPrimary());
+  lv_obj_set_width(batteryValue, half);
+  lv_obj_set_style_text_align(batteryValue, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_t *batteryCaption = makeLabel(tile, "Battery", half, 86, &lv_font_montserrat_10, muted);
+  lv_obj_set_width(batteryCaption, half);
+  lv_obj_set_style_text_align(batteryCaption, LV_TEXT_ALIGN_CENTER, 0);
 
   brightnessLastActivityMs = millis();
   lv_obj_move_foreground(brightnessOverlay);
