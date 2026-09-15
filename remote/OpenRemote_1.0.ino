@@ -1,6 +1,20 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.59 - 2026-09-15
+    - The old OpenRemote settings menu style is gone, and the Stormy style
+      takes its name: there are now two styles, OpenRemote (menuStyle 0, the
+      storm-blue Stormy look) and OMOTE (1). Every settings page renders
+      through the card layouts both styles share, so the flat OpenRemote-only
+      page code after each OMOTE branch was deleted. OpenRemote stays value 0,
+      so existing runtime.json files and backups keep their style, and a
+      value of 2 saved while Stormy was being previewed loads as OpenRemote.
+      The Menu Style dropdowns list OpenRemote and OMOTE; ORUSB MENUSTYLE takes
+      0 or 1 and still accepts 2 as OpenRemote.
+    - Settings > Buttons: the Test Button subtitle reads "No commands are sent"
+      instead of "No commands are transmitted", which was cut to "No commands
+      are..." beside the switch. Same wording in every menu style.
+
   5.58 - 2026-09-15
     - Stormy sliders are easier to grab. The knob is one plain white circle
       26px across, up from a 20px knob ringed in blue, and every Stormy slider
@@ -7025,7 +7039,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.58"
+#define OPENREMOTE_VERSION_STRING "5.59"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -12093,7 +12107,8 @@ void loadSettings() {
   backlightPwmHz = preferences.getULong("blPwmHz", BACKLIGHT_PWM_HZ);
   if (!backlightPwmFrequencyValid(backlightPwmHz)) backlightPwmHz = BACKLIGHT_PWM_HZ;
   menuStyle = preferences.getUChar("menuStyle", 0);
-  if (menuStyle > 2) menuStyle = 0;   // 0 OpenRemote, 1 OMOTE, 2 Stormy
+  // 0 OpenRemote, 1 OMOTE. 2 was the Stormy preview, which became OpenRemote.
+  if (menuStyle > 1) menuStyle = 0;
   physicalRepeatEnabled = preferences.getBool("btnRpt", true);
   physicalRepeatDelayMs = constrain(
     (int)preferences.getUShort("btnDelay", 400),
@@ -15267,7 +15282,8 @@ void applySettingsJson(JsonVariantConst settings) {
   for (const char *key : ownedSettingKeys) {
     if (settings[key].isNull()) { settingsIncomplete = true; break; }
   }
-  menuStyle = constrain((int)(settings["menuStyle"] | menuStyle), 0, 2);
+  // 2 was the Stormy preview, which is now the OpenRemote style (0).
+  menuStyle = ((int)(settings["menuStyle"] | menuStyle)) == 1 ? 1 : 0;
   displayModuleChoice = constrain(
     (int)(settings["displayModule"] | displayModuleChoice),
     (int)DISPLAY_MODULE_ADAFRUIT, (int)DISPLAY_MODULE_ST7789);
@@ -19728,11 +19744,12 @@ void handleUsbCommand(Stream &port, UsbSerialSession &session, String command) {
     // 0 OpenRemote, 1 OMOTE, 2 Stormy - saved exactly as the Menu Style
     // dropdown saves it.
     int style = command.substring(16).toInt();
+    // 0 OpenRemote, 1 OMOTE; 2 (the old Stormy preview) is accepted as OpenRemote.
     if (style < 0 || style > 2) {
-      usbImportReply(port, "{\"ok\":false,\"error\":\"Menu style must be 0, 1 or 2\"}");
+      usbImportReply(port, "{\"ok\":false,\"error\":\"Menu style must be 0 (OpenRemote) or 1 (OMOTE)\"}");
       return;
     }
-    menuStyle = (uint8_t)style;
+    menuStyle = style == 1 ? 1 : 0;
     // Into runtime.json as well as NVS, or the next boot restores the old style.
     saveSettings();
     scheduleRuntimeSettingsSave();
@@ -29607,7 +29624,7 @@ void styleModernSlider(lv_obj_t *sl, int knobPad = 6) {
 void styleOmoteSwitch(lv_obj_t *sw) {
   // Stormy renders every settings page through the OMOTE layouts, so each
   // OMOTE helper hands off to its Stormy counterpart in that style.
-  if (menuStyle == 2) { styleStormySwitch(sw); return; }
+  if (menuStyle == 0) { styleStormySwitch(sw); return; }
   lv_obj_set_style_radius(sw, LV_RADIUS_CIRCLE, LV_PART_MAIN);
   lv_obj_set_style_bg_color(sw, lvRgb(0x50, 0x50, 0x50), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(sw, LV_OPA_COVER, LV_PART_MAIN);
@@ -29625,7 +29642,7 @@ void styleOmoteSwitch(lv_obj_t *sw) {
 // is 0x303030, and leave the indicator/knob at the default theme's values
 // (primary blue fill, white knob).
 void styleOmoteSlider(lv_obj_t *sl, int knobPad = 6) {
-  if (menuStyle == 2) { styleStormySlider(sl); return; }
+  if (menuStyle == 0) { styleStormySlider(sl); return; }
   lv_obj_set_style_radius(sl, LV_RADIUS_CIRCLE, LV_PART_MAIN);
   lv_obj_set_style_bg_color(sl, lv_color_lighten(lvRgb(0x30, 0x30, 0x30), 50), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(sl, LV_OPA_COVER, LV_PART_MAIN);
@@ -29646,7 +29663,7 @@ void styleOmoteSlider(lv_obj_t *sl, int knobPad = 6) {
 // used everywhere else in that style, rather than the OpenRemote-style
 // controls' own darker/bordered look.
 void styleOmotePanel(lv_obj_t *obj, lv_color_t bg) {
-  if (menuStyle == 2) {
+  if (menuStyle == 0) {
     // OMOTE's accent blue becomes the Stormy blue gradient, its greys become a
     // navy panel with the blue hairline, and any other colour (a warning red,
     // say) keeps its meaning and only takes the Stormy shape.
@@ -29740,7 +29757,7 @@ lv_obj_t *makeOpenRemoteLogoEmblem(lv_obj_t *parent, int centerX, int centerY, i
 // Matches gui_settings.cpp's dropdown styling exactly: box and open-list both
 // on color_primary (0x303030), 1px 0x505050 border on the list only.
 void styleOmoteDropdown(lv_obj_t *dropdown) {
-  if (menuStyle == 2) { styleStormyDropdown(dropdown); return; }
+  if (menuStyle == 0) { styleStormyDropdown(dropdown); return; }
   lv_obj_set_style_text_font(dropdown, &lv_font_montserrat_12, 0);
   lv_obj_set_style_text_color(dropdown, textPrimary(), 0);
   lv_obj_set_style_bg_color(dropdown, lvRgb(0x30, 0x30, 0x30), 0);
@@ -29766,7 +29783,7 @@ void styleOmoteDropdown(lv_obj_t *dropdown) {
 }
 
 void styleOmoteRoller(lv_obj_t *roller) {
-  if (menuStyle == 2) {
+  if (menuStyle == 0) {
     lv_obj_set_style_bg_color(roller, lvRgb(20, 34, 62), 0);
     lv_obj_set_style_bg_opa(roller, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(roller, 1, 0);
@@ -29804,7 +29821,7 @@ lv_obj_t *makeOmoteKeyboardKey(lv_obj_t *parent, lv_event_cb_t clickCallback,
   lv_obj_set_style_shadow_width(button, 0, 0);
   lv_obj_set_style_pad_all(button, 0, 0);
   lv_obj_set_style_bg_color(button, lvRgb(0x21, 0x96, 0xF3), LV_STATE_PRESSED);
-  if (menuStyle == 2) {
+  if (menuStyle == 0) {
     // Navy keys with the Stormy hairline; OMOTE's blue keys and the pressed
     // state become the Stormy blue.
     bool accent = bg.full == lvRgb(0x21, 0x96, 0xF3).full;
@@ -30621,7 +30638,7 @@ void drawDots() {
   // Stormy hides them on the settings home as well: every pixel of the 240x320
   // screen goes to the page instead, the way the settings sub-pages already
   // work in every style.
-  if (currentPage == 0 && (settingsView != SETTINGS_HOME || menuStyle == 2)) {
+  if (currentPage == 0 && (settingsView != SETTINGS_HOME || menuStyle == 0)) {
     lv_obj_add_flag(dots, LV_OBJ_FLAG_HIDDEN);
     return;
   }
@@ -31118,7 +31135,7 @@ lv_obj_t *makeSettingRow(const char *name, const char *sub, int y, bool *switchT
 // ---------------------------------------------------------------------------
 
 lv_obj_t *makeOmoteCard(lv_obj_t *parent, int y, int height) {
-  if (menuStyle == 2) return makeStormyCard(parent, y, height);
+  if (menuStyle == 0) return makeStormyCard(parent, y, height);
   lv_obj_t *card = lv_obj_create(parent);
   lv_obj_set_pos(card, 8, y);
   lv_obj_set_size(card, 224, height);
@@ -31140,7 +31157,7 @@ lv_obj_t *makeOmoteCard(lv_obj_t *parent, int y, int height) {
 // several topics into one card with drill-down rows, a structure 2.0 doesn't
 // have; retinted to sit correctly against the corrected 0x303030 card colour.
 void makeOmoteDivider(lv_obj_t *card, int y) {
-  if (menuStyle == 2) { makeStormyDivider(card, y); return; }
+  if (menuStyle == 0) { makeStormyDivider(card, y); return; }
   lv_obj_t *line = lv_obj_create(card);
   lv_obj_remove_style_all(line);
   lv_obj_set_pos(line, 14, y);
@@ -31156,7 +31173,7 @@ void makeOmoteDivider(lv_obj_t *card, int y) {
 lv_obj_t *makeOmoteRow(lv_obj_t *card, const char *name, const char *value, int y, int height,
                        bool *switchTarget, lv_event_cb_t clickCallback = nullptr,
                        lv_obj_t **nameLabelOut = nullptr, lv_obj_t **subLabelOut = nullptr) {
-  if (menuStyle == 2) {
+  if (menuStyle == 0) {
     // OMOTE's sub-value is the Stormy subtitle; the label pointers still come
     // back for pages that update them live.
     return makeStormyRowEx(card, name, value, nullptr, y, height, switchTarget,
@@ -31212,7 +31229,7 @@ lv_obj_t *makeOmoteRow(lv_obj_t *card, const char *name, const char *value, int 
 // Returns the (unconfigured) dropdown so the caller sets its own options,
 // selection and event callback.
 lv_obj_t *makeOmoteDropdownRow(lv_obj_t *card, const char *name, int y, int height, int dropdownWidth = 112) {
-  if (menuStyle == 2) return makeStormyDropdownRow(card, name, y, height, dropdownWidth);
+  if (menuStyle == 0) return makeStormyDropdownRow(card, name, y, height, dropdownWidth);
   lv_obj_t *row = lv_obj_create(card);
   lv_obj_remove_style_all(row);
   lv_obj_set_pos(row, 0, y);
@@ -31711,7 +31728,7 @@ void renderSettingsBackButton() {
   // Omote pages must leave this (8,6)-(50,36) footprint clear - several of
   // them used to place their first card/button at y=4, which drew over this
   // button and hid it entirely rather than just recolouring it.
-  if (menuStyle == 2) {
+  if (menuStyle == 0) {
     // A navy pill with the accent-blue hairline, matching the Stormy cards.
     lv_obj_t *back = makeButton(content, LV_SYMBOL_LEFT, 8, 6, 42, 30, lvRgb(20, 34, 62));
     lv_obj_set_style_radius(back, 15, 0);
@@ -31721,13 +31738,11 @@ void renderSettingsBackButton() {
     lv_obj_add_event_cb(back, backToSettings, LV_EVENT_CLICKED, nullptr);
     return;
   }
-  if (menuStyle == 1 || menuStyle == 2) {   // OMOTE layouts, drawn Stormy in style 2
-    lv_obj_t *back = makeOmoteButton(content, LV_SYMBOL_LEFT, 8, 6, 42, 30, lvRgb(0x50, 0x50, 0x50));
-    lv_obj_add_event_cb(back, backToSettings, LV_EVENT_CLICKED, nullptr);
-    return;
-  }
-  lv_obj_t *back = makeButton(content, LV_SYMBOL_LEFT, 8, 6, 42, 30, lvRgb(30, 38, 50));
+   // OMOTE layouts, drawn Stormy in style 2
+  lv_obj_t *back = makeOmoteButton(content, LV_SYMBOL_LEFT, 8, 6, 42, 30, lvRgb(0x50, 0x50, 0x50));
   lv_obj_add_event_cb(back, backToSettings, LV_EVENT_CLICKED, nullptr);
+  return;
+  
 }
 
 void renderSettingsHome() {
@@ -31740,52 +31755,14 @@ void renderSettingsHome() {
   lv_obj_set_scrollbar_mode(content, LV_SCROLLBAR_MODE_ACTIVE);
   lv_obj_set_style_pad_bottom(content, 20, 0);
   renderTopBar("Settings", false);
-  if (menuStyle == 2) {
+  if (menuStyle == 0) {
     renderSettingsHomeStormy();
     return;
   }
-  if (menuStyle == 1 || menuStyle == 2) {   // OMOTE layouts, drawn Stormy in style 2
-    renderSettingsHomeOmote();
-    return;
-  }
-  String wifiState = !wifiOn ? "Off" : (WiFi.status() == WL_CONNECTED ? WiFi.SSID() : "Tap to scan networks");
-  makeSettingRow("Wi-Fi", wifiState.c_str(), 8, &wifiOn,
-    [](lv_event_t *e) {
-      if (lv_event_get_target(e) == lv_event_get_current_target(e) && wifiOn) openSettingsView(SETTINGS_WIFI);
-    });
-  const char *bluetoothState = bleConnected ? "Connected" :
-    (blePairingMode ? "Pairing" : (bleBonded ? "Paired" : (bluetoothOn ? "Not paired" : "Off")));
-  makeSettingRow("Bluetooth", bluetoothState, 58, &bluetoothOn,
-    [](lv_event_t *e) {
-      if (lv_event_get_target(e) == lv_event_get_current_target(e)) {
-        openSettingsView(SETTINGS_BLUETOOTH);
-      }
-    });
-  makeSettingRow("Clock", clockUseInternetTime ? "Internet time and manual wheels" : "Manual time wheels", 108, &clockEnabled,
-    [](lv_event_t *e) {
-      if (lv_event_get_target(e) == lv_event_get_current_target(e)) openSettingsView(SETTINGS_CLOCK);
-    });
-  makeSettingRow("Wi-Fi Config", WiFi.status() == WL_CONNECTED ? "Scan QR to open WebConfig" : "Scan QR to join setup network", 158, nullptr,
-    [](lv_event_t *e) { openSettingsView(SETTINGS_WIFI_QR); });
-  makeSettingRow("Display", "Brightness, sleep, wake", 208, nullptr,
-    [](lv_event_t *e) { openSettingsView(SETTINGS_DISPLAY); });
-  makeSettingRow("Buttons", "Repeat timing and button test", 258, nullptr,
-    [](lv_event_t *e) { openSettingsView(SETTINGS_BUTTONS); });
-  makeSettingRow("Dock", "Blaster dock pairing over ESP-NOW", 308, nullptr,
-    [](lv_event_t *e) { openSettingsView(SETTINGS_DOCK); });
-  // Rows here are positioned by literal y, so removing Debug has to close the
-  // gap rather than leave a hole. Hidden unless About > Debug Menu is on.
-  int homeRowY = 358;
-  if (debugMenuVisible) {
-    makeSettingRow("Debug", "Touch, display, sensors and microphone", homeRowY, nullptr,
-      [](lv_event_t *e) { openSettingsView(SETTINGS_DEBUG); });
-    homeRowY += 50;
-  }
-  makeSettingRow("Backup / Restore", "Full configuration backups", homeRowY, nullptr,
-    [](lv_event_t *e) { openSettingsView(SETTINGS_BACKUP); });
-  homeRowY += 50;
-  makeSettingRow("About", "Version, device and battery information", homeRowY, nullptr,
-    [](lv_event_t *e) { openSettingsView(SETTINGS_ABOUT); });
+   // OMOTE layouts, drawn Stormy in style 2
+  renderSettingsHomeOmote();
+  return;
+  
 }
 
 void bluetoothPairEvent(lv_event_t *e) {
@@ -31842,43 +31819,13 @@ void renderBluetoothPage() {
   configureContent(42, 278, false);
   renderTopBar("Bluetooth", false);
   renderSettingsBackButton();
-  if (menuStyle == 1 || menuStyle == 2) {   // OMOTE layouts, drawn Stormy in style 2
-    lv_obj_add_flag(content, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_scroll_dir(content, LV_DIR_VER);
-    lv_obj_set_scrollbar_mode(content, LV_SCROLLBAR_MODE_AUTO);
-    renderBluetoothPageOmote();
-    return;
-  }
-
-  const char *state = bleConnected ? "Connected to streamer" :
-    (blePairingMode ? "Ready to pair" : (bleBonded ? "Paired - waiting to reconnect" : "Not paired"));
-  makeLabel(content, state, 58, 10, &lv_font_montserrat_16,
-            bleConnected ? lvRgb(120, 255, 155) : textPrimary());
-  makeLabel(content, BLE_HID_NAME, 12, 52, &lv_font_montserrat_12, lvRgb(150, 190, 240));
-  makeLabel(content, "On Chromecast open Settings >", 12, 76,
-            &lv_font_montserrat_10, lvRgb(175, 175, 185));
-  makeLabel(content, "Remotes & Accessories > Pair", 12, 92,
-            &lv_font_montserrat_10, lvRgb(175, 175, 185));
-  makeLabel(content, "remote, then choose OpenRemote HID.", 12, 108,
-            &lv_font_montserrat_10, lvRgb(175, 175, 185));
-
-  lv_obj_t *pair = makeButton(content, bleBonded ? "Pair another" : "Start pairing",
-                              12, 138, 216, 42, lvRgb(24, 105, 220));
-  lv_obj_add_event_cb(pair, bluetoothPairEvent, LV_EVENT_CLICKED, nullptr);
-
-  // Always offered, not just when bonded. Stored bonds can outlive bleBonded -
-  // the flag is cleared as soon as a pairing is deleted, while the NVS records
-  // are what actually fill NimBLE's 3-bond limit. Hiding this when bleBonded
-  // was false left those records with no way to be removed, which is how a
-  // remote ends up unable to pair with nothing on screen to explain it.
-  {
-    lv_obj_t *forget = makeButton(content,
-                                  bleBonded ? "Forget pairing" : "Clear pairing data",
-                                  12, 188, 216, 38, lvRgb(115, 38, 45));
-    lv_obj_add_event_cb(forget, bluetoothForgetEvent, LV_EVENT_CLICKED, nullptr);
-  }
-  makeLabel(content, "Keyboard and media controls only. No voice.", 12, 238,
-            &lv_font_montserrat_10, lvRgb(145, 145, 155));
+   // OMOTE layouts, drawn Stormy in style 2
+  lv_obj_add_flag(content, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_scroll_dir(content, LV_DIR_VER);
+  lv_obj_set_scrollbar_mode(content, LV_SCROLLBAR_MODE_AUTO);
+  renderBluetoothPageOmote();
+  return;
+  
 }
 
 void beginWifiScan(lv_event_t *e) {
@@ -32052,37 +31999,10 @@ void renderWifiPage() {
   lv_obj_set_scrollbar_mode(content, LV_SCROLLBAR_MODE_ACTIVE);
   renderTopBar("Wi-Fi", false);
   renderSettingsBackButton();
-  if (menuStyle == 1 || menuStyle == 2) {   // OMOTE layouts, drawn Stormy in style 2
-    renderWifiPageOmote();
-    return;
-  }
-
-  char status[64];
-  if (WiFi.status() == WL_CONNECTED) {
-    snprintf(status, sizeof(status), "%s  %s", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
-  } else if (wifiConnectPending) {
-    snprintf(status, sizeof(status), "Connecting to %s...", selectedWifiSsid.c_str());
-  } else if (findWifiProfile(selectedWifiSsid) >= 0) {
-    snprintf(status, sizeof(status), "Saved: %s", selectedWifiSsid.c_str());
-  } else {
-    snprintf(status, sizeof(status), "Not connected");
-  }
-  makeLabel(content, status, 58, 13, &lv_font_montserrat_10,
-            WiFi.status() == WL_CONNECTED ? lvRgb(166, 255, 184) : lvRgb(170, 175, 185));
-
-  lv_obj_t *scan = makeButton(content, wifiScanPending ? "Scanning..." : "Scan networks", 8, 45, 224, 34, lvRgb(35, 86, 140));
-  lv_obj_add_event_cb(scan, beginWifiScan, LV_EVENT_CLICKED, nullptr);
-  if (wifiScanPending) lv_obj_add_state(scan, LV_STATE_DISABLED);
-
-  int visible = max(0, min(wifiScanCount, 10));
-  if (wifiScanCount == 0) makeLabel(content, "No Wi-Fi networks found", 12, 94, &lv_font_montserrat_12, lvRgb(170, 175, 185));
-  for (int i = 0; i < visible; i++) {
-    String label = wifiScanResults[i].ssid;
-    if (findWifiProfile(label) >= 0) label += "  Saved";
-    else if (wifiScanResults[i].encryption != WIFI_AUTH_OPEN) label += "  " LV_SYMBOL_EYE_CLOSE;
-    lv_obj_t *network = makeButton(content, label.c_str(), 8, 88 + i * 38, 224, 34, lvRgb(32, 35, 42));
-    lv_obj_add_event_cb(network, chooseWifiNetwork, LV_EVENT_CLICKED, (void *)(intptr_t)i);
-  }
+   // OMOTE layouts, drawn Stormy in style 2
+  renderWifiPageOmote();
+  return;
+  
 }
 
 void connectSelectedWifi(const String &password, bool saveCredential) {
@@ -32544,48 +32464,10 @@ void renderWifiPasswordPage() {
   configureContent(42, 278, false);
   renderTopBar("Password", false);
   renderSettingsBackButton();
-  if (menuStyle == 1 || menuStyle == 2) {   // OMOTE layouts, drawn Stormy in style 2
-    renderWifiPasswordPageOmote();
-    return;
-  }
-  makeLabel(content, selectedWifiSsid.c_str(), 58, 13, &lv_font_montserrat_12, textPrimary());
-
-  wifiPasswordArea = nullptr;
-  if (findWifiProfile(selectedWifiSsid) >= 0) {
-    // An open network is saved with an empty password (see chooseWifiNetwork()/
-    // saveWifiCredentials(ssid, "")), so an empty saved password reliably means
-    // "open network" here rather than a real (never blank in practice) one.
-    bool savedIsOpen = savedWifiPassword(selectedWifiSsid).isEmpty();
-    makeLabel(content, savedIsOpen ? "This is a saved open network - no password required."
-                                   : "A password is saved for this network.",
-              10, 50, &lv_font_montserrat_10, lvRgb(165, 180, 200));
-    lv_obj_t *useSaved = makeButton(content, savedIsOpen ? "Reconnect" : "Use saved password",
-                                    8, 78, 224, 42, lvRgb(24, 105, 220));
-    lv_obj_add_event_cb(useSaved, useSavedWifiEvent, LV_EVENT_CLICKED, nullptr);
-    lv_obj_t *forget = makeButton(content, savedIsOpen ? "Forget this network" : "Forget & enter password",
-                                  8, 132, 224, 42, lvRgb(115, 38, 45));
-    lv_obj_add_event_cb(forget, forgetSavedWifiEvent, LV_EVENT_CLICKED, nullptr);
-    return;
-  }
-
-  wifiPasswordArea = lv_textarea_create(content);
-  lv_obj_set_pos(wifiPasswordArea, 8, 41);
-  // 184, not 224 - leaves room for the show/hide eye toggle to its right
-  // (this page never had one; only the Omote version did).
-  lv_obj_set_size(wifiPasswordArea, 184, 36);
-  lv_textarea_set_one_line(wifiPasswordArea, true);
-  lv_textarea_set_password_mode(wifiPasswordArea, !wifiPasswordVisible);
-  lv_textarea_set_placeholder_text(wifiPasswordArea, "Wi-Fi password");
-  // Both survive the rebuild that shift and the symbols key cause.
-  lv_textarea_set_text(wifiPasswordArea, wifiPasswordDraft.c_str());
-
-  lv_obj_t *eyeIcon = makeButton(content,
-    wifiPasswordVisible ? LV_SYMBOL_EYE_CLOSE : LV_SYMBOL_EYE_OPEN,
-    196, 41, 36, 36, lvRgb(30, 38, 50));
-  lv_obj_t *eyeLabel = lv_obj_get_child(eyeIcon, 0);
-  lv_obj_add_event_cb(eyeIcon, wifiPasswordVisibilityEvent, LV_EVENT_CLICKED, eyeLabel);
-
-  renderCompactWifiKeyboard();
+   // OMOTE layouts, drawn Stormy in style 2
+  renderWifiPasswordPageOmote();
+  return;
+  
 }
 
 void refreshSetupApStatusLabel() {
@@ -32654,41 +32536,13 @@ void renderWifiQrPage() {
   configureContent(42, 278, false);
   renderTopBar("WebConfig", false);
   renderSettingsBackButton();
-  if (menuStyle == 1 || menuStyle == 2) {   // OMOTE layouts, drawn Stormy in style 2
-    lv_obj_add_flag(content, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_scroll_dir(content, LV_DIR_VER);
-    lv_obj_set_scrollbar_mode(content, LV_SCROLLBAR_MODE_AUTO);
-    renderWifiQrPageOmote();
-    return;
-  }
-
-  bool stationConnected = !setupApActive && WiFi.status() == WL_CONNECTED;
-  bool connectionReady = stationConnected || setupApActive;
-  if (!connectionReady) {
-    makeLabel(content, "Connecting to saved Wi-Fi...", 18, 112,
-              &lv_font_montserrat_12, textPrimary());
-    makeLabel(content, "Setup AP starts automatically if needed", 15, 140,
-              &lv_font_montserrat_10, lvRgb(155, 165, 180));
-    setupApStatusLabel = makeLabel(content, "", 18, 172,
-                                  &lv_font_montserrat_10, lvRgb(155, 165, 180));
-    refreshSetupApStatusLabel();
-    nextSetupApStatusRefreshMs = millis() + 1000UL;
-    return;
-  }
-  String payload = stationConnected
-    ? webConfigUrl()
-    : String("WIFI:T:nopass;S:") + setupApSsid + ";;";
-  lv_obj_t *qr = lv_qrcode_create(content, 166, lv_color_black(), lv_color_white());
-  lv_obj_set_pos(qr, 37, 43);
-  lv_qrcode_update(qr, payload.c_str(), payload.length());
-  makeLabel(content, stationConnected ? "Scan to open WebConfig" : "Open network - no password", 35, 220,
-            &lv_font_montserrat_12, textPrimary());
-  makeLabel(content, stationConnected ? "Connected Wi-Fi" :
-            (setupApActive ? setupApSsid.c_str() : "Turn Wi-Fi on to start setup"), 24, 240,
-            &lv_font_montserrat_10, lvRgb(155, 165, 180));
-  setupApStatusLabel = makeLabel(content, "", 24, 255, &lv_font_montserrat_10, lvRgb(155, 165, 180));
-  refreshSetupApStatusLabel();
-  nextSetupApStatusRefreshMs = millis() + 1000UL;
+   // OMOTE layouts, drawn Stormy in style 2
+  lv_obj_add_flag(content, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_scroll_dir(content, LV_DIR_VER);
+  lv_obj_set_scrollbar_mode(content, LV_SCROLLBAR_MODE_AUTO);
+  renderWifiQrPageOmote();
+  return;
+  
 }
 
 void serviceRemoteIdentify(unsigned long now) {
@@ -32842,26 +32696,10 @@ void renderClockCityPage() {
   lv_obj_set_scrollbar_mode(content, LV_SCROLLBAR_MODE_AUTO);
   renderTopBar("Search City", false);
   renderSettingsBackButton();
-  if (menuStyle == 1 || menuStyle == 2) {   // OMOTE layouts, drawn Stormy in style 2
-    renderClockCityPageOmote();
-    return;
-  }
-
-  if (!wifiOn || !hasSelectedWifiProfile()) {
-    makeLabel(content, "Connect Wi-Fi before selecting\nan Internet time city.", 12, 70,
-              &lv_font_montserrat_12, textPrimary());
-    return;
-  }
-
-  static const char *cities[] = {
-    "Canberra", "Sydney", "Melbourne", "Brisbane", "Perth",
-    "Adelaide", "Darwin", "Hobart", "UTC"
-  };
-  makeLabel(content, "Select nearest city", 58, 13, &lv_font_montserrat_12, textPrimary());
-  for (uint8_t i = 0; i < sizeof(cities) / sizeof(cities[0]); i++) {
-    lv_obj_t *city = makeButton(content, cities[i], 8, 48 + i * 38, 224, 34, lvRgb(32, 35, 42));
-    lv_obj_add_event_cb(city, chooseClockCity, LV_EVENT_CLICKED, (void *)cities[i]);
-  }
+   // OMOTE layouts, drawn Stormy in style 2
+  renderClockCityPageOmote();
+  return;
+  
 }
 
 void renderClockPageOmote() {
@@ -32936,66 +32774,13 @@ void renderClockPage() {
   configureContent(42, 278, false);
   renderTopBar("Clock", false);
   renderSettingsBackButton();
-  if (menuStyle == 1 || menuStyle == 2) {   // OMOTE layouts, drawn Stormy in style 2
-    lv_obj_add_flag(content, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_scroll_dir(content, LV_DIR_VER);
-    lv_obj_set_scrollbar_mode(content, LV_SCROLLBAR_MODE_AUTO);
-    renderClockPageOmote();
-    return;
-  }
-
-  makeSettingRow("Status bar", clockEnabled ? "Show time in top right" : "Battery only", 42, &clockEnabled);
-  makeSettingRow("Internet time", hasAnyWifiProfile()
-    ? "Boot and daily 3am sync" : "Needs a saved Wi-Fi network", 92,
-    &clockUseInternetTime);
-
-  if (clockUseInternetTime) {
-    makeSettingRow("City", clockCityName.c_str(), 142, nullptr,
-      [](lv_event_t *e) { openSettingsView(SETTINGS_CLOCK_CITY); });
-    makeLabel(content, "Wi-Fi turns on only while time syncs.", 12, 200,
-              &lv_font_montserrat_12, lvRgb(170, 175, 185));
-    return;
-  }
-
-  makeLabel(content, "Set manually", 10, 148, &lv_font_montserrat_12, textPrimary());
-  // Sized with real headroom, not exactly to the byte - see the matching
-  // comment in renderClockPageOmote() for why an exact-fit buffer silently
-  // drops its last entry (December, hour 23, minute 59 were all missing).
-  static char yearOptions[420];
-  static char monthOptions[48];
-  static char dayOptions[110];
-  static char hourOptions[48];
-  static char minuteOptions[200];
-  buildNumberOptions(yearOptions, sizeof(yearOptions), 2024, 2099, 4);
-  buildNumberOptions(monthOptions, sizeof(monthOptions), 1, 12, 2);
-  buildNumberOptions(dayOptions, sizeof(dayOptions), 1, 31, 2);
-  buildNumberOptions(hourOptions, sizeof(hourOptions), 1, 12, 2);
-  buildNumberOptions(minuteOptions, sizeof(minuteOptions), 0, 59, 2);
-
-  time_t now = time(nullptr);
-  if (now < 1700000000 && manualClockEpoch > 0) now = (time_t)manualClockEpoch;
-  tm timeInfo = {};
-  if (now >= 1700000000) localtime_r(&now, &timeInfo);
-  else {
-    timeInfo.tm_year = 2026 - 1900;
-    timeInfo.tm_mon = 6;
-    timeInfo.tm_mday = 18;
-    timeInfo.tm_hour = 12;
-    timeInfo.tm_min = 0;
-  }
-  int hour12 = timeInfo.tm_hour % 12;
-  if (hour12 == 0) hour12 = 12;
-  bool isPM = timeInfo.tm_hour >= 12;
-
-  makeClockRoller(0, "Year", 8, 176, 44, yearOptions, constrain(timeInfo.tm_year + 1900 - 2024, 0, 75));
-  makeClockRoller(1, "Mon", 58, 176, 30, monthOptions, constrain(timeInfo.tm_mon, 0, 11));
-  makeClockRoller(2, "Day", 94, 176, 30, dayOptions, constrain(timeInfo.tm_mday - 1, 0, 30));
-  makeClockRoller(3, "Hr", 130, 176, 26, hourOptions, constrain(hour12 - 1, 0, 11));
-  makeClockRoller(4, "AM/PM", 162, 176, 34, "AM\nPM", isPM ? 1 : 0);
-  makeClockRoller(5, "Min", 202, 176, 30, minuteOptions, constrain(timeInfo.tm_min, 0, 59));
-
-  lv_obj_t *set = makeButton(content, "Set manual time", 8, 250, 224, 24, lvRgb(35, 86, 140));
-  lv_obj_add_event_cb(set, setManualClockEvent, LV_EVENT_CLICKED, nullptr);
+   // OMOTE layouts, drawn Stormy in style 2
+  lv_obj_add_flag(content, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_scroll_dir(content, LV_DIR_VER);
+  lv_obj_set_scrollbar_mode(content, LV_SCROLLBAR_MODE_AUTO);
+  renderClockPageOmote();
+  return;
+  
 }
 
 // OMOTE-style rows nest sliders inside a card container that sits between
@@ -33161,7 +32946,7 @@ void makeDisplaySlider(const char *label, int y, int minValue, int maxValue, int
   // OpenRemote_2.0's real accent colour (0x2196F3, LVGL default theme blue)
   // in Omote mode instead of the OpenRemote-style page's own lighter blue.
   // Stormy wins over the OMOTE flag: Stormy pages reuse the OMOTE layouts.
-  bool stormy = menuStyle == 2;
+  bool stormy = menuStyle == 0;
   lv_obj_t *number = makeLabel(parent, valueText, x + width - 38, y, &lv_font_montserrat_12,
                                 stormy ? lvRgb(90, 162, 255)
                                        : (omoteStyle ? lvRgb(0x21, 0x96, 0xF3) : lvRgb(95, 180, 255)));
@@ -33306,53 +33091,14 @@ void renderDisplayPage() {
   lv_obj_set_style_pad_bottom(content, 14, 0);
   renderTopBar("Display", false);
   renderSettingsBackButton();
-  if (menuStyle == 2) {
+  if (menuStyle == 0) {
     renderDisplayPageStormy();
     return;
   }
-  if (menuStyle == 1 || menuStyle == 2) {   // OMOTE layouts, drawn Stormy in style 2
-    renderDisplayPageOmote();
-    return;
-  }
-  makeDisplaySlider("Brightness", 46, 5, 100, brightness, 0);
-  makeDisplaySlider("Sleep timer", 100, 5, 120, timeoutSeconds, 1);
-  makeDisplaySlider("Deep Sleep", 154, 1, 30, deepSleepMinutes, 2);
-  makeDisplaySlider("Motion sensitivity", 208, 1, 100, wakeSensitivity, 3);
-  makeDisplaySlider("Gamma", 262, 50, 250, displayGamma, 4);
-  makeDisplaySlider("Saturation", 316, 0, 200, displaySaturation, 5);
-  lv_obj_t *wakePanel = lv_obj_create(content);
-  lv_obj_set_pos(wakePanel, 8, 370);
-  lv_obj_set_size(wakePanel, 224, 44);
-  lv_obj_clear_flag(wakePanel, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_clear_flag(wakePanel, LV_OBJ_FLAG_CLICKABLE);
-  stylePanel(wakePanel, lvRgb(34, 35, 39), lvRgb(54, 56, 62));
-  makeLabel(wakePanel, "Wake", 8, 14, &lv_font_montserrat_16, textPrimary());
-  lv_obj_t *wakeDropdown = lv_dropdown_create(wakePanel);
-  lv_obj_set_pos(wakeDropdown, 224 - 108 - 8, 6);
-  lv_obj_set_size(wakeDropdown, 108, 32);
-  styleDebugDropdown(wakeDropdown);
-  lv_dropdown_set_options(wakeDropdown, "Motion\nButton");
-  lv_dropdown_set_selected(wakeDropdown, wakeMode == WAKE_MODE_BUTTON ? 1 : 0);
-  lv_obj_add_event_cb(wakeDropdown, wakeModeDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
-  addPhysicalNavFocusable(wakeDropdown);
-  makeSettingRow("Colour Depth", displayRgb666 ? "RGB666 panel transfer" : "RGB565 panel transfer", 420, &displayRgb666);
-
-  lv_obj_t *panelPanel = lv_obj_create(content);
-  lv_obj_set_pos(panelPanel, 8, 470);
-  lv_obj_set_size(panelPanel, 224, 44);
-  lv_obj_clear_flag(panelPanel, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_clear_flag(panelPanel, LV_OBJ_FLAG_CLICKABLE);
-  stylePanel(panelPanel, lvRgb(34, 35, 39), lvRgb(54, 56, 62));
-  makeLabel(panelPanel, "LCD", 8, 14, &lv_font_montserrat_14, textPrimary());
-  lv_obj_t *panelDropdown = lv_dropdown_create(panelPanel);
-  lv_obj_set_pos(panelDropdown, 224 - 150 - 8, 6);
-  lv_obj_set_size(panelDropdown, 150, 32);
-  styleDebugDropdown(panelDropdown);
-  lv_dropdown_set_options(panelDropdown,
-                          "Adafruit\nBuyDisplay-ILI9341\nBuyDisplay-ST7789V");
-  lv_dropdown_set_selected(panelDropdown, lcdPanelDropdownSelection());
-  lv_obj_add_event_cb(panelDropdown, lcdPanelDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
-  addPhysicalNavFocusable(panelDropdown);
+   // OMOTE layouts, drawn Stormy in style 2
+  renderDisplayPageOmote();
+  return;
+  
 }
 
 void buttonSliderEvent(lv_event_t *e) {
@@ -33398,15 +33144,15 @@ void makeButtonTimingSlider(const char *label, int y, int minValue,
   else snprintf(text, sizeof(text), "%d/s", value);
   lv_obj_t *number = makeLabel(parent, text, x + width - 44, y,
                                &lv_font_montserrat_12,
-                               menuStyle == 2 ? lvRgb(90, 162, 255)
+                               menuStyle == 0 ? lvRgb(90, 162, 255)
                                               : (omoteStyle ? lvRgb(0x21, 0x96, 0xF3) : lvRgb(95, 180, 255)));
   buttonValueLabels[setting] = number;
   lv_obj_set_width(number, 44);
   lv_obj_set_style_text_align(number, LV_TEXT_ALIGN_RIGHT, 0);
   lv_obj_t *slider = lv_slider_create(parent);
   lv_obj_set_pos(slider, x, y + 23);
-  lv_obj_set_size(slider, width, menuStyle == 2 ? 8 : (omoteStyle ? 10 : 12));
-  if (omoteStyle || menuStyle == 2) styleOmoteSlider(slider); else styleModernSlider(slider);
+  lv_obj_set_size(slider, width, menuStyle == 0 ? 8 : (omoteStyle ? 10 : 12));
+  if (omoteStyle || menuStyle == 0) styleOmoteSlider(slider); else styleModernSlider(slider);
   addPhysicalNavFocusable(slider);
   int sliderValue = value;
   if (setting == 0) {
@@ -33441,7 +33187,7 @@ void renderButtonsPageOmote() {
   }
 
   lv_obj_t *testCard = makeOmoteCard(content, y, 48);
-  makeOmoteRow(testCard, "Test Button", "No commands are transmitted", 0, 48, &buttonTestActive);
+  makeOmoteRow(testCard, "Test Button", "No commands are sent", 0, 48, &buttonTestActive);
   y += 48 + 12;
 
   buttonTestPanel = lv_obj_create(content);
@@ -33472,41 +33218,10 @@ void renderButtonsPage() {
   lv_obj_set_style_pad_bottom(content, 18, 0);
   renderTopBar("Buttons", false);
   renderSettingsBackButton();
-  if (menuStyle == 1 || menuStyle == 2) {   // OMOTE layouts, drawn Stormy in style 2
-    renderButtonsPageOmote();
-    return;
-  }
-
-  makeSettingRow("Repeat", physicalRepeatEnabled ? "Repeat while held" : "Send once per press",
-                 44, &physicalRepeatEnabled);
-  int testRowY = 98;
-  if (physicalRepeatEnabled) {
-    makeButtonTimingSlider("Delay before repeat", 98,
-      BUTTON_REPEAT_DELAY_MIN_MS, BUTTON_REPEAT_DELAY_MAX_MS,
-      physicalRepeatDelayMs, 0);
-    makeButtonTimingSlider("Repeat speed", 152,
-      BUTTON_REPEAT_RATE_MIN_HZ, BUTTON_REPEAT_RATE_MAX_HZ,
-      physicalRepeatRateHz, 1);
-    testRowY = 206;
-  }
-
-  makeSettingRow("Test Button", "No commands are transmitted", testRowY,
-                 &buttonTestActive);
-  buttonTestPanel = lv_obj_create(content);
-  lv_obj_set_pos(buttonTestPanel, 8, testRowY + 50);
-  lv_obj_set_size(buttonTestPanel, 224, 54);
-  lv_obj_clear_flag(buttonTestPanel, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_clear_flag(buttonTestPanel, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_set_style_radius(buttonTestPanel, 6, 0);
-  lv_obj_set_style_border_width(buttonTestPanel, 1, 0);
-  buttonTestLabel = makeLabel(buttonTestPanel, "No button pressed", 0, 0,
-                              &lv_font_montserrat_16, lvRgb(150, 150, 160));
-  lv_obj_set_width(buttonTestLabel, 206);
-  lv_obj_set_style_text_align(buttonTestLabel, LV_TEXT_ALIGN_CENTER, 0);
-  // A fixed (8,13) position isn't actually centred in the panel - true
-  // centring regardless of panel size/label height.
-  lv_obj_center(buttonTestLabel);
-  setButtonTestVisual(false);
+   // OMOTE layouts, drawn Stormy in style 2
+  renderButtonsPageOmote();
+  return;
+  
 }
 
 void debugRowDropdownEvent(lv_event_t *e) {
@@ -34036,8 +33751,8 @@ void makeMenuStyleRow(int y) {
   lv_obj_set_pos(dropdown, 104, 1);
   lv_obj_set_size(dropdown, 112, 32);
   styleDebugDropdown(dropdown);
-  lv_dropdown_set_options(dropdown, "OpenRemote\nOMOTE\nStormy");
-  lv_dropdown_set_selected(dropdown, menuStyle <= 2 ? menuStyle : 0);
+  lv_dropdown_set_options(dropdown, "OpenRemote\nOMOTE");
+  lv_dropdown_set_selected(dropdown, menuStyle == 1 ? 1 : 0);
   lv_obj_add_event_cb(dropdown, menuStyleDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
   addPhysicalNavFocusable(dropdown);
 }
@@ -34156,8 +33871,8 @@ void renderDebugPageOmote() {
   y += 22;
   lv_obj_t *menuCard = makeOmoteCard(content, y, calibRowH);
   lv_obj_t *menuDropdown = makeOmoteDropdownRow(menuCard, "Menu Style", 0, calibRowH, 112);
-  lv_dropdown_set_options(menuDropdown, "OpenRemote\nOMOTE\nStormy");
-  lv_dropdown_set_selected(menuDropdown, menuStyle <= 2 ? menuStyle : 0);
+  lv_dropdown_set_options(menuDropdown, "OpenRemote\nOMOTE");
+  lv_dropdown_set_selected(menuDropdown, menuStyle == 1 ? 1 : 0);
   lv_obj_add_event_cb(menuDropdown, menuStyleDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
   y += calibRowH + 20;
 
@@ -34312,24 +34027,10 @@ void renderDockRenamePage() {
   const char *current = dockRenameIndex < espNowDeviceCount
     ? espNowDevices[dockRenameIndex].name : "";
 
-  if (menuStyle == 1 || menuStyle == 2) {   // OMOTE layouts, drawn Stormy in style 2
-    renderDockRenamePageOmote(current);
-    return;
-  }
-
-  makeLabel(content, dockRenameIndex < espNowDeviceCount
-              ? formatMacAddress(espNowDevices[dockRenameIndex].mac).c_str() : "",
-            8, 13, &lv_font_montserrat_10, lvRgb(165, 180, 200));
-
-  wifiPasswordArea = lv_textarea_create(content);
-  lv_obj_set_pos(wifiPasswordArea, 8, 41);
-  lv_obj_set_size(wifiPasswordArea, 224, 36);
-  lv_textarea_set_one_line(wifiPasswordArea, true);
-  lv_textarea_set_max_length(wifiPasswordArea, 23);  // Matches EspNowPairedDevice::name.
-  lv_textarea_set_placeholder_text(wifiPasswordArea, "Dock name");
-  lv_textarea_set_text(wifiPasswordArea, current);
-
-  renderCompactWifiKeyboard();
+   // OMOTE layouts, drawn Stormy in style 2
+  renderDockRenamePageOmote(current);
+  return;
+  
 }
 
 void espNowTxPowerDropdownEvent(lv_event_t *e) {
@@ -34350,55 +34051,10 @@ void renderDockPage() {
   lv_obj_set_scrollbar_mode(content, LV_SCROLLBAR_MODE_AUTO);
   renderTopBar("Dock", false);
   renderSettingsBackButton();
-  if (menuStyle == 1 || menuStyle == 2) {   // OMOTE layouts, drawn Stormy in style 2
-    renderDockPageOmote();
-    return;
-  }
-  char espNowStatusText[24];
-  snprintf(espNowStatusText, sizeof(espNowStatusText), "%u paired", (unsigned)espNowDeviceCount);
-  makeSettingRow("ESP-NOW", "Send commands to a paired blaster dock", 52, &espNowEnabled);
-  makeSettingRow("Paired docks", espNowStatusText, 102, nullptr,
-                 showEspNowPairedOverlay);
-  makeSettingRow("Search for a dock", "Find a dock in pairing mode", 152, nullptr,
-                 toggleEspNowDevicesModal);
-  int hintY = 214;
-  // See renderDockPageOmote() for why the route row outlives the dock-only ones.
-  if (espNowDeviceCount > 0 || irRoute != IR_ROUTE_REMOTE) {
-    lv_obj_t *routeRow = makeSettingRow("Transmit IR from", "", 202, nullptr, nullptr);
-    lv_obj_t *routeDropdown = lv_dropdown_create(routeRow);
-    lv_obj_set_pos(routeDropdown, 112, 8);
-    lv_obj_set_size(routeDropdown, 100, 32);
-    styleDebugDropdown(routeDropdown);
-    lv_dropdown_set_options(routeDropdown, IR_ROUTE_OPTIONS);
-    lv_dropdown_set_selected(routeDropdown, irRoute);
-    lv_obj_add_event_cb(routeDropdown, irRouteDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
-    addPhysicalNavFocusable(routeDropdown);
-    makeSettingRow("Dock RF433", "Let the dock send RF433", 252, &dockRfEnabled);
-    makeSettingRow("Dock LED", "Blink as the dock transmits", 302, &dockLedOnTransmit);
-    makeSettingRow("Homebridge via dock", "Dock sends them - far quicker", 352,
-                   &homebridgeViaDock);
-    lv_obj_t *txRow = makeSettingRow("Tx Power", "", 402, nullptr, nullptr);
-    lv_obj_t *txDropdown = lv_dropdown_create(txRow);
-    lv_obj_set_pos(txDropdown, 112, 8);
-    lv_obj_set_size(txDropdown, 100, 32);
-    styleDebugDropdown(txDropdown);
-    lv_dropdown_set_options(txDropdown, ESPNOW_TX_POWER_OPTIONS);
-    lv_dropdown_set_selected(txDropdown, espNowTxPower);
-    lv_obj_add_event_cb(txDropdown, espNowTxPowerDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
-    addPhysicalNavFocusable(txDropdown);
-    hintY = 454;
-  }
-  lv_obj_t *hint = makeLabel(content,
-    espNowDeviceCount > 0
-      ? "Transmit IR from decides which emitter actually fires - this remote, the "
-        "dock, both together, or remote then dock. Sequential sends twice, so do "
-        "not use it for toggle commands such as Power."
-      : "A dock relays IR and RF433 commands for devices the remote cannot reach "
-        "directly. Turn ESP-NOW on, then use Paired devices to search for a dock "
-        "in pairing mode.",
-    10, hintY, &lv_font_montserrat_12, lvRgb(150, 160, 175));
-  lv_obj_set_width(hint, 216);
-  lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
+   // OMOTE layouts, drawn Stormy in style 2
+  renderDockPageOmote();
+  return;
+  
 }
 
 void renderDebugPage() {
@@ -34412,77 +34068,10 @@ void renderDebugPage() {
   lv_obj_set_style_pad_bottom(content, 18, 0);
   renderTopBar("Debug", false);
   renderSettingsBackButton();
-  if (menuStyle == 1 || menuStyle == 2) {   // OMOTE layouts, drawn Stormy in style 2
-    renderDebugPageOmote();
-    return;
-  }
-
-  // The Split Line switch and the five saved-row-position dropdowns were
-  // removed: row calibration is settled, and the values still drive the layout
-  // from their saved defaults - only the controls are gone. Everything below
-  // moves up by the 308px they occupied.
-  makeSettingRow("Touch", "Live reticle, coordinates and trail", 44,
-                 &debugTouchEnabled);
-  makeSettingRow("CPU / RAM", "Processor load and heap used/free", 94,
-                 &debugCpuRamEnabled);
-  makeSettingRow("Accelerometer", "Live X,Y,Z tilt samples", 144,
-                 &debugAccelerometerEnabled);
-  makeSettingRow("FPS", "Display frames per second", 194, &debugFpsEnabled);
-  makeSettingRow("Bluetooth Sleep", "On disconnects BLE - may pause casting", 244,
-                 &bluetoothSleepEnabled);
-  makeMicrophoneSourceRow(294);
-
-  makeLabel(content, "Display driver (reboot required)", 10, 346,
-            &lv_font_montserrat_12, lvRgb(170, 178, 190));
-  int driverSectionY = 368;
-  makeDisplayModuleRow(driverSectionY);
-  driverSectionY += 50;
-  // Its own switch now, next to the module it relates to, rather than a value
-  // the module dropdown wrote on the user's behalf.
-  makeSettingRow("Invert Colours", "Flip the panel's colour polarity",
-                 driverSectionY, &displayInverted);
-  driverSectionY += 50;
-  makeDisplayDriverRow(driverSectionY);
-  driverSectionY += 50;
-  if (displayDriverChoice == 0) {
-    // Hidden, not disabled, on the ST-7789: the clock is fixed at 20MHz for
-    // that panel, and a control that cannot change anything is only clutter.
-    if (displayModuleChoice != DISPLAY_MODULE_ST7789) {
-      makeLcdFrequencyRow(driverSectionY);
-      driverSectionY += 50;
-    }
-    makeLcdBufferRow(driverSectionY);
-    driverSectionY += 50;
-    makeLcdDriveStrengthRow(driverSectionY);
-    driverSectionY += 50;
-  }
-
-  // Not gated on the LCD driver: the backlight rail is shared with the touch
-  // controller either way, so this is worth testing under both.
-  makeLabel(content, "Backlight PWM (applies immediately)", 10, driverSectionY,
-            &lv_font_montserrat_12, lvRgb(170, 178, 190));
-  driverSectionY += 22;
-  makeBacklightPwmRow(driverSectionY);
-  driverSectionY += 50;
-
-  makeLabel(content, "Menu style (applies immediately)", 10, driverSectionY,
-            &lv_font_montserrat_12, lvRgb(170, 178, 190));
-  driverSectionY += 22;
-  makeMenuStyleRow(driverSectionY);
-  driverSectionY += 50;
-
-  int rebootButtonY = driverSectionY + 8;
-
-  lv_obj_t *softButton = makeButton(content, "Soft reboot", 8, rebootButtonY, 108, 42,
-                                    lvRgb(28, 91, 150));
-  lv_obj_t *hardButton = makeButton(content, "Hard reboot", 124, rebootButtonY, 108, 42,
-                                    lvRgb(132, 43, 48));
-  lv_obj_add_event_cb(softButton, debugRebootButtonEvent, LV_EVENT_CLICKED,
-                      (void *)(uintptr_t)false);
-  lv_obj_add_event_cb(hardButton, debugRebootButtonEvent, LV_EVENT_CLICKED,
-                      (void *)(uintptr_t)true);
-  addPhysicalNavFocusable(softButton);
-  addPhysicalNavFocusable(hardButton);
+   // OMOTE layouts, drawn Stormy in style 2
+  renderDebugPageOmote();
+  return;
+  
 }
 
 String signedBatteryValue(float value, const char *suffix) {
@@ -34591,14 +34180,12 @@ void renderBatteryPage() {
   lv_obj_set_scrollbar_mode(content, LV_SCROLLBAR_MODE_AUTO);
   renderTopBar("Battery", false);
   renderSettingsBackButton();
-  if (menuStyle == 1 || menuStyle == 2) {   // OMOTE layouts, drawn Stormy in style 2
-    // y=44, not 4: the card at 4 was drawn over the back button's (8,6)-(50,36)
-    // footprint and hid it, leaving no way back from this page.
-    makeBatteryMetricRows(44, true);
-    return;
-  }
-
-  makeBatteryMetricRows(44);
+   // OMOTE layouts, drawn Stormy in style 2
+  // y=44, not 4: the card at 4 was drawn over the back button's (8,6)-(50,36)
+  // footprint and hid it, leaving no way back from this page.
+  makeBatteryMetricRows(44, true);
+  return;
+  
 }
 
 // Backup/restore run synchronously on the LVGL/touch core, so there's no
@@ -34881,34 +34468,10 @@ void renderBackupRestorePage() {
   lv_obj_set_style_pad_bottom(content, 18, 0);
   renderTopBar("Backup / Restore", false);
   renderSettingsBackButton();
-  if (menuStyle == 1 || menuStyle == 2) {   // OMOTE layouts, drawn Stormy in style 2
-    renderBackupRestorePageOmote();
-    return;
-  }
-
-  lv_obj_t *create = makeButton(content, "Create full backup", 8, 44, 224, 38,
-                                lvRgb(35, 86, 140));
-  lv_obj_add_event_cb(create, createBackupFromLcd, LV_EVENT_CLICKED, nullptr);
-  lcdBackupStatusLabel = makeLabel(
-    content, lcdBackupStatus[0] ? lcdBackupStatus : "Backups are saved on the SD card",
-    10, 90, &lv_font_montserrat_10, lvRgb(160, 170, 185));
-  lcdBackupTrack = makeLcdBackupTrack(content, 104);
-  lcdBackupAnimBar = makeLcdBackupAnimBar(content, 104);
-
-  loadLcdBackupEntries();
-  makeLabel(content, "Restore a backup", 10, 116, &lv_font_montserrat_12, textPrimary());
-  if (!lcdBackupCount) {
-    makeLabel(content, "No full backups found", 10, 145,
-              &lv_font_montserrat_12, lvRgb(160, 170, 185));
-    return;
-  }
-  for (uint8_t index = 0; index < lcdBackupCount; index++) {
-    lv_obj_t *backup = makeButton(content, lcdBackupEntries[index].displayDate,
-                                  8, 140 + index * 42, 224, 36,
-                                  lvRgb(32, 35, 42));
-    lv_obj_add_event_cb(backup, chooseLcdBackup, LV_EVENT_CLICKED,
-                        (void *)(intptr_t)index);
-  }
+   // OMOTE layouts, drawn Stormy in style 2
+  renderBackupRestorePageOmote();
+  return;
+  
 }
 
 void renderAboutPageOmote() {
@@ -34952,21 +34515,10 @@ void renderAboutPage() {
   lv_obj_set_scrollbar_mode(content, LV_SCROLLBAR_MODE_AUTO);
   renderTopBar("About", false);
   renderSettingsBackButton();
-  if (menuStyle == 1 || menuStyle == 2) {   // OMOTE layouts, drawn Stormy in style 2
-    renderAboutPageOmote();
-    return;
-  }
-  makeLabel(content, "OpenRemote", 58, 12, &lv_font_montserrat_16, textPrimary());
-  makeSettingRow("Firmware", OPENREMOTE_VERSION_TEXT, 52, nullptr);
-  makeSettingRow("Hardware", "OMOTE Rev 5 / ESP32-S3", 102, nullptr);
-  String webVersion = installedWebConfigVersion();
-  makeSettingRow("WebConfig", webVersion.length() ? webVersion.c_str() : "Not installed", 152, nullptr);
-  makeSettingRow("Setup network", setupApSsid.c_str(), 202, nullptr);
-  makeSettingRow("SD Card", sdStatusText, 252, nullptr);
-  makeSettingRow("Debug Menu", "Show Debug in Settings", 302, &debugMenuVisible);
-
-  makeLabel(content, "Battery", 10, 360, &lv_font_montserrat_16, textPrimary());
-  makeBatteryMetricRows(386);
+   // OMOTE layouts, drawn Stormy in style 2
+  renderAboutPageOmote();
+  return;
+  
 }
 
 void renderSettingsPage() {
@@ -35035,7 +34587,7 @@ void renderSettingsPage() {
     default: renderSettingsHome(); break;
   }
   // Every settings page, including the OMOTE layouts Stormy reuses.
-  if (menuStyle == 2) applyStormyBackground();
+  if (menuStyle == 0) applyStormyBackground();
   if (physicalNavPendingRefocusIndex >= 0 &&
       physicalNavPendingRefocusIndex < physicalNavRegisteredCount) {
     lv_group_focus_obj(physicalNavRegisteredObjs[physicalNavPendingRefocusIndex]);
