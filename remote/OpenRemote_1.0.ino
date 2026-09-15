@@ -1,6 +1,23 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.40 - 2026-09-15
+    - The charging overlay's green charge keeps the same gap from the battery
+      shell at the top as at the bottom. LVGL 8 measures a container's content
+      area inside its border as well as its padding; the fill height subtracted
+      the padding only, so a full battery was 10px too tall and ran into the
+      shell. Its corners now follow the shell's radius too.
+    - The charging overlay stays up for four seconds instead of three.
+    - The status bar battery no longer keeps animating a charge after the cable
+      is unplugged. CRG_STAT reads the same for "unplugged" and "charge
+      complete", so a full battery was held at "charging" until the fuel gauge
+      reported a falling rate, which can take minutes - and the saved power
+      mode could restore it straight into "charging" at boot. The CH340C is
+      powered only from USB, so its TXD on RXD0 now serves as a USB-power
+      signal: a line that stays low means the cable is out and releases the
+      charging state at once. Holding it on a full battery still needs the old
+      fuel-gauge test as well.
+
   5.39 - 2026-09-15
     - Plugging in the charger shows a charging overlay for three seconds, on
       any page and even with the screen off: a large rounded battery whose
@@ -6831,7 +6848,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.39"
+#define OPENREMOTE_VERSION_STRING "5.40"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -22691,7 +22708,7 @@ bool sdBusyWithBackupJob() {
   Built on lv_layer_top() like the backup overlay: it belongs to no page, so it
   needs no navigation and leaves the page underneath exactly as it was.
 */
-static const uint32_t CHARGE_OVERLAY_SHOW_MS = 3000UL;
+static const uint32_t CHARGE_OVERLAY_SHOW_MS = 4000UL;
 static const uint32_t CHARGE_OVERLAY_POLL_MS = 100UL;
 static const uint32_t CHARGE_WAKE_CONFIRM_MS = 1000UL;
 unsigned long chargeOverlayShownMs = 0;
@@ -22749,7 +22766,7 @@ void showChargeOverlay() {
 
   // The battery: a rounded terminal cap, then the rounded shell drawn over its
   // lower edge so the two read as one piece.
-  const int bodyW = 104, bodyH = 172, bodyY = 44, inset = 9;
+  const int bodyW = 104, bodyH = 172, bodyY = 44, border = 5, inset = 9;
   lv_obj_t *cap = lv_obj_create(chargeOverlay);
   lv_obj_remove_style_all(cap);
   lv_obj_set_size(cap, 40, 16);
@@ -22763,7 +22780,7 @@ void showChargeOverlay() {
   lv_obj_set_size(body, bodyW, bodyH);
   lv_obj_set_pos(body, (LCD_W - bodyW) / 2, bodyY);
   lv_obj_set_style_radius(body, 24, 0);
-  lv_obj_set_style_border_width(body, 5, 0);
+  lv_obj_set_style_border_width(body, border, 0);
   lv_obj_set_style_border_color(body, shell, 0);
   lv_obj_set_style_border_opa(body, LV_OPA_COVER, 0);
   lv_obj_set_style_bg_opa(body, LV_OPA_COVER, 0);
@@ -22773,7 +22790,10 @@ void showChargeOverlay() {
   lv_obj_clear_flag(body, LV_OBJ_FLAG_SCROLLABLE);
 
   // Green charge, rising from empty to the real level and then breathing.
-  const int innerH = bodyH - inset * 2;
+  // LVGL 8 measures the content area inside the border AND the padding. Using
+  // the padding alone made a full battery 10px too tall, so its top ran into
+  // the shell while the bottom kept its gap.
+  const int innerH = bodyH - (border + inset) * 2;
   int level = percent < 0.0f ? innerH : (int)((float)innerH * percent / 100.0f + 0.5f);
   if (level < 16) level = 16;   // always a visible sliver of green
   lv_obj_t *fill = lv_obj_create(body);
@@ -22781,7 +22801,7 @@ void showChargeOverlay() {
   lv_obj_set_width(fill, lv_pct(100));
   lv_obj_set_height(fill, 0);
   lv_obj_align(fill, LV_ALIGN_BOTTOM_MID, 0, 0);
-  lv_obj_set_style_radius(fill, 15, 0);
+  lv_obj_set_style_radius(fill, 24 - border - inset + 2, 0);   // concentric with the shell
   lv_obj_set_style_bg_opa(fill, LV_OPA_COVER, 0);
   lv_obj_set_style_bg_color(fill, greenLight, 0);
   lv_obj_set_style_bg_grad_color(fill, green, 0);
@@ -30304,6 +30324,30 @@ void serviceDebugOverlay(unsigned long now) {
   if (debugTouchEnabled && lvTouchDown) lv_obj_move_foreground(touchDot);
 }
 
+/*
+  Whether USB power is present, read from the serial receive line.
+
+  CRG_STAT alone cannot say. The TP4056 releases it both when the cable is
+  pulled and when a charge completes, so "charging" was kept on a full battery
+  by a guess from the fuel gauge - and the gauge's rate can sit near zero for
+  minutes after unplugging, leaving the status bar animating a charge on a
+  remote running from its battery.
+
+  On Rev 6 the CH340C runs from its own AP2112K fed only by VUSB_RAW, and its
+  TXD drives the ESP32's RXD0, which idles high whenever the bridge has power.
+  With the cable out the bridge is unpowered and the line falls low. Serial data
+  pulls it low only a bit at a time, so "present" means the line was seen high
+  within the last half second. This only reads the pad; the pin stays UART0's.
+*/
+static const uint8_t USB_BRIDGE_RX_PIN = 44;   // RXD0, driven by the CH340C's TXD
+unsigned long usbBridgeLastHighMs = 0;
+
+bool usbPowerPresent() {
+  unsigned long now = millis();
+  if (gpio_get_level((gpio_num_t)USB_BRIDGE_RX_PIN)) usbBridgeLastHighMs = now;
+  return usbBridgeLastHighMs && (uint32_t)(now - usbBridgeLastHighMs) < 500UL;
+}
+
 bool updateChargingState() {
   unsigned long now = millis();
   bool rawCharging = digitalRead(PIN_CHARGE_STATUS) == LOW;
@@ -30311,11 +30355,14 @@ bool updateChargingState() {
 
   // CRG_STAT becomes high-impedance both when USB is removed and when the
   // TP4056 completes a charge. Retain the connected state at a full, stable
-  // battery; after unplugging, the MAX17048 negative rate releases it.
+  // battery - but only while the USB bridge still has power. A dead bridge is
+  // proof the cable is out and releases it at once, instead of waiting minutes
+  // for the MAX17048's rate to turn negative. The fuel-gauge test still has to
+  // pass as well, so nothing is held that was not held before.
   if (!rawCharging && (chargingState || batteryPowerModeCharging)) {
     float percent = readBatteryPercent();
     float rate = readBatteryRatePerHour();
-    chargerConnected = percent >= 99.0f &&
+    chargerConnected = usbPowerPresent() && percent >= 99.0f &&
       (isnan(rate) || rate >= -0.02f);
   }
 
@@ -30339,7 +30386,9 @@ void initialiseChargingState() {
   float rate = readBatteryRatePerHour();
   bool chargerConnected = rawCharging;
   if (!rawCharging && batteryPowerModeKnown && batteryPowerModeCharging) {
-    chargerConnected = percent >= 99.0f &&
+    // The saved mode survives a reboot, so an unplugged remote booting on a
+    // full battery was restored straight into "charging". See usbPowerPresent().
+    chargerConnected = usbPowerPresent() && percent >= 99.0f &&
       (isnan(rate) || rate >= -0.02f);
   }
   chargingState = chargerConnected;
