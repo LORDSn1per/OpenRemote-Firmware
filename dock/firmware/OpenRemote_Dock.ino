@@ -1,6 +1,17 @@
 /*
   OpenRemote Dock firmware change log (newest first)
 
+  1.84 - 2026-09-16
+    - Weather and time for the remote. The dock keeps the clock from NTP on its
+      always-on Wi-Fi and fetches the weather from Open-Meteo on the remote's
+      schedule (slots counted from 2am in the remote's time zone), keeping
+      only the newest reading in NVS - each fetch overwrites the last. The
+      remote asks with ORDQ only when it needs something, and the dock answers
+      at once with ORDU: the time, the cached reading and whether it has Wi-Fi
+      details. Each request carries the remote's weather location, interval
+      and time zone; a changed location discards the old reading, and a
+      request that finds nothing cached fetches before it answers.
+
   1.83 - 2026-09-16
     - The status LED has a brightness, 5-100%, set in WebConfig and sent by the
       remote (5.67 or later) in the dock settings packet's spare byte. The LED
@@ -1236,7 +1247,7 @@ static inline bool serialHostAttached() {
 }
 
 
-#define OPENREMOTE_DOCK_VERSION_STRING "1.83"
+#define OPENREMOTE_DOCK_VERSION_STRING "1.84"
 
 // A literal in the built image, so a tool holding the .bin can tell what it is
 // without running it. The remote firmware carries the same idea under
@@ -1545,6 +1556,24 @@ volatile bool castTargetChanged = false;
 volatile bool castScanRequested = false;
 volatile bool castReplyRequested = false;
 
+// Weather and time for the remote - see serviceDockData().
+volatile bool dockDataRequested = false;
+float dockWeatherLat = 0.0f;
+float dockWeatherLon = 0.0f;
+uint8_t dockWeatherInterval = 6;
+bool dockWeatherLocationValid = false;
+char dockTimezone[48] = "";
+bool dockWeatherValid = false;
+bool dockWeatherRangeValid = false;
+float dockWeatherTempC = 0.0f;
+float dockWeatherHighC = 0.0f;
+float dockWeatherLowC = 0.0f;
+int16_t dockWeatherCode = -1;
+uint32_t dockWeatherFetchedEpoch = 0;
+uint32_t dockWeatherSlotEpoch = 0;
+unsigned long dockWeatherNextAttemptMs = 0;
+bool dockNtpStarted = false;
+
 // Dock -> remote, for the media widget. Sent only when something meaningful
 // changes: the remote advances the position itself between updates, so a
 // ticking clock costs no frames.
@@ -1622,6 +1651,52 @@ struct __attribute__((packed)) EspNowDockSettingsPacket {
   uint8_t reserved;
 };
 static_assert(sizeof(EspNowDockSettingsPacket) == 8, "dock settings layout drifted from the remote");
+
+/*
+  Weather and time for the remote.
+
+  With a dock paired the remote does not use its own Wi-Fi for these. The dock
+  keeps the clock from NTP on its always-on connection and fetches the weather
+  on the remote's schedule, keeping only the newest reading - the weather lives
+  here, not on the remote. The remote asks (ORDQ) only when it needs something,
+  such as a weather widget coming on screen or a clock sync falling due, and
+  the dock answers at once (ORDU) with whatever it holds. Every request carries
+  the remote's weather location, schedule and time zone, so the dock always
+  fetches for the right place without a separate configuration push.
+*/
+static const uint32_t ESPNOW_DOCK_DATA_REQ_MAGIC = 0x4F524451UL;  // "ORDQ"
+static const uint32_t ESPNOW_DOCK_DATA_MAGIC     = 0x4F524455UL;  // "ORDU"
+static const uint8_t DOCK_DATA_WANT_TIME = 0x01;
+static const uint8_t DOCK_DATA_WANT_WEATHER = 0x02;
+static const uint8_t DOCK_DATA_TIME_VALID = 0x01;
+static const uint8_t DOCK_DATA_WEATHER_VALID = 0x02;
+static const uint8_t DOCK_DATA_RANGE_VALID = 0x04;
+static const uint8_t DOCK_DATA_WIFI_CONFIGURED = 0x08;
+
+struct __attribute__((packed)) EspNowDockDataRequestPacket {
+  uint32_t magic;
+  uint8_t wants;
+  uint8_t intervalHours;
+  uint8_t locationValid;
+  uint8_t reserved;
+  float latitude;
+  float longitude;
+  char timezone[48];     // POSIX TZ rule, for the 2am-anchored weather slots
+};
+static_assert(sizeof(EspNowDockDataRequestPacket) == 64, "dock data request layout drifted from the remote");
+EspNowDockDataRequestPacket dockDataRequest = {};   // written by the receive callback
+
+struct __attribute__((packed)) EspNowDockDataPacket {
+  uint32_t magic;
+  uint8_t flags;
+  uint32_t epoch;                // UTC seconds, as the dock sends the frame
+  uint32_t weatherFetchedEpoch;  // UTC seconds the reading was fetched, 0 unknown
+  float temperatureC;
+  float highC;
+  float lowC;
+  int16_t code;                  // WMO weather code; the remote words it
+};
+static_assert(sizeof(EspNowDockDataPacket) == 27, "dock data layout drifted from the remote");
 
 struct __attribute__((packed)) EspNowAnnouncePacket {
   uint32_t magic;
@@ -3270,6 +3345,21 @@ void loadRemote() {
   haEnabled = prefs.getBool("haEn", false);
   hbUser = prefs.getString("hbUser", "");
   hbPass = prefs.getString("hbPass", "");
+  // The remote's weather settings and the newest reading, so a dock reboot
+  // keeps both the schedule and something to answer with.
+  dockWeatherLocationValid = prefs.getBool("wxLocOk", false);
+  dockWeatherLat = prefs.getFloat("wxLat", 0.0f);
+  dockWeatherLon = prefs.getFloat("wxLon", 0.0f);
+  dockWeatherInterval = prefs.getUChar("wxInt", 6);
+  strlcpy(dockTimezone, prefs.getString("wxTz", "").c_str(), sizeof(dockTimezone));
+  dockWeatherValid = prefs.getBool("wxValid", false);
+  dockWeatherRangeValid = prefs.getBool("wxRange", false);
+  dockWeatherTempC = prefs.getFloat("wxTemp", 0.0f);
+  dockWeatherHighC = prefs.getFloat("wxHigh", 0.0f);
+  dockWeatherLowC = prefs.getFloat("wxLow", 0.0f);
+  dockWeatherCode = prefs.getShort("wxCode", -1);
+  dockWeatherFetchedEpoch = prefs.getULong("wxFetched", 0);
+  dockWeatherSlotEpoch = prefs.getULong("wxSlot", 0);
   String savedCastTarget = prefs.getString("castTarget", "");
   strlcpy(castTargetName, savedCastTarget.c_str(), sizeof(castTargetName));
   wifiConfigured = hbSsid.length() > 0;
@@ -3554,6 +3644,13 @@ void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len)
     pendingSettingsBrightness = packet.ledBrightness == 0 ? 100
       : (packet.ledBrightness < 5 ? 5 : (packet.ledBrightness > 100 ? 100 : packet.ledBrightness));
     pendingSettings = true;
+    return;
+  }
+  if (magic == ESPNOW_DOCK_DATA_REQ_MAGIC && len >= (int)sizeof(EspNowDockDataRequestPacket)) {
+    if (!remoteKnown || memcmp(info->src_addr, remoteMac, 6) != 0) return;
+    memcpy(&dockDataRequest, data, sizeof(dockDataRequest));
+    dockDataRequest.timezone[sizeof(dockDataRequest.timezone) - 1] = '\0';
+    dockDataRequested = true;   // Answered from loop(): it may fetch and it writes NVS.
     return;
   }
   if (magic == ESPNOW_DOCK_LINK_DOWN_MAGIC) {
@@ -3946,6 +4043,206 @@ void serviceInfoReply() {
   info.rfPresent = 0;
 #endif
   esp_now_send(remoteMac, (const uint8_t *)&info, sizeof(info));
+}
+
+// ---------------------------------------------------------------------------
+// Weather and time for the remote
+// ---------------------------------------------------------------------------
+
+void applyDockTimezone() {
+  if (!dockTimezone[0]) return;
+  setenv("TZ", dockTimezone, 1);
+  tzset();
+}
+
+bool dockClockValid() {
+  return time(nullptr) > 1700000000;
+}
+
+// The remote's schedule exactly: slots counted from 2am local time, so every
+// interval that divides 24 lands on the same clock times each day.
+time_t dockWeatherSlotStart(time_t epoch, uint8_t intervalHours) {
+  if (intervalHours < 1) intervalHours = 1;
+  tm local = {};
+  localtime_r(&epoch, &local);
+  int hoursSinceAnchor = (local.tm_hour - 2 + 24) % 24;
+  int intoSlot = hoursSinceAnchor % (int)intervalHours;
+  return epoch - (time_t)intoSlot * 3600 -
+         (time_t)local.tm_min * 60 - (time_t)local.tm_sec;
+}
+
+void saveDockWeatherConfig() {
+  prefs.begin("dock", false);
+  prefs.putBool("wxLocOk", dockWeatherLocationValid);
+  prefs.putFloat("wxLat", dockWeatherLat);
+  prefs.putFloat("wxLon", dockWeatherLon);
+  prefs.putUChar("wxInt", dockWeatherInterval);
+  prefs.putString("wxTz", dockTimezone);
+  prefs.end();
+}
+
+void saveDockWeatherReading() {
+  prefs.begin("dock", false);
+  prefs.putBool("wxValid", dockWeatherValid);
+  prefs.putBool("wxRange", dockWeatherRangeValid);
+  prefs.putFloat("wxTemp", dockWeatherTempC);
+  prefs.putFloat("wxHigh", dockWeatherHighC);
+  prefs.putFloat("wxLow", dockWeatherLowC);
+  prefs.putShort("wxCode", dockWeatherCode);
+  prefs.putULong("wxFetched", dockWeatherFetchedEpoch);
+  prefs.putULong("wxSlot", dockWeatherSlotEpoch);
+  prefs.end();
+}
+
+/*
+  One Open-Meteo forecast, overwriting the cached reading. Same request and
+  parsing as the remote used when it fetched for itself; getString() rather
+  than a stream because the reply is chunked and only about 560 bytes.
+*/
+bool fetchDockWeather() {
+  if (!dockWeatherLocationValid || WiFi.status() != WL_CONNECTED) return false;
+  char url[220];
+  snprintf(url, sizeof(url),
+           "https://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f"
+           "&current=temperature_2m,weather_code"
+           "&daily=temperature_2m_max,temperature_2m_min"
+           "&timezone=auto&forecast_days=1",
+           dockWeatherLat, dockWeatherLon);
+  NetworkClientSecure secure;
+  secure.setInsecure();   // Public read-only endpoint; the dock carries no root store.
+  HTTPClient http;
+  http.setConnectTimeout(4000);
+  http.setTimeout(8000);
+  if (!http.begin(secure, url)) {
+    Serial.println("Weather: could not open the forecast connection");
+    return false;
+  }
+  http.addHeader("Accept", "application/json");
+  int status = http.GET();
+  if (status < 200 || status >= 300) {
+    http.end();
+    Serial.printf("Weather: forecast request failed (HTTP %d)\n", status);
+    return false;
+  }
+  String body = http.getString();
+  http.end();
+
+  JsonDocument filter;
+  JsonObject current = filter["current"].to<JsonObject>();
+  current["temperature_2m"] = true;
+  current["weather_code"] = true;
+  JsonObject daily = filter["daily"].to<JsonObject>();
+  daily["temperature_2m_max"] = true;
+  daily["temperature_2m_min"] = true;
+  JsonDocument doc;
+  DeserializationError parse = deserializeJson(doc, body, DeserializationOption::Filter(filter));
+  JsonObjectConst readings = doc["current"].as<JsonObjectConst>();
+  if (parse || readings.isNull() || !readings["temperature_2m"].is<float>()) {
+    Serial.printf("Weather: unreadable forecast (%s), %u bytes\n",
+                  parse ? parse.c_str() : "no temperature", (unsigned)body.length());
+    return false;
+  }
+  dockWeatherTempC = readings["temperature_2m"] | 0.0f;
+  dockWeatherCode = (int16_t)(readings["weather_code"] | -1);
+  JsonArrayConst highs = doc["daily"]["temperature_2m_max"].as<JsonArrayConst>();
+  JsonArrayConst lows = doc["daily"]["temperature_2m_min"].as<JsonArrayConst>();
+  dockWeatherRangeValid = highs.size() > 0 && lows.size() > 0;
+  if (dockWeatherRangeValid) {
+    dockWeatherHighC = highs[0] | 0.0f;
+    dockWeatherLowC = lows[0] | 0.0f;
+  }
+  dockWeatherValid = true;
+  dockWeatherFetchedEpoch = dockClockValid() ? (uint32_t)time(nullptr) : 0;
+  if (dockClockValid()) {
+    dockWeatherSlotEpoch = (uint32_t)dockWeatherSlotStart(time(nullptr), dockWeatherInterval);
+  }
+  saveDockWeatherReading();
+  Serial.printf("Weather: %.1fC code %d (%.1f/%.1f) cached for the remote\n",
+                dockWeatherTempC, (int)dockWeatherCode, dockWeatherHighC, dockWeatherLowC);
+  return true;
+}
+
+void sendDockData() {
+  EspNowDockDataPacket packet = {};
+  packet.magic = ESPNOW_DOCK_DATA_MAGIC;
+  time_t epoch = time(nullptr);
+  if (epoch > 1700000000) {
+    packet.flags |= DOCK_DATA_TIME_VALID;
+    packet.epoch = (uint32_t)epoch;
+  }
+  if (dockWeatherValid && dockWeatherLocationValid) {
+    packet.flags |= DOCK_DATA_WEATHER_VALID;
+    if (dockWeatherRangeValid) packet.flags |= DOCK_DATA_RANGE_VALID;
+    packet.weatherFetchedEpoch = dockWeatherFetchedEpoch;
+    packet.temperatureC = dockWeatherTempC;
+    packet.highC = dockWeatherHighC;
+    packet.lowC = dockWeatherLowC;
+    packet.code = dockWeatherCode;
+  }
+  if (wifiConfigured) packet.flags |= DOCK_DATA_WIFI_CONFIGURED;
+  bool sent = false;
+  for (uint8_t attempt = 0; attempt < 3 && !sent; attempt++) {
+    sent = esp_now_send(remoteMac, (const uint8_t *)&packet, sizeof(packet)) == ESP_OK;
+  }
+  Serial.printf("Dock: data for the remote - time %s, weather %s%s\n",
+                (packet.flags & DOCK_DATA_TIME_VALID) ? "ok" : "not set",
+                (packet.flags & DOCK_DATA_WEATHER_VALID) ? "cached" : "none",
+                sent ? "" : " (send failed)");
+}
+
+void serviceDockData(unsigned long now) {
+  // The clock, from NTP whenever the dock is on Wi-Fi. configTime() leaves
+  // TZ at UTC, so the remote's zone goes back on for the slot schedule.
+  if (WiFi.status() == WL_CONNECTED && !dockNtpStarted) {
+    configTime(0, 0, "pool.ntp.org", "time.google.com");
+    applyDockTimezone();
+    dockNtpStarted = true;
+    Serial.println("Dock: NTP started, keeping time for the remote");
+  }
+
+  if (dockDataRequested) {
+    dockDataRequested = false;
+    EspNowDockDataRequestPacket request;
+    memcpy(&request, &dockDataRequest, sizeof(request));
+    bool locationValid = request.locationValid != 0;
+    bool moved = locationValid != dockWeatherLocationValid ||
+                 fabsf(request.latitude - dockWeatherLat) > 0.0005f ||
+                 fabsf(request.longitude - dockWeatherLon) > 0.0005f;
+    uint8_t interval = request.intervalHours ? request.intervalHours : 6;
+    if (moved || interval != dockWeatherInterval || strcmp(request.timezone, dockTimezone) != 0) {
+      dockWeatherLocationValid = locationValid;
+      dockWeatherLat = request.latitude;
+      dockWeatherLon = request.longitude;
+      dockWeatherInterval = interval;
+      strlcpy(dockTimezone, request.timezone, sizeof(dockTimezone));
+      applyDockTimezone();
+      if (moved) {
+        dockWeatherValid = false;   // A forecast for somewhere else is no answer.
+        dockWeatherSlotEpoch = 0;
+        saveDockWeatherReading();
+      }
+      saveDockWeatherConfig();
+      dockWeatherNextAttemptMs = 0;
+      Serial.printf("Dock: weather settings from the remote - %s every %u h\n",
+                    locationValid ? "location set" : "no location", (unsigned)interval);
+    }
+    // Nothing held yet but the remote wants weather: fetch now, so even its
+    // first request gets an answer rather than waiting for the next slot.
+    if ((request.wants & DOCK_DATA_WANT_WEATHER) && dockWeatherLocationValid &&
+        !dockWeatherValid && WiFi.status() == WL_CONNECTED) {
+      fetchDockWeather();
+    }
+    sendDockData();
+  }
+
+  // The schedule runs whether or not the remote is awake. Each fetch
+  // overwrites the cache, so a remote that sleeps for a day wakes to the latest.
+  if (!dockWeatherLocationValid || WiFi.status() != WL_CONNECTED || !dockClockValid()) return;
+  if (dockWeatherNextAttemptMs && (long)(now - dockWeatherNextAttemptMs) < 0) return;
+  time_t slot = dockWeatherSlotStart(time(nullptr), dockWeatherInterval);
+  if (dockWeatherValid && (uint32_t)slot <= dockWeatherSlotEpoch) return;
+  if (fetchDockWeather()) dockWeatherNextAttemptMs = 0;
+  else dockWeatherNextAttemptMs = now + 5UL * 60UL * 1000UL;
 }
 
 void serviceSettings() {
@@ -6539,6 +6836,7 @@ void loop() {
     serviceMqttUnavailable();
     serviceHomeAssistant(now);
     serviceHaWebSocket(now);
+    serviceDockData(now);
   }
   serviceRfLearn(now);
   serviceSettings();
