@@ -1,6 +1,13 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.48 - 2026-09-15
+    - Opening the brightness panel fades the page behind it about 40% darker
+      (black at 100 of 255, eased in over 180 ms), so the readout tile and the
+      slider stand off busy artwork. The page still shows through for judging
+      the brightness. The fade is the panel's own full-screen tap-to-close
+      layer, so it goes when the panel closes.
+
   5.47 - 2026-09-15
     - The brightness panel's readout tile is less see-through: background
       opacity 230 of 255 (about 90%), up from 190 (about 75%), so busy page
@@ -6906,7 +6913,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.47"
+#define OPENREMOTE_VERSION_STRING "5.48"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -37670,6 +37677,10 @@ void closeBrightnessPanel() {
   brightnessLastActivityMs = 0;
 }
 
+void brightnessScrimOpaAnim(void *obj, int32_t value) {
+  lv_obj_set_style_bg_opa((lv_obj_t *)obj, (lv_opa_t)value, 0);
+}
+
 void brightnessOverlayEvent(lv_event_t *e) {
   if (lv_event_get_target(e) == brightnessOverlay) closeBrightnessPanel();
 }
@@ -37684,7 +37695,21 @@ void toggleBrightnessPanel() {
   lv_obj_remove_style_all(brightnessOverlay);
   lv_obj_set_pos(brightnessOverlay, 0, 0);
   lv_obj_set_size(brightnessOverlay, LCD_W, LCD_H);
+  // Fades the page behind to about 40% darker (black at 100 of 255) so the
+  // tile and slider stand off busy artwork. Kept light on purpose: the page
+  // still has to show through, because it is what the brightness is judged
+  // by. A flat full-screen fill with no radius or gradient, so fading its
+  // opacity is a plain blend.
+  lv_obj_set_style_bg_color(brightnessOverlay, lv_color_black(), 0);
   lv_obj_set_style_bg_opa(brightnessOverlay, LV_OPA_TRANSP, 0);
+  lv_anim_t scrim;
+  lv_anim_init(&scrim);
+  lv_anim_set_var(&scrim, brightnessOverlay);
+  lv_anim_set_exec_cb(&scrim, brightnessScrimOpaAnim);
+  lv_anim_set_values(&scrim, LV_OPA_TRANSP, 100);
+  lv_anim_set_time(&scrim, 180);
+  lv_anim_set_path_cb(&scrim, lv_anim_path_ease_out);
+  lv_anim_start(&scrim);
   lv_obj_add_flag(brightnessOverlay, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_clear_flag(brightnessOverlay, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_event_cb(brightnessOverlay, brightnessOverlayEvent, LV_EVENT_CLICKED, nullptr);
