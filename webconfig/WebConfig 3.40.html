@@ -10464,6 +10464,17 @@
         startClock(zone,name);
         selectedUtcOffsetMinutes=timezoneOffsetMinutes(zone,new Date());
         if(cityInput) cityInput.value=name;
+        /* A clock city is enough information to initialise Weather too. Keep
+           an explicitly chosen weather location independent, but never leave
+           a new user with a configured city and an unusable weather widget. */
+        if(widgetSettings.weather.latitude===null || widgetSettings.weather.longitude===null){
+          widgetSettings.weather.location=shortPlaceName(place,name);
+          widgetSettings.weather.latitude=Number(place.lat);
+          widgetSettings.weather.longitude=Number(place.lon);
+          renderWidgetLibrary();
+          renderLcdGrid();
+          if(typeof markSyncChanged==="function") markSyncChanged();
+        }
         return saveClockSettings().then(function(){
           setStatus("Internet time set for "+name+" · "+zone,"ok");
         });
