@@ -8,6 +8,9 @@
     - Settings > Display gains a persistent Face-down sleep switch. It is on
       by default to preserve the existing behaviour and can now disable the
       automatic sleep that occurs after the LCD is held face down.
+    - ORUSB SCREENSHOTDELAY waits for the twelve-second Studio overlay to
+      clear before capturing, so hardware QA can photograph the live
+      Activities widgets rather than the USB-connected notice.
 
   5.74 - 2026-09-17
     - Weather received through a paired dock is now retained on the remote in
@@ -9608,6 +9611,7 @@ volatile bool usbWebConfigStartRequest = false;
 // which owns LVGL. The screenshot is raw little-endian RGB565 for ORUSB READ.
 volatile bool usbBrightnessPanelRequest = false;
 volatile bool usbScreenshotRequest = false;
+unsigned long usbScreenshotAtMs = 0;
 static const char *LCD_SCREENSHOT_PATH = "/tmp/screenshot.rgb565";
 // ORUSB OVERLAYDEMO: shows the backup (1) or restore (2) overlay at a given
 // percentage without a job, for screenshots; 0 hides it.
@@ -20583,6 +20587,11 @@ void handleUsbCommand(Stream &port, UsbSerialSession &session, String command) {
   } else if (command == "ORUSB SCREENSHOT") {
     // Answered from the loop once the snapshot is on the card.
     usbScreenshotRequest = true;
+  } else if (command == "ORUSB SCREENSHOTDELAY") {
+    // The command itself makes the Activities page show its USB-connected
+    // notice for USB_LINK_IDLE_MS. Capture after that notice has cleared, with
+    // enough margin for the normal page repaint to complete.
+    usbScreenshotAtMs = millis() + USB_LINK_IDLE_MS + 1000UL;
   } else if (command == "ORUSB BACKUPSTATUS") {
     // The queued job's state, with the same fields as /api/backups/progress.
     bool busy = backupRequestPending || backupRequestRunning || restoreRequestPending;
@@ -24195,6 +24204,10 @@ void serviceUsbWebConfigRequest() {
   if (usbOverlayDemoUntilMs && (int32_t)(millis() - usbOverlayDemoUntilMs) >= 0) {
     usbOverlayDemoUntilMs = 0;
     if (!sdBusyWithBackupJob()) hideBackupOverlay();
+  }
+  if (usbScreenshotAtMs && (int32_t)(millis() - usbScreenshotAtMs) >= 0) {
+    usbScreenshotAtMs = 0;
+    usbScreenshotRequest = true;
   }
   if (usbScreenshotRequest) {
     usbScreenshotRequest = false;
