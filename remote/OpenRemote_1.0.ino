@@ -1,6 +1,16 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.77 - 2026-09-17
+    - Settings > Clock gains a persistent 24-hour clock switch. It changes the
+      top status pill, clock and custom widgets, backup timestamps, and the
+      manual-time picker (00-23 with no AM/PM wheel). WebConfig reports and
+      controls the same setting, including its live Screen designer preview.
+    - Audited the recent Button backlight, Face-down sleep, IR repeat,
+      Chromecast repeat and RF repeat settings: each is saved to NVS, mirrored
+      into runtime.json, and therefore carried by both LCD and WebConfig backup
+      and restore paths alongside the new clock-format preference.
+
   5.76 - 2026-09-17
     - Settings > Buttons now has independent repeat switches for IR,
       Chromecast and RF. IR and RF switch between repeat and one transmission;
@@ -7256,7 +7266,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.76"
+#define OPENREMOTE_VERSION_STRING "5.77"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -8812,6 +8822,7 @@ bool wifiOn = true;
 bool bluetoothOn = true;
 bool clockEnabled = true;
 bool clockUseInternetTime = true;
+bool clock24Hour = false;
 // Replaces the old slideToUnlock lock-screen concept: Motion (default) keeps
 // today's behaviour (motion lights the LCD directly); Button leaves the LCD
 // dark on a motion-only wake - the MCU still comes back out of light sleep
@@ -9402,6 +9413,7 @@ struct WebClockRequest {
   bool pending = false;
   bool enabled = true;
   bool useInternetTime = true;
+  bool use24Hour = false;
   bool hasManualEpoch = false;
   uint64_t manualEpoch = 0;
   int16_t utcOffsetMinutes = 600;
@@ -10401,7 +10413,7 @@ lv_obj_t *buttonTestLabel = nullptr;
 lv_obj_t *lcdRebootConfirmBox = nullptr;
 bool lcdRebootConfirmHard = false;
 lv_obj_t *batteryLearningResetConfirmBox = nullptr;
-// 0=Year, 1=Month, 2=Day, 3=Hour(1-12), 4=AM/PM, 5=Minute.
+// 0=Year, 1=Month, 2=Day, 3=Hour(1-12 or 00-23), 4=AM/PM, 5=Minute.
 lv_obj_t *clockRollers[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
 lv_obj_t *displayValueLabels[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
 lv_obj_t *buttonValueLabels[3] = {nullptr, nullptr, nullptr};
@@ -12727,6 +12739,7 @@ void loadSettings() {
   if (espNowTxPower > 2) espNowTxPower = 2;
   clockEnabled = preferences.getBool("clock", true);
   clockUseInternetTime = preferences.getBool("ntp", true);
+  clock24Hour = preferences.getBool("clock24", false);
   wakeMode = constrain((int)preferences.getUChar("wakeMode", WAKE_MODE_MOTION),
                        (int)WAKE_MODE_MOTION, (int)WAKE_MODE_BUTTON);
   brightness = preferences.getUChar("bright", 72);
@@ -12920,6 +12933,7 @@ void saveSettings() {
   preferences.putUChar("enTxPwr", espNowTxPower);
   preferences.putBool("clock", clockEnabled);
   preferences.putBool("ntp", clockUseInternetTime);
+  preferences.putBool("clock24", clock24Hour);
   preferences.putUChar("wakeMode", wakeMode);
   preferences.putUChar("bright", brightness);
   preferences.putUChar("sleep", timeoutSeconds);
@@ -15459,6 +15473,7 @@ String buildStatusJson() {
   doc["espNowDeviceCount"] = espNowDeviceCount;
   doc["clockEnabled"] = clockEnabled;
   doc["clockUseInternetTime"] = clockUseInternetTime;
+  doc["clock24Hour"] = clock24Hour;
   doc["clockCity"] = clockCityName;
   doc["clockUtcOffsetMinutes"] = clockUtcOffsetMinutes;
   doc["manualClockEpoch"] = manualClockEpoch;
@@ -15561,6 +15576,7 @@ void handleClockSettingsApi() {
   request.pending = true;
   request.enabled = doc["clockEnabled"] | clockEnabled;
   request.useInternetTime = doc["clockUseInternetTime"] | clockUseInternetTime;
+  request.use24Hour = doc["clock24Hour"] | clock24Hour;
   if (request.useInternetTime && WiFi.status() != WL_CONNECTED) {
     sendJson(409, "{\"ok\":false,\"error\":\"Connect the remote to Wi-Fi before enabling Internet time\"}");
     return;
@@ -15881,6 +15897,7 @@ void applySettingsJson(JsonVariantConst settings) {
   bluetoothOn = settings["bluetoothEnabled"] | bluetoothOn;
   clockEnabled = settings["clockEnabled"] | clockEnabled;
   clockUseInternetTime = settings["clockUseInternetTime"] | clockUseInternetTime;
+  clock24Hour = settings["clock24Hour"] | clock24Hour;
   const char *city = settings["clockCity"].as<const char *>();
   if (city && city[0]) clockCityName = city;
   clockUtcOffsetMinutes = constrain(
@@ -19425,6 +19442,7 @@ bool persistSettingsToRuntimeConfig() {
   settings["bluetoothEnabled"] = bluetoothOn;
   settings["clockEnabled"] = clockEnabled;
   settings["clockUseInternetTime"] = clockUseInternetTime;
+  settings["clock24Hour"] = clock24Hour;
   settings["clockCity"] = clockCityName;
   settings["city"] = clockCityName;
   settings["clockUtcOffsetMinutes"] = clockUtcOffsetMinutes;
@@ -22816,11 +22834,16 @@ void formatBackupDisplayDate(const char *exportedAt, char *output, size_t output
       "Jan", "Feb", "Mar", "Apr", "May", "Jun",
       "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
     };
-    int displayHour = hour % 12;
-    if (!displayHour) displayHour = 12;
-    snprintf(output, outputSize, "%02d %s %04d  %d:%02d %s",
-             day, months[constrain(month, 1, 12) - 1], year,
-             displayHour, minute, hour >= 12 ? "PM" : "AM");
+    if (clock24Hour) {
+      snprintf(output, outputSize, "%02d %s %04d  %02d:%02d",
+               day, months[constrain(month, 1, 12) - 1], year, hour, minute);
+    } else {
+      int displayHour = hour % 12;
+      if (!displayHour) displayHour = 12;
+      snprintf(output, outputSize, "%02d %s %04d  %d:%02d %s",
+               day, months[constrain(month, 1, 12) - 1], year,
+               displayHour, minute, hour >= 12 ? "PM" : "AM");
+    }
   } else {
     strlcpy(output, "Date unavailable", outputSize);
   }
@@ -31986,8 +32009,10 @@ void refreshStatusPill() {
     char timeText[12];
     struct tm timeInfo;
     if (getLocalTime(&timeInfo, 5)) {
-      strftime(timeText, sizeof(timeText), "%l:%M %p", &timeInfo);
-      if (timeText[0] == ' ') memmove(timeText, timeText + 1, strlen(timeText));
+      strftime(timeText, sizeof(timeText), clock24Hour ? "%H:%M" : "%l:%M %p", &timeInfo);
+      if (!clock24Hour && timeText[0] == ' ') {
+        memmove(timeText, timeText + 1, strlen(timeText));
+      }
     } else {
       snprintf(timeText, sizeof(timeText), "--:--");
     }
@@ -32143,6 +32168,8 @@ void switchEvent(lv_event_t *e) {
   } else if (target == &bluetoothOn) {
     applyBluetoothState();
   } else if (target == &clockEnabled) {
+    pendingUiRefresh = true;
+  } else if (target == &clock24Hour) {
     pendingUiRefresh = true;
   } else if (target == &clockUseInternetTime) {
     // Any saved network is enough here, not specifically the one currently
@@ -33195,6 +33222,7 @@ void serviceWebControlRequests(unsigned long now) {
   if (hasClockRequest) {
     clockEnabled = clockRequest.enabled;
     clockUseInternetTime = clockRequest.useInternetTime;
+    clock24Hour = clockRequest.use24Hour;
     clockUtcOffsetMinutes = clockRequest.utcOffsetMinutes;
     clockCityName = clockRequest.city;
     if (!clockUseInternetTime && clockRequest.hasManualEpoch) {
@@ -33205,9 +33233,10 @@ void serviceWebControlRequests(unsigned long now) {
     scheduleRuntimeSettingsSave();
     if (clockUseInternetTime) requestInternetTimeSync();
     pendingUiRefresh = true;
-    Serial.printf("WebConfig Clock: %s, %s, %s, UTC offset %+d min\n",
+    Serial.printf("WebConfig Clock: %s, %s, %s, %s, UTC offset %+d min\n",
                   clockEnabled ? "visible" : "hidden",
                   clockUseInternetTime ? "Internet" : "manual",
+                  clock24Hour ? "24-hour" : "12-hour",
                   clockCityName.c_str(), (int)clockUtcOffsetMinutes);
   }
 
@@ -33794,9 +33823,13 @@ void setManualClockEvent(lv_event_t *e) {
   manual.tm_year = 2024 + lv_roller_get_selected(clockRollers[0]) - 1900;
   manual.tm_mon = lv_roller_get_selected(clockRollers[1]);
   manual.tm_mday = 1 + lv_roller_get_selected(clockRollers[2]);
-  int hour12 = 1 + lv_roller_get_selected(clockRollers[3]);
-  bool isPM = lv_roller_get_selected(clockRollers[4]) == 1;
-  manual.tm_hour = (hour12 % 12) + (isPM ? 12 : 0);
+  if (clock24Hour) {
+    manual.tm_hour = lv_roller_get_selected(clockRollers[3]);
+  } else {
+    int hour12 = 1 + lv_roller_get_selected(clockRollers[3]);
+    bool isPM = lv_roller_get_selected(clockRollers[4]) == 1;
+    manual.tm_hour = (hour12 % 12) + (isPM ? 12 : 0);
+  }
   manual.tm_min = lv_roller_get_selected(clockRollers[5]);
   manual.tm_sec = 0;
   manual.tm_isdst = -1;
@@ -33858,14 +33891,17 @@ void renderClockCityPage() {
 
 void renderClockPageOmote() {
   // y=44, not 4 - clears the back button's (8,6)-(50,36) footprint.
-  lv_obj_t *toggleCard = makeOmoteCard(content, 44, 2 * 48 + 1);
+  lv_obj_t *toggleCard = makeOmoteCard(content, 44, 3 * 48 + 2);
   makeOmoteRow(toggleCard, "Status bar", clockEnabled ? "Show time in top right" : "Battery only",
                0, 48, &clockEnabled);
   makeOmoteDivider(toggleCard, 48);
+  makeOmoteRow(toggleCard, "24-hour clock", clock24Hour ? "Example: 23:45" : "Example: 11:45 PM",
+               49, 48, &clock24Hour);
+  makeOmoteDivider(toggleCard, 97);
   makeOmoteRow(toggleCard, "Internet time", hasAnyWifiProfile()
-    ? "Boot and daily 3am sync" : "Needs a saved Wi-Fi network", 49, 48, &clockUseInternetTime);
+    ? "Boot and daily 3am sync" : "Needs a saved Wi-Fi network", 98, 48, &clockUseInternetTime);
 
-  int y = 44 + 2 * 48 + 1 + 12;
+  int y = 44 + 3 * 48 + 2 + 12;
   if (clockUseInternetTime) {
     lv_obj_t *cityCard = makeOmoteCard(content, y, 48);
     makeOmoteRow(cityCard, "City", clockCityName.c_str(), 0, 48, nullptr,
@@ -33892,7 +33928,8 @@ void renderClockPageOmote() {
   buildNumberOptions(yearOptions, sizeof(yearOptions), 2024, 2099, 4);
   buildNumberOptions(monthOptions, sizeof(monthOptions), 1, 12, 2);
   buildNumberOptions(dayOptions, sizeof(dayOptions), 1, 31, 2);
-  buildNumberOptions(hourOptions, sizeof(hourOptions), 1, 12, 2);
+  buildNumberOptions(hourOptions, sizeof(hourOptions), clock24Hour ? 0 : 1,
+                     clock24Hour ? 23 : 12, 2);
   buildNumberOptions(minuteOptions, sizeof(minuteOptions), 0, 59, 2);
 
   time_t now = time(nullptr);
@@ -33915,9 +33952,19 @@ void renderClockPageOmote() {
                   constrain(timeInfo.tm_year + 1900 - 2024, 0, 75), true);
   makeClockRoller(1, "Mon", 58, rollerY, 30, monthOptions, constrain(timeInfo.tm_mon, 0, 11), true);
   makeClockRoller(2, "Day", 94, rollerY, 30, dayOptions, constrain(timeInfo.tm_mday - 1, 0, 30), true);
-  makeClockRoller(3, "Hr", 130, rollerY, 26, hourOptions, constrain(hour12 - 1, 0, 11), true);
-  makeClockRoller(4, "AM/PM", 162, rollerY, 34, "AM\nPM", isPM ? 1 : 0, true);
-  makeClockRoller(5, "Min", 202, rollerY, 30, minuteOptions, constrain(timeInfo.tm_min, 0, 59), true);
+  if (clock24Hour) {
+    makeClockRoller(3, "Hr", 142, rollerY, 34, hourOptions,
+                    constrain(timeInfo.tm_hour, 0, 23), true);
+    clockRollers[4] = nullptr;
+    makeClockRoller(5, "Min", 190, rollerY, 34, minuteOptions,
+                    constrain(timeInfo.tm_min, 0, 59), true);
+  } else {
+    makeClockRoller(3, "Hr", 130, rollerY, 26, hourOptions,
+                    constrain(hour12 - 1, 0, 11), true);
+    makeClockRoller(4, "AM/PM", 162, rollerY, 34, "AM\nPM", isPM ? 1 : 0, true);
+    makeClockRoller(5, "Min", 202, rollerY, 30, minuteOptions,
+                    constrain(timeInfo.tm_min, 0, 59), true);
+  }
 
   lv_obj_t *set = makeOmoteButton(content, "Set manual time", 8, rollerY + 80, 224, 36, lvRgb(0x21, 0x96, 0xF3));
   lv_obj_add_event_cb(set, setManualClockEvent, LV_EVENT_CLICKED, nullptr);
@@ -37775,8 +37822,9 @@ void initWidgetInstance(WidgetInstance &instance, lv_obj_t *parent, uint8_t kind
 }
 
 /*
-  The time as "10:51" with "PM" kept apart, and the date - "Tue 16 Sep", or
-  spelt out where there is room. Twelve-hour, matching the status bar clock.
+  The time as "10:51" with "PM" kept apart, or "22:51" in 24-hour mode, and
+  the date - "Tue 16 Sep", or spelt out where there is room. This always
+  matches the status bar clock.
 */
 void formatWidgetClockText(char *timeText, size_t timeSize, char *ampm, size_t ampmSize,
                            char *dateText, size_t dateSize, bool longDate) {
@@ -37787,9 +37835,15 @@ void formatWidgetClockText(char *timeText, size_t timeSize, char *ampm, size_t a
     snprintf(dateText, dateSize, "Clock not set");
     return;
   }
-  strftime(timeText, timeSize, "%l:%M", &timeInfo);
-  if (timeText[0] == ' ') memmove(timeText, timeText + 1, strlen(timeText));
-  strftime(ampm, ampmSize, "%p", &timeInfo);
+  strftime(timeText, timeSize, clock24Hour ? "%H:%M" : "%l:%M", &timeInfo);
+  if (!clock24Hour && timeText[0] == ' ') {
+    memmove(timeText, timeText + 1, strlen(timeText));
+  }
+  if (clock24Hour) {
+    if (ampmSize) ampm[0] = '\0';
+  } else {
+    strftime(ampm, ampmSize, "%p", &timeInfo);
+  }
   strftime(dateText, dateSize, longDate ? "%A %e %B" : "%a %e %b", &timeInfo);
   // %e pads a single-digit day with a space, leaving "Tue  6 Sep".
   char *gap = strstr(dateText, "  ");
