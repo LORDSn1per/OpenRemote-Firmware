@@ -1,6 +1,26 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.71 - 2026-09-16
+    - Settings > Battery gains "Time since last full charge". It starts when a
+      remote that reached 100% is unplugged and counts up live from there. A
+      later partial recharge resets it to zero and leaves it there until the
+      next 100% unplug, so a 51%-to-88% charge never masquerades as a complete
+      discharge cycle.
+    - "Estimated until empty" now prefers a rate measured over that same
+      since-full-charge window instead of the rolling one-hour window, once
+      it has run for at least 30 minutes and the battery has measurably
+      dropped - a battery drains close to linearly, and a much longer
+      baseline is far steadier than one hour on this fuel gauge. The one-hour
+      calculation remains exactly as it was, and is still what shows before
+      30 minutes have passed, while charging (a charge's speed has nothing to
+      do with how long ago the last unplug was), or with no full-charge
+      baseline yet. A partial recharge invalidates that long baseline.
+    - The Battery widget, and each custom widget's battery element, can show a
+      single statistic from the Battery information page - level, voltage,
+      rate, last-hour or last-24-hour change, time since full charge, or the
+      estimate - in place of the normal multi-value face.
+
   5.70 - 2026-09-16
     - Auto hiding for media-only widgets (the Media widget, or a custom widget
       whose only element is media), set per placement with autoHide on the
@@ -7183,7 +7203,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.70"
+#define OPENREMOTE_VERSION_STRING "5.71"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -8392,6 +8412,17 @@ static const int WIDGET_TILE_HEIGHT = 96;
 static const int WIDGET_SLIM_HEIGHT = 44;
 static const uint8_t WIDGET_NO_CUSTOM = 0xFF;
 
+enum BatteryWidgetStatistic : uint8_t {
+  BATTERY_STAT_DEFAULT = 0,
+  BATTERY_STAT_LEVEL = 1,
+  BATTERY_STAT_VOLTAGE = 2,
+  BATTERY_STAT_RATE = 3,
+  BATTERY_STAT_CHANGE_1H = 4,
+  BATTERY_STAT_CHANGE_24H = 5,
+  BATTERY_STAT_SINCE_FULL = 6,
+  BATTERY_STAT_ESTIMATE = 7
+};
+
 struct WidgetSettings {
   bool weatherSolidBackground;
   char weatherWallpaper[96];
@@ -8410,6 +8441,9 @@ struct WidgetSettings {
   bool batteryShowPercent;
   bool batteryShowVoltage;
   uint8_t batteryWarnBelow;
+  // A single Battery-information-page statistic to show instead of the
+  // percentage above - BATTERY_STAT_DEFAULT keeps the toggles' own display.
+  uint8_t batteryStatistic;
 
   bool mediaSolidBackground;
   char mediaWallpaper[96];
@@ -8432,7 +8466,7 @@ struct WidgetSettings {
    has never been synced draws the same thing WebConfig previews. */
 WidgetSettings widgetSettings = {
   false, "", "", "", 0.0f, 0.0f, false, false, true, 6,
-  false, "", "", true, false, 20,
+  false, "", "", true, false, 20, 0,
   false, "", "", false, "", "", true, true, true
 };
 
@@ -8461,6 +8495,9 @@ struct CustomWidget {
   char wallpaper[96];
   char expandedWallpaper[96];
   WidgetContentPanelStyle panel;
+  // A custom battery element may choose its own single statistic. DEFAULT
+  // inherits the Battery library widget's selection.
+  uint8_t batteryStatistic;
   // With media beside other elements: media shows only while something is
   // playing, and/or takes over the whole widget while playing.
   bool mediaWhenPlaying;
@@ -10175,6 +10212,20 @@ bool batteryPowerModeCharging = false;
 uint32_t batteryPowerModeChangedEpoch = 0;
 float batteryPowerModeStartPercent = -1.0f;
 
+/*
+  Time since last full charge - see updateChargingState()'s unplug transition
+  and currentBatteryMetrics(). batterySinceFullKnown stays false (metric not
+  shown) until the battery has been seen at 100% and unplugged at least once;
+  after that, batterySinceFullEpoch/StartPercent mark that full-charge unplug.
+  Any partial recharge invalidates the baseline until the next full charge.
+*/
+bool batterySinceFullKnown = false;
+uint32_t batterySinceFullEpoch = 0;
+float batterySinceFullStartPercent = -1.0f;
+// Set once per charging session when the battery is observed at (near) 100%,
+// and consumed by the unplug transition below.
+bool batteryReachedFullThisSession = false;
+
 lv_obj_t *screenRoot = nullptr;
 lv_obj_t *wallpaper = nullptr;
 lv_obj_t *topBar = nullptr;
@@ -10283,8 +10334,8 @@ lv_obj_t *displayValueLabels[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, 
 lv_obj_t *buttonValueLabels[2] = {nullptr, nullptr};
 lv_obj_t *debugRowDropdowns[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
 int16_t debugRowDropdownMinimums[5] = {0, 0, 0, 0, 0};
-lv_obj_t *batteryMetricNameLabels[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
-lv_obj_t *batteryMetricValueLabels[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+lv_obj_t *batteryMetricNameLabels[7] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+lv_obj_t *batteryMetricValueLabels[7] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
 unsigned long nextStatusRefreshMs = 0;
 unsigned long nextDebugCpuRamRefreshMs = 0;
 unsigned long nextDebugAccelerometerRefreshMs = 0;
@@ -11979,6 +12030,10 @@ struct BatteryMetrics {
   float change24h = NAN;
   float estimatedHours = NAN;
   bool chargerConnected = false;
+  // Time in the current uninterrupted discharge cycle after a 100% unplug.
+  // A partial recharge invalidates the cycle and returns this statistic to 0.
+  float sinceFullHours = NAN;
+  bool sinceFullKnown = false;
 };
 
 void saveBatteryPowerMode() {
@@ -11987,6 +12042,14 @@ void saveBatteryPowerMode() {
   preferences.putBool("batModePlug", batteryPowerModeCharging);
   preferences.putULong("batModeAt", batteryPowerModeChangedEpoch);
   preferences.putFloat("batModePct", batteryPowerModeStartPercent);
+  preferences.end();
+}
+
+void saveBatterySinceFull() {
+  preferences.begin(PREFERENCES_NAMESPACE, false);
+  preferences.putBool("fullChgOk", batterySinceFullKnown);
+  preferences.putULong("fullChgAt", batterySinceFullEpoch);
+  preferences.putFloat("fullChgPct", batterySinceFullStartPercent);
   preferences.end();
 }
 
@@ -12094,6 +12157,14 @@ BatteryMetrics currentBatteryMetrics() {
 
   BatteryHistorySample day = {};
   uint32_t nowEpoch = (uint32_t)nowTime;
+  if (batterySinceFullKnown && !batterySinceFullEpoch) {
+    // The unplug happened before the clock was valid. Start the elapsed clock
+    // as soon as wall time becomes available instead of leaving it at zero
+    // forever; the estimate remains conservative because that lost interval
+    // is not invented.
+    batterySinceFullEpoch = nowEpoch;
+    saveBatterySinceFull();
+  }
   if (batteryPowerModeChangedEpoch &&
       nowEpoch >= batteryPowerModeChangedEpoch + 3600UL) {
     float hourPercent = NAN;
@@ -12111,6 +12182,37 @@ BatteryMetrics currentBatteryMetrics() {
   if (batterySampleAtOrBefore(nowEpoch - 86400UL, day)) {
     metrics.change24h = metrics.percent - day.percent;
   }
+
+  /*
+    Time since last full charge. A valid baseline only exists after unplugging
+    a battery which reached 100%. Connecting a charger clears the previous
+    baseline immediately; only another full-charge unplug starts a new one.
+  */
+  metrics.sinceFullKnown = batterySinceFullKnown;
+  metrics.sinceFullHours = 0.0f;
+  if (batterySinceFullKnown && batterySinceFullEpoch && nowEpoch >= batterySinceFullEpoch) {
+    metrics.sinceFullHours = (float)(nowEpoch - batterySinceFullEpoch) / 3600.0f;
+  }
+
+  /*
+    The preferred discharge estimate: the fuel gauge's one-hour rate above is
+    noisy enough that "Estimated until empty" visibly jumps around, while the
+    battery itself drains close to linearly. The time and percentage since the
+    last full-charge unplug make a far steadier
+    rate over a much longer baseline. Needs at least 30 minutes and a
+    measurable drop before it is trusted, and only while discharging -
+    charging speed has nothing to do with how long ago the last unplug was.
+    Below that, or with no baseline yet, the one-hour estimate above stands.
+  */
+  if (!metrics.chargerConnected && batterySinceFullKnown &&
+      !isnan(metrics.sinceFullHours) && metrics.sinceFullHours >= 0.5f &&
+      batterySinceFullStartPercent >= 0.0f) {
+    float dropped = batterySinceFullStartPercent - metrics.percent;
+    if (dropped >= 0.3f) {
+      float ratePerHour = dropped / metrics.sinceFullHours;
+      metrics.estimatedHours = metrics.percent / ratePerHour;
+    }
+  }
   return metrics;
 }
 
@@ -12125,6 +12227,9 @@ void loadBatteryHistory() {
   batteryPowerModeCharging = preferences.getBool("batModePlug", false);
   batteryPowerModeChangedEpoch = preferences.getULong("batModeAt", 0);
   batteryPowerModeStartPercent = preferences.getFloat("batModePct", -1.0f);
+  batterySinceFullKnown = preferences.getBool("fullChgOk", false);
+  batterySinceFullEpoch = preferences.getULong("fullChgAt", 0);
+  batterySinceFullStartPercent = preferences.getFloat("fullChgPct", -1.0f);
   preferences.end();
   if (batteryHistory.magic != BATTERY_HISTORY_MAGIC ||
       batteryHistory.count > 49 || batteryHistory.next >= 49) {
@@ -18003,6 +18108,18 @@ uint8_t widgetKindFromName(const char *name) {
   return WIDGET_MEDIA;
 }
 
+uint8_t batteryStatisticFromName(const char *name) {
+  if (!name) return BATTERY_STAT_DEFAULT;
+  if (strcmp(name, "level") == 0) return BATTERY_STAT_LEVEL;
+  if (strcmp(name, "voltage") == 0) return BATTERY_STAT_VOLTAGE;
+  if (strcmp(name, "rate") == 0) return BATTERY_STAT_RATE;
+  if (strcmp(name, "change1h") == 0) return BATTERY_STAT_CHANGE_1H;
+  if (strcmp(name, "change24h") == 0) return BATTERY_STAT_CHANGE_24H;
+  if (strcmp(name, "sinceFull") == 0) return BATTERY_STAT_SINCE_FULL;
+  if (strcmp(name, "estimate") == 0) return BATTERY_STAT_ESTIMATE;
+  return BATTERY_STAT_DEFAULT;
+}
+
 const char *widgetKindName(uint8_t kind) {
   if (kind == WIDGET_WEATHER) return "weather";
   if (kind == WIDGET_BATTERY) return "battery";
@@ -18113,6 +18230,7 @@ void applyCustomWidgetsJson(JsonArrayConst rows, JsonArrayConst wallpapers) {
     widget.mediaWhenPlaying = row["mediaWhenPlaying"] | false;
     widget.mediaTakeover = row["mediaTakeover"] | false;
     widget.dateFirst = row["dateFirst"] | false;
+    widget.batteryStatistic = batteryStatisticFromName(row["batteryStatistic"] | "");
     strlcpy(widget.id, id, sizeof(widget.id));
     copyDisplayTextAscii(row["name"] | "Widget", widget.name, sizeof(widget.name));
     resolveWidgetWallpaperPaths(row["background"] | "theme", wallpapers,
@@ -18175,6 +18293,7 @@ void applyWidgetSettingsJson(JsonObjectConst widgets, JsonArrayConst wallpapers)
     widgetSettings.batteryShowVoltage = battery["showVoltage"] | false;
     widgetSettings.batteryWarnBelow =
       (uint8_t)constrain((int)(battery["warnBelow"] | 20), 5, 50);
+    widgetSettings.batteryStatistic = batteryStatisticFromName(battery["statistic"] | "");
   }
 
   JsonObjectConst media = widgets["media"].as<JsonObjectConst>();
@@ -31400,6 +31519,17 @@ bool updateChargingState() {
       (isnan(rate) || rate >= -0.02f);
   }
 
+  // Notes when the battery is seen at full while genuinely charging,
+  // for the unplug transition below to recognise as a full charge. Checked
+  // at most once a second - this runs on every loop() tick via
+  // refreshStatusPill(), and a full charge is not a thing that needs to be
+  // caught within milliseconds of happening.
+  static unsigned long nextFullCheckMs = 0;
+  if (chargingState && (int32_t)(now - nextFullCheckMs) >= 0) {
+    nextFullCheckMs = now + 1000UL;
+    if (readBatteryPercent() >= 99.95f) batteryReachedFullThisSession = true;
+  }
+
   if (chargerConnected != chargingCandidate) {
     chargingCandidate = chargerConnected;
     chargingCandidateSinceMs = now;
@@ -31407,10 +31537,43 @@ bool updateChargingState() {
 
   if (chargingCandidate != chargingState &&
       (uint32_t)(now - chargingCandidateSinceMs) >= CHARGE_STATE_DEBOUNCE_MS) {
+    bool wasCharging = chargingState;
     chargingState = chargingCandidate;
     Serial.printf("Charging state: %s\n", chargingState ? "charging" : "not charging");
     if (chargingState) chargingAnimationStartMs = now;
     resetBatteryMeasurementWindow(chargingState);
+
+    /*
+      A full-charge unplug starts a fresh discharge cycle. A partial recharge
+      makes the old full-charge curve unusable, so its unplug resets the visible
+      statistic to zero and disables the long-window estimate until another
+      charge reaches 100%.
+    */
+    if (wasCharging && !chargingState) {
+      if (batteryReachedFullThisSession) {
+        batterySinceFullKnown = true;
+        time_t epoch = time(nullptr);
+        batterySinceFullEpoch = epoch >= 1700000000 ? (uint32_t)epoch : 0;
+        batterySinceFullStartPercent = 100.0f;
+        Serial.println("Battery: full-charge discharge counter started");
+      } else {
+        batterySinceFullKnown = false;
+        batterySinceFullEpoch = 0;
+        batterySinceFullStartPercent = -1.0f;
+        Serial.println("Battery: partial recharge reset full-charge counter to zero");
+      }
+      saveBatterySinceFull();
+      batteryReachedFullThisSession = false;
+    } else if (!wasCharging && chargingState) {
+      // The old discharge is no longer uninterrupted from a full charge.
+      // Clear it immediately so the Battery page reads zero throughout the
+      // new charging session, whether this charge later reaches 100% or not.
+      batterySinceFullKnown = false;
+      batterySinceFullEpoch = 0;
+      batterySinceFullStartPercent = -1.0f;
+      saveBatterySinceFull();
+      batteryReachedFullThisSession = false;   // a fresh session to watch
+    }
   }
   return chargingState;
 }
@@ -31430,6 +31593,14 @@ void initialiseChargingState() {
   if (!batteryPowerModeKnown || batteryPowerModeCharging != chargerConnected) {
     resetBatteryMeasurementWindow(chargerConnected);
   }
+  if (chargerConnected && batterySinceFullKnown) {
+    batterySinceFullKnown = false;
+    batterySinceFullEpoch = 0;
+    batterySinceFullStartPercent = -1.0f;
+    saveBatterySinceFull();
+  }
+  // A reboot mid-charge should not lose a full charge that already happened.
+  batteryReachedFullThisSession = chargerConnected && percent >= 99.95f;
 }
 
 void refreshStatusPill() {
@@ -34740,6 +34911,122 @@ String batteryEstimateText(const BatteryMetrics &metrics) {
   return String(remaining);
 }
 
+/*
+  A duration since a past event, in full words for the Battery information
+  page ("6 hours", "2 days 3 hours") - distinct from batteryEstimateText()
+  above, which is a REMAINING time with its own "Estimated" framing and never
+  needs to say "Just now" or a bare minute count.
+*/
+String formatElapsedWords(float hours) {
+  if (isnan(hours) || hours < 0.0f) return "Not yet known";
+  uint32_t totalMinutes = (uint32_t)roundf(hours * 60.0f);
+  if (totalMinutes < 1U) return "Just now";
+  char text[40];
+  if (totalMinutes < 60U) {
+    snprintf(text, sizeof(text), "%lu minute%s", (unsigned long)totalMinutes,
+             totalMinutes == 1U ? "" : "s");
+    return String(text);
+  }
+  uint32_t roundedHours = (totalMinutes + 30U) / 60U;
+  if (roundedHours < 24U) {
+    snprintf(text, sizeof(text), "%lu hour%s", (unsigned long)roundedHours,
+             roundedHours == 1U ? "" : "s");
+    return String(text);
+  }
+  uint32_t days = roundedHours / 24U;
+  uint32_t remainingHours = roundedHours % 24U;
+  if (remainingHours) {
+    snprintf(text, sizeof(text), "%lu day%s %lu hour%s",
+             (unsigned long)days, days == 1U ? "" : "s",
+             (unsigned long)remainingHours, remainingHours == 1U ? "" : "s");
+  } else {
+    snprintf(text, sizeof(text), "%lu day%s", (unsigned long)days, days == 1U ? "" : "s");
+  }
+  return String(text);
+}
+
+/*
+  The same duration compacted for a widget's headline number, which has no
+  room for "2 days 3 hours": "5 min", "6h", "2d 3h". Hours are dropped once
+  there is at least an hour to show - a widget's number is read at a glance,
+  not studied.
+*/
+String formatElapsedCompact(float hours) {
+  if (isnan(hours) || hours < 0.0f) return "--";
+  uint32_t totalMinutes = (uint32_t)roundf(hours * 60.0f);
+  char text[16];
+  if (totalMinutes < 60U) {
+    snprintf(text, sizeof(text), "%lu min", (unsigned long)totalMinutes);
+    return String(text);
+  }
+  uint32_t roundedHours = (totalMinutes + 30U) / 60U;
+  if (roundedHours < 24U) {
+    snprintf(text, sizeof(text), "%luh", (unsigned long)roundedHours);
+    return String(text);
+  }
+  uint32_t days = roundedHours / 24U;
+  uint32_t remainingHours = roundedHours % 24U;
+  snprintf(text, sizeof(text), "%lud %luh", (unsigned long)days, (unsigned long)remainingHours);
+  return String(text);
+}
+
+String batterySinceFullText(const BatteryMetrics &metrics) {
+  if (!metrics.sinceFullKnown) return "0 minutes";
+  return formatElapsedWords(metrics.sinceFullHours);
+}
+
+/*
+  Formats one statistic from the Battery information page for display on a
+  battery widget or a custom widget's battery element, when a single
+  statistic has been chosen in place of the usual percentage. valueOut is the
+  big number a widget shows; labelOut names it, because a bare "6h" or "+0.4%"
+  means nothing without the label beside it that the settings page gives it
+  for free.
+*/
+void formatBatteryWidgetStatistic(uint8_t stat, char *valueOut, size_t valueSize,
+                                  char *labelOut, size_t labelSize) {
+  BatteryMetrics metrics = currentBatteryMetrics();
+  switch (stat) {
+    case BATTERY_STAT_LEVEL:
+      if (metrics.percent < 0.0f) strlcpy(valueOut, "--", valueSize);
+      else snprintf(valueOut, valueSize, "%.1f%%", metrics.percent);
+      strlcpy(labelOut, "Battery level", labelSize);
+      break;
+    case BATTERY_STAT_VOLTAGE:
+      snprintf(valueOut, valueSize, metrics.voltage >= 0.0f ? "%.2fV" : "--", metrics.voltage);
+      strlcpy(labelOut, "Voltage", labelSize);
+      break;
+    case BATTERY_STAT_RATE:
+      if (isnan(metrics.ratePerHour)) strlcpy(valueOut, "--", valueSize);
+      else snprintf(valueOut, valueSize, "%+.1f%%/h", metrics.ratePerHour);
+      strlcpy(labelOut, "Rate", labelSize);
+      break;
+    case BATTERY_STAT_CHANGE_1H:
+      if (isnan(metrics.change1h)) strlcpy(valueOut, "--", valueSize);
+      else snprintf(valueOut, valueSize, "%+.1f%%", metrics.change1h);
+      strlcpy(labelOut, "Last hour", labelSize);
+      break;
+    case BATTERY_STAT_CHANGE_24H:
+      if (isnan(metrics.change24h)) strlcpy(valueOut, "--", valueSize);
+      else snprintf(valueOut, valueSize, "%+.1f%%", metrics.change24h);
+      strlcpy(labelOut, "Last 24 hours", labelSize);
+      break;
+    case BATTERY_STAT_SINCE_FULL:
+      strlcpy(valueOut, metrics.sinceFullKnown
+        ? formatElapsedCompact(metrics.sinceFullHours).c_str() : "0 min", valueSize);
+      strlcpy(labelOut, "Since full charge", labelSize);
+      break;
+    case BATTERY_STAT_ESTIMATE:
+      strlcpy(valueOut, batteryEstimateText(metrics).c_str(), valueSize);
+      strlcpy(labelOut, batteryEstimateLabel(metrics), labelSize);
+      break;
+    default:
+      valueOut[0] = '\0';
+      labelOut[0] = '\0';
+      break;
+  }
+}
+
 void updateBatteryMetricLabels(BatteryMetrics metrics) {
   char voltage[20];
   char level[20];
@@ -34747,19 +35034,20 @@ void updateBatteryMetricLabels(BatteryMetrics metrics) {
            metrics.voltage);
   snprintf(level, sizeof(level), metrics.percent >= 0.0f ? "%.2f%%" : "Unavailable",
            metrics.percent);
-  String values[6] = {
+  String values[7] = {
     voltage,
     level,
     signedBatteryValue(metrics.ratePerHour, " per hour"),
     signedBatteryValue(metrics.change1h, " in last hour"),
     signedBatteryValue(metrics.change24h, " in last 24 hours"),
-    batteryEstimateText(metrics)
+    batteryEstimateText(metrics),
+    batterySinceFullText(metrics)
   };
-  const char *names[6] = {
+  const char *names[7] = {
     "Voltage", "Battery Level", "Rate", "Last hour", "Last 24 hours",
-    batteryEstimateLabel(metrics)
+    batteryEstimateLabel(metrics), "Time since last full charge"
   };
-  for (uint8_t i = 0; i < 6; i++) {
+  for (uint8_t i = 0; i < 7; i++) {
     if (batteryMetricNameLabels[i]) lv_label_set_text(batteryMetricNameLabels[i], names[i]);
     if (batteryMetricValueLabels[i]) lv_label_set_text(batteryMetricValueLabels[i], values[i].c_str());
   }
@@ -34774,28 +35062,29 @@ void makeBatteryMetricRows(int firstY, bool omoteStyle = false) {
            metrics.voltage);
   snprintf(level, sizeof(level), metrics.percent >= 0.0f ? "%.2f%%" : "Unavailable",
            metrics.percent);
-  String values[6] = {
+  String values[7] = {
     voltage,
     level,
     signedBatteryValue(metrics.ratePerHour, " per hour"),
     signedBatteryValue(metrics.change1h, " in last hour"),
     signedBatteryValue(metrics.change24h, " in last 24 hours"),
-    batteryEstimateText(metrics)
+    batteryEstimateText(metrics),
+    batterySinceFullText(metrics)
   };
-  const char *names[6] = {
+  const char *names[7] = {
     "Voltage", "Battery Level", "Rate", "Last hour", "Last 24 hours",
-    batteryEstimateLabel(metrics)
+    batteryEstimateLabel(metrics), "Time since last full charge"
   };
   if (omoteStyle) {
     const int rowH = 48;
-    lv_obj_t *card = makeOmoteCard(content, firstY, 6 * rowH + 5);
-    for (uint8_t i = 0; i < 6; i++) {
+    lv_obj_t *card = makeOmoteCard(content, firstY, 7 * rowH + 6);
+    for (uint8_t i = 0; i < 7; i++) {
       makeOmoteRow(card, names[i], values[i].c_str(), i * (rowH + 1), rowH, nullptr, nullptr,
                    &batteryMetricNameLabels[i], &batteryMetricValueLabels[i]);
-      if (i < 5) makeOmoteDivider(card, (i + 1) * (rowH + 1) - 1);
+      if (i < 6) makeOmoteDivider(card, (i + 1) * (rowH + 1) - 1);
     }
   } else {
-    for (uint8_t i = 0; i < 6; i++) {
+    for (uint8_t i = 0; i < 7; i++) {
       makeSettingRow(names[i], values[i].c_str(), firstY + i * 50, nullptr, nullptr,
                      &batteryMetricNameLabels[i], &batteryMetricValueLabels[i]);
     }
@@ -36104,6 +36393,9 @@ struct WidgetInstance {
   lv_obj_t *tile;
   uint8_t ownerKind;
   uint8_t custom;
+  // The statistic selected for this particular Battery face/cell. Custom
+  // widgets can override the Battery library widget without changing it.
+  uint8_t batteryStatistic;
 };
 
 // A page of custom widgets holds up to three live elements per widget, plus a
@@ -36875,7 +37167,8 @@ void buildWidgetWeatherFace(WidgetInstance &instance, lv_obj_t *parent,
 
 /* -------------------------------------------------------------- battery */
 void buildWidgetBatteryFace(WidgetInstance &instance, lv_obj_t *parent,
-                            int width, int height, bool expanded) {
+                            int width, int height, bool expanded,
+                            uint8_t batteryStatistic) {
   int pad = expanded ? 16 : 10;
   float percent = readBatteryPercent();
   float voltage = readBatteryVoltage();
@@ -36922,8 +37215,19 @@ void buildWidgetBatteryFace(WidgetInstance &instance, lv_obj_t *parent,
   lv_obj_set_style_bg_opa(nub, LV_OPA_40, 0);
   lv_obj_clear_flag(nub, LV_OBJ_FLAG_CLICKABLE);
 
-  char headline[16];
-  if (widgetSettings.batteryShowPercent && percent >= 0.0f) {
+  instance.batteryStatistic = batteryStatistic;
+  bool singleStat = batteryStatistic != BATTERY_STAT_DEFAULT;
+  char statValue[24];
+  char statLabel[24];
+  if (singleStat) {
+    formatBatteryWidgetStatistic(batteryStatistic, statValue, sizeof(statValue),
+                                 statLabel, sizeof(statLabel));
+  }
+
+  char headline[24];
+  if (singleStat) {
+    strlcpy(headline, statValue, sizeof(headline));
+  } else if (widgetSettings.batteryShowPercent && percent >= 0.0f) {
     snprintf(headline, sizeof(headline), "%d%%", level);
   } else {
     snprintf(headline, sizeof(headline), "%s", percent >= 0.0f ? "Battery" : "No gauge");
@@ -36938,11 +37242,15 @@ void buildWidgetBatteryFace(WidgetInstance &instance, lv_obj_t *parent,
     textPrimary(), textWidth, align);
 
   char meta[48];
-  const char *state = chargingState ? "Charging" : "Discharging";
-  if (widgetSettings.batteryShowVoltage && voltage >= 0.0f) {
-    snprintf(meta, sizeof(meta), "%.2f V \xE2\x80\xA2 %s", voltage, state);
+  if (singleStat) {
+    strlcpy(meta, statLabel, sizeof(meta));
   } else {
-    snprintf(meta, sizeof(meta), "%s", state);
+    const char *state = chargingState ? "Charging" : "Discharging";
+    if (widgetSettings.batteryShowVoltage && voltage >= 0.0f) {
+      snprintf(meta, sizeof(meta), "%.2f V \xE2\x80\xA2 %s", voltage, state);
+    } else {
+      snprintf(meta, sizeof(meta), "%s", state);
+    }
   }
   instance.secondary = makeWidgetLabel(parent, meta, textX,
     expanded ? 186 : cellY + 30, &lv_font_montserrat_12, widgetMutedColour(),
@@ -36971,7 +37279,8 @@ void buildWidgetBatteryFace(WidgetInstance &instance, lv_obj_t *parent,
 LV_FONT_DECLARE(lv_font_openremote_12);
 
 void buildWidgetFace(WidgetInstance &instance, lv_obj_t *parent, uint8_t kind,
-                     int width, int height, bool expanded);
+                     int width, int height, bool expanded,
+                     uint8_t batteryStatistic);
 
 enum WidgetCellStyle : uint8_t {
   CELL_COLUMN,       // one of two or three columns on a large tile
@@ -36992,6 +37301,7 @@ void initWidgetInstance(WidgetInstance &instance, lv_obj_t *parent, uint8_t kind
   instance.kind = kind;
   instance.ownerKind = kind;
   instance.custom = WIDGET_NO_CUSTOM;
+  instance.batteryStatistic = widgetSettings.batteryStatistic;
   instance.expanded = expanded;
   instance.glyphCode = -32768;
   instance.faceWidth = width;
@@ -37149,8 +37459,10 @@ void buildWidgetClockFace(WidgetInstance &instance, lv_obj_t *parent,
   and one line under it, and a slim column keeps only the headline.
 */
 void buildWidgetCell(WidgetInstance &instance, lv_obj_t *cell, uint8_t element,
-                     int width, int height, WidgetCellStyle style) {
+                     int width, int height, WidgetCellStyle style,
+                     uint8_t batteryStatistic) {
   initWidgetInstance(instance, cell, element, width, height, style == CELL_ROW);
+  instance.batteryStatistic = batteryStatistic;
   instance.cell = true;
   bool roomy = height >= 110;       // an expanded widget with only two rows
   bool wideColumn = width >= 100;   // two columns rather than three
@@ -37327,6 +37639,14 @@ static const uint16_t WIDGET_MOTION_MS = 380;
 
 bool widgetMediaHasData() {
   return nowPlaying.valid && nowPlaying.title[0];
+}
+
+uint8_t resolvedBatteryStatistic(uint8_t kind, uint8_t custom) {
+  if (kind == WIDGET_CUSTOM && custom < customWidgetCount &&
+      customWidgets[custom].batteryStatistic != BATTERY_STAT_DEFAULT) {
+    return customWidgets[custom].batteryStatistic;
+  }
+  return widgetSettings.batteryStatistic;
 }
 
 // The media element's index in a custom widget whose media animates, or -1.
@@ -37598,6 +37918,7 @@ uint8_t buildAnimatedWidgetContents(lv_obj_t *card, uint8_t kind, uint8_t custom
   motion->height = (int16_t)height;
   motion->top = expanded ? 6 : 0;
   motion->length = (int16_t)(expanded ? height - 6 - 28 : width);
+  uint8_t batteryStatistic = resolvedBatteryStatistic(kind, custom);
 
   motion->stage = makeWidgetCellBox(card, 0, 0, width, height);
   int equal = motion->length / motion->count;
@@ -37614,7 +37935,7 @@ uint8_t buildAnimatedWidgetContents(lv_obj_t *card, uint8_t kind, uint8_t custom
     int cellHeight = expanded ? equal : height;
     motion->cells[i] = makeWidgetCellBox(motion->stage, 0, 0, cellWidth, cellHeight);
     buildWidgetCell(instances[i], motion->cells[i], widget.elements[i],
-                    cellWidth, cellHeight, style);
+                    cellWidth, cellHeight, style, batteryStatistic);
   }
 
   uint8_t used = motion->count;
@@ -37623,9 +37944,10 @@ uint8_t buildAnimatedWidgetContents(lv_obj_t *card, uint8_t kind, uint8_t custom
     motion->takeover = makeWidgetCellBox(card, width, 0, width, height);
     if (slim && !expanded) {
       buildWidgetCell(instances[used], motion->takeover, WIDGET_MEDIA, width, height,
-                      CELL_SLIM_SINGLE);
+                      CELL_SLIM_SINGLE, batteryStatistic);
     } else {
-      buildWidgetFace(instances[used], motion->takeover, WIDGET_MEDIA, width, height, expanded);
+      buildWidgetFace(instances[used], motion->takeover, WIDGET_MEDIA, width, height, expanded,
+                      batteryStatistic);
     }
     used++;
   }
@@ -37661,12 +37983,14 @@ uint8_t buildWidgetContents(lv_obj_t *card, uint8_t kind, uint8_t custom, int wi
 
   widgetBuildDateFirst = kind == WIDGET_CUSTOM && custom < customWidgetCount &&
                          customWidgets[custom].dateFirst;
+  uint8_t batteryStatistic = resolvedBatteryStatistic(kind, custom);
   uint8_t animated = buildAnimatedWidgetContents(card, kind, custom, width, height,
                                                  expanded, slim, instances, capacity);
   if (animated) return animated;
 
   if (count == 1 && (!slim || expanded)) {
-    buildWidgetFace(instances[0], card, elements[0], width, height, expanded);
+    buildWidgetFace(instances[0], card, elements[0], width, height, expanded,
+                    batteryStatistic);
   } else if (expanded) {
     // Rows down the screen, above the "Tap to close" line.
     const int top = 6;
@@ -37675,7 +37999,8 @@ uint8_t buildWidgetContents(lv_obj_t *card, uint8_t kind, uint8_t custom, int wi
       int y = top + rowHeight * i;
       if (i) makeWidgetDivider(card, 18, y, width - 36, 1);
       lv_obj_t *cell = makeWidgetCellBox(card, 0, y, width, rowHeight);
-      buildWidgetCell(instances[i], cell, elements[i], width, rowHeight, CELL_ROW);
+      buildWidgetCell(instances[i], cell, elements[i], width, rowHeight, CELL_ROW,
+                      batteryStatistic);
     }
   } else {
     int cellWidth = width / count;
@@ -37685,7 +38010,8 @@ uint8_t buildWidgetContents(lv_obj_t *card, uint8_t kind, uint8_t custom, int wi
       int cellW = i == count - 1 ? width - x : cellWidth;
       if (i) makeWidgetDivider(card, x, slim ? 9 : 14, 1, height - (slim ? 18 : 28));
       lv_obj_t *cell = makeWidgetCellBox(card, x, 0, cellW, height);
-      buildWidgetCell(instances[i], cell, elements[i], cellW, height, style);
+      buildWidgetCell(instances[i], cell, elements[i], cellW, height, style,
+                      batteryStatistic);
     }
   }
   for (uint8_t i = 0; i < count; i++) {
@@ -37697,10 +38023,13 @@ uint8_t buildWidgetContents(lv_obj_t *card, uint8_t kind, uint8_t custom, int wi
 }
 
 void buildWidgetFace(WidgetInstance &instance, lv_obj_t *parent, uint8_t kind,
-                     int width, int height, bool expanded) {
+                     int width, int height, bool expanded,
+                     uint8_t batteryStatistic) {
   initWidgetInstance(instance, parent, kind, width, height, expanded);
   if (kind == WIDGET_WEATHER) buildWidgetWeatherFace(instance, parent, width, height, expanded);
-  else if (kind == WIDGET_BATTERY) buildWidgetBatteryFace(instance, parent, width, height, expanded);
+  else if (kind == WIDGET_BATTERY) {
+    buildWidgetBatteryFace(instance, parent, width, height, expanded, batteryStatistic);
+  }
   else if (kind == WIDGET_CLOCK) buildWidgetClockFace(instance, parent, width, height, expanded);
   else buildWidgetMediaFace(instance, parent, width, height, expanded);
 }
@@ -37736,6 +38065,17 @@ void refreshWidgetInstance(WidgetInstance &instance) {
       lv_obj_set_width(instance.fill, (instance.fillTrackWidth * level) / 100);
       lv_obj_set_style_bg_color(instance.fill,
         low ? lvRgb(255, 69, 58) : lvRgb(48, 209, 88), 0);
+    }
+    // The glyph above always follows the level, whichever statistic is
+    // chosen - a single statistic replaces only the text.
+    if (instance.batteryStatistic != BATTERY_STAT_DEFAULT) {
+      char statValue[24];
+      char statLabel[24];
+      formatBatteryWidgetStatistic(instance.batteryStatistic, statValue, sizeof(statValue),
+                                   statLabel, sizeof(statLabel));
+      setWidgetLabelText(instance.primary, statValue);
+      setWidgetLabelText(instance.secondary, statLabel);
+      return;
     }
     if (instance.primary && lv_obj_is_valid(instance.primary) &&
         (widgetSettings.batteryShowPercent || instance.cell)) {
