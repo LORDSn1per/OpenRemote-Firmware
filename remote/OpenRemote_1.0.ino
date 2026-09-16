@@ -1,6 +1,14 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.75 - 2026-09-17
+    - Settings > Buttons gains a persistent Button backlight slider from
+      0-100%. Zero fully disables the keypad LEDs; other values use a smooth
+      perceptual PWM curve and apply immediately while the screen is awake.
+    - Settings > Display gains a persistent Face-down sleep switch. It is on
+      by default to preserve the existing behaviour and can now disable the
+      automatic sleep that occurs after the LCD is held face down.
+
   5.74 - 2026-09-17
     - Weather received through a paired dock is now retained on the remote in
       NVS and restored after deep sleep or reboot. The last valid forecast
@@ -7238,7 +7246,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.74"
+#define OPENREMOTE_VERSION_STRING "5.75"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -8817,6 +8825,8 @@ bool raiseToWake = true;
 bool physicalRepeatEnabled = true;
 uint16_t physicalRepeatDelayMs = 400;
 uint8_t physicalRepeatRateHz = 9;
+uint8_t buttonBacklightBrightness = 100;
+bool faceDownSleepEnabled = true;
 // Settings > Debug is hidden unless this is on, and the only thing that turns
 // it on is the "Debug Menu" switch under SD Card on Settings > About. It is a
 // page of hardware bring-up controls that can leave a remote with an unreadable
@@ -10380,7 +10390,7 @@ lv_obj_t *batteryLearningResetConfirmBox = nullptr;
 // 0=Year, 1=Month, 2=Day, 3=Hour(1-12), 4=AM/PM, 5=Minute.
 lv_obj_t *clockRollers[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
 lv_obj_t *displayValueLabels[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
-lv_obj_t *buttonValueLabels[2] = {nullptr, nullptr};
+lv_obj_t *buttonValueLabels[3] = {nullptr, nullptr, nullptr};
 lv_obj_t *debugRowDropdowns[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
 int16_t debugRowDropdownMinimums[5] = {0, 0, 0, 0, 0};
 lv_obj_t *batteryMetricNameLabels[8] = {};
@@ -10818,11 +10828,19 @@ void initialiseChargingState();
 // Hardware helpers
 // ---------------------------------------------------------------------------
 
+uint32_t currentButtonBacklightDuty() {
+  if (!buttonBacklightBrightness) return 0;
+  if (buttonBacklightBrightness >= 100) return BACKLIGHT_PWM_MAX;
+  float level = buttonBacklightBrightness / 100.0f;
+  return (uint32_t)roundf(powf(level, 2.2f) * BACKLIGHT_PWM_MAX);
+}
+
 void buttonBacklight(bool on) {
+  uint32_t duty = on ? currentButtonBacklightDuty() : 0;
   if (buttonBacklightPwmReady) {
-    ledcWrite(PIN_BUTTON_BL, on ? BACKLIGHT_PWM_MAX : 0);
+    ledcWrite(PIN_BUTTON_BL, duty);
   } else {
-    digitalWrite(PIN_BUTTON_BL, on ? HIGH : LOW);
+    digitalWrite(PIN_BUTTON_BL, duty ? HIGH : LOW);
   }
 }
 
@@ -11545,9 +11563,7 @@ void initBacklightPwm() {
 // Retunes the already-attached LCD backlight timer in place, so a new
 // frequency takes effect immediately without a reboot or a visible backlight
 // glitch. Brightness is re-applied afterwards because changing the timer
-// frequency does not carry the duty across on its own. The button LEDs are
-// deliberately left alone: buttonBacklight() only ever writes duty 0 or full
-// scale, neither of which switches, so their frequency is irrelevant here.
+// frequency does not carry the duty across on its own.
 void applyBacklightPwmFrequency() {
   if (!backlightPwmReady) return;
   ledcChangeFrequency(PIN_LCD_BL, backlightPwmHz, BACKLIGHT_PWM_BITS);
@@ -11598,7 +11614,7 @@ void fadeBacklightsToOff() {
   for (uint8_t step = 0; step <= BACKLIGHT_FADE_STEPS; step++) {
     uint8_t remaining = BACKLIGHT_FADE_STEPS - step;
     uint32_t lcdDuty = (lcdStartDuty * remaining) / BACKLIGHT_FADE_STEPS;
-    uint32_t buttonDuty = (BACKLIGHT_PWM_MAX * remaining) / BACKLIGHT_FADE_STEPS;
+    uint32_t buttonDuty = (currentButtonBacklightDuty() * remaining) / BACKLIGHT_FADE_STEPS;
 
     if (backlightPwmReady) {
       ledcWrite(PIN_LCD_BL, BACKLIGHT_PWM_MAX - lcdDuty);
@@ -12005,7 +12021,7 @@ bool readLIS3DH(int16_t &x, int16_t &y, int16_t &z) {
 // enough to keep the 800ms window tight, without adding an extra I2C
 // transaction to every single ~5ms loop iteration.
 void serviceFaceDownSleep(unsigned long now) {
-  if (displaySleeping || !lis3dhReady) {
+  if (!faceDownSleepEnabled || displaySleeping || !lis3dhReady) {
     faceDownSinceMs = 0;
     return;
   }
@@ -12674,6 +12690,9 @@ void loadSettings() {
   physicalRepeatRateHz = constrain(
     (int)preferences.getUChar("btnRate", 9),
     (int)BUTTON_REPEAT_RATE_MIN_HZ, (int)BUTTON_REPEAT_RATE_MAX_HZ);
+  buttonBacklightBrightness = (uint8_t)constrain(
+    (int)preferences.getUChar("btnLight", 100), 0, 100);
+  faceDownSleepEnabled = preferences.getBool("faceSleep", true);
   debugMenuVisible = preferences.getBool("dbgMenu", false);
   debugSplitEnabled = preferences.getBool("dbgSplit", false);
   bluetoothSleepEnabled = preferences.getBool("bleSleep", false);
@@ -12836,6 +12855,8 @@ void saveSettings() {
   preferences.putBool("btnRpt", physicalRepeatEnabled);
   preferences.putUShort("btnDelay", physicalRepeatDelayMs);
   preferences.putUChar("btnRate", physicalRepeatRateHz);
+  preferences.putUChar("btnLight", buttonBacklightBrightness);
+  preferences.putBool("faceSleep", faceDownSleepEnabled);
   preferences.putBool("dbgMenu", debugMenuVisible);
   preferences.putBool("dbgSplit", debugSplitEnabled);
   preferences.putBool("bleSleep", bluetoothSleepEnabled);
@@ -15398,6 +15419,8 @@ String buildStatusJson() {
   doc["physicalRepeatEnabled"] = physicalRepeatEnabled;
   doc["physicalRepeatDelayMs"] = physicalRepeatDelayMs;
   doc["physicalRepeatRateHz"] = physicalRepeatRateHz;
+  doc["buttonBacklightBrightness"] = buttonBacklightBrightness;
+  doc["faceDownSleepEnabled"] = faceDownSleepEnabled;
   doc["wakeMode"] = wakeMode;
   doc["displaySleeping"] = displaySleeping;
   doc["touchDown"] = lvTouchDown;
@@ -15798,6 +15821,9 @@ void applySettingsJson(JsonVariantConst settings) {
   physicalRepeatRateHz = constrain(
     (int)(settings["physicalRepeatRateHz"] | physicalRepeatRateHz),
     (int)BUTTON_REPEAT_RATE_MIN_HZ, (int)BUTTON_REPEAT_RATE_MAX_HZ);
+  buttonBacklightBrightness = (uint8_t)constrain(
+    (int)(settings["buttonBacklightBrightness"] | (int)buttonBacklightBrightness), 0, 100);
+  faceDownSleepEnabled = settings["faceDownSleepEnabled"] | faceDownSleepEnabled;
   debugSplitEnabled = settings["debugSplit"] | debugSplitEnabled;
   bluetoothSleepEnabled = settings["bluetoothSleepEnabled"] | bluetoothSleepEnabled;
   espNowEnabled = settings["espNowEnabled"] | espNowEnabled;
@@ -19324,6 +19350,8 @@ bool persistSettingsToRuntimeConfig() {
   settings["physicalRepeatEnabled"] = physicalRepeatEnabled;
   settings["physicalRepeatDelayMs"] = physicalRepeatDelayMs;
   settings["physicalRepeatRateHz"] = physicalRepeatRateHz;
+  settings["buttonBacklightBrightness"] = buttonBacklightBrightness;
+  settings["faceDownSleepEnabled"] = faceDownSleepEnabled;
   settings["debugSplit"] = debugSplitEnabled;
   settings["bluetoothSleepEnabled"] = bluetoothSleepEnabled;
   settings["espNowEnabled"] = espNowEnabled;
@@ -32030,6 +32058,8 @@ void switchEvent(lv_event_t *e) {
   } else if (target == &physicalRepeatEnabled) {
     endHeldIrCommand();
     pendingUiRefresh = settingsView == SETTINGS_BUTTONS;
+  } else if (target == &faceDownSleepEnabled) {
+    faceDownSinceMs = 0;
   } else if (target == &debugSplitEnabled || target == &debugTouchEnabled ||
              target == &debugCpuRamEnabled ||
              target == &debugAccelerometerEnabled ||
@@ -34032,24 +34062,27 @@ void renderDisplayPageOmote() {
   makeDisplaySlider("Motion sensitivity", sliderH * 2 + 8, 1, 100, wakeSensitivity, 3, sleepCard, 14, 196, true);
   y += 3 * sliderH + 2 + 12;
 
-  lv_obj_t *optionsCard = makeOmoteCard(content, y, 3 * rowH + 2);
+  lv_obj_t *optionsCard = makeOmoteCard(content, y, 4 * rowH + 3);
   lv_obj_t *wakeDropdown = makeOmoteDropdownRow(optionsCard, "Wake", 0, rowH, 108);
   lv_dropdown_set_options(wakeDropdown, "Motion\nButton");
   lv_dropdown_set_selected(wakeDropdown, wakeMode == WAKE_MODE_BUTTON ? 1 : 0);
   lv_obj_add_event_cb(wakeDropdown, wakeModeDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
   makeOmoteDivider(optionsCard, rowH);
-  makeOmoteRow(optionsCard, "Colour Depth", displayRgb666 ? "RGB666 panel transfer" : "RGB565 panel transfer", rowH + 1, rowH, &displayRgb666);
+  makeOmoteRow(optionsCard, "Face-down sleep", "Sleep when screen faces down",
+               rowH + 1, rowH, &faceDownSleepEnabled);
   makeOmoteDivider(optionsCard, 2 * rowH + 1);
+  makeOmoteRow(optionsCard, "Colour Depth", displayRgb666 ? "RGB666 panel transfer" : "RGB565 panel transfer", 2 * rowH + 2, rowH, &displayRgb666);
+  makeOmoteDivider(optionsCard, 3 * rowH + 2);
   // Sets the whole panel configuration in one go, so the six individual
   // controls on Settings > Debug are not the only way to change a panel - which
   // matters now that Debug is hidden by default.
   lv_obj_t *panelDropdown = makeOmoteDropdownRow(optionsCard, "LCD",
-                                                 2 * rowH + 2, rowH, 150);
+                                                 3 * rowH + 3, rowH, 150);
   lv_dropdown_set_options(panelDropdown,
                           "Adafruit\nBuyDisplay-ILI9341\nBuyDisplay-ST7789V");
   lv_dropdown_set_selected(panelDropdown, lcdPanelDropdownSelection());
   lv_obj_add_event_cb(panelDropdown, lcdPanelDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
-  y += 3 * rowH + 2 + 12;
+  y += 4 * rowH + 3 + 12;
 
   // Menu style, moved here from Settings > Debug in 5.65. Labelled just
   // "Menu" so the dropdown has room; the explanation above is unchanged.
@@ -34096,23 +34129,26 @@ void renderDisplayPageStormy() {
 
   makeStormySection(content, "Panel", y);
   y += 20;
-  lv_obj_t *panelCard = makeStormyCard(content, y, 3 * rowH + 2);
+  lv_obj_t *panelCard = makeStormyCard(content, y, 4 * rowH + 3);
   lv_obj_t *wakeDropdown = makeStormyDropdownRow(panelCard, "Wake", 0, rowH, 108);
   lv_dropdown_set_options(wakeDropdown, "Motion\nButton");
   lv_dropdown_set_selected(wakeDropdown, wakeMode == WAKE_MODE_BUTTON ? 1 : 0);
   lv_obj_add_event_cb(wakeDropdown, wakeModeDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
   stormyWakeDropdown = wakeDropdown;
   makeStormyDivider(panelCard, rowH);
-  makeStormyRow(panelCard, "Colour Depth", displayRgb666 ? "RGB666 panel transfer" : "RGB565 panel transfer",
-                nullptr, rowH + 1, rowH, &displayRgb666, nullptr);
+  makeStormyRow(panelCard, "Face-down sleep", "Sleep when screen faces down",
+                nullptr, rowH + 1, rowH, &faceDownSleepEnabled, nullptr);
   makeStormyDivider(panelCard, 2 * rowH + 1);
+  makeStormyRow(panelCard, "Colour Depth", displayRgb666 ? "RGB666 panel transfer" : "RGB565 panel transfer",
+                nullptr, 2 * rowH + 2, rowH, &displayRgb666, nullptr);
+  makeStormyDivider(panelCard, 3 * rowH + 2);
   // 164, not OMOTE's 150: the pill's wider padding otherwise runs
   // "BuyDisplay-ILI9341" into the chevron.
-  lv_obj_t *panelDropdown = makeStormyDropdownRow(panelCard, "LCD", 2 * rowH + 2, rowH, 164);
+  lv_obj_t *panelDropdown = makeStormyDropdownRow(panelCard, "LCD", 3 * rowH + 3, rowH, 164);
   lv_dropdown_set_options(panelDropdown, "Adafruit\nBuyDisplay-ILI9341\nBuyDisplay-ST7789V");
   lv_dropdown_set_selected(panelDropdown, lcdPanelDropdownSelection());
   lv_obj_add_event_cb(panelDropdown, lcdPanelDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
-  y += 3 * rowH + 2 + 12;
+  y += 4 * rowH + 3 + 12;
 
   // Menu style, moved here from Settings > Debug in 5.65. Labelled just
   // "Menu" so the dropdown has room; the explanation above is unchanged.
@@ -34153,15 +34189,20 @@ void buttonSliderEvent(lv_event_t *e) {
     value = constrain(value * 50,
       (int)BUTTON_REPEAT_DELAY_MIN_MS, (int)BUTTON_REPEAT_DELAY_MAX_MS);
     physicalRepeatDelayMs = value;
-  } else {
+  } else if (setting == 1) {
     value = constrain(value, (int)BUTTON_REPEAT_RATE_MIN_HZ,
                       (int)BUTTON_REPEAT_RATE_MAX_HZ);
     physicalRepeatRateHz = value;
+  } else {
+    value = constrain(value, 0, 100);
+    buttonBacklightBrightness = (uint8_t)value;
+    buttonBacklight(!displaySleeping);
   }
-  if (setting >= 0 && setting < 2 && buttonValueLabels[setting]) {
+  if (setting >= 0 && setting < 3 && buttonValueLabels[setting]) {
     char text[16];
     if (setting == 0) snprintf(text, sizeof(text), "%dms", value);
-    else snprintf(text, sizeof(text), "%d/s", value);
+    else if (setting == 1) snprintf(text, sizeof(text), "%d/s", value);
+    else snprintf(text, sizeof(text), "%d%%", value);
     lv_label_set_text(buttonValueLabels[setting], text);
   }
   // See displaySliderEvent()'s comment: LVGL's keypad indev never sends
@@ -34185,7 +34226,8 @@ void makeButtonTimingSlider(const char *label, int y, int minValue,
   makeLabel(parent, label, x, y, &lv_font_montserrat_12, textPrimary());
   char text[16];
   if (setting == 0) snprintf(text, sizeof(text), "%dms", value);
-  else snprintf(text, sizeof(text), "%d/s", value);
+  else if (setting == 1) snprintf(text, sizeof(text), "%d/s", value);
+  else snprintf(text, sizeof(text), "%d%%", value);
   lv_obj_t *number = makeLabel(parent, text, x + width - 44, y,
                                &lv_font_montserrat_12,
                                menuStyle == 0 ? lvRgb(90, 162, 255)
@@ -34215,10 +34257,16 @@ void makeButtonTimingSlider(const char *label, int y, int minValue,
 
 void renderButtonsPageOmote() {
   // y=44, not 4 - clears the back button's (8,6)-(50,36) footprint.
-  lv_obj_t *repeatCard = makeOmoteCard(content, 44, 48);
+  int y = 44;
+  lv_obj_t *lightCard = makeOmoteCard(content, y, 52);
+  makeButtonTimingSlider("Button backlight", 7, 0, 100, buttonBacklightBrightness,
+                         2, lightCard, 14, 196, true);
+  y += 52 + 12;
+
+  lv_obj_t *repeatCard = makeOmoteCard(content, y, 48);
   makeOmoteRow(repeatCard, "Repeat", physicalRepeatEnabled ? "Repeat while held" : "Send once per press",
                0, 48, &physicalRepeatEnabled);
-  int y = 44 + 48 + 12;
+  y += 48 + 12;
 
   if (physicalRepeatEnabled) {
     lv_obj_t *timingCard = makeOmoteCard(content, y, 2 * 50 + 2);
