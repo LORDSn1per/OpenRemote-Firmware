@@ -10,9 +10,10 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Firmware-v3.08-2f8cff?style=flat-square" alt="Firmware v3.08">
-  <img src="https://img.shields.io/badge/Studio-v2.67-2f8cff?style=flat-square" alt="Studio v2.67">
-  <img src="https://img.shields.io/badge/WebConfig-v2.47-2f8cff?style=flat-square" alt="WebConfig v2.47">
+  <img src="https://img.shields.io/badge/Remote-v5.72-2f8cff?style=flat-square" alt="Remote firmware v5.72">
+  <img src="https://img.shields.io/badge/Dock-v1.84-2f8cff?style=flat-square" alt="Dock firmware v1.84">
+  <img src="https://img.shields.io/badge/Studio-v2.85-2f8cff?style=flat-square" alt="Studio v2.85">
+  <img src="https://img.shields.io/badge/WebConfig-v3.39-2f8cff?style=flat-square" alt="WebConfig v3.39">
   <img src="https://img.shields.io/badge/100%25-Local-30d158?style=flat-square" alt="100% Local">
   <img src="https://img.shields.io/badge/Cloud-None-30d158?style=flat-square" alt="No Cloud">
 </p>

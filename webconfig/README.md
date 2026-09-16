@@ -109,7 +109,7 @@ itself. The upload is checksummed on arrival **and read back off the SD card
 afterwards**, so a card that drops bytes is caught rather than leaving you with
 a half-written configurator you would need a cable to fix.
 
-[**Download the latest WebConfig →**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-WebConfig-3.38.html)
+[**Download the latest WebConfig →**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-WebConfig-3.39.html)
 
 ---
 
@@ -141,8 +141,8 @@ Every released version is kept here, newest last. They are plain single-file
 HTML with no build step and no external dependencies — open one in a browser
 and it runs.
 
-    webconfig/WebConfig 3.38.html    current
-    webconfig/WebConfig 3.37.html    previous, and so on
+    webconfig/WebConfig 3.39.html    current
+    webconfig/WebConfig 3.38.html    previous, and so on
 
 The whole page — markup, styles, scripts and images — is one file because the
 remote serves it from an SD card over a small embedded web server, where each
