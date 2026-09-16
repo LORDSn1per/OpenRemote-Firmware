@@ -1,6 +1,18 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.78 - 2026-09-17
+    - A slim Battery widget now centres one selected Battery Information
+      statistic beneath its battery glyph. It uses the existing Battery widget
+      statistic selection (or a custom widget's override), so the value remains
+      live and the already-backed-up widget setting needs no schema change.
+    - Expanded Weather now centres the temperature and unit as one measured
+      group, keeping the reading aligned beneath the centred weather icon for
+      one-digit, two-digit, negative and unavailable values.
+    - WebConfig 3.42 refreshes the Widgets-tab previews after live remote status
+      arrives, fixing Weather, Battery, Time and Date remaining blank after the
+      sidebar had connected. Media preview data remains intentionally sampled.
+
   5.77 - 2026-09-17
     - Settings > Clock gains a persistent 24-hour clock switch. It changes the
       top status pill, clock and custom widgets, backup timestamps, and the
@@ -7266,7 +7278,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.77"
+#define OPENREMOTE_VERSION_STRING "5.78"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -36889,6 +36901,7 @@ struct WidgetInstance {
   lv_obj_t *right;      // remaining
   lv_obj_t *unit;       // the degree suffix beside a temperature
   int8_t unitOffsetY;
+  bool unitFlexLayout;  // unit is centred with the value by a flex container
   lv_obj_t *glyph;      // weather icon container
   int16_t glyphCode;    // what that icon was drawn for
   int16_t glyphSize;
@@ -37628,15 +37641,36 @@ void buildWidgetWeatherFace(WidgetInstance &instance, lv_obj_t *parent,
     expanded ? 10 : 8,
     instance.glyphSize, instance.glyphCode);
 
-  instance.primary = makeLabel(parent, temperature, pad, expanded ? 90 : 10,
-    expanded ? &lv_font_montserrat_48 : &lv_font_montserrat_24, textPrimary());
-  if (expanded) lv_obj_align(instance.primary, LV_ALIGN_TOP_MID, -18, 88);
-
-  instance.unitOffsetY = expanded ? 8 : 3;
-  instance.unit = makeLabel(parent, widgetTemperatureUnit(), 0, 0,
-    expanded ? &lv_font_openremote_20 : &lv_font_openremote_16, widgetMutedColour());
-  lv_obj_align_to(instance.unit, instance.primary, LV_ALIGN_OUT_RIGHT_TOP, 3,
-                  instance.unitOffsetY);
+  if (expanded) {
+    // Centre the number and its unit as one measured group. The old fixed
+    // -18px offset only happened to centre two digits; "--", one digit and
+    // negative temperatures visibly drifted left or right.
+    lv_obj_t *temperatureRow = lv_obj_create(parent);
+    lv_obj_remove_style_all(temperatureRow);
+    lv_obj_set_size(temperatureRow, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(temperatureRow, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(temperatureRow, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_style_pad_column(temperatureRow, 3, 0);
+    lv_obj_clear_flag(temperatureRow, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(temperatureRow, LV_OBJ_FLAG_SCROLLABLE);
+    instance.primary = makeLabel(temperatureRow, temperature, 0, 0,
+      &lv_font_montserrat_48, textPrimary());
+    instance.unit = makeLabel(temperatureRow, widgetTemperatureUnit(), 0, 0,
+      &lv_font_openremote_20, widgetMutedColour());
+    lv_obj_set_style_pad_top(instance.unit, 8, 0);
+    instance.unitFlexLayout = true;
+    lv_obj_update_layout(temperatureRow);
+    lv_obj_align(temperatureRow, LV_ALIGN_TOP_MID, 0, 88);
+  } else {
+    instance.primary = makeLabel(parent, temperature, pad, 10,
+      &lv_font_montserrat_24, textPrimary());
+    instance.unitOffsetY = 3;
+    instance.unit = makeLabel(parent, widgetTemperatureUnit(), 0, 0,
+      &lv_font_openremote_16, widgetMutedColour());
+    lv_obj_align_to(instance.unit, instance.primary, LV_ALIGN_OUT_RIGHT_TOP, 3,
+                    instance.unitOffsetY);
+  }
 
   const char *condition = haveReading && weatherReading.condition[0]
     ? weatherReading.condition
@@ -38071,6 +38105,7 @@ void buildWidgetCell(WidgetInstance &instance, lv_obj_t *cell, uint8_t element,
     const lv_font_t *percentFont = style == CELL_ROW
       ? (roomy ? &lv_font_montserrat_48 : &lv_font_montserrat_24)
       : (style == CELL_SLIM ? (wideColumn ? &lv_font_montserrat_16 : &lv_font_montserrat_14)
+                            : style == CELL_SLIM_SINGLE ? &lv_font_montserrat_14
                             : &lv_font_montserrat_20);
     if (style == CELL_COLUMN) {
       setFlow(LV_FLEX_FLOW_COLUMN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
@@ -38082,6 +38117,12 @@ void buildWidgetCell(WidgetInstance &instance, lv_obj_t *cell, uint8_t element,
       setFlow(LV_FLEX_FLOW_ROW, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
       makeWidgetBatteryGlyph(instance, cell, 24, 12);
       instance.primary = makeLabel(cell, "--%", 0, 0, percentFont, textPrimary());
+    } else if (style == CELL_SLIM_SINGLE) {
+      setFlow(LV_FLEX_FLOW_COLUMN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+      lv_obj_set_style_pad_row(cell, 2, 0);
+      makeWidgetBatteryGlyph(instance, cell, 40, 19);
+      instance.primary = makeWidgetLabel(cell, "--%", 0, 0, percentFont,
+        textPrimary(), textWidth, LV_TEXT_ALIGN_CENTER);
     } else {
       bool big = style == CELL_ROW;
       setFlow(LV_FLEX_FLOW_ROW, big ? LV_FLEX_ALIGN_CENTER : LV_FLEX_ALIGN_START,
@@ -38694,7 +38735,7 @@ void refreshWidgetInstance(WidgetInstance &instance) {
       snprintf(temperature, sizeof(temperature), "%d",
                (int)lroundf(widgetDisplayTemperature(weatherReading.temperatureC)));
       lv_label_set_text(instance.primary, temperature);
-      if (instance.unit && lv_obj_is_valid(instance.unit)) {
+      if (instance.unit && lv_obj_is_valid(instance.unit) && !instance.unitFlexLayout) {
         lv_obj_align_to(instance.unit, instance.primary, LV_ALIGN_OUT_RIGHT_TOP, 3,
                         instance.unitOffsetY);
       }
