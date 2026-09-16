@@ -1,6 +1,13 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.76 - 2026-09-17
+    - Settings > Buttons now has independent repeat switches for IR,
+      Chromecast and RF. IR and RF switch between repeat and one transmission;
+      Chromecast switches between repeated taps and one Bluetooth key-down
+      held until the physical button is released. Shared timing applies to
+      every transport whose repeat switch is on.
+
   5.75 - 2026-09-17
     - Settings > Buttons gains a persistent Button backlight slider from
       0-100%. Zero fully disables the keypad LEDs; other values use a smooth
@@ -7249,7 +7256,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.75"
+#define OPENREMOTE_VERSION_STRING "5.76"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -8644,6 +8651,7 @@ uint8_t MACRO_COUNT = 0;
 UiCommandBinding *uiCommandBindings = nullptr;
 uint8_t uiCommandBindingCount = 0;
 DeviceCommand *heldRepeatCommand = nullptr;
+const DeviceCommand *heldBleHidCommand = nullptr;
 const DeviceCommand *heldVoiceSearchCommand = nullptr;
 uint8_t heldVoiceSearchPhysicalKey = 0;
 unsigned long nextIrRepeatMs = 0;
@@ -8825,7 +8833,9 @@ bool awaitingButtonWake = false;
 unsigned long buttonWakeWindowEndMs = 0;
 static const uint32_t BUTTON_WAKE_WINDOW_MS = 8000UL;
 bool raiseToWake = true;
-bool physicalRepeatEnabled = true;
+bool irRepeatEnabled = true;
+bool chromecastRepeatEnabled = true;
+bool rfRepeatEnabled = true;
 uint16_t physicalRepeatDelayMs = 400;
 uint8_t physicalRepeatRateHz = 9;
 uint8_t buttonBacklightBrightness = 100;
@@ -10786,6 +10796,8 @@ uint16_t countSavedIrDeviceFiles();
 uint8_t *readSdFileToPsramBuffer(File &file, size_t &outSize);
 bool i2cDevicePresent(uint8_t address);
 bool transmitIrCommand(const DeviceCommand &command);
+bool sendBleHidState(const DeviceCommand &command, bool pressed);
+void flashCommandFeedback();
 // Defined with the rest of the widget drawing, far below renderActivitiesPage.
 void makeWidgetTile(uint8_t slot, uint8_t kind, uint8_t custom, bool slim, int originY,
                     bool autoHide = false);
@@ -11156,12 +11168,56 @@ RuntimeCommandResult transmitRuntimeCommand(DeviceCommand *command,
   return RUNTIME_COMMAND_SENT;
 }
 
+bool beginBleHidKeyHold(DeviceCommand *command) {
+  if (!command || command->kind != DeviceCommand::BLE_HID ||
+      isVoiceSearchCommand(command)) return false;
+  if (heldBleHidCommand == command) return true;
+  if (heldBleHidCommand) {
+    sendBleHidState(*heldBleHidCommand, false);
+    heldBleHidCommand = nullptr;
+  }
+  if (!bleReady) applyBluetoothState();
+  if (!bleReady || bleSuspended || !bleConnected || !command->hidUsage) return false;
+  bleKeepAliveUntilMs = millis() + BLE_POST_CONNECT_GRACE_MS;
+  if (!sendBleHidState(*command, true)) return false;
+  heldBleHidCommand = command;
+  flashCommandFeedback();
+  nowPlayingRefreshWanted = true;
+  Serial.printf("Bluetooth key hold: %s pressed\n", command->label);
+  return true;
+}
+
+void endBleHidKeyHold(const DeviceCommand *command = nullptr) {
+  if (!heldBleHidCommand ||
+      (command && command != heldBleHidCommand)) return;
+  const DeviceCommand *released = heldBleHidCommand;
+  heldBleHidCommand = nullptr;
+  sendBleHidState(*released, false);
+  bleKeepAliveUntilMs = millis() + BLE_POST_CONNECT_GRACE_MS;
+  nowPlayingRefreshWanted = true;
+  Serial.printf("Bluetooth key hold: %s released\n", released->label);
+}
+
 void beginHeldIrCommand(DeviceCommand *command, bool repeat, bool fromTouch = false) {
   heldRepeatCommand = nullptr;
   heldRepeatFromTouch = false;
   if (!command) return;
+  if (heldBleHidCommand && heldBleHidCommand != command) {
+    endBleHidKeyHold();
+  }
   if (isVoiceSearchCommand(command)) {
     beginVoiceSearchHold(command, fromTouch);
+    lastWakeMs = millis();
+    return;
+  }
+  bool chromecastCommand = command->kind == DeviceCommand::BLE_HID;
+  bool rfCommand = command->kind == DeviceCommand::ESPNOW &&
+                   command->espNowTransport == ESPNOW_TRANSPORT_RF433;
+  bool irCommand = command->kind == DeviceCommand::PARSED ||
+                   command->kind == DeviceCommand::RAW ||
+                   (command->kind == DeviceCommand::ESPNOW && !rfCommand);
+  if (chromecastCommand && !chromecastRepeatEnabled && !fromTouch) {
+    beginBleHidKeyHold(command);
     lastWakeMs = millis();
     return;
   }
@@ -11170,7 +11226,17 @@ void beginHeldIrCommand(DeviceCommand *command, bool repeat, bool fromTouch = fa
   uint8_t commandIndex = 0;
   bool trackedPower = locateRuntimeCommand(command, deviceIndex, commandIndex) &&
     runtimePowerRole(devices[deviceIndex], commandIndex) != RUNTIME_POWER_NONE;
-  if (result == RUNTIME_COMMAND_SENT && repeat && !trackedPower) {
+  // Physical holds select their repeat policy by transport. Touch commands
+  // retain their tile's explicit repeat request (currently only Voice Search
+  // uses beginHeldIrCommand() from a touch tile).
+  bool shouldRepeat = repeat;
+  if (!fromTouch) {
+    shouldRepeat = chromecastCommand ? chromecastRepeatEnabled
+                 : rfCommand ? rfRepeatEnabled
+                 : irCommand ? irRepeatEnabled
+                 : false;
+  }
+  if (result == RUNTIME_COMMAND_SENT && shouldRepeat && !trackedPower) {
     heldRepeatCommand = command;
     heldRepeatFromTouch = fromTouch;
     heldRepeatIntervalMs = fromTouch ? IR_REPEAT_INTERVAL_MS :
@@ -11187,7 +11253,7 @@ void beginHeldIrCommand(DeviceCommand *command, bool repeat, bool fromTouch = fa
     // The remote's own emitter has exactly the same limit - it simply never
     // had to say no to itself, because it drops the repeat silently when the
     // send is still running.
-    if (irRoute != IR_ROUTE_REMOTE && espNowDeviceCount > 0 &&
+    if (irCommand && irRoute != IR_ROUTE_REMOTE && espNowDeviceCount > 0 &&
         heldRepeatIntervalMs < DOCK_MIN_REPEAT_INTERVAL_MS) {
       heldRepeatIntervalMs = DOCK_MIN_REPEAT_INTERVAL_MS;
     }
@@ -11198,6 +11264,9 @@ void beginHeldIrCommand(DeviceCommand *command, bool repeat, bool fromTouch = fa
 }
 
 void endHeldIrCommand(DeviceCommand *command = nullptr) {
+  if (!command || heldBleHidCommand == command) {
+    endBleHidKeyHold(command);
+  }
   if (!command || heldVoiceSearchCommand == command) {
     endVoiceSearchHold(command);
   }
@@ -11208,6 +11277,7 @@ void endHeldIrCommand(DeviceCommand *command = nullptr) {
 }
 
 void serviceHeldIrRepeat(unsigned long now) {
+  if (heldBleHidCommand) lastWakeMs = now;
   if (heldVoiceSearchCommand) {
     lastWakeMs = now;
     if (heldVoiceSearchFromTouch && !lvTouchDown) endVoiceSearchHold();
@@ -11459,7 +11529,7 @@ void serviceKeypad(unsigned long now) {
                         heldVoiceSearchPhysicalKey, key);
           endVoiceSearchHold();
         }
-        beginHeldIrCommand(command, physicalRepeatEnabled);
+        beginHeldIrCommand(command, false);
         if (heldVoiceSearchCommand == command && !heldVoiceSearchFromTouch) {
           heldVoiceSearchPhysicalKey = key;
           physicalVoiceOverlayShowAfterMs = now + 180UL;
@@ -12686,7 +12756,10 @@ void loadSettings() {
   menuStyle = preferences.getUChar("menuStyle", 0);
   // 0 OpenRemote, 1 OMOTE. 2 was the Stormy preview, which became OpenRemote.
   if (menuStyle > 1) menuStyle = 0;
-  physicalRepeatEnabled = preferences.getBool("btnRpt", true);
+  bool legacyRepeatEnabled = preferences.getBool("btnRpt", true);
+  irRepeatEnabled = preferences.getBool("irRpt", legacyRepeatEnabled);
+  chromecastRepeatEnabled = preferences.getBool("castRpt", legacyRepeatEnabled);
+  rfRepeatEnabled = preferences.getBool("rfRpt", legacyRepeatEnabled);
   physicalRepeatDelayMs = constrain(
     (int)preferences.getUShort("btnDelay", 400),
     (int)BUTTON_REPEAT_DELAY_MIN_MS, (int)BUTTON_REPEAT_DELAY_MAX_MS);
@@ -12856,7 +12929,12 @@ void saveSettings() {
   preferences.putUShort("saturation", displaySaturation);
   preferences.putBool("rgb666", displayRgb666);
   preferences.putBool("invert", displayInverted);
-  preferences.putBool("btnRpt", physicalRepeatEnabled);
+  // Keep btnRpt as the legacy IR value so an older firmware still receives a
+  // sensible setting if the user temporarily rolls back.
+  preferences.putBool("btnRpt", irRepeatEnabled);
+  preferences.putBool("irRpt", irRepeatEnabled);
+  preferences.putBool("castRpt", chromecastRepeatEnabled);
+  preferences.putBool("rfRpt", rfRepeatEnabled);
   preferences.putUShort("btnDelay", physicalRepeatDelayMs);
   preferences.putUChar("btnRate", physicalRepeatRateHz);
   preferences.putUChar("btnLight", buttonBacklightBrightness);
@@ -14407,6 +14485,7 @@ class OpenRemoteBleServerCallbacks : public BLEServerCallbacks {
   void onDisconnect(BLEServer *server) override {
     bleConnected = false;
     if (realMicrophoneActive) microphoneStopPending = true;
+    heldBleHidCommand = nullptr;
     heldVoiceSearchCommand = nullptr;
     heldVoiceSearchFromTouch = false;
     heldVoiceSearchPhysicalKey = 0;
@@ -15420,7 +15499,10 @@ String buildStatusJson() {
   doc["displaySaturation"] = displaySaturation;
   doc["displayRgb666"] = displayRgb666;
   doc["displayInverted"] = displayInverted;
-  doc["physicalRepeatEnabled"] = physicalRepeatEnabled;
+  doc["physicalRepeatEnabled"] = irRepeatEnabled;
+  doc["irRepeatEnabled"] = irRepeatEnabled;
+  doc["chromecastRepeatEnabled"] = chromecastRepeatEnabled;
+  doc["rfRepeatEnabled"] = rfRepeatEnabled;
   doc["physicalRepeatDelayMs"] = physicalRepeatDelayMs;
   doc["physicalRepeatRateHz"] = physicalRepeatRateHz;
   doc["buttonBacklightBrightness"] = buttonBacklightBrightness;
@@ -15817,7 +15899,11 @@ void applySettingsJson(JsonVariantConst settings) {
   displaySaturation = constrain((int)(settings["displaySaturation"] | displaySaturation), 0, 200);
   displayRgb666 = settings["displayRgb666"] | displayRgb666;
   displayInverted = settings["displayInverted"] | displayInverted;
-  physicalRepeatEnabled = settings["physicalRepeatEnabled"] | physicalRepeatEnabled;
+  bool legacyRepeatEnabled = settings["physicalRepeatEnabled"] | irRepeatEnabled;
+  irRepeatEnabled = settings["irRepeatEnabled"] | legacyRepeatEnabled;
+  chromecastRepeatEnabled = settings["chromecastRepeatEnabled"] |
+                             legacyRepeatEnabled;
+  rfRepeatEnabled = settings["rfRepeatEnabled"] | legacyRepeatEnabled;
   physicalRepeatDelayMs = constrain(
     (int)(settings["physicalRepeatDelayMs"] | physicalRepeatDelayMs),
     (int)BUTTON_REPEAT_DELAY_MIN_MS, (int)BUTTON_REPEAT_DELAY_MAX_MS);
@@ -16910,7 +16996,8 @@ void serviceButtonTest(unsigned long now) {
     buttonTestPulseUntilMs = 0;
     setButtonTestVisual(false);
   }
-  if (buttonTestHeldIndex == -1 || !physicalRepeatEnabled ||
+  if (buttonTestHeldIndex == -1 ||
+      !(irRepeatEnabled || chromecastRepeatEnabled || rfRepeatEnabled) ||
       (int32_t)(now - nextButtonTestRepeatMs) < 0) return;
   pulseButtonTest();
   nextButtonTestRepeatMs = now +
@@ -19351,7 +19438,10 @@ bool persistSettingsToRuntimeConfig() {
   settings["displaySaturation"] = displaySaturation;
   settings["displayRgb666"] = displayRgb666;
   settings["displayInverted"] = displayInverted;
-  settings["physicalRepeatEnabled"] = physicalRepeatEnabled;
+  settings["physicalRepeatEnabled"] = irRepeatEnabled;
+  settings["irRepeatEnabled"] = irRepeatEnabled;
+  settings["chromecastRepeatEnabled"] = chromecastRepeatEnabled;
+  settings["rfRepeatEnabled"] = rfRepeatEnabled;
   settings["physicalRepeatDelayMs"] = physicalRepeatDelayMs;
   settings["physicalRepeatRateHz"] = physicalRepeatRateHz;
   settings["buttonBacklightBrightness"] = buttonBacklightBrightness;
@@ -32068,7 +32158,9 @@ void switchEvent(lv_event_t *e) {
     applyClockMode();
     if (clockUseInternetTime) requestInternetTimeSync();
     pendingUiRefresh = settingsView == SETTINGS_CLOCK;
-  } else if (target == &physicalRepeatEnabled) {
+  } else if (target == &irRepeatEnabled ||
+             target == &chromecastRepeatEnabled ||
+             target == &rfRepeatEnabled) {
     endHeldIrCommand();
     pendingUiRefresh = settingsView == SETTINGS_BUTTONS;
   } else if (target == &faceDownSleepEnabled) {
@@ -32551,7 +32643,7 @@ void renderSettingsHomeStormy() {
     });
   makeStormyDivider(preferencesCard, 2 * rowH + 1);
   makeStormyRow(preferencesCard, "Buttons", nullptr,
-    physicalRepeatEnabled ? "Repeat" : "Single press", 2 * rowH + 2, rowH, nullptr,
+    "IR / Chromecast", 2 * rowH + 2, rowH, nullptr,
     [](lv_event_t *e) { openSettingsView(SETTINGS_BUTTONS); });
   y += 3 * rowH + 2 + 12;
 
@@ -32672,7 +32764,7 @@ void renderSettingsHomeOmote() {
   makeOmoteRow(card, "Display", "Brightness, sleep, wake", y, rowH, nullptr,
     [](lv_event_t *e) { openSettingsView(SETTINGS_DISPLAY); });
   makeOmoteDivider(card, y + rowH); y += rowH + 1;
-  makeOmoteRow(card, "Buttons", "Repeat timing and button test", y, rowH, nullptr,
+  makeOmoteRow(card, "Buttons", "Backlight and hold behaviour", y, rowH, nullptr,
     [](lv_event_t *e) { openSettingsView(SETTINGS_BUTTONS); });
   makeOmoteDivider(card, y + rowH); y += rowH + 1;
   makeOmoteRow(card, "Dock", "Blaster dock pairing over ESP-NOW", y, rowH, nullptr,
@@ -34276,12 +34368,22 @@ void renderButtonsPageOmote() {
                          2, lightCard, 14, 196, true);
   y += 52 + 12;
 
-  lv_obj_t *repeatCard = makeOmoteCard(content, y, 48);
-  makeOmoteRow(repeatCard, "Repeat", physicalRepeatEnabled ? "Repeat while held" : "Send once per press",
-               0, 48, &physicalRepeatEnabled);
-  y += 48 + 12;
+  const int repeatRowH = 48;
+  lv_obj_t *repeatCard = makeOmoteCard(content, y, 3 * repeatRowH + 2);
+  makeOmoteRow(repeatCard, "IR",
+               irRepeatEnabled ? "Repeat while held" : "Send once per press",
+               0, repeatRowH, &irRepeatEnabled);
+  makeOmoteDivider(repeatCard, repeatRowH);
+  makeOmoteRow(repeatCard, "Chromecast",
+               chromecastRepeatEnabled ? "Repeat taps while held" : "Hold key until released",
+               repeatRowH + 1, repeatRowH, &chromecastRepeatEnabled);
+  makeOmoteDivider(repeatCard, 2 * repeatRowH + 1);
+  makeOmoteRow(repeatCard, "RF",
+               rfRepeatEnabled ? "Repeat while held" : "Send once per press",
+               2 * repeatRowH + 2, repeatRowH, &rfRepeatEnabled);
+  y += 3 * repeatRowH + 2 + 12;
 
-  if (physicalRepeatEnabled) {
+  if (irRepeatEnabled || chromecastRepeatEnabled || rfRepeatEnabled) {
     lv_obj_t *timingCard = makeOmoteCard(content, y, 2 * 50 + 2);
     makeButtonTimingSlider("Delay before repeat", 8, BUTTON_REPEAT_DELAY_MIN_MS,
       BUTTON_REPEAT_DELAY_MAX_MS, physicalRepeatDelayMs, 0, timingCard, 14, 196, true);
