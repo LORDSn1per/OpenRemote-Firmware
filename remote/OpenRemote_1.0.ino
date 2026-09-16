@@ -1,6 +1,16 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.74 - 2026-09-17
+    - Weather received through a paired dock is now retained on the remote in
+      NVS and restored after deep sleep or reboot. The last valid forecast
+      remains visible until a newer valid reply replaces it; an empty dock
+      reply schedules another request instead of leaving the widget waiting
+      indefinitely.
+    - The live status API now reports the remote's local clock, weather and
+      complete battery values so WebConfig's Screen designer can render real
+      device data rather than invented preview figures.
+
   5.73 - 2026-09-16
     - Adds a confirmed "Reset Battery Learning" action at the bottom of
       Settings > Battery. It clears only the persistent segmented discharge
@@ -7228,7 +7238,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.73"
+#define OPENREMOTE_VERSION_STRING "5.74"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -15348,6 +15358,32 @@ String buildStatusJson() {
   doc["clockCity"] = clockCityName;
   doc["clockUtcOffsetMinutes"] = clockUtcOffsetMinutes;
   doc["manualClockEpoch"] = manualClockEpoch;
+  time_t statusEpoch = time(nullptr);
+  bool statusTimeValid = statusEpoch > 1700000000;
+  doc["currentTimeValid"] = statusTimeValid;
+  if (statusTimeValid) {
+    tm statusLocal = {};
+    localtime_r(&statusEpoch, &statusLocal);
+    doc["currentEpoch"] = (uint32_t)statusEpoch;
+    doc["localYear"] = statusLocal.tm_year + 1900;
+    doc["localMonth"] = statusLocal.tm_mon + 1;
+    doc["localDay"] = statusLocal.tm_mday;
+    doc["localWeekday"] = statusLocal.tm_wday;
+    doc["localHour"] = statusLocal.tm_hour;
+    doc["localMinute"] = statusLocal.tm_min;
+  }
+  doc["weatherValid"] = weatherReading.valid;
+  doc["weatherLocation"] = widgetSettings.weatherLocation;
+  if (weatherReading.valid) {
+    doc["weatherTemperatureC"] = roundf(weatherReading.temperatureC * 10.0f) / 10.0f;
+    doc["weatherCode"] = weatherReading.code;
+    doc["weatherCondition"] = weatherReading.condition;
+    doc["weatherRangeValid"] = weatherReading.rangeValid;
+    if (weatherReading.rangeValid) {
+      doc["weatherHighC"] = roundf(weatherReading.highC * 10.0f) / 10.0f;
+      doc["weatherLowC"] = roundf(weatherReading.lowC * 10.0f) / 10.0f;
+    }
+  }
   doc["wifiScanning"] = wifiScanPending || webWifiScanRequested;
   doc["wifiConnecting"] = wifiConnectPending;
   doc["wifiStatus"] = webWifiStatusText;
@@ -15384,6 +15420,12 @@ String buildStatusJson() {
   else doc["batteryChange24h"] = nullptr;
   if (!isnan(battery.estimatedHours)) doc["batteryEstimatedHours"] = roundf(battery.estimatedHours * 10.0f) / 10.0f;
   else doc["batteryEstimatedHours"] = nullptr;
+  doc["batterySinceFullKnown"] = battery.sinceFullKnown;
+  if (battery.sinceFullKnown && !isnan(battery.sinceFullHours)) {
+    doc["batterySinceFullHours"] = roundf(battery.sinceFullHours * 10.0f) / 10.0f;
+  } else {
+    doc["batterySinceFullHours"] = nullptr;
+  }
   doc["resetReason"] = (int)esp_reset_reason();
   String body;
   serializeJson(doc, body);
@@ -18510,9 +18552,11 @@ void applyWidgetSettingsJson(JsonObjectConst widgets, JsonArrayConst wallpapers)
     do. Only re-read from storage when nothing is held, so a sync partway
     through a session does not discard a fresher reading for an identical one.
   */
-  // With a dock paired the weather lives on the dock and is asked for when a
-  // widget shows it, so nothing is restored or fetched from here.
-  if (!weatherReading.valid && !dockDataPreferred()) loadWeatherReading();
+  // The dock remains the network source, but the last valid reading belongs
+  // on the remote too: it is what the user sees while a fresh request is in
+  // flight, and it must survive deep sleep or a reboot. Empty/failed dock
+  // replies never replace it.
+  if (!weatherReading.valid) loadWeatherReading();
   if (weatherWidgetPlaced && widgetSettings.weatherValidLocation &&
       !weatherReading.valid && !dockDataPreferred()) {
     weatherFetchWanted = true;
@@ -38877,7 +38921,8 @@ void serviceWeatherWidget(uint32_t now) {
     With a dock paired, ask the dock - and only when the weather is actually
     needed: when a weather widget comes on screen, and again shortly after a
     new schedule slot begins while one stays on screen, by which time the dock
-    has fetched it. No reading is kept on this remote beyond the one shown.
+    has fetched it. The newest valid reading is retained locally so it remains
+    visible while the next transaction is pending and across a reboot.
   */
   if (dockDataPreferred() && !weatherUseOwnWifi) {
     releaseWeatherRadio();
@@ -38892,8 +38937,11 @@ void serviceWeatherWidget(uint32_t now) {
       ? weatherSlotStart(nowEpoch, widgetSettings.weatherIntervalHours) : 0;
     bool appeared = !wasOnScreen;
     bool newSlot = currentSlot && currentSlot != requestedSlot && nowEpoch - currentSlot >= 120;
+    bool retryDue = weatherFetchWanted &&
+      (!dockDataRetryAfterMs || (int32_t)(now - dockDataRetryAfterMs) >= 0);
     wasOnScreen = true;
-    if (!(appeared || newSlot) || dockDataRequestPending) return;
+    if (!(appeared || newSlot || retryDue) || dockDataRequestPending) return;
+    weatherFetchWanted = false;
     requestedSlot = currentSlot;
     requestDockData(DOCK_DATA_WANT_WEATHER);
     return;
@@ -39535,12 +39583,24 @@ void serviceDockData(uint32_t now) {
       weatherReading.valid = true;
       weatherReading.fetchedAtMs = now;
       weatherReading.fetchedThisSession = true;
+      time_t fetchedEpoch = (time_t)packet.weatherFetchedEpoch;
+      if (fetchedEpoch <= 1700000000) fetchedEpoch = time(nullptr);
+      if (fetchedEpoch > 1700000000) {
+        weatherLastSlotEpoch = weatherSlotStart(
+          fetchedEpoch, widgetSettings.weatherIntervalHours);
+      }
+      saveWeatherReading();
       Serial.printf("Dock data: weather %s %.1fC from the dock\n",
                     weatherReading.condition, weatherReading.temperatureC);
       for (uint8_t i = 0; i < widgetInstanceCount; i++) refreshWidgetInstance(widgetInstances[i]);
       refreshExpandedWidgetInstances();
     } else if (wants & DOCK_DATA_WANT_WEATHER) {
-      Serial.println("Dock data: the dock has no weather yet");
+      // A valid response proves the dock is present, but it may have replied
+      // before Wi-Fi associated or its first Open-Meteo fetch completed. Keep
+      // any stored reading on screen and ask again after a bounded delay.
+      weatherFetchWanted = true;
+      dockDataRetryAfterMs = now + DOCK_DATA_RETRY_MS;
+      Serial.println("Dock data: the dock has no weather yet - retrying in 1 minute");
     }
 
     if (!(packet.flags & DOCK_DATA_WIFI_CONFIGURED)) sendDockWifiDetails();
