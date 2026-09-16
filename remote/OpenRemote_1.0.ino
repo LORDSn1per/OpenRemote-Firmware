@@ -1,6 +1,16 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.73 - 2026-09-16
+    - Adds a confirmed "Reset Battery Learning" action at the bottom of
+      Settings > Battery. It clears only the persistent segmented discharge
+      average used by "Estimated until empty", then starts learning a clean
+      segment immediately if the remote is unplugged. Battery level, voltage,
+      recent-history rows and the separate time-since-full counter are kept.
+    - The Battery information page now shows that model directly as "Learned
+      average" in percentage discharged per hour, or "Collecting data" before
+      a usable segment exists.
+
   5.72 - 2026-09-16
     - Replaces the noisy one-hour time-remaining calculation with one
       persistent discharge-history model. Every unplugged segment contributes
@@ -7218,7 +7228,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.72"
+#define OPENREMOTE_VERSION_STRING "5.73"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -10356,14 +10366,15 @@ lv_obj_t *buttonTestPanel = nullptr;
 lv_obj_t *buttonTestLabel = nullptr;
 lv_obj_t *lcdRebootConfirmBox = nullptr;
 bool lcdRebootConfirmHard = false;
+lv_obj_t *batteryLearningResetConfirmBox = nullptr;
 // 0=Year, 1=Month, 2=Day, 3=Hour(1-12), 4=AM/PM, 5=Minute.
 lv_obj_t *clockRollers[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
 lv_obj_t *displayValueLabels[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
 lv_obj_t *buttonValueLabels[2] = {nullptr, nullptr};
 lv_obj_t *debugRowDropdowns[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
 int16_t debugRowDropdownMinimums[5] = {0, 0, 0, 0, 0};
-lv_obj_t *batteryMetricNameLabels[7] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
-lv_obj_t *batteryMetricValueLabels[7] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+lv_obj_t *batteryMetricNameLabels[8] = {};
+lv_obj_t *batteryMetricValueLabels[8] = {};
 unsigned long nextStatusRefreshMs = 0;
 unsigned long nextDebugCpuRamRefreshMs = 0;
 unsigned long nextDebugAccelerometerRefreshMs = 0;
@@ -12056,6 +12067,7 @@ struct BatteryMetrics {
   float ratePerHour = NAN;
   float change1h = NAN;
   float change24h = NAN;
+  float learnedDischargePerHour = NAN;
   float estimatedHours = NAN;
   bool chargerConnected = false;
   // Time in the current uninterrupted discharge cycle after a 100% unplug.
@@ -12188,6 +12200,23 @@ void currentBatteryDischargeTotals(float percent, uint32_t epoch,
   }
 }
 
+void resetBatteryDischargeLearning() {
+  batteryDischargePercentTotal = 0.0f;
+  batteryDischargeHoursTotal = 0.0f;
+  batteryDischargeSegmentActive = false;
+  batteryDischargeSegmentEpoch = 0;
+  batteryDischargeSegmentStartPercent = -1.0f;
+
+  if (!chargingState) {
+    time_t now = time(nullptr);
+    startBatteryDischargeSegment(readBatteryPercent(),
+      now >= 1700000000 ? (uint32_t)now : 0);
+  } else {
+    saveBatteryDischargeModel();
+  }
+  Serial.println("Battery model: learned discharge average reset by user");
+}
+
 void resetBatteryMeasurementWindow(bool chargerConnected) {
   time_t epoch = time(nullptr);
   batteryPowerModeKnown = true;
@@ -12283,6 +12312,10 @@ BatteryMetrics currentBatteryMetrics() {
   metrics.percent = readBatteryPercent();
   metrics.voltage = readBatteryVoltage();
   metrics.ratePerHour = readBatteryRatePerHour();
+  if (batteryDischargePercentTotal > 0.0f && batteryDischargeHoursTotal > 0.0f) {
+    metrics.learnedDischargePerHour =
+      batteryDischargePercentTotal / batteryDischargeHoursTotal;
+  }
   time_t nowTime = time(nullptr);
   if (metrics.percent < 0.0f || nowTime < 1700000000) return metrics;
 
@@ -12334,9 +12367,13 @@ BatteryMetrics currentBatteryMetrics() {
   float modelDrop = 0.0f;
   float modelHours = 0.0f;
   currentBatteryDischargeTotals(metrics.percent, nowEpoch, modelDrop, modelHours);
+  if (modelDrop > 0.0f && modelHours > 0.0f) {
+    metrics.learnedDischargePerHour = modelDrop / modelHours;
+  }
   if (modelDrop >= 0.3f && modelHours >= 0.5f) {
-    float ratePerHour = modelDrop / modelHours;
-    if (ratePerHour > 0.0f) metrics.estimatedHours = metrics.percent / ratePerHour;
+    if (metrics.learnedDischargePerHour > 0.0f) {
+      metrics.estimatedHours = metrics.percent / metrics.learnedDischargePerHour;
+    }
   }
   return metrics;
 }
@@ -20408,6 +20445,10 @@ void handleUsbCommand(Stream &port, UsbSerialSession &session, String command) {
   } else if (command.startsWith("ORUSB SETTINGS ")) {
     String target = command.substring(15);
     target.trim();
+    String pageTarget = target;
+    if (pageTarget.endsWith("-bottom")) {
+      pageTarget.remove(pageTarget.length() - 7);
+    }
     // display-panel scrolls to the Panel card and opens Wake; display-bottom
     // scrolls there with every control closed.
     // "<page>-bottom" scrolls any page to its end once rendered.
@@ -20416,16 +20457,16 @@ void handleUsbCommand(Stream &port, UsbSerialSession &session, String command) {
                          : target.endsWith("-bottom") ? 3 : 0;
     // Any settings page by name, so each one can be captured.
     SettingsView view = SETTINGS_HOME;
-    if (target.startsWith("display")) view = SETTINGS_DISPLAY;
-    else if (target == "wifi") view = SETTINGS_WIFI;
-    else if (target == "bluetooth") view = SETTINGS_BLUETOOTH;
-    else if (target == "clock") view = SETTINGS_CLOCK;
-    else if (target == "buttons") view = SETTINGS_BUTTONS;
-    else if (target == "dock") view = SETTINGS_DOCK;
-    else if (target == "battery") view = SETTINGS_BATTERY;
-    else if (target == "backup") view = SETTINGS_BACKUP;
-    else if (target.startsWith("about")) view = SETTINGS_ABOUT;
-    else if (target == "debug") view = SETTINGS_DEBUG;
+    if (pageTarget.startsWith("display")) view = SETTINGS_DISPLAY;
+    else if (pageTarget == "wifi") view = SETTINGS_WIFI;
+    else if (pageTarget == "bluetooth") view = SETTINGS_BLUETOOTH;
+    else if (pageTarget == "clock") view = SETTINGS_CLOCK;
+    else if (pageTarget == "buttons") view = SETTINGS_BUTTONS;
+    else if (pageTarget == "dock") view = SETTINGS_DOCK;
+    else if (pageTarget == "battery") view = SETTINGS_BATTERY;
+    else if (pageTarget == "backup") view = SETTINGS_BACKUP;
+    else if (pageTarget.startsWith("about")) view = SETTINGS_ABOUT;
+    else if (pageTarget == "debug") view = SETTINGS_DEBUG;
     usbSettingsNavView = (uint8_t)view;
     usbSettingsNavRequest = true;
     usbImportReply(port, String("{\"ok\":true,\"settings\":\"") + target + "\"}");
@@ -35041,6 +35082,13 @@ const char *batteryEstimateLabel(const BatteryMetrics &metrics) {
   return "Estimated until empty";
 }
 
+String batteryLearnedAverageText(const BatteryMetrics &metrics) {
+  if (isnan(metrics.learnedDischargePerHour)) return "Collecting data";
+  char text[32];
+  snprintf(text, sizeof(text), "%.2f%% per hour", metrics.learnedDischargePerHour);
+  return String(text);
+}
+
 String batteryEstimateText(const BatteryMetrics &metrics) {
   if (isnan(metrics.estimatedHours)) return "Collecting data";
   uint32_t totalMinutes = (uint32_t)roundf(metrics.estimatedHours * 60.0f);
@@ -35184,20 +35232,21 @@ void updateBatteryMetricLabels(BatteryMetrics metrics) {
            metrics.voltage);
   snprintf(level, sizeof(level), metrics.percent >= 0.0f ? "%.2f%%" : "Unavailable",
            metrics.percent);
-  String values[7] = {
+  String values[8] = {
     voltage,
     level,
     signedBatteryValue(metrics.ratePerHour, " per hour"),
     signedBatteryValue(metrics.change1h, " in last hour"),
     signedBatteryValue(metrics.change24h, " in last 24 hours"),
+    batteryLearnedAverageText(metrics),
     batteryEstimateText(metrics),
     batterySinceFullText(metrics)
   };
-  const char *names[7] = {
+  const char *names[8] = {
     "Voltage", "Battery Level", "Rate", "Last hour", "Last 24 hours",
-    batteryEstimateLabel(metrics), "Time since last full charge"
+    "Learned average", batteryEstimateLabel(metrics), "Time since last full charge"
   };
-  for (uint8_t i = 0; i < 7; i++) {
+  for (uint8_t i = 0; i < 8; i++) {
     if (batteryMetricNameLabels[i]) lv_label_set_text(batteryMetricNameLabels[i], names[i]);
     if (batteryMetricValueLabels[i]) lv_label_set_text(batteryMetricValueLabels[i], values[i].c_str());
   }
@@ -35212,34 +35261,80 @@ void makeBatteryMetricRows(int firstY, bool omoteStyle = false) {
            metrics.voltage);
   snprintf(level, sizeof(level), metrics.percent >= 0.0f ? "%.2f%%" : "Unavailable",
            metrics.percent);
-  String values[7] = {
+  String values[8] = {
     voltage,
     level,
     signedBatteryValue(metrics.ratePerHour, " per hour"),
     signedBatteryValue(metrics.change1h, " in last hour"),
     signedBatteryValue(metrics.change24h, " in last 24 hours"),
+    batteryLearnedAverageText(metrics),
     batteryEstimateText(metrics),
     batterySinceFullText(metrics)
   };
-  const char *names[7] = {
+  const char *names[8] = {
     "Voltage", "Battery Level", "Rate", "Last hour", "Last 24 hours",
-    batteryEstimateLabel(metrics), "Time since last full charge"
+    "Learned average", batteryEstimateLabel(metrics), "Time since last full charge"
   };
   if (omoteStyle) {
     const int rowH = 48;
-    lv_obj_t *card = makeOmoteCard(content, firstY, 7 * rowH + 6);
-    for (uint8_t i = 0; i < 7; i++) {
+    lv_obj_t *card = makeOmoteCard(content, firstY, 8 * rowH + 7);
+    for (uint8_t i = 0; i < 8; i++) {
       makeOmoteRow(card, names[i], values[i].c_str(), i * (rowH + 1), rowH, nullptr, nullptr,
                    &batteryMetricNameLabels[i], &batteryMetricValueLabels[i]);
-      if (i < 6) makeOmoteDivider(card, (i + 1) * (rowH + 1) - 1);
+      if (i < 7) makeOmoteDivider(card, (i + 1) * (rowH + 1) - 1);
     }
   } else {
-    for (uint8_t i = 0; i < 7; i++) {
+    for (uint8_t i = 0; i < 8; i++) {
       makeSettingRow(names[i], values[i].c_str(), firstY + i * 50, nullptr, nullptr,
                      &batteryMetricNameLabels[i], &batteryMetricValueLabels[i]);
     }
   }
   nextBatteryPageRefreshMs = millis() + 1000UL;
+}
+
+void confirmBatteryLearningReset(lv_event_t *e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED ||
+      !batteryLearningResetConfirmBox) return;
+  const char *choice = lv_msgbox_get_active_btn_text(batteryLearningResetConfirmBox);
+  bool confirmed = choice && strcmp(choice, "Reset") == 0;
+  lv_msgbox_close(batteryLearningResetConfirmBox);
+  batteryLearningResetConfirmBox = nullptr;
+  if (physicalNavInputDevice && physicalNavGroup) {
+    lv_indev_set_group(physicalNavInputDevice, physicalNavGroup);
+  }
+  if (!confirmed) return;
+
+  resetBatteryDischargeLearning();
+  updateBatteryMetricLabels(currentBatteryMetrics());
+  lastWakeMs = millis();
+}
+
+void showBatteryLearningResetConfirmation() {
+  if (batteryLearningResetConfirmBox) return;
+  static const char *buttons[] = {"Reset", "Cancel", ""};
+  batteryLearningResetConfirmBox = lv_msgbox_create(
+    lv_scr_act(), "Reset battery learning?",
+    "This clears the saved discharge average. A new time estimate will build from future battery use.",
+    buttons, false);
+  lv_obj_set_width(batteryLearningResetConfirmBox, 220);
+  lv_obj_center(batteryLearningResetConfirmBox);
+  lv_obj_add_event_cb(batteryLearningResetConfirmBox,
+                      confirmBatteryLearningReset,
+                      LV_EVENT_VALUE_CHANGED, nullptr);
+  if (physicalNavModalGroup) {
+    lv_group_remove_all_objs(physicalNavModalGroup);
+    lv_obj_t *buttonMatrix = findMsgboxButtonMatrix(batteryLearningResetConfirmBox);
+    if (buttonMatrix) lv_group_add_obj(physicalNavModalGroup, buttonMatrix);
+    if (physicalNavInputDevice) {
+      lv_indev_set_group(physicalNavInputDevice, physicalNavModalGroup);
+    }
+  }
+}
+
+void batteryLearningResetButtonEvent(lv_event_t *e) {
+  if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
+    showBatteryLearningResetConfirmation();
+  }
 }
 
 void renderBatteryPage() {
@@ -35254,6 +35349,20 @@ void renderBatteryPage() {
   // y=44, not 4: the card at 4 was drawn over the back button's (8,6)-(50,36)
   // footprint and hid it, leaving no way back from this page.
   makeBatteryMetricRows(44, true);
+  makeLabel(content, "Battery estimate", 10, 453,
+            &lv_font_montserrat_12, textPrimary());
+  lv_obj_t *description = makeLabel(
+    content,
+    "Clears the learned discharge average. The time estimate will rebuild as you use the remote.",
+    10, 475, &lv_font_montserrat_10, textPrimary());
+  lv_obj_set_width(description, 220);
+  lv_label_set_long_mode(description, LV_LABEL_LONG_WRAP);
+  lv_obj_set_style_text_opa(description, LV_OPA_60, 0);
+  lv_obj_t *reset = makeOmoteButton(content, "Reset Battery Learning",
+                                    8, 515, 224, 40, lvRgb(115, 38, 45));
+  lv_obj_add_event_cb(reset, batteryLearningResetButtonEvent,
+                      LV_EVENT_CLICKED, nullptr);
+  addPhysicalNavFocusable(reset);
   return;
   
 }
