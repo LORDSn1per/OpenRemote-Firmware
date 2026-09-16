@@ -1,6 +1,21 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.72 - 2026-09-16
+    - Replaces the noisy one-hour time-remaining calculation with one
+      persistent discharge-history model. Every unplugged segment contributes
+      its percentage drop and elapsed time; charging time and percentage gains
+      are excluded, so a partial charge pauses the model and the next unplug
+      resumes from all the useful history collected before it.
+    - Completed totals and the active segment's start time/level live in NVS.
+      A reboot while discharging therefore continues the same segment, and a
+      reboot while charging cannot accidentally count charging time as battery
+      life. The estimate becomes steadier as genuine discharge data accumulates
+      across partial and full recharges.
+    - "Estimated until empty" is now exclusively the current percentage divided
+      by that long-term segmented discharge rate. There is no one-hour fallback
+      and no charging-time estimate.
+
   5.71 - 2026-09-16
     - Settings > Battery gains "Time since last full charge". It starts when a
       remote that reached 100% is unplugged and counts up live from there. A
@@ -7203,7 +7218,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.71"
+#define OPENREMOTE_VERSION_STRING "5.72"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -10226,6 +10241,19 @@ float batterySinceFullStartPercent = -1.0f;
 // and consumed by the unplug transition below.
 bool batteryReachedFullThisSession = false;
 
+/*
+  Long-term discharge model. Completed unplugged segments accumulate forever
+  (percentage consumed / hours discharging); the currently open segment is
+  stored separately so it can continue across a reboot. Charging never enters
+  either total. This deliberately has different semantics from the visible
+  "Time since last full charge" counter above, which a partial charge resets.
+*/
+float batteryDischargePercentTotal = 0.0f;
+float batteryDischargeHoursTotal = 0.0f;
+bool batteryDischargeSegmentActive = false;
+uint32_t batteryDischargeSegmentEpoch = 0;
+float batteryDischargeSegmentStartPercent = -1.0f;
+
 lv_obj_t *screenRoot = nullptr;
 lv_obj_t *wallpaper = nullptr;
 lv_obj_t *topBar = nullptr;
@@ -12053,6 +12081,113 @@ void saveBatterySinceFull() {
   preferences.end();
 }
 
+void saveBatteryDischargeModel() {
+  preferences.begin(PREFERENCES_NAMESPACE, false);
+  preferences.putFloat("dsgPct", batteryDischargePercentTotal);
+  preferences.putFloat("dsgHours", batteryDischargeHoursTotal);
+  preferences.putBool("dsgOpen", batteryDischargeSegmentActive);
+  preferences.putULong("dsgAt", batteryDischargeSegmentEpoch);
+  preferences.putFloat("dsgStart", batteryDischargeSegmentStartPercent);
+  preferences.end();
+}
+
+void startBatteryDischargeSegment(float percent, uint32_t epoch) {
+  if (percent < 0.0f) percent = readBatteryPercent();
+  batteryDischargeSegmentActive = percent >= 0.0f;
+  batteryDischargeSegmentEpoch = epoch;
+  batteryDischargeSegmentStartPercent = percent;
+  saveBatteryDischargeModel();
+  Serial.printf("Battery model: discharge segment started at %.2f%%, epoch=%lu\n",
+                percent, (unsigned long)epoch);
+}
+
+void discardBatteryDischargeSegment() {
+  batteryDischargeSegmentActive = false;
+  batteryDischargeSegmentEpoch = 0;
+  batteryDischargeSegmentStartPercent = -1.0f;
+  saveBatteryDischargeModel();
+}
+
+void closeBatteryDischargeSegment(float percent, uint32_t epoch) {
+  if (!batteryDischargeSegmentActive) return;
+  float dropped = batteryDischargeSegmentStartPercent - percent;
+  float hours = batteryDischargeSegmentEpoch && epoch >= batteryDischargeSegmentEpoch
+    ? (float)(epoch - batteryDischargeSegmentEpoch) / 3600.0f : 0.0f;
+  // Very short/no-change segments are mostly fuel-gauge relaxation. Excluding
+  // both their time and their percentage keeps them from slowing the learned
+  // rate simply because the charger was connected again a few minutes later.
+  if (dropped >= 0.1f && hours >= 0.1f) {
+    batteryDischargePercentTotal += dropped;
+    batteryDischargeHoursTotal += hours;
+    Serial.printf("Battery model: closed %.2f%% over %.2fh; totals %.2f%% / %.2fh\n",
+                  dropped, hours, batteryDischargePercentTotal,
+                  batteryDischargeHoursTotal);
+  } else {
+    Serial.printf("Battery model: discarded short segment %.2f%% over %.2fh\n",
+                  dropped, hours);
+  }
+  batteryDischargeSegmentActive = false;
+  batteryDischargeSegmentEpoch = 0;
+  batteryDischargeSegmentStartPercent = -1.0f;
+  saveBatteryDischargeModel();
+}
+
+/*
+  Repairs/opens the active segment once wall time is available. It also
+  migrates a 5.71 since-full baseline into the new model on the first 5.72
+  boot, so already-collected discharge data is not thrown away.
+*/
+void serviceBatteryDischargeSegment(bool chargerConnected, float percent,
+                                    uint32_t epoch) {
+  if (percent < 0.0f || !epoch) return;
+  if (chargerConnected) {
+    // A reboot may have happened after the cable was connected but before the
+    // old firmware observed that transition. Its stored interval now contains
+    // an unknown amount of charging time, so it cannot safely be learned.
+    if (batteryDischargeSegmentActive) discardBatteryDischargeSegment();
+    return;
+  }
+
+  if (!batteryDischargeSegmentActive) {
+    if (batteryDischargePercentTotal == 0.0f &&
+        batteryDischargeHoursTotal == 0.0f && batterySinceFullKnown &&
+        batterySinceFullEpoch && epoch >= batterySinceFullEpoch &&
+        batterySinceFullStartPercent >= percent) {
+      batteryDischargeSegmentActive = true;
+      batteryDischargeSegmentEpoch = batterySinceFullEpoch;
+      batteryDischargeSegmentStartPercent = batterySinceFullStartPercent;
+      saveBatteryDischargeModel();
+      Serial.println("Battery model: migrated the existing full-charge segment");
+    } else {
+      startBatteryDischargeSegment(percent, epoch);
+    }
+    return;
+  }
+
+  if (!batteryDischargeSegmentEpoch ||
+      epoch < batteryDischargeSegmentEpoch ||
+      percent > batteryDischargeSegmentStartPercent + 1.0f) {
+    // No valid clock at the original unplug, a clock correction backwards, or
+    // a level increase while the firmware was not watching means the boundary
+    // is unknowable. Preserve completed history and start clean from now.
+    startBatteryDischargeSegment(percent, epoch);
+  }
+}
+
+void currentBatteryDischargeTotals(float percent, uint32_t epoch,
+                                   float &dropped, float &hours) {
+  dropped = batteryDischargePercentTotal;
+  hours = batteryDischargeHoursTotal;
+  if (!batteryDischargeSegmentActive || !batteryDischargeSegmentEpoch ||
+      epoch < batteryDischargeSegmentEpoch || percent < 0.0f) return;
+  float activeDrop = batteryDischargeSegmentStartPercent - percent;
+  float activeHours = (float)(epoch - batteryDischargeSegmentEpoch) / 3600.0f;
+  if (activeDrop >= 0.1f && activeHours >= 0.1f) {
+    dropped += activeDrop;
+    hours += activeHours;
+  }
+}
+
 void resetBatteryMeasurementWindow(bool chargerConnected) {
   time_t epoch = time(nullptr);
   batteryPowerModeKnown = true;
@@ -12171,12 +12306,6 @@ BatteryMetrics currentBatteryMetrics() {
     if (batteryPercentAtEpoch(nowEpoch - 3600UL,
                               batteryPowerModeChangedEpoch, hourPercent)) {
       metrics.change1h = metrics.percent - hourPercent;
-      float displayedHourlyChange = roundf(metrics.change1h * 100.0f) / 100.0f;
-      if (metrics.chargerConnected && displayedHourlyChange > 0.005f) {
-        metrics.estimatedHours = (100.0f - metrics.percent) / displayedHourlyChange;
-      } else if (!metrics.chargerConnected && displayedHourlyChange < -0.005f) {
-        metrics.estimatedHours = metrics.percent / -displayedHourlyChange;
-      }
     }
   }
   if (batterySampleAtOrBefore(nowEpoch - 86400UL, day)) {
@@ -12195,23 +12324,19 @@ BatteryMetrics currentBatteryMetrics() {
   }
 
   /*
-    The preferred discharge estimate: the fuel gauge's one-hour rate above is
-    noisy enough that "Estimated until empty" visibly jumps around, while the
-    battery itself drains close to linearly. The time and percentage since the
-    last full-charge unplug make a far steadier
-    rate over a much longer baseline. Needs at least 30 minutes and a
-    measurable drop before it is trusted, and only while discharging -
-    charging speed has nothing to do with how long ago the last unplug was.
-    Below that, or with no baseline yet, the one-hour estimate above stands.
+    One estimator only: all valid unplugged segments, including the active
+    one, contribute percentage consumed / hours discharging. Charging pauses
+    the model rather than erasing it. With at least 30 minutes and 0.3% of
+    evidence, current percentage divided by that long-term rate is the time to
+    empty if unplugged now. The old one-hour fallback is intentionally gone.
   */
-  if (!metrics.chargerConnected && batterySinceFullKnown &&
-      !isnan(metrics.sinceFullHours) && metrics.sinceFullHours >= 0.5f &&
-      batterySinceFullStartPercent >= 0.0f) {
-    float dropped = batterySinceFullStartPercent - metrics.percent;
-    if (dropped >= 0.3f) {
-      float ratePerHour = dropped / metrics.sinceFullHours;
-      metrics.estimatedHours = metrics.percent / ratePerHour;
-    }
+  serviceBatteryDischargeSegment(metrics.chargerConnected, metrics.percent, nowEpoch);
+  float modelDrop = 0.0f;
+  float modelHours = 0.0f;
+  currentBatteryDischargeTotals(metrics.percent, nowEpoch, modelDrop, modelHours);
+  if (modelDrop >= 0.3f && modelHours >= 0.5f) {
+    float ratePerHour = modelDrop / modelHours;
+    if (ratePerHour > 0.0f) metrics.estimatedHours = metrics.percent / ratePerHour;
   }
   return metrics;
 }
@@ -12230,7 +12355,24 @@ void loadBatteryHistory() {
   batterySinceFullKnown = preferences.getBool("fullChgOk", false);
   batterySinceFullEpoch = preferences.getULong("fullChgAt", 0);
   batterySinceFullStartPercent = preferences.getFloat("fullChgPct", -1.0f);
+  batteryDischargePercentTotal = preferences.getFloat("dsgPct", 0.0f);
+  batteryDischargeHoursTotal = preferences.getFloat("dsgHours", 0.0f);
+  batteryDischargeSegmentActive = preferences.getBool("dsgOpen", false);
+  batteryDischargeSegmentEpoch = preferences.getULong("dsgAt", 0);
+  batteryDischargeSegmentStartPercent = preferences.getFloat("dsgStart", -1.0f);
   preferences.end();
+  if (!isfinite(batteryDischargePercentTotal) || batteryDischargePercentTotal < 0.0f ||
+      !isfinite(batteryDischargeHoursTotal) || batteryDischargeHoursTotal < 0.0f) {
+    batteryDischargePercentTotal = 0.0f;
+    batteryDischargeHoursTotal = 0.0f;
+  }
+  if (!isfinite(batteryDischargeSegmentStartPercent) ||
+      batteryDischargeSegmentStartPercent < 0.0f ||
+      batteryDischargeSegmentStartPercent > 100.0f) {
+    batteryDischargeSegmentActive = false;
+    batteryDischargeSegmentEpoch = 0;
+    batteryDischargeSegmentStartPercent = -1.0f;
+  }
   if (batteryHistory.magic != BATTERY_HISTORY_MAGIC ||
       batteryHistory.count > 49 || batteryHistory.next >= 49) {
     memset(&batteryHistory, 0, sizeof(batteryHistory));
@@ -31544,15 +31686,15 @@ bool updateChargingState() {
     resetBatteryMeasurementWindow(chargingState);
 
     /*
-      A full-charge unplug starts a fresh discharge cycle. A partial recharge
-      makes the old full-charge curve unusable, so its unplug resets the visible
-      statistic to zero and disables the long-window estimate until another
-      charge reaches 100%.
+      A full-charge unplug starts the visible since-full counter. A partial
+      recharge makes that uninterrupted counter unusable, so its unplug resets
+      the visible statistic to zero. The segmented discharge model is separate:
+      it closes before charging and resumes with all completed history afterward.
     */
     if (wasCharging && !chargingState) {
+      time_t epoch = time(nullptr);
       if (batteryReachedFullThisSession) {
         batterySinceFullKnown = true;
-        time_t epoch = time(nullptr);
         batterySinceFullEpoch = epoch >= 1700000000 ? (uint32_t)epoch : 0;
         batterySinceFullStartPercent = 100.0f;
         Serial.println("Battery: full-charge discharge counter started");
@@ -31563,8 +31705,13 @@ bool updateChargingState() {
         Serial.println("Battery: partial recharge reset full-charge counter to zero");
       }
       saveBatterySinceFull();
+      startBatteryDischargeSegment(readBatteryPercent(),
+        epoch >= 1700000000 ? (uint32_t)epoch : 0);
       batteryReachedFullThisSession = false;
     } else if (!wasCharging && chargingState) {
+      time_t epoch = time(nullptr);
+      closeBatteryDischargeSegment(readBatteryPercent(),
+        epoch >= 1700000000 ? (uint32_t)epoch : 0);
       // The old discharge is no longer uninterrupted from a full charge.
       // Clear it immediately so the Battery page reads zero throughout the
       // new charging session, whether this charge later reaches 100% or not.
@@ -31598,6 +31745,12 @@ void initialiseChargingState() {
     batterySinceFullEpoch = 0;
     batterySinceFullStartPercent = -1.0f;
     saveBatterySinceFull();
+  }
+  if (chargerConnected && batteryDischargeSegmentActive) {
+    // We do not know how long this boot-time charging session has already
+    // lasted, so the stored open segment cannot be closed at a trustworthy
+    // boundary. Completed earlier segments remain intact.
+    discardBatteryDischargeSegment();
   }
   // A reboot mid-charge should not lose a full charge that already happened.
   batteryReachedFullThisSession = chargerConnected && percent >= 99.95f;
@@ -34884,15 +35037,12 @@ String signedBatteryValue(float value, const char *suffix) {
 }
 
 const char *batteryEstimateLabel(const BatteryMetrics &metrics) {
-  return metrics.chargerConnected ? "Estimated until full" : "Estimated until empty";
+  (void)metrics;
+  return "Estimated until empty";
 }
 
 String batteryEstimateText(const BatteryMetrics &metrics) {
-  if (isnan(metrics.estimatedHours)) {
-    if (metrics.chargerConnected && metrics.percent >= 99.95f) return "Full";
-    if (isnan(metrics.change1h)) return "Collecting data";
-    return "Stable";
-  }
+  if (isnan(metrics.estimatedHours)) return "Collecting data";
   uint32_t totalMinutes = (uint32_t)roundf(metrics.estimatedHours * 60.0f);
   uint32_t hours = totalMinutes / 60U;
   uint32_t minutes = totalMinutes % 60U;
