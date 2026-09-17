@@ -1,7 +1,7 @@
 /*
   OpenRemote firmware change log (newest first)
 
-  5.78 - 2026-09-17
+  5.79 - 2026-09-17
     - Weather and Battery widgets now stack their icon above the value rather
       than beside it. The large weather tile reads as one centred column -
       icon, temperature, condition - as does a weather row in an expanded
@@ -14,10 +14,24 @@
       A slim Battery widget still shows the percentage large and to the right
       of the glyph; any other chosen Battery Information statistic is shown
       smaller and centred beneath the glyph.
+    - WebConfig 3.43 refreshes the Widgets-tab previews after live remote status
+      arrives, fixing Weather, Battery, Time and Date remaining blank after the
+      sidebar had connected. Media preview data remains intentionally sampled.
+      Its widget previews now match the column layouts above, and a slim
+      battery preview shows any statistic other than the percentage beneath the
+      glyph in smaller text.
+
+  5.78 - 2026-09-17
+    - A slim Battery widget now centres one selected Battery Information
+      statistic beneath its battery glyph. It uses the existing Battery widget
+      statistic selection (or a custom widget's override), so the value remains
+      live and the already-backed-up widget setting needs no schema change.
+    - Expanded Weather now centres the temperature and unit as one measured
+      group, keeping the reading aligned beneath the centred weather icon for
+      one-digit, two-digit, negative and unavailable values.
     - WebConfig 3.42 refreshes the Widgets-tab previews after live remote status
       arrives, fixing Weather, Battery, Time and Date remaining blank after the
       sidebar had connected. Media preview data remains intentionally sampled.
-      Its widget previews now match the column layouts above.
 
   5.77 - 2026-09-17
     - Settings > Clock gains a persistent 24-hour clock switch. It changes the
@@ -7284,7 +7298,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.78"
+#define OPENREMOTE_VERSION_STRING "5.79"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
