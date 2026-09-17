@@ -3423,6 +3423,9 @@
 .wgSlim.wgSingle .wgPartBattery{flex-direction:column;justify-content:center;gap:calc(3px * var(--wgScale))}
 .wgSlim.wgSingle .wgPartBattery .wgMiniCell{margin-right:0}
 .wgSlim.wgSingle .wgPartBattery .wgPartValue{font-size:calc(14px * var(--wgScale))}
+.wgSlim .wgPartBattery{flex-direction:column;justify-content:center;gap:calc(2px * var(--wgScale))}
+.wgSlim .wgPartBattery .wgMiniCell{margin-right:0}
+.wgSlim .wgPartBattery .wgPartValue{font-size:calc(10px * var(--wgScale))}
 .wgSlim.wgSingle .wgPartBatteryPercent{flex-direction:row;justify-content:flex-start;gap:calc(6px * var(--wgScale))}
 .wgSlim.wgSingle .wgPartBatteryPercent .wgMiniCell{margin-right:calc(4px * var(--wgScale))}
 .wgSlim.wgSingle .wgPartBatteryPercent .wgPartValue{font-size:calc(24px * var(--wgScale))}
@@ -6715,7 +6718,7 @@
       var percentView=!statisticPreview;
       var value='<div class="wgPartValue">'+escapeWidgetText(statisticPreview ? statisticPreview.value : (livePercent===null?"--":Math.round(percent)+"%"))+'</div>';
       var sub=statisticPreview ? statisticPreview.label : (remoteLiveStatus ? (remoteLiveStatus.chargerConnected?"Charging":"Discharging") : "Waiting for remote");
-      if(slim && !single) return '<div class="wgPart">'+cell+value+'</div>';
+      if(slim && !single) return '<div class="wgPart'+(percentView ? "" : " wgPartBattery")+'">'+cell+value+'</div>';
       if(slim) return '<div class="wgPart wgPartBattery'+(percentView ? " wgPartBatteryPercent" : "")+'">'+cell+value+'</div>';
       return '<div class="wgPart">'+cell+value+'<div class="wgPartSub">'+escapeWidgetText(sub)+'</div></div>';
     }
