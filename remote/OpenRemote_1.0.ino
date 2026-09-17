@@ -2,16 +2,22 @@
   OpenRemote firmware change log (newest first)
 
   5.78 - 2026-09-17
-    - A slim Battery widget now centres one selected Battery Information
-      statistic beneath its battery glyph. It uses the existing Battery widget
-      statistic selection (or a custom widget's override), so the value remains
-      live and the already-backed-up widget setting needs no schema change.
-    - Expanded Weather now centres the temperature and unit as one measured
-      group, keeping the reading aligned beneath the centred weather icon for
-      one-digit, two-digit, negative and unavailable values.
+    - Weather and Battery widgets now stack their icon above the value rather
+      than beside it. The large weather tile reads as one centred column -
+      icon, temperature, condition - as does a weather row in an expanded
+      custom widget, and the temperature and its unit travel as one measured,
+      centred group, so one, two, negative and "--" readings all stay centred
+      beneath the icon. A slim weather element keeps its side-by-side layout,
+      icon left and reading right.
+    - The large Battery tile centres its glyph above the percentage, and an
+      expanded custom widget's battery row matches the library's expanded face.
+      A slim Battery widget still shows the percentage large and to the right
+      of the glyph; any other chosen Battery Information statistic is shown
+      smaller and centred beneath the glyph.
     - WebConfig 3.42 refreshes the Widgets-tab previews after live remote status
       arrives, fixing Weather, Battery, Time and Date remaining blank after the
       sidebar had connected. Media preview data remains intentionally sampled.
+      Its widget previews now match the column layouts above.
 
   5.77 - 2026-09-17
     - Settings > Clock gains a persistent 24-hour clock switch. It changes the
@@ -37637,40 +37643,29 @@ void buildWidgetWeatherFace(WidgetInstance &instance, lv_obj_t *parent,
   instance.glyphCode = haveReading ? weatherReading.code : -1;
   instance.glyphSize = expanded ? 72 : 40;
   instance.glyph = makeWeatherGlyph(parent,
-    expanded ? (width - instance.glyphSize) / 2 : width - pad - 44,
-    expanded ? 10 : 8,
+    (width - instance.glyphSize) / 2,
+    expanded ? 10 : 3,
     instance.glyphSize, instance.glyphCode);
 
-  if (expanded) {
-    // Centre the number and its unit as one measured group. The old fixed
-    // -18px offset only happened to centre two digits; "--", one digit and
-    // negative temperatures visibly drifted left or right.
-    lv_obj_t *temperatureRow = lv_obj_create(parent);
-    lv_obj_remove_style_all(temperatureRow);
-    lv_obj_set_size(temperatureRow, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
-    lv_obj_set_flex_flow(temperatureRow, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(temperatureRow, LV_FLEX_ALIGN_START,
-                          LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-    lv_obj_set_style_pad_column(temperatureRow, 3, 0);
-    lv_obj_clear_flag(temperatureRow, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_clear_flag(temperatureRow, LV_OBJ_FLAG_SCROLLABLE);
-    instance.primary = makeLabel(temperatureRow, temperature, 0, 0,
-      &lv_font_montserrat_48, textPrimary());
-    instance.unit = makeLabel(temperatureRow, widgetTemperatureUnit(), 0, 0,
-      &lv_font_openremote_20, widgetMutedColour());
-    lv_obj_set_style_pad_top(instance.unit, 8, 0);
-    instance.unitFlexLayout = true;
-    lv_obj_update_layout(temperatureRow);
-    lv_obj_align(temperatureRow, LV_ALIGN_TOP_MID, 0, 88);
-  } else {
-    instance.primary = makeLabel(parent, temperature, pad, 10,
-      &lv_font_montserrat_24, textPrimary());
-    instance.unitOffsetY = 3;
-    instance.unit = makeLabel(parent, widgetTemperatureUnit(), 0, 0,
-      &lv_font_openremote_16, widgetMutedColour());
-    lv_obj_align_to(instance.unit, instance.primary, LV_ALIGN_OUT_RIGHT_TOP, 3,
-                    instance.unitOffsetY);
-  }
+  // The number and its unit travel as one measured, centred group, so one,
+  // two and negative digits and "--" all stay centred beneath the icon.
+  lv_obj_t *temperatureRow = lv_obj_create(parent);
+  lv_obj_remove_style_all(temperatureRow);
+  lv_obj_set_size(temperatureRow, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+  lv_obj_set_flex_flow(temperatureRow, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(temperatureRow, LV_FLEX_ALIGN_START,
+                        LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+  lv_obj_set_style_pad_column(temperatureRow, 3, 0);
+  lv_obj_clear_flag(temperatureRow, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_clear_flag(temperatureRow, LV_OBJ_FLAG_SCROLLABLE);
+  instance.primary = makeLabel(temperatureRow, temperature, 0, 0,
+    expanded ? &lv_font_montserrat_48 : &lv_font_montserrat_24, textPrimary());
+  instance.unit = makeLabel(temperatureRow, widgetTemperatureUnit(), 0, 0,
+    expanded ? &lv_font_openremote_20 : &lv_font_openremote_16, widgetMutedColour());
+  lv_obj_set_style_pad_top(instance.unit, expanded ? 8 : 3, 0);
+  instance.unitFlexLayout = true;
+  lv_obj_update_layout(temperatureRow);
+  lv_obj_align(temperatureRow, LV_ALIGN_TOP_MID, 0, expanded ? 88 : 46);
 
   const char *condition = haveReading && weatherReading.condition[0]
     ? weatherReading.condition
@@ -37684,15 +37679,9 @@ void buildWidgetWeatherFace(WidgetInstance &instance, lv_obj_t *parent,
       pad, 182, &lv_font_montserrat_12, widgetMutedColour(), width - pad * 2,
       LV_TEXT_ALIGN_CENTER);
   } else {
-    // Kept clear of the high/low, which is right-aligned under the icon:
-    // a long condition ("Thunderstorm, hail") would otherwise reach it.
-    int textWidth = width - pad - 100;
-    instance.secondary = makeWidgetLabel(parent, condition, pad, 44,
-      &lv_font_montserrat_12, textPrimary(), textWidth, LV_TEXT_ALIGN_LEFT);
-    makeWidgetLabel(parent,
-      widgetSettings.weatherLocation[0] ? widgetSettings.weatherLocation : "No location",
-      pad, 62, &lv_font_montserrat_10, widgetMutedColour(), textWidth,
-      LV_TEXT_ALIGN_LEFT);
+    // The tile reads as one centred column: icon, temperature, condition.
+    instance.secondary = makeWidgetLabel(parent, condition, pad, 74,
+      &lv_font_montserrat_12, textPrimary(), width - pad * 2, LV_TEXT_ALIGN_CENTER);
   }
 
   if (!widgetSettings.weatherShowRange || !haveReading || !weatherReading.rangeValid) return;
@@ -37701,14 +37690,11 @@ void buildWidgetWeatherFace(WidgetInstance &instance, lv_obj_t *parent,
   snprintf(range, sizeof(range), "%d%s / %d%s",
            (int)lroundf(widgetDisplayTemperature(weatherReading.highC)), widgetTemperatureUnit(),
            (int)lroundf(widgetDisplayTemperature(weatherReading.lowC)), widgetTemperatureUnit());
+  // The high/low range fits the expanded view; the tile keeps the three
+  // centred lines above.
   if (expanded) {
     makeWidgetLabel(parent, range, pad, 210, &lv_font_openremote_20,
                     widgetMutedColour(), width - pad * 2, LV_TEXT_ALIGN_CENTER);
-  } else {
-    // Under the icon rather than beside it, now that the icon holds the
-    // top-right corner of the tile.
-    makeWidgetLabel(parent, range, width - pad - 84, 56, &lv_font_openremote_16,
-                    widgetMutedColour(), 84, LV_TEXT_ALIGN_RIGHT);
   }
 }
 
@@ -37724,8 +37710,8 @@ void buildWidgetBatteryFace(WidgetInstance &instance, lv_obj_t *parent,
 
   int cellWidth = expanded ? 140 : 58;
   int cellHeight = expanded ? 62 : 28;
-  int cellX = expanded ? (width - cellWidth) / 2 : pad;
-  int cellY = expanded ? 34 : (height - cellHeight) / 2;
+  int cellX = (width - cellWidth) / 2;
+  int cellY = expanded ? 34 : 12;
 
   lv_obj_t *cell = lv_obj_create(parent);
   lv_obj_remove_style_all(cell);
@@ -37780,11 +37766,13 @@ void buildWidgetBatteryFace(WidgetInstance &instance, lv_obj_t *parent,
     snprintf(headline, sizeof(headline), "%s", percent >= 0.0f ? "Battery" : "No gauge");
   }
 
-  int textX = expanded ? pad : pad + cellWidth + 16;
-  int textWidth = expanded ? width - pad * 2 : width - textX - pad;
-  lv_text_align_t align = expanded ? LV_TEXT_ALIGN_CENTER : LV_TEXT_ALIGN_LEFT;
+  // The headline sits centred beneath the cell on a large tile, matching the
+  // expanded view's column rather than running beside the glyph.
+  int textX = pad;
+  int textWidth = width - pad * 2;
+  lv_text_align_t align = LV_TEXT_ALIGN_CENTER;
   instance.primary = makeWidgetLabel(parent, headline, textX,
-    expanded ? 118 : cellY + 1,
+    expanded ? 118 : cellY + cellHeight + 4,
     expanded ? &lv_font_montserrat_48 : &lv_font_montserrat_24,
     textPrimary(), textWidth, align);
 
@@ -37800,7 +37788,7 @@ void buildWidgetBatteryFace(WidgetInstance &instance, lv_obj_t *parent,
     }
   }
   instance.secondary = makeWidgetLabel(parent, meta, textX,
-    expanded ? 186 : cellY + 30, &lv_font_montserrat_12, widgetMutedColour(),
+    expanded ? 186 : cellY + cellHeight + 32, &lv_font_montserrat_12, widgetMutedColour(),
     textWidth, align);
 
   if (!expanded) return;
@@ -38061,15 +38049,18 @@ void buildWidgetCell(WidgetInstance &instance, lv_obj_t *cell, uint8_t element,
   }
 
   if (element == WIDGET_WEATHER) {
-    int glyphSize = style == CELL_ROW ? (roomy ? 64 : 44)
+    // A large tile or an expanded row stacks the icon above the reading; a
+    // slim weather element stays side by side, icon left and reading right.
+    int glyphSize = style == CELL_ROW ? (roomy ? 48 : 36)
                   : style == CELL_COLUMN ? (wideColumn ? 34 : 28)
                   : style == CELL_SLIM_SINGLE ? 30 : 20;
     instance.glyphSize = glyphSize;
     instance.glyphCode = weatherReading.valid ? weatherReading.code : -1;
     const lv_font_t *tempFont = style == CELL_ROW
-      ? (roomy ? &lv_font_montserrat_48 : &lv_font_montserrat_24)
+      ? (roomy ? &lv_font_montserrat_24 : &lv_font_montserrat_20)
       : (style == CELL_SLIM ? &lv_font_montserrat_16 : &lv_font_montserrat_20);
-    const lv_font_t *unitFont = style == CELL_ROW ? &lv_font_openremote_20
+    const lv_font_t *unitFont = style == CELL_ROW
+      ? &lv_font_openremote_16
       : (style == CELL_SLIM ? &lv_font_openremote_12 : &lv_font_openremote_16);
     // What the library face says until the first forecast; a reading replaces it.
     const char *waiting = weatherReading.valid && weatherReading.condition[0]
@@ -38085,25 +38076,30 @@ void buildWidgetCell(WidgetInstance &instance, lv_obj_t *cell, uint8_t element,
       setFlow(LV_FLEX_FLOW_ROW, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
       instance.glyph = makeWeatherGlyph(cell, 0, 0, glyphSize, instance.glyphCode);
       makeWidgetTemperature(instance, cell, tempFont, unitFont);
-    } else {
-      // The icon beside the temperature, with the conditions under it.
-      setFlow(LV_FLEX_FLOW_ROW,
-              style == CELL_ROW ? LV_FLEX_ALIGN_CENTER : LV_FLEX_ALIGN_START,
-              LV_FLEX_ALIGN_CENTER);
+    } else if (style == CELL_SLIM_SINGLE) {
+      setFlow(LV_FLEX_FLOW_ROW, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
       instance.glyph = makeWeatherGlyph(cell, 0, 0, glyphSize, instance.glyphCode);
       lv_obj_t *text = makeWidgetFlex(cell, LV_FLEX_FLOW_COLUMN, LV_FLEX_ALIGN_CENTER,
                                       LV_FLEX_ALIGN_START, 0);
       makeWidgetTemperature(instance, text, tempFont, unitFont);
-      instance.secondary = makeWidgetLabel(text, waiting, 0, 0, small, widgetMutedColour(),
-        max(60, textWidth - glyphSize - 34), LV_TEXT_ALIGN_LEFT);
+      instance.secondary = makeWidgetLabel(text, waiting, 0, 0, &lv_font_montserrat_12,
+        widgetMutedColour(), max(60, textWidth - glyphSize - 34), LV_TEXT_ALIGN_LEFT);
+    } else {
+      setFlow(LV_FLEX_FLOW_COLUMN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+      instance.glyph = makeWeatherGlyph(cell, 0, 0, glyphSize, instance.glyphCode);
+      makeWidgetTemperature(instance, cell, tempFont, unitFont);
+      instance.secondary = makeWidgetLabel(cell, waiting, 0, 0, &lv_font_montserrat_12,
+        widgetMutedColour(), textWidth, LV_TEXT_ALIGN_CENTER);
     }
     return;
   }
 
   if (element == WIDGET_BATTERY) {
-    // "100%" beside the glyph only just fits a slim third, so it drops a size there.
+    // A chosen statistic (voltage, rate, ...) is shown smaller and under the
+    // glyph; the percentage stays large beside it on a slim tile.
+    bool percentage = batteryStatistic == BATTERY_STAT_DEFAULT;
     const lv_font_t *percentFont = style == CELL_ROW
-      ? (roomy ? &lv_font_montserrat_48 : &lv_font_montserrat_24)
+      ? (roomy ? &lv_font_montserrat_24 : &lv_font_montserrat_20)
       : (style == CELL_SLIM ? (wideColumn ? &lv_font_montserrat_16 : &lv_font_montserrat_14)
                             : style == CELL_SLIM_SINGLE ? &lv_font_montserrat_14
                             : &lv_font_montserrat_20);
@@ -38114,26 +38110,39 @@ void buildWidgetCell(WidgetInstance &instance, lv_obj_t *cell, uint8_t element,
       instance.secondary = makeWidgetLabel(cell, "", 0, 0, &lv_font_montserrat_10,
         widgetMutedColour(), textWidth, LV_TEXT_ALIGN_CENTER);
     } else if (style == CELL_SLIM) {
-      setFlow(LV_FLEX_FLOW_ROW, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-      makeWidgetBatteryGlyph(instance, cell, 24, 12);
-      instance.primary = makeLabel(cell, "--%", 0, 0, percentFont, textPrimary());
+      if (percentage) {
+        setFlow(LV_FLEX_FLOW_ROW, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        makeWidgetBatteryGlyph(instance, cell, 24, 12);
+        instance.primary = makeLabel(cell, "--%", 0, 0, percentFont, textPrimary());
+      } else {
+        setFlow(LV_FLEX_FLOW_COLUMN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_row(cell, 1, 0);
+        makeWidgetBatteryGlyph(instance, cell, 24, 12);
+        instance.primary = makeWidgetLabel(cell, "--%", 0, 0, &lv_font_montserrat_10,
+          textPrimary(), textWidth, LV_TEXT_ALIGN_CENTER);
+      }
     } else if (style == CELL_SLIM_SINGLE) {
-      setFlow(LV_FLEX_FLOW_COLUMN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-      lv_obj_set_style_pad_row(cell, 2, 0);
-      makeWidgetBatteryGlyph(instance, cell, 40, 19);
-      instance.primary = makeWidgetLabel(cell, "--%", 0, 0, percentFont,
-        textPrimary(), textWidth, LV_TEXT_ALIGN_CENTER);
+      if (percentage) {
+        // The percentage is the one value shown large, beside the glyph.
+        setFlow(LV_FLEX_FLOW_ROW, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        makeWidgetBatteryGlyph(instance, cell, 40, 19);
+        instance.primary = makeLabel(cell, "--%", 0, 0, &lv_font_montserrat_24, textPrimary());
+      } else {
+        // Every other statistic is smaller and centred under the glyph.
+        setFlow(LV_FLEX_FLOW_COLUMN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_row(cell, 2, 0);
+        makeWidgetBatteryGlyph(instance, cell, 40, 19);
+        instance.primary = makeWidgetLabel(cell, "--%", 0, 0, &lv_font_montserrat_14,
+          textPrimary(), textWidth, LV_TEXT_ALIGN_CENTER);
+      }
     } else {
-      bool big = style == CELL_ROW;
-      setFlow(LV_FLEX_FLOW_ROW, big ? LV_FLEX_ALIGN_CENTER : LV_FLEX_ALIGN_START,
-              LV_FLEX_ALIGN_CENTER);
-      makeWidgetBatteryGlyph(instance, cell, big ? (roomy ? 84 : 60) : 40,
-                             big ? (roomy ? 38 : 28) : 19);
-      lv_obj_t *text = makeWidgetFlex(cell, LV_FLEX_FLOW_COLUMN, LV_FLEX_ALIGN_CENTER,
-                                      LV_FLEX_ALIGN_START, 0);
-      instance.primary = makeLabel(text, "--%", 0, 0, percentFont, textPrimary());
-      instance.secondary = makeWidgetLabel(text, "", 0, 0, small, widgetMutedColour(),
-        big ? 110 : 120, LV_TEXT_ALIGN_LEFT);
+      // An expanded custom row stacks the glyph above the value, matching the
+      // library's own expanded battery face.
+      setFlow(LV_FLEX_FLOW_COLUMN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+      makeWidgetBatteryGlyph(instance, cell, roomy ? 48 : 36, roomy ? 22 : 16);
+      instance.primary = makeLabel(cell, "--%", 0, 0, percentFont, textPrimary());
+      instance.secondary = makeWidgetLabel(cell, "", 0, 0, &lv_font_montserrat_12,
+        widgetMutedColour(), textWidth, LV_TEXT_ALIGN_CENTER);
     }
     return;
   }

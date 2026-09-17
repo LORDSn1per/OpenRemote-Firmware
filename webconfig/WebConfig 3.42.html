@@ -3370,27 +3370,21 @@
   font-variant-numeric:tabular-nums;margin-top:calc(3px * var(--wgScale))}
 
 /* Weather */
-.wgWeather{grid-template-columns:minmax(0,1fr) auto;gap:calc(10px * var(--wgScale));align-items:center}
-.wgWeatherMain{display:grid;gap:calc(2px * var(--wgScale));min-width:0}
+.wgWeather{grid-template-columns:minmax(0,1fr);justify-items:center;align-content:center;gap:calc(2px * var(--wgScale))}
+.wgWeather svg{width:calc(40px * var(--wgScale));height:calc(40px * var(--wgScale))}
 .wgTemp{font-size:calc(34px * var(--wgScale));font-weight:950;letter-spacing:-.05em;line-height:1}
 .wgTemp sup{font-size:calc(15px * var(--wgScale));font-weight:900;vertical-align:top;margin-left:calc(2px * var(--wgScale))}
 .wgCond{font-size:calc(12px * var(--wgScale));color:rgba(255,255,255,.66);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.wgPlace{font-size:calc(10px * var(--wgScale));color:rgba(255,255,255,.44);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.wgWeatherSide{display:grid;gap:calc(6px * var(--wgScale));justify-items:center}
-.wgWeatherSide svg{width:calc(40px * var(--wgScale));height:calc(40px * var(--wgScale))}
-.wgLiveWeatherGlyph{font-size:calc(34px * var(--wgScale));line-height:1;color:#dcecff;text-shadow:0 0 calc(12px * var(--wgScale)) rgba(92,164,255,.55)}
-.wgWeatherSide .wgLiveWeatherGlyph{font-size:calc(40px * var(--wgScale))}
-.wgRange{font-size:calc(11px * var(--wgScale));color:rgba(255,255,255,.66);font-variant-numeric:tabular-nums;white-space:nowrap}
+.wgLiveWeatherGlyph{font-size:calc(40px * var(--wgScale));line-height:1;color:#dcecff;text-shadow:0 0 calc(12px * var(--wgScale)) rgba(92,164,255,.55)}
 
 /* Battery */
-.wgBattery{grid-template-columns:auto minmax(0,1fr);gap:calc(13px * var(--wgScale));align-items:center}
+.wgBattery{grid-template-columns:minmax(0,1fr);justify-items:center;align-content:center;gap:calc(4px * var(--wgScale))}
 .wgCell{position:relative;width:calc(58px * var(--wgScale));height:calc(28px * var(--wgScale));
   border:calc(2px * var(--wgScale)) solid rgba(255,255,255,.34);border-radius:calc(7px * var(--wgScale));padding:calc(3px * var(--wgScale))}
 .wgCell:after{content:"";position:absolute;right:calc(-6px * var(--wgScale));top:calc(8px * var(--wgScale));
   width:calc(4px * var(--wgScale));height:calc(9px * var(--wgScale));background:rgba(255,255,255,.34);border-radius:0 3px 3px 0}
 .wgCell i{display:block;height:100%;border-radius:calc(4px * var(--wgScale));background:linear-gradient(90deg,#30d158,#9dffb5)}
 .wgCell.low i{background:linear-gradient(90deg,#ff453a,#ff9d95)}
-.wgBatteryText{display:grid;gap:calc(2px * var(--wgScale));min-width:0}
 .wgPercent{font-size:calc(30px * var(--wgScale));font-weight:950;letter-spacing:-.05em;line-height:1}
 .wgPercent sup{font-size:calc(14px * var(--wgScale));font-weight:900;vertical-align:top;margin-left:calc(2px * var(--wgScale))}
 .wgMeta{font-size:calc(11px * var(--wgScale));color:rgba(255,255,255,.56);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -3428,6 +3422,10 @@
 .wgSlim.wgSingle .wgPart{justify-content:flex-start;padding:0 calc(12px * var(--wgScale))}
 .wgSlim.wgSingle .wgPartBattery{flex-direction:column;justify-content:center;gap:calc(3px * var(--wgScale))}
 .wgSlim.wgSingle .wgPartBattery .wgMiniCell{margin-right:0}
+.wgSlim.wgSingle .wgPartBattery .wgPartValue{font-size:calc(14px * var(--wgScale))}
+.wgSlim.wgSingle .wgPartBatteryPercent{flex-direction:row;justify-content:flex-start;gap:calc(6px * var(--wgScale))}
+.wgSlim.wgSingle .wgPartBatteryPercent .wgMiniCell{margin-right:calc(4px * var(--wgScale))}
+.wgSlim.wgSingle .wgPartBatteryPercent .wgPartValue{font-size:calc(24px * var(--wgScale))}
 .wgSlim.wgBackgroundWallpaper{background-size:100% auto}
 .wgSlim.wgContentPanel:before{inset:calc(4px * var(--wgScale));border-radius:calc(9px * var(--wgScale))}
 .wgPartText{display:flex;flex-direction:column;align-items:flex-start;min-width:0;gap:calc(1px * var(--wgScale));text-align:left}
@@ -6634,16 +6632,10 @@
 
     if(kind==="weather"){
       var weather=designerWeatherPreview();
-      var range=widgetSettings.weather.showRange && weather.rangeValid
-        ? '<div class="wgRange">'+weather.high+'&deg; / '+weather.low+'&deg;</div>'
-        : "";
       return '<div class="wgTile wgWeather'+tileClass+'"'+style+'>'+
-        '<div class="wgWeatherMain">'+
-          '<div class="wgTemp">'+weather.temperature+'<sup>&deg;'+weather.unit+'</sup></div>'+
-          '<div class="wgCond">'+escapeWidgetText(weather.condition)+'</div>'+
-          '<div class="wgPlace">'+escapeWidgetText(weather.place)+'</div>'+
-        '</div>'+
-        '<div class="wgWeatherSide">'+designerWeatherGlyph(weather.code)+range+'</div>'+
+        designerWeatherGlyph(weather.code)+
+        '<div class="wgTemp">'+weather.temperature+'<sup>&deg;'+weather.unit+'</sup></div>'+
+        '<div class="wgCond">'+escapeWidgetText(weather.condition)+'</div>'+
       '</div>';
     }
 
@@ -6663,14 +6655,12 @@
       }
       return '<div class="wgTile wgBattery'+tileClass+'"'+style+'>'+
         '<div class="wgCell'+(low ? " low" : "")+'"><i style="width:'+percent+'%"></i></div>'+
-        '<div class="wgBatteryText">'+
-          (statisticPreview
-            ? '<div class="wgPercent">'+escapeWidgetText(statisticPreview.value)+'</div>'
-            : widgetSettings.battery.showPercent
-            ? '<div class="wgPercent">'+percentText+(livePercent===null?'':'<sup>%</sup>')+'</div>'
-            : '<div class="wgTitle">Battery</div>')+
-          '<div class="wgMeta">'+meta.join(" &middot; ")+'</div>'+
-        '</div>'+
+        (statisticPreview
+          ? '<div class="wgPercent">'+escapeWidgetText(statisticPreview.value)+'</div>'
+          : widgetSettings.battery.showPercent
+          ? '<div class="wgPercent">'+percentText+(livePercent===null?'':'<sup>%</sup>')+'</div>'
+          : '<div class="wgTitle">Battery</div>')+
+        '<div class="wgMeta">'+meta.join(" &middot; ")+'</div>'+
       '</div>';
     }
 
@@ -6722,10 +6712,11 @@
       var percent=livePercent===null?0:Math.max(0,Math.min(100,livePercent));
       var cell='<div class="wgMiniCell"><i style="width:'+percent+'%"></i></div>';
       var statisticPreview=batteryStatisticPreview(batteryStatistic);
+      var percentView=!statisticPreview;
       var value='<div class="wgPartValue">'+escapeWidgetText(statisticPreview ? statisticPreview.value : (livePercent===null?"--":Math.round(percent)+"%"))+'</div>';
       var sub=statisticPreview ? statisticPreview.label : (remoteLiveStatus ? (remoteLiveStatus.chargerConnected?"Charging":"Discharging") : "Waiting for remote");
       if(slim && !single) return '<div class="wgPart">'+cell+value+'</div>';
-      if(slim) return '<div class="wgPart wgPartBattery">'+cell+value+'</div>';
+      if(slim) return '<div class="wgPart wgPartBattery'+(percentView ? " wgPartBatteryPercent" : "")+'">'+cell+value+'</div>';
       return '<div class="wgPart">'+cell+value+'<div class="wgPartSub">'+escapeWidgetText(sub)+'</div></div>';
     }
     return '<div class="wgPart wgPartMedia"><div class="wgPartTitle">Media title</div>'+
