@@ -1,6 +1,17 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.80 - 2026-09-20
+    - The title bar (the page title and the clock/battery pill) is now one
+      object shared by every page instead of living inside each page's own
+      tile, so it no longer drags with a finger-swipe between Activities and
+      device pages - it was always meant to sit still, the way the page dots
+      already do. A changed title (Activities to a device's name, say) fades
+      out and back in over 260ms rather than jumping; the pill's own contents
+      never rebuild between pages, so its dock-link outline colour survives
+      untouched too.
+    - The page dots sit 3px closer to the bottom edge than before.
+
   5.79 - 2026-09-17
     - Weather and Battery widgets now stack their icon above the value rather
       than beside it. The large weather tile reads as one centred column -
@@ -7298,7 +7309,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.79"
+#define OPENREMOTE_VERSION_STRING "5.80"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -10505,14 +10516,10 @@ struct PageUi {
   lv_obj_t *tile = nullptr;
   lv_obj_t *root = nullptr;
   lv_obj_t *wallpaper = nullptr;
-  lv_obj_t *topBar = nullptr;
   lv_obj_t *content = nullptr;
-  lv_obj_t *dots = nullptr;
-  lv_obj_t *clockLabel = nullptr;
-  lv_obj_t *statusPill = nullptr;
-  lv_obj_t *statusBattery = nullptr;
-  lv_obj_t *statusBatteryTerminal = nullptr;
-  lv_obj_t *batteryFill = nullptr;
+  // No topBar, dots, statusPill or its contents here any more - they are one
+  // object each, shared by every slot (see their creation beside pageDotsBar
+  // and renderTopBar()), not per-tile state.
   uint16_t *wallpaperPixels = nullptr;
   lv_img_dsc_t wallpaperDescriptor = {};
   char themePath[72] = "";
@@ -16771,7 +16778,7 @@ void refreshDockLinkIndicator() {
 // Every page slot builds its own status pill, and bindPageUi() swaps the
 // globals to whichever page is showing. Painting only the bound one therefore
 // left every other page's pill white - green in Settings, white the moment you
-// went back to the remote. All slots are painted here instead.
+// went back to the remote. One shared pill now, not one per slot.
 void applyDockLinkPillColour() {
   bool linked = dockConnected();
   lv_color_t idle = pillIdleColour();
@@ -16781,15 +16788,12 @@ void applyDockLinkPillColour() {
   // LV_OPA_COVER, so the green link outline uses it too. Same border width as
   // ever; only the opacity was ever the difference.
   lv_opa_t opa = linked ? LV_OPA_COVER : (lv_opa_t)64;
-  for (uint8_t slot = 0; slot < PAGE_SLOT_COUNT; slot++) {
-    PageUi &ui = pageUi[slot];
-    if (ui.statusPill && lv_obj_is_valid(ui.statusPill)) {
-      lv_obj_set_style_border_color(ui.statusPill, idle, 0);
-      lv_obj_set_style_border_opa(ui.statusPill, opa, 0);
-    }
-    if (ui.statusBattery && lv_obj_is_valid(ui.statusBattery)) {
-      lv_obj_set_style_border_color(ui.statusBattery, idle, 0);
-    }
+  if (statusPill && lv_obj_is_valid(statusPill)) {
+    lv_obj_set_style_border_color(statusPill, idle, 0);
+    lv_obj_set_style_border_opa(statusPill, opa, 0);
+  }
+  if (statusBattery && lv_obj_is_valid(statusBattery)) {
+    lv_obj_set_style_border_color(statusBattery, idle, 0);
   }
 }
 
@@ -16892,15 +16896,12 @@ static const uint32_t ESPNOW_PULSE_MS = 320;
 void applyEspNowPulse(bool bright) {
   (void)bright;
   lv_color_t dockBlue = lv_color_hex(0x007AFF);
-  for (uint8_t slot = 0; slot < PAGE_SLOT_COUNT; slot++) {
-    PageUi &ui = pageUi[slot];
-    if (ui.statusPill && lv_obj_is_valid(ui.statusPill)) {
-      lv_obj_set_style_border_color(ui.statusPill, dockBlue, 0);
-      lv_obj_set_style_border_opa(ui.statusPill, LV_OPA_COVER, 0);
-    }
-    if (ui.statusBattery && lv_obj_is_valid(ui.statusBattery)) {
-      lv_obj_set_style_border_color(ui.statusBattery, dockBlue, 0);
-    }
+  if (statusPill && lv_obj_is_valid(statusPill)) {
+    lv_obj_set_style_border_color(statusPill, dockBlue, 0);
+    lv_obj_set_style_border_opa(statusPill, LV_OPA_COVER, 0);
+  }
+  if (statusBattery && lv_obj_is_valid(statusBattery)) {
+    lv_obj_set_style_border_color(statusBattery, dockBlue, 0);
   }
 }
 
@@ -31729,7 +31730,7 @@ void drawDots() {
 
   lv_obj_set_size(pageDotsBar, (pageCount - 1) * PAGE_DOT_PITCH + PAGE_DOT_SIZE + 2 * PAGE_DOT_INSET,
                   PAGE_DOT_SIZE + 2 * PAGE_DOT_INSET);
-  lv_obj_align(pageDotsBar, LV_ALIGN_BOTTOM_MID, 0, -6);
+  lv_obj_align(pageDotsBar, LV_ALIGN_BOTTOM_MID, 0, -3);
   lv_obj_move_foreground(pageDotsBar);
   positionPageDotsActive();
 }
@@ -32082,43 +32083,66 @@ void refreshStatusPill() {
   }
 }
 
-void renderTopBar(const char *title, bool allowDevices) {
-  lv_obj_clean(topBar);
-  brightnessBatteryLabel = nullptr;
-  brightnessBatteryUnderline = nullptr;   // both lived in the pill just deleted
-  lv_obj_set_style_bg_opa(topBar, LV_OPA_TRANSP, 0);
+/*
+  The top bar - the title and the status pill (clock/battery) - is a single
+  object shared by every page (see its creation, once, beside pageDotsBar),
+  not part of the page tiles the pageStrip drags. It survives every page
+  render untouched: renderTopBar() below updates it in place rather than
+  rebuilding it, which is what keeps the pill genuinely fixed on screen while
+  pages swipe underneath it, and lets a changed title animate instead of
+  jumping.
+*/
+lv_obj_t *topBarTitleLabel = nullptr;
+lv_obj_t *topBarDownHint = nullptr;
+bool topBarAllowDevices = false;
+char topBarCurrentTitle[40] = "";
+char topBarPendingTitle[40] = "";
 
-  int titleX = 8;
-  int titleWidth = clockEnabled ? 126 : 182;
+void topBarTitleOpacityExec(void *target, int32_t value) {
+  lv_obj_t *label = static_cast<lv_obj_t *>(target);
+  if (label && lv_obj_is_valid(label)) lv_obj_set_style_text_opa(label, (lv_opa_t)value, 0);
+}
 
-  lv_obj_t *titleLabel = lv_label_create(topBar);
-  lv_label_set_text(titleLabel, title);
-  lv_label_set_long_mode(titleLabel, LV_LABEL_LONG_DOT);
-  lv_obj_set_pos(titleLabel, titleX, 9);
-  lv_obj_set_width(titleLabel, titleWidth);
-  lv_obj_set_style_text_align(titleLabel, LV_TEXT_ALIGN_LEFT, 0);
-  // A long title (e.g. "Backup / Restore") at 20pt doesn't fit titleWidth and
-  // was getting cut down to almost nothing by LV_LABEL_LONG_DOT; drop to 16pt
-  // for anything past ~10 characters so it still fits and truncates gracefully.
-  bool longTitle = strlen(title) > 10;
-  lv_obj_set_style_text_font(titleLabel, (allowDevices || longTitle) ? &lv_font_montserrat_16 : &lv_font_montserrat_20, 0);
-  lv_obj_set_style_text_color(titleLabel, textPrimary(), 0);
-  if (allowDevices) {
-    lv_obj_add_flag(titleLabel, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_flag(titleLabel, LV_OBJ_FLAG_PRESS_LOCK);
-    lv_obj_set_ext_click_area(titleLabel, 6);
-    lv_obj_add_event_cb(titleLabel, [](lv_event_t *e) { showDevicePicker(); }, LV_EVENT_CLICKED, nullptr);
-  }
+void topBarTitleFadeOutReady(lv_anim_t *animation) {
+  (void)animation;
+  if (!topBarTitleLabel || !lv_obj_is_valid(topBarTitleLabel)) return;
+  lv_label_set_text(topBarTitleLabel, topBarPendingTitle);
+  lv_anim_t fadeIn;
+  lv_anim_init(&fadeIn);
+  lv_anim_set_var(&fadeIn, topBarTitleLabel);
+  lv_anim_set_exec_cb(&fadeIn, topBarTitleOpacityExec);
+  lv_anim_set_values(&fadeIn, 0, 255);
+  lv_anim_set_time(&fadeIn, 140);
+  lv_anim_set_path_cb(&fadeIn, lv_anim_path_ease_out);
+  lv_anim_start(&fadeIn);
+}
 
-  if (!allowDevices) {
-    lv_obj_t *hint = makeLabel(topBar, LV_SYMBOL_DOWN, 119, 13, &lv_font_montserrat_10, textPrimary());
-    lv_obj_set_style_text_opa(hint, LV_OPA_60, 0);
-  }
+// Swaps the title's text once fully faded, rather than jumping straight from
+// one name to the next - "Activities" to "Fetch TV" reads as a change, not a
+// glitch. Only the text fades; the bar and the pill beside it never move.
+void animateTopBarTitleChange(const char *title) {
+  strlcpy(topBarPendingTitle, title, sizeof(topBarPendingTitle));
+  lv_anim_del(topBarTitleLabel, topBarTitleOpacityExec);
+  lv_anim_t fadeOut;
+  lv_anim_init(&fadeOut);
+  lv_anim_set_var(&fadeOut, topBarTitleLabel);
+  lv_anim_set_exec_cb(&fadeOut, topBarTitleOpacityExec);
+  lv_anim_set_values(&fadeOut, 255, 0);
+  lv_anim_set_time(&fadeOut, 120);
+  lv_anim_set_path_cb(&fadeOut, lv_anim_path_ease_in);
+  lv_anim_set_ready_cb(&fadeOut, topBarTitleFadeOutReady);
+  lv_anim_start(&fadeOut);
+}
 
+void repositionStatusPill();
+
+// Builds the status pill once; every later call is a no-op; only
+// refreshStatusPill() ever touches its labels after that, so it never
+// flickers or resets its dock-link colour between pages.
+void ensureStatusPill() {
+  if (statusPill) return;
   statusPill = lv_btn_create(topBar);
   lv_obj_t *pill = statusPill;
-  lv_obj_set_pos(pill, clockEnabled ? 138 : 196, 5);
-  lv_obj_set_size(pill, clockEnabled ? 96 : 38, 31);
   lv_obj_set_style_radius(pill, 16, 0);
   lv_obj_set_style_bg_color(pill, lv_color_black(), 0);
   lv_obj_set_style_bg_opa(pill, (lv_opa_t)115, 0);
@@ -32131,17 +32155,13 @@ void renderTopBar(const char *title, bool allowDevices) {
   lv_obj_clear_flag(pill, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_event_cb(pill, [](lv_event_t *e) { toggleBrightnessPanel(); }, LV_EVENT_CLICKED, nullptr);
 
-  clockLabel = nullptr;
-  if (clockEnabled) {
-    clockLabel = makeLabel(pill, "--:--", 4, 8, &lv_font_montserrat_12, textPrimary());
-    lv_obj_set_width(clockLabel, 54);
-    lv_obj_set_style_text_align(clockLabel, LV_TEXT_ALIGN_RIGHT, 0);
-  }
+  clockLabel = makeLabel(pill, "--:--", 4, 8, &lv_font_montserrat_12, textPrimary());
+  lv_obj_set_width(clockLabel, 54);
+  lv_obj_set_style_text_align(clockLabel, LV_TEXT_ALIGN_RIGHT, 0);
 
   lv_obj_t *battery = lv_obj_create(pill);
   statusBattery = battery;
   lv_obj_remove_style_all(battery);
-  lv_obj_set_pos(battery, clockEnabled ? 61 : 7, 9);
   lv_obj_set_size(battery, 18, 12);
   lv_obj_set_style_radius(battery, 2, 0);
   lv_obj_set_style_border_color(battery, lv_color_white(), 0);
@@ -32160,23 +32180,83 @@ void renderTopBar(const char *title, bool allowDevices) {
   lv_obj_t *terminal = lv_obj_create(pill);
   statusBatteryTerminal = terminal;
   lv_obj_remove_style_all(terminal);
-  lv_obj_set_pos(terminal, clockEnabled ? 79 : 25, 12);
   lv_obj_set_size(terminal, 2, 6);
   lv_obj_set_style_bg_color(terminal, lv_color_white(), 0);
   lv_obj_set_style_bg_opa(terminal, LV_OPA_80, 0);
 
+  // Sets every position above from clockEnabled, and positions the pill
+  // itself - shared with repositionStatusPill() below, since a live change to
+  // "Show clock" needs exactly the same layout this creation does.
+  repositionStatusPill();
   refreshStatusPill();
-  if (boundPageUi) {
-    boundPageUi->clockLabel = clockLabel;
-    boundPageUi->statusPill = statusPill;
-    boundPageUi->statusBattery = statusBattery;
-    boundPageUi->statusBatteryTerminal = statusBatteryTerminal;
-    boundPageUi->batteryFill = batteryFill;
-  }
-  // The pill has just been rebuilt with the default outline, so restore the
-  // dock's green if a dock is connected.
   applyDockLinkPillColour();
-  lv_obj_move_foreground(topBar);
+}
+
+// The pill's own layout, split out of ensureStatusPill() so a live toggle of
+// "Show clock" (clockEnabled) can re-lay it out without rebuilding it -
+// renderTopBar() below calls this on every page render, which is what
+// applies the change the moment the setting's own page re-renders itself.
+void repositionStatusPill() {
+  if (!statusPill) return;
+  lv_obj_set_pos(statusPill, clockEnabled ? 138 : 196, 5);
+  lv_obj_set_size(statusPill, clockEnabled ? 96 : 38, 31);
+  if (clockLabel) lv_obj_add_flag(clockLabel, LV_OBJ_FLAG_HIDDEN);
+  if (clockEnabled && clockLabel) lv_obj_clear_flag(clockLabel, LV_OBJ_FLAG_HIDDEN);
+  if (statusBattery) lv_obj_set_pos(statusBattery, clockEnabled ? 61 : 7, 9);
+  if (statusBatteryTerminal) lv_obj_set_pos(statusBatteryTerminal, clockEnabled ? 79 : 25, 12);
+}
+
+void renderTopBar(const char *title, bool allowDevices) {
+  lv_obj_set_style_bg_opa(topBar, LV_OPA_TRANSP, 0);
+  ensureStatusPill();
+  repositionStatusPill();
+
+  int titleX = 8;
+  int titleWidth = clockEnabled ? 126 : 182;
+  // A long title (e.g. "Backup / Restore") at 20pt doesn't fit titleWidth and
+  // was getting cut down to almost nothing by LV_LABEL_LONG_DOT; drop to 16pt
+  // for anything past ~10 characters so it still fits and truncates gracefully.
+  bool longTitle = strlen(title) > 10;
+
+  if (!topBarTitleLabel) {
+    topBarTitleLabel = lv_label_create(topBar);
+    lv_label_set_long_mode(topBarTitleLabel, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_align(topBarTitleLabel, LV_TEXT_ALIGN_LEFT, 0);
+    lv_obj_set_style_text_color(topBarTitleLabel, textPrimary(), 0);
+    lv_obj_set_ext_click_area(topBarTitleLabel, 6);
+    lv_obj_add_event_cb(topBarTitleLabel,
+      [](lv_event_t *e) { if (topBarAllowDevices) showDevicePicker(); }, LV_EVENT_CLICKED, nullptr);
+    topBarDownHint = makeLabel(topBar, LV_SYMBOL_DOWN, 119, 13, &lv_font_montserrat_10, textPrimary());
+    lv_obj_set_style_text_opa(topBarDownHint, LV_OPA_60, 0);
+  }
+  lv_obj_set_pos(topBarTitleLabel, titleX, 9);
+  lv_obj_set_width(topBarTitleLabel, titleWidth);
+  lv_obj_set_style_text_font(topBarTitleLabel,
+    (allowDevices || longTitle) ? &lv_font_montserrat_16 : &lv_font_montserrat_20, 0);
+  topBarAllowDevices = allowDevices;
+  if (allowDevices) {
+    lv_obj_add_flag(topBarTitleLabel, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_PRESS_LOCK);
+  } else {
+    lv_obj_clear_flag(topBarTitleLabel, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_PRESS_LOCK);
+  }
+  if (allowDevices) lv_obj_add_flag(topBarDownHint, LV_OBJ_FLAG_HIDDEN);
+  else lv_obj_clear_flag(topBarDownHint, LV_OBJ_FLAG_HIDDEN);
+
+  if (strcmp(topBarCurrentTitle, title) == 0) {
+    // The same title as before (a data refresh re-rendering the current
+    // page, say) - just make sure it is showing, with no fade to replay.
+    lv_label_set_text(topBarTitleLabel, title);
+    lv_obj_set_style_text_opa(topBarTitleLabel, LV_OPA_COVER, 0);
+  } else {
+    strlcpy(topBarCurrentTitle, title, sizeof(topBarCurrentTitle));
+    animateTopBarTitleChange(title);
+  }
+  // Not raised to the foreground here any more: topBar is now a direct child
+  // of uiRoot, created once right after pageStrip (see its creation), and
+  // that fixed position already keeps it above every page's sliding tiles.
+  // Re-raising it on every render would risk popping it in front of a
+  // later-created overlay - the charging animation, a backup's progress -
+  // that also lives on uiRoot and is meant to cover it.
 }
 
 // ---------------------------------------------------------------------------
@@ -40309,7 +40389,11 @@ void renderCurrentPage() {
   }
   pendingSettingsSlideDirection = 0;
 
-  lv_obj_clean(topBar);
+  // topBar itself is no longer cleaned here: it is a single object shared by
+  // every page (see its creation beside pageDotsBar), and renderTopBar()
+  // updates its title and pill in place rather than being handed an empty
+  // bar to rebuild - that is what keeps the pill genuinely fixed on screen
+  // and lets the title animate instead of flashing empty between pages.
   /*
     Cleared with the page that owned them. These point at objects inside
     content, and lv_obj_clean() has just deleted them - nothing ever reset the
@@ -40374,14 +40458,10 @@ void bindPageUi(uint8_t index) {
   boundPageUi = &pageUi[index];
   screenRoot = boundPageUi->root;
   wallpaper = boundPageUi->wallpaper;
-  topBar = boundPageUi->topBar;
   content = boundPageUi->content;
-  dots = boundPageUi->dots;
-  clockLabel = boundPageUi->clockLabel;
-  statusPill = boundPageUi->statusPill;
-  statusBattery = boundPageUi->statusBattery;
-  statusBatteryTerminal = boundPageUi->statusBatteryTerminal;
-  batteryFill = boundPageUi->batteryFill;
+  // topBar, dots, the status pill and its contents are one object shared by
+  // every page slot now (see their creation beside pageDotsBar) - not
+  // per-slot, so binding a different slot leaves them exactly as they are.
   uiCommandBindings = boundPageUi->commandBindings;
   activitySliderUi = boundPageUi->sliderUi;
 }
@@ -41794,16 +41874,10 @@ void setupUiRoot() {
     lv_obj_set_style_bg_opa(slot.content, LV_OPA_COVER, 0);
     lv_obj_add_flag(slot.content, LV_OBJ_FLAG_SCROLL_CHAIN_HOR);
 
-    slot.topBar = lv_obj_create(slot.root);
-    lv_obj_remove_style_all(slot.topBar);
-    lv_obj_set_pos(slot.topBar, 0, 0);
-    lv_obj_set_size(slot.topBar, LCD_W, 42);
-    lv_obj_set_style_bg_opa(slot.topBar, LV_OPA_TRANSP, 0);
-    lv_obj_clear_flag(slot.topBar, LV_OBJ_FLAG_SCROLLABLE);
-
-    // No per-tile dots: one bar above the strip is shared by every page, so it
-    // stays still while the pages slide (see drawDots()).
-    slot.dots = nullptr;
+    // No per-tile topBar or dots any more: one title/pill bar and one dots
+    // bar are shared by every page (created below, after this loop), so both
+    // stay still while the pages slide beneath them - see renderTopBar() and
+    // drawDots().
   }
 
   // Resolve all tile x positions before the first call to lv_obj_set_tile().
@@ -41813,7 +41887,19 @@ void setupUiRoot() {
 
   // Created after the strip so it draws above the sliding tiles, and on uiRoot
   // rather than lv_layer_top() so the charging and backup overlays still cover
-  // it. Not clickable, so taps pass through to the page underneath.
+  // it. Not clickable itself, so a tap not on the title or the pill (both
+  // clickable children) passes through to the page underneath. Shared by
+  // every page rather than living inside each tile - see renderTopBar() -
+  // which is what keeps the title and the status pill in one fixed place on
+  // screen instead of dragging with a finger-swipe between pages.
+  topBar = lv_obj_create(uiRoot);
+  lv_obj_remove_style_all(topBar);
+  lv_obj_set_pos(topBar, 0, 0);
+  lv_obj_set_size(topBar, LCD_W, 42);
+  lv_obj_set_style_bg_opa(topBar, LV_OPA_TRANSP, 0);
+  lv_obj_clear_flag(topBar, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(topBar, LV_OBJ_FLAG_CLICKABLE);
+
   pageDotsBar = lv_obj_create(uiRoot);
   lv_obj_remove_style_all(pageDotsBar);
   lv_obj_clear_flag(pageDotsBar, LV_OBJ_FLAG_SCROLLABLE);
