@@ -1,6 +1,16 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.83 - 2026-09-20
+    - A duration on a widget keeps its minutes: "15h 22m" rather than a bare
+      "15h" while the Battery page showed 15h 22m at the same moment, which
+      read as the widget disagreeing rather than abbreviating. Past a day it
+      stays two units, "12d 15h", and under an hour "22 min". This is the
+      format WebConfig's preview (compactLiveDuration) already produced, so
+      the device now matches it instead of the other way round. Affects the
+      estimate and time-since-full statistics on both the Battery widget and
+      a custom widget's battery element.
+
   5.82 - 2026-09-20
     - Fixes the title left behind by 5.80. Swiping between already-rendered
       tiles re-binds the page without re-rendering it, which was fine while
@@ -7335,7 +7345,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.82"
+#define OPENREMOTE_VERSION_STRING "5.83"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -35617,14 +35627,20 @@ String formatElapsedCompact(float hours) {
   uint32_t totalMinutes = (uint32_t)roundf(hours * 60.0f);
   char text[16];
   if (totalMinutes < 60U) {
+    // "22 min", the spelling WebConfig's own preview uses for this case.
     snprintf(text, sizeof(text), "%lu min", (unsigned long)totalMinutes);
     return String(text);
   }
-  uint32_t roundedHours = (totalMinutes + 30U) / 60U;
-  if (roundedHours < 24U) {
-    snprintf(text, sizeof(text), "%luh", (unsigned long)roundedHours);
+  if (totalMinutes < 24U * 60U) {
+    // Two units, not one: a bare "15h" threw away the 22 minutes the Battery
+    // page was showing at the same moment, which read as the widget being
+    // wrong rather than shorter.
+    snprintf(text, sizeof(text), "%luh %lum", (unsigned long)(totalMinutes / 60U),
+             (unsigned long)(totalMinutes % 60U));
     return String(text);
   }
+  // Past a day, hours are the useful second unit and minutes are noise.
+  uint32_t roundedHours = (totalMinutes + 30U) / 60U;
   uint32_t days = roundedHours / 24U;
   uint32_t remainingHours = roundedHours % 24U;
   snprintf(text, sizeof(text), "%lud %luh", (unsigned long)days, (unsigned long)remainingHours);
