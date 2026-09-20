@@ -1,6 +1,20 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.81 - 2026-09-20
+    - A battery element showing a chosen statistic no longer runs outside its
+      cell. The two-column and expanded-row cases built the value with a
+      plain makeLabel(), which auto-sizes with no width, so a 20pt
+      "Collecting data" ran clear across the tile; they now use the same
+      smaller, cell-width label the slim cases already did. Every statistic
+      value also scrolls when it is longer than its cell instead of being cut
+      short with dots, the way the media title does.
+    - The estimate statistic is compacted for a widget: "2d 5h" rather than
+      the Battery page's "2 days 5 hours", and "--" rather than "Collecting
+      data" before there is an estimate, matching every other statistic's
+      not-known-yet value. Its caption reads "Until empty", which is both
+      shorter and what WebConfig's own preview has always called it.
+
   5.80 - 2026-09-20
     - The title bar (the page title and the clock/battery pill) is now one
       object shared by every page instead of living inside each page's own
@@ -7309,7 +7323,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.80"
+#define OPENREMOTE_VERSION_STRING "5.81"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -35581,8 +35595,13 @@ void formatBatteryWidgetStatistic(uint8_t stat, char *valueOut, size_t valueSize
       strlcpy(labelOut, "Since full charge", labelSize);
       break;
     case BATTERY_STAT_ESTIMATE:
-      strlcpy(valueOut, batteryEstimateText(metrics).c_str(), valueSize);
-      strlcpy(labelOut, batteryEstimateLabel(metrics), labelSize);
+      // The Battery page's own wording is written for a full-width row:
+      // "2 days 5 hours", or "Collecting data" before there is an estimate.
+      // Neither fits a widget's headline, so this compacts it the way the
+      // since-full statistic above already is ("2d 5h"), and falls back to
+      // the same "--" every other statistic here uses for "not known yet".
+      strlcpy(valueOut, formatElapsedCompact(metrics.estimatedHours).c_str(), valueSize);
+      strlcpy(labelOut, "Until empty", labelSize);
       break;
     default:
       valueOut[0] = '\0';
@@ -37239,6 +37258,24 @@ lv_obj_t *makeWidgetLabel(lv_obj_t *parent, const char *text, int x, int y,
   return label;
 }
 
+/*
+  A chosen battery statistic's value. Two things a plain makeLabel() gets
+  wrong here: with no width it auto-sizes and simply runs outside its cell
+  (a 20pt "Collecting data" ran clear across the tile), and with a width it
+  would be cut short with dots instead. This is bounded to the cell AND
+  scrolls when the text is longer than the space, the same treatment the
+  media title gets in these cells. setWidgetLabelText() only writes when the
+  text actually changes, so the per-second refresh never restarts the scroll.
+*/
+lv_obj_t *makeWidgetStatisticLabel(lv_obj_t *parent, const lv_font_t *font, int width,
+                                   lv_color_t colour,
+                                   lv_text_align_t align = LV_TEXT_ALIGN_CENTER) {
+  lv_obj_t *label = makeWidgetLabel(parent, "--", 0, 0, font, colour, width, align);
+  lv_label_set_long_mode(label, LV_LABEL_LONG_SCROLL_CIRCULAR);
+  lv_obj_set_style_anim_speed(label, 22, 0);
+  return label;
+}
+
 void formatWidgetClock(char *out, size_t size, uint32_t seconds, bool negative) {
   uint32_t hours = seconds / 3600U;
   uint32_t minutes = (seconds / 60U) % 60U;
@@ -37865,10 +37902,19 @@ void buildWidgetBatteryFace(WidgetInstance &instance, lv_obj_t *parent,
   int textX = pad;
   int textWidth = width - pad * 2;
   lv_text_align_t align = LV_TEXT_ALIGN_CENTER;
+  // A statistic is words rather than a two-character percentage, so it takes
+  // a smaller size and scrolls if it is still too long, instead of being cut
+  // short with dots at 48pt.
+  const lv_font_t *headlineFont = singleStat
+    ? (expanded ? &lv_font_montserrat_24 : &lv_font_montserrat_20)
+    : (expanded ? &lv_font_montserrat_48 : &lv_font_montserrat_24);
   instance.primary = makeWidgetLabel(parent, headline, textX,
     expanded ? 118 : cellY + cellHeight + 4,
-    expanded ? &lv_font_montserrat_48 : &lv_font_montserrat_24,
-    textPrimary(), textWidth, align);
+    headlineFont, textPrimary(), textWidth, align);
+  if (singleStat) {
+    lv_label_set_long_mode(instance.primary, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_obj_set_style_anim_speed(instance.primary, 22, 0);
+  }
 
   char meta[48];
   if (singleStat) {
@@ -38200,9 +38246,23 @@ void buildWidgetCell(WidgetInstance &instance, lv_obj_t *cell, uint8_t element,
     if (style == CELL_COLUMN) {
       setFlow(LV_FLEX_FLOW_COLUMN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
       makeWidgetBatteryGlyph(instance, cell, wideColumn ? 46 : 40, wideColumn ? 22 : 19);
-      instance.primary = makeLabel(cell, "--%", 0, 0, percentFont, textPrimary());
-      instance.secondary = makeWidgetLabel(cell, "", 0, 0, &lv_font_montserrat_10,
-        widgetMutedColour(), textWidth, LV_TEXT_ALIGN_CENTER);
+      if (percentage) {
+        instance.primary = makeLabel(cell, "--%", 0, 0, percentFont, textPrimary());
+      } else {
+        // Words, not a two-character percentage: smaller, bounded to the cell
+        // and scrolling if it still does not fit.
+        instance.primary = makeWidgetStatisticLabel(cell,
+          wideColumn ? &lv_font_montserrat_14 : &lv_font_montserrat_12,
+          textWidth, textPrimary());
+      }
+      // A statistic's caption names it ("Estimated until empty"), which is
+      // longer than "Discharging" and was being cut to "Estimated until...",
+      // so it scrolls too rather than being shortened into something vaguer.
+      instance.secondary = percentage
+        ? makeWidgetLabel(cell, "", 0, 0, &lv_font_montserrat_10,
+            widgetMutedColour(), textWidth, LV_TEXT_ALIGN_CENTER)
+        : makeWidgetStatisticLabel(cell, &lv_font_montserrat_10, textWidth,
+            widgetMutedColour());
     } else if (style == CELL_SLIM) {
       if (percentage) {
         setFlow(LV_FLEX_FLOW_ROW, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
@@ -38212,8 +38272,8 @@ void buildWidgetCell(WidgetInstance &instance, lv_obj_t *cell, uint8_t element,
         setFlow(LV_FLEX_FLOW_COLUMN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
         lv_obj_set_style_pad_row(cell, 1, 0);
         makeWidgetBatteryGlyph(instance, cell, 24, 12);
-        instance.primary = makeWidgetLabel(cell, "--%", 0, 0, &lv_font_montserrat_10,
-          textPrimary(), textWidth, LV_TEXT_ALIGN_CENTER);
+        instance.primary = makeWidgetStatisticLabel(cell, &lv_font_montserrat_10,
+          textWidth, textPrimary());
       }
     } else if (style == CELL_SLIM_SINGLE) {
       if (percentage) {
@@ -38226,17 +38286,26 @@ void buildWidgetCell(WidgetInstance &instance, lv_obj_t *cell, uint8_t element,
         setFlow(LV_FLEX_FLOW_COLUMN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
         lv_obj_set_style_pad_row(cell, 2, 0);
         makeWidgetBatteryGlyph(instance, cell, 40, 19);
-        instance.primary = makeWidgetLabel(cell, "--%", 0, 0, &lv_font_montserrat_14,
-          textPrimary(), textWidth, LV_TEXT_ALIGN_CENTER);
+        instance.primary = makeWidgetStatisticLabel(cell, &lv_font_montserrat_14,
+          textWidth, textPrimary());
       }
     } else {
       // An expanded custom row stacks the glyph above the value, matching the
       // library's own expanded battery face.
       setFlow(LV_FLEX_FLOW_COLUMN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
       makeWidgetBatteryGlyph(instance, cell, roomy ? 48 : 36, roomy ? 22 : 16);
-      instance.primary = makeLabel(cell, "--%", 0, 0, percentFont, textPrimary());
-      instance.secondary = makeWidgetLabel(cell, "", 0, 0, &lv_font_montserrat_12,
-        widgetMutedColour(), textWidth, LV_TEXT_ALIGN_CENTER);
+      if (percentage) {
+        instance.primary = makeLabel(cell, "--%", 0, 0, percentFont, textPrimary());
+      } else {
+        instance.primary = makeWidgetStatisticLabel(cell,
+          roomy ? &lv_font_montserrat_16 : &lv_font_montserrat_14,
+          textWidth, textPrimary());
+      }
+      instance.secondary = percentage
+        ? makeWidgetLabel(cell, "", 0, 0, &lv_font_montserrat_12,
+            widgetMutedColour(), textWidth, LV_TEXT_ALIGN_CENTER)
+        : makeWidgetStatisticLabel(cell, &lv_font_montserrat_12, textWidth,
+            widgetMutedColour());
     }
     return;
   }
