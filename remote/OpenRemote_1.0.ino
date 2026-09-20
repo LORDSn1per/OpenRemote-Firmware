@@ -1,6 +1,18 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.82 - 2026-09-20
+    - Fixes the title left behind by 5.80. Swiping between already-rendered
+      tiles re-binds the page without re-rendering it, which was fine while
+      every tile carried its own title bar, but 5.80 made the bar shared: the
+      name then stayed on whatever page last rendered, so starting an
+      activity and swiping back to the home screen still read "Chromecast".
+      Each slot now remembers the title it rendered, and a swipe applies the
+      newly visible slot's own name.
+    - A changed title slides instead of fading: the old name leaves the way
+      the pages are travelling and the new one slides in behind it, from the
+      side the page came from, the way the dots move.
+
   5.81 - 2026-09-20
     - A battery element showing a chosen statistic no longer runs outside its
       cell. The two-column and expanded-row cases built the value with a
@@ -7323,7 +7335,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.81"
+#define OPENREMOTE_VERSION_STRING "5.82"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -10534,6 +10546,13 @@ struct PageUi {
   // No topBar, dots, statusPill or its contents here any more - they are one
   // object each, shared by every slot (see their creation beside pageDotsBar
   // and renderTopBar()), not per-tile state.
+  //
+  // The title each slot last rendered, though, is still per-slot. A swipe
+  // between already-rendered tiles does not re-render anything, so the one
+  // shared bar has to be told which name to show; before 5.80 each tile
+  // simply carried its own bar and its own title with it.
+  char title[40] = "";
+  bool allowDevices = false;
   uint16_t *wallpaperPixels = nullptr;
   lv_img_dsc_t wallpaperDescriptor = {};
   char themePath[72] = "";
@@ -32111,40 +32130,81 @@ lv_obj_t *topBarDownHint = nullptr;
 bool topBarAllowDevices = false;
 char topBarCurrentTitle[40] = "";
 char topBarPendingTitle[40] = "";
+// Which side the incoming title arrives from: +1 from the right (the page
+// strip moved forwards), -1 from the left. Set from the swipe that caused
+// the change, so the name travels the same way the pages and dots do.
+int8_t topBarTitleSlideDirection = 1;
+static const int32_t TOP_BAR_TITLE_SLIDE = 18;
 
 void topBarTitleOpacityExec(void *target, int32_t value) {
   lv_obj_t *label = static_cast<lv_obj_t *>(target);
   if (label && lv_obj_is_valid(label)) lv_obj_set_style_text_opa(label, (lv_opa_t)value, 0);
 }
 
-void topBarTitleFadeOutReady(lv_anim_t *animation) {
+void topBarTitleTranslateExec(void *target, int32_t value) {
+  lv_obj_t *label = static_cast<lv_obj_t *>(target);
+  if (label && lv_obj_is_valid(label)) lv_obj_set_style_translate_x(label, value, 0);
+}
+
+// Second half of the change: the new name is set while it is off to one side
+// and invisible, then travels back to rest as it fades up.
+void topBarTitleSlideOutReady(lv_anim_t *animation) {
   (void)animation;
   if (!topBarTitleLabel || !lv_obj_is_valid(topBarTitleLabel)) return;
   lv_label_set_text(topBarTitleLabel, topBarPendingTitle);
+  int32_t from = topBarTitleSlideDirection >= 0 ? TOP_BAR_TITLE_SLIDE : -TOP_BAR_TITLE_SLIDE;
+  lv_obj_set_style_translate_x(topBarTitleLabel, from, 0);
+
+  lv_anim_t slideIn;
+  lv_anim_init(&slideIn);
+  lv_anim_set_var(&slideIn, topBarTitleLabel);
+  lv_anim_set_exec_cb(&slideIn, topBarTitleTranslateExec);
+  lv_anim_set_values(&slideIn, from, 0);
+  lv_anim_set_time(&slideIn, 170);
+  lv_anim_set_path_cb(&slideIn, lv_anim_path_ease_out);
+  lv_anim_start(&slideIn);
+
   lv_anim_t fadeIn;
   lv_anim_init(&fadeIn);
   lv_anim_set_var(&fadeIn, topBarTitleLabel);
   lv_anim_set_exec_cb(&fadeIn, topBarTitleOpacityExec);
   lv_anim_set_values(&fadeIn, 0, 255);
-  lv_anim_set_time(&fadeIn, 140);
+  lv_anim_set_time(&fadeIn, 170);
   lv_anim_set_path_cb(&fadeIn, lv_anim_path_ease_out);
   lv_anim_start(&fadeIn);
 }
 
-// Swaps the title's text once fully faded, rather than jumping straight from
-// one name to the next - "Activities" to "Fetch TV" reads as a change, not a
-// glitch. Only the text fades; the bar and the pill beside it never move.
+/*
+  The title slides out the way the pages are going and the new one slides in
+  behind it, rather than the text jumping from one name to the next. Starting
+  values are read back from the label so a second change part-way through the
+  first continues from where it actually is instead of snapping to rest.
+*/
 void animateTopBarTitleChange(const char *title) {
   strlcpy(topBarPendingTitle, title, sizeof(topBarPendingTitle));
   lv_anim_del(topBarTitleLabel, topBarTitleOpacityExec);
+  lv_anim_del(topBarTitleLabel, topBarTitleTranslateExec);
+  int32_t fromX = lv_obj_get_style_translate_x(topBarTitleLabel, 0);
+  int32_t fromOpa = (int32_t)lv_obj_get_style_text_opa(topBarTitleLabel, 0);
+  int32_t toX = topBarTitleSlideDirection >= 0 ? -TOP_BAR_TITLE_SLIDE : TOP_BAR_TITLE_SLIDE;
+
+  lv_anim_t slideOut;
+  lv_anim_init(&slideOut);
+  lv_anim_set_var(&slideOut, topBarTitleLabel);
+  lv_anim_set_exec_cb(&slideOut, topBarTitleTranslateExec);
+  lv_anim_set_values(&slideOut, fromX, toX);
+  lv_anim_set_time(&slideOut, 110);
+  lv_anim_set_path_cb(&slideOut, lv_anim_path_ease_in);
+  lv_anim_set_ready_cb(&slideOut, topBarTitleSlideOutReady);
+  lv_anim_start(&slideOut);
+
   lv_anim_t fadeOut;
   lv_anim_init(&fadeOut);
   lv_anim_set_var(&fadeOut, topBarTitleLabel);
   lv_anim_set_exec_cb(&fadeOut, topBarTitleOpacityExec);
-  lv_anim_set_values(&fadeOut, 255, 0);
-  lv_anim_set_time(&fadeOut, 120);
+  lv_anim_set_values(&fadeOut, fromOpa, 0);
+  lv_anim_set_time(&fadeOut, 110);
   lv_anim_set_path_cb(&fadeOut, lv_anim_path_ease_in);
-  lv_anim_set_ready_cb(&fadeOut, topBarTitleFadeOutReady);
   lv_anim_start(&fadeOut);
 }
 
@@ -32220,11 +32280,13 @@ void repositionStatusPill() {
   if (statusBatteryTerminal) lv_obj_set_pos(statusBatteryTerminal, clockEnabled ? 79 : 25, 12);
 }
 
-void renderTopBar(const char *title, bool allowDevices) {
-  lv_obj_set_style_bg_opa(topBar, LV_OPA_TRANSP, 0);
-  ensureStatusPill();
-  repositionStatusPill();
-
+/*
+  Puts one name on the shared bar. Split out of renderTopBar() because a
+  swipe between already-rendered tiles changes which page is visible without
+  re-rendering anything, and the bar still has to follow - see
+  applyTopBarForBoundPage() below.
+*/
+void setTopBarTitle(const char *title, bool allowDevices) {
   int titleX = 8;
   int titleWidth = clockEnabled ? 126 : 182;
   // A long title (e.g. "Backup / Restore") at 20pt doesn't fit titleWidth and
@@ -32258,12 +32320,26 @@ void renderTopBar(const char *title, bool allowDevices) {
 
   if (strcmp(topBarCurrentTitle, title) == 0) {
     // The same title as before (a data refresh re-rendering the current
-    // page, say) - just make sure it is showing, with no fade to replay.
+    // page, say) - just make sure it is showing, with no slide to replay.
     lv_label_set_text(topBarTitleLabel, title);
     lv_obj_set_style_text_opa(topBarTitleLabel, LV_OPA_COVER, 0);
+    lv_obj_set_style_translate_x(topBarTitleLabel, 0, 0);
   } else {
     strlcpy(topBarCurrentTitle, title, sizeof(topBarCurrentTitle));
     animateTopBarTitleChange(title);
+  }
+}
+
+void renderTopBar(const char *title, bool allowDevices) {
+  lv_obj_set_style_bg_opa(topBar, LV_OPA_TRANSP, 0);
+  ensureStatusPill();
+  repositionStatusPill();
+  setTopBarTitle(title, allowDevices);
+  // Remembered per slot: a later swipe onto this tile re-applies this name
+  // without rendering the page again.
+  if (boundPageUi) {
+    strlcpy(boundPageUi->title, title, sizeof(boundPageUi->title));
+    boundPageUi->allowDevices = allowDevices;
   }
   // Not raised to the foreground here any more: topBar is now a direct child
   // of uiRoot, created once right after pageStrip (see its creation), and
@@ -32271,6 +32347,13 @@ void renderTopBar(const char *title, bool allowDevices) {
   // Re-raising it on every render would risk popping it in front of a
   // later-created overlay - the charging animation, a backup's progress -
   // that also lives on uiRoot and is meant to cover it.
+}
+
+// Shows whatever the currently bound slot last rendered as its title. Used by
+// the swipe path, which rebinds without re-rendering.
+void applyTopBarForBoundPage() {
+  if (!boundPageUi || !boundPageUi->title[0]) return;
+  setTopBarTitle(boundPageUi->title, boundPageUi->allowDevices);
 }
 
 // ---------------------------------------------------------------------------
@@ -40656,6 +40739,16 @@ void servicePageStripChange() {
     }
     currentPage = target;
     bindPageUi(currentPage);
+    /*
+      Nothing re-renders on this path - the destination tile was drawn long
+      ago and the swipe simply revealed it. Before 5.80 that was enough,
+      because each tile carried its own title bar; with one shared bar the
+      name has to be moved here or it keeps the last rendered page's title
+      (starting an activity, then swiping home, left "Chromecast" showing).
+      It arrives from the side the new page came from.
+    */
+    topBarTitleSlideDirection = target >= previous ? 1 : -1;
+    applyTopBarForBoundPage();
     configurePageStripDirections();
     drawDots();   // the new page may show or hide the bar
   }
