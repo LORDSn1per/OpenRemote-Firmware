@@ -1,6 +1,17 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.84 - 2026-09-28
+    - Added the 26 keyboard letters to the Chromecast device as assignable
+      commands, "Keyboard a" to "Keyboard z" (HID usages 0x04-0x1D on the
+      existing keyboard report, no modifier, so Android types the lowercase
+      letter). They can be put on a tile or bound to a physical button.
+    - A preset now says whether it also belongs on the Chromecast page.
+      Every preset before this one did, and still does; the letters do not,
+      because ensureBluetoothRuntimeDevice() adds a page button for any
+      preset the page is missing and would otherwise have dropped 26 new
+      tiles onto an existing remote at its next boot.
+
   5.83 - 2026-09-20
     - A duration on a widget keeps its minutes: "15h 22m" rather than a bare
       "15h" while the Battery page showed 15h 22m at the same moment, which
@@ -7345,7 +7356,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.83"
+#define OPENREMOTE_VERSION_STRING "5.84"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -7737,38 +7748,72 @@ struct BluetoothPresetCommand {
   const char *report;
   uint16_t usage;
   const char *iconPath;
+  // Every preset becomes a command on the Chromecast device, but only the
+  // ones marked here are also placed as buttons on its page. The 26 letter
+  // keys are assignable and stay off the page; 26 tiles nobody asked for
+  // would be added to an existing remote on its next boot.
+  bool defaultTile;
 };
 
 static const BluetoothPresetCommand CHROMECAST_COMMANDS[] = {
-  {"ble_home", "Home", "consumer", 0x0223, "/icons/Default/home.png"},
-  {"ble_back", "Back", "consumer", 0x0224, "/icons/Default/back.png"},
-  {"ble_up", "Up", "consumer", 0x0042, "/icons/Default/up.png"},
-  {"ble_down", "Down", "consumer", 0x0043, "/icons/Default/down.png"},
-  {"ble_left", "Left", "consumer", 0x0044, "/icons/Default/left.png"},
-  {"ble_right", "Right", "consumer", 0x0045, "/icons/Default/right.png"},
-  {"ble_ok", "OK", "consumer", 0x0041, "/icons/Default/ok_select.png"},
-  {"ble_play_pause", "Play / Pause", "consumer", 0x00CD, "/icons/Default/play.png"},
-  {"ble_stop", "Stop", "consumer", 0x00B7, "/icons/Default/stop.png"},
-  {"ble_rewind", "Rewind", "consumer", 0x00B4, "/icons/Default/rewind.png"},
-  {"ble_fast_forward", "Fast Forward", "consumer", 0x00B3, "/icons/Default/fast_forward.png"},
-  {"ble_previous", "Previous", "consumer", 0x00B6, "/icons/Default/skip_previous.png"},
-  {"ble_next", "Next", "consumer", 0x00B5, "/icons/Default/skip_next.png"},
-  {"ble_volume_up", "Volume Up", "consumer", 0x00E9, "/icons/Default/volume_up.png"},
-  {"ble_volume_down", "Volume Down", "consumer", 0x00EA, "/icons/Default/volume_down.png"},
-  {"ble_mute", "Mute", "consumer", 0x00E2, "/icons/Default/mute.png"},
-  {"ble_power", "Power", "consumer", 0x0030, "/icons/Default/power.png"},
-  {"ble_key_0", "Keyboard 0", "keyboard", 0x0027, "/icons/Default/number_0.png"},
-  {"ble_key_1", "Keyboard 1", "keyboard", 0x001E, "/icons/Default/number_1.png"},
-  {"ble_key_2", "Keyboard 2", "keyboard", 0x001F, "/icons/Default/number_2.png"},
-  {"ble_key_3", "Keyboard 3", "keyboard", 0x0020, "/icons/Default/number_3.png"},
-  {"ble_key_4", "Keyboard 4", "keyboard", 0x0021, "/icons/Default/number_4.png"},
-  {"ble_key_5", "Keyboard 5", "keyboard", 0x0022, "/icons/Default/number_5.png"},
-  {"ble_key_6", "Keyboard 6", "keyboard", 0x0023, "/icons/Default/number_6.png"},
-  {"ble_key_7", "Keyboard 7", "keyboard", 0x0024, "/icons/Default/number_7.png"},
-  {"ble_key_8", "Keyboard 8", "keyboard", 0x0025, "/icons/Default/number_8.png"},
-  {"ble_key_9", "Keyboard 9", "keyboard", 0x0026, "/icons/Default/number_9.png"},
+  {"ble_home", "Home", "consumer", 0x0223, "/icons/Default/home.png", true},
+  {"ble_back", "Back", "consumer", 0x0224, "/icons/Default/back.png", true},
+  {"ble_up", "Up", "consumer", 0x0042, "/icons/Default/up.png", true},
+  {"ble_down", "Down", "consumer", 0x0043, "/icons/Default/down.png", true},
+  {"ble_left", "Left", "consumer", 0x0044, "/icons/Default/left.png", true},
+  {"ble_right", "Right", "consumer", 0x0045, "/icons/Default/right.png", true},
+  {"ble_ok", "OK", "consumer", 0x0041, "/icons/Default/ok_select.png", true},
+  {"ble_play_pause", "Play / Pause", "consumer", 0x00CD, "/icons/Default/play.png", true},
+  {"ble_stop", "Stop", "consumer", 0x00B7, "/icons/Default/stop.png", true},
+  {"ble_rewind", "Rewind", "consumer", 0x00B4, "/icons/Default/rewind.png", true},
+  {"ble_fast_forward", "Fast Forward", "consumer", 0x00B3, "/icons/Default/fast_forward.png", true},
+  {"ble_previous", "Previous", "consumer", 0x00B6, "/icons/Default/skip_previous.png", true},
+  {"ble_next", "Next", "consumer", 0x00B5, "/icons/Default/skip_next.png", true},
+  {"ble_volume_up", "Volume Up", "consumer", 0x00E9, "/icons/Default/volume_up.png", true},
+  {"ble_volume_down", "Volume Down", "consumer", 0x00EA, "/icons/Default/volume_down.png", true},
+  {"ble_mute", "Mute", "consumer", 0x00E2, "/icons/Default/mute.png", true},
+  {"ble_power", "Power", "consumer", 0x0030, "/icons/Default/power.png", true},
+  {"ble_key_0", "Keyboard 0", "keyboard", 0x0027, "/icons/Default/number_0.png", true},
+  {"ble_key_1", "Keyboard 1", "keyboard", 0x001E, "/icons/Default/number_1.png", true},
+  {"ble_key_2", "Keyboard 2", "keyboard", 0x001F, "/icons/Default/number_2.png", true},
+  {"ble_key_3", "Keyboard 3", "keyboard", 0x0020, "/icons/Default/number_3.png", true},
+  {"ble_key_4", "Keyboard 4", "keyboard", 0x0021, "/icons/Default/number_4.png", true},
+  {"ble_key_5", "Keyboard 5", "keyboard", 0x0022, "/icons/Default/number_5.png", true},
+  {"ble_key_6", "Keyboard 6", "keyboard", 0x0023, "/icons/Default/number_6.png", true},
+  {"ble_key_7", "Keyboard 7", "keyboard", 0x0024, "/icons/Default/number_7.png", true},
+  {"ble_key_8", "Keyboard 8", "keyboard", 0x0025, "/icons/Default/number_8.png", true},
+  {"ble_key_9", "Keyboard 9", "keyboard", 0x0026, "/icons/Default/number_9.png", true},
   {"ble_voice_search", "Voice Search", "consumer", 0x0221,
-   "/icons/Default/microphone_voice.png"}
+   "/icons/Default/microphone_voice.png", true},
+  // Keyboard letters, HID usage 0x04-0x1D, sent with no modifier - the same
+  // plain key a keyboard sends unshifted, so Android types a lowercase
+  // letter. Assignable to a tile or a physical button; never auto-placed.
+  {"ble_key_a", "Keyboard a", "keyboard", 0x0004, "", false},
+  {"ble_key_b", "Keyboard b", "keyboard", 0x0005, "", false},
+  {"ble_key_c", "Keyboard c", "keyboard", 0x0006, "", false},
+  {"ble_key_d", "Keyboard d", "keyboard", 0x0007, "", false},
+  {"ble_key_e", "Keyboard e", "keyboard", 0x0008, "", false},
+  {"ble_key_f", "Keyboard f", "keyboard", 0x0009, "", false},
+  {"ble_key_g", "Keyboard g", "keyboard", 0x000A, "", false},
+  {"ble_key_h", "Keyboard h", "keyboard", 0x000B, "", false},
+  {"ble_key_i", "Keyboard i", "keyboard", 0x000C, "", false},
+  {"ble_key_j", "Keyboard j", "keyboard", 0x000D, "", false},
+  {"ble_key_k", "Keyboard k", "keyboard", 0x000E, "", false},
+  {"ble_key_l", "Keyboard l", "keyboard", 0x000F, "", false},
+  {"ble_key_m", "Keyboard m", "keyboard", 0x0010, "", false},
+  {"ble_key_n", "Keyboard n", "keyboard", 0x0011, "", false},
+  {"ble_key_o", "Keyboard o", "keyboard", 0x0012, "", false},
+  {"ble_key_p", "Keyboard p", "keyboard", 0x0013, "", false},
+  {"ble_key_q", "Keyboard q", "keyboard", 0x0014, "", false},
+  {"ble_key_r", "Keyboard r", "keyboard", 0x0015, "", false},
+  {"ble_key_s", "Keyboard s", "keyboard", 0x0016, "", false},
+  {"ble_key_t", "Keyboard t", "keyboard", 0x0017, "", false},
+  {"ble_key_u", "Keyboard u", "keyboard", 0x0018, "", false},
+  {"ble_key_v", "Keyboard v", "keyboard", 0x0019, "", false},
+  {"ble_key_w", "Keyboard w", "keyboard", 0x001A, "", false},
+  {"ble_key_x", "Keyboard x", "keyboard", 0x001B, "", false},
+  {"ble_key_y", "Keyboard y", "keyboard", 0x001C, "", false},
+  {"ble_key_z", "Keyboard z", "keyboard", 0x001D, "", false}
 };
 static const uint8_t CHROMECAST_COMMAND_COUNT =
   sizeof(CHROMECAST_COMMANDS) / sizeof(CHROMECAST_COMMANDS[0]);
@@ -19763,6 +19808,7 @@ bool ensureBluetoothRuntimeDevice() {
   JsonArray itemList = devicePage["items"].as<JsonArray>();
   if (itemList.isNull()) itemList = devicePage["items"].to<JsonArray>();
   for (uint8_t i = 0; i < CHROMECAST_COMMAND_COUNT; i++) {
+    if (!CHROMECAST_COMMANDS[i].defaultTile) continue;
     bool found = false;
     for (JsonObjectConst item : itemList) {
       if (strcmp(item["commandId"] | "", commandIds[i].c_str()) == 0) {
