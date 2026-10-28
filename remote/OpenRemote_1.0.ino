@@ -1,6 +1,24 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.91 - 2026-10-28
+    - Page swipes slide pictures of the pages instead of the live pages. 5.90
+      measured a full-screen frame mid-swipe at 45-82 ms (7-12 fps): every
+      pixel of the wallpaper, the translucent cards and their rounded corners
+      was redrawn each frame, and RGB565 or calibration off made no visible
+      difference. Each page slot now keeps a snapshot (240x320 RGB565, 150 KB
+      of PSRAM, four at most). When the strip starts scrolling, slots with a
+      current snapshot show it and hide their live content, so a frame is
+      mostly a copy; when the scroll ends the live pages come straight back,
+      so every button works as before.
+    - Snapshots are retaken in the background, one per loop pass, once the
+      screen has been still for 250 ms: the visible page when anything on it
+      is redrawn (spotted through the display driver's rounder_cb, which LVGL
+      calls for every invalidated area), every page after a re-render, a live
+      tile refresh or a wake, and the neighbouring pages every 20 s for
+      changes made off screen. A page without a current snapshot still
+      slides live, exactly as before.
+
   5.90 - 2026-10-28  (swipe diagnostic)
     - 5.89 measured on hardware: page swipes ran at 4-21 fps, nowhere near
       the new 66 fps cap, and hesitated mid-swipe. The screen redraws only
@@ -7468,7 +7486,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.90"
+#define OPENREMOTE_VERSION_STRING "5.91"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -10770,6 +10788,28 @@ struct PageUi {
 
 static const uint8_t PAGE_SLOT_COUNT = 4;
 PageUi pageUi[PAGE_SLOT_COUNT];
+
+/*
+  Pre-rendered pictures of the page slots, slid during a swipe (5.91). A
+  swipe moves every pixel, and drawing the live pages took 45-82 ms a frame;
+  a snapshot is one opaque image, drawn as a copy.
+*/
+struct PageSnapshot {
+  uint16_t *pixels = nullptr;
+  lv_img_dsc_t dsc = {};
+  lv_obj_t *img = nullptr;
+  bool valid = false;
+  uint32_t takenMs = 0;
+};
+PageSnapshot pageSnapshots[PAGE_SLOT_COUNT];
+bool pageSnapshotsShown = false;
+// Set while the firmware itself is swapping snapshots and live pages, so the
+// redraw that causes is not mistaken for the page changing.
+bool pageSnapshotsSwapping = false;
+uint32_t pageSnapshotLastChangeMs = 0;
+static const uint32_t PAGE_SNAPSHOT_SETTLE_MS = 250;
+static const uint32_t PAGE_SNAPSHOT_NEIGHBOUR_MAX_AGE_MS = 20000;
+void pageSnapshotsInvalidateAll();
 PageUi *boundPageUi = nullptr;
 lv_obj_t *uiRoot = nullptr;
 lv_obj_t *pageStrip = nullptr;
@@ -32549,6 +32589,7 @@ void clearModalObjects() {
 // ---------------------------------------------------------------------------
 
 void rebuildPages() {
+  pageSnapshotsInvalidateAll();
   pages[0] = {PAGE_REMOTE_SETTINGS, "Settings"};
   pages[1] = {PAGE_ACTIVITIES, "Activities"};
   pageCount = 2;
@@ -32593,6 +32634,122 @@ void positionPageDotsActive() {
 void pageStripScrollEvent(lv_event_t *e) {
   (void)e;
   positionPageDotsActive();
+}
+
+void pageSnapshotsInvalidateAll() {
+  for (uint8_t i = 0; i < PAGE_SLOT_COUNT; i++) pageSnapshots[i].valid = false;
+  pageSnapshotLastChangeMs = millis();
+}
+
+// Shows the snapshots (true) or the live pages (false). A slot without a
+// current snapshot stays live either way.
+void showPageSnapshots(bool show) {
+  if (show == pageSnapshotsShown) return;
+  pageSnapshotsSwapping = true;
+  for (uint8_t i = 0; i < PAGE_SLOT_COUNT; i++) {
+    PageSnapshot &snapshot = pageSnapshots[i];
+    PageUi &slot = pageUi[i];
+    if (!snapshot.img || !slot.root) continue;
+    bool useSnapshot = show && snapshot.valid && i < pageCount;
+    if (useSnapshot) {
+      lv_obj_clear_flag(snapshot.img, LV_OBJ_FLAG_HIDDEN);
+      lv_obj_add_flag(slot.root, LV_OBJ_FLAG_HIDDEN);
+    } else {
+      lv_obj_add_flag(snapshot.img, LV_OBJ_FLAG_HIDDEN);
+      lv_obj_clear_flag(slot.root, LV_OBJ_FLAG_HIDDEN);
+    }
+  }
+  pageSnapshotsShown = show;
+  pageSnapshotsSwapping = false;
+}
+
+void pageStripSnapshotEvent(lv_event_t *e) {
+  lv_event_code_t code = lv_event_get_code(e);
+  if (code == LV_EVENT_SCROLL_BEGIN && !pageStripRendering) showPageSnapshots(true);
+  else if (code == LV_EVENT_SCROLL_END) showPageSnapshots(false);
+}
+
+/*
+  LVGL calls the display driver's rounder_cb for every area it invalidates,
+  which makes it a cheap way to learn that the visible page changed. The area
+  is left exactly as it is. The title bar and the page dots draw above the
+  pages and are not part of any snapshot, so changes confined to them (the
+  clock, the dot sliding) do not count.
+*/
+void lvInvalidateObserver(lv_disp_drv_t *drv, lv_area_t *area) {
+  (void)drv;
+  if (pageSnapshotsSwapping || pageSnapshotsShown || !pageStrip ||
+      lv_obj_is_scrolling(pageStrip)) return;
+  // Also skips LVGL's own probe calls: its row-height check passes a scratch
+  // area at (0,0) one draw buffer (32 rows) tall, which is not an
+  // invalidation at all.
+  if (area->y2 < 42) return;
+  if (pageDotsBar && !lv_obj_has_flag(pageDotsBar, LV_OBJ_FLAG_HIDDEN)) {
+    lv_area_t dots;
+    lv_obj_get_coords(pageDotsBar, &dots);
+    if (_lv_area_is_in(area, &dots, 0)) return;
+  }
+  if (currentPage < PAGE_SLOT_COUNT) pageSnapshots[currentPage].valid = false;
+  pageSnapshotLastChangeMs = millis();
+}
+
+bool takePageSnapshot(uint8_t index) {
+  PageSnapshot &snapshot = pageSnapshots[index];
+  PageUi &slot = pageUi[index];
+  if (!slot.root || !snapshot.img) return false;
+  uint32_t bytes = lv_snapshot_buf_size_needed(slot.root, LV_IMG_CF_TRUE_COLOR);
+  if (bytes != (uint32_t)LCD_W * LCD_H * sizeof(uint16_t)) return false;
+  if (!snapshot.pixels) {
+    snapshot.pixels = static_cast<uint16_t *>(ps_malloc(bytes));
+    if (!snapshot.pixels) return false;
+  }
+  pageSnapshotsSwapping = true;
+  lv_res_t res = lv_snapshot_take_to_buf(slot.root, LV_IMG_CF_TRUE_COLOR,
+                                         &snapshot.dsc, snapshot.pixels, bytes);
+  if (res == LV_RES_OK) {
+    // Same descriptor, new pixels: make LVGL forget anything it cached.
+    lv_img_cache_invalidate_src(&snapshot.dsc);
+    lv_img_set_src(snapshot.img, &snapshot.dsc);
+  }
+  pageSnapshotsSwapping = false;
+  snapshot.valid = res == LV_RES_OK;
+  snapshot.takenMs = millis();
+  return snapshot.valid;
+}
+
+/*
+  Retakes one snapshot per call while the screen is still: the visible page
+  first, then its neighbours when stale or older than
+  PAGE_SNAPSHOT_NEIGHBOUR_MAX_AGE_MS (they can change off screen, where no
+  invalidation is reported). One per pass keeps a touch from waiting on more
+  than a single page render (~60 ms).
+*/
+void servicePageSnapshots(uint32_t now) {
+  // Safety net: the live pages must come back even if LV_EVENT_SCROLL_END
+  // never arrives, or nothing on them could be pressed.
+  static uint32_t shownStillSinceMs = 0;
+  if (pageSnapshotsShown && pageStrip && !lv_obj_is_scrolling(pageStrip)) {
+    if (!shownStillSinceMs) shownStillSinceMs = now;
+    else if ((uint32_t)(now - shownStillSinceMs) >= 300UL) showPageSnapshots(false);
+  } else {
+    shownStillSinceMs = 0;
+  }
+  if (displaySleeping || pageSnapshotsShown || pageStripRendering || !pageStrip) return;
+  if (touchWasDown || lvTouchDown || pageStripChangePending ||
+      lv_obj_is_scrolling(pageStrip)) return;
+  if ((uint32_t)(now - pageSnapshotLastChangeMs) < PAGE_SNAPSHOT_SETTLE_MS) return;
+  if (currentPage >= pageCount) return;
+  int order[3] = {currentPage, currentPage - 1, currentPage + 1};
+  for (int k = 0; k < 3; k++) {
+    int i = order[k];
+    if (i < 0 || i >= pageCount || i >= PAGE_SLOT_COUNT) continue;
+    PageSnapshot &snapshot = pageSnapshots[i];
+    bool stale = !snapshot.valid ||
+      (k > 0 && (uint32_t)(now - snapshot.takenMs) > PAGE_SNAPSHOT_NEIGHBOUR_MAX_AGE_MS);
+    if (!stale) continue;
+    takePageSnapshot((uint8_t)i);
+    return;
+  }
 }
 
 void drawDots() {
@@ -37865,6 +38022,7 @@ void applyLiveTileState(const LiveTileBinding &binding) {
 }
 
 void refreshLiveTiles() {
+  pageSnapshotsInvalidateAll();
   for (uint8_t i = 0; i < liveTileBindingCount; i++) applyLiveTileState(liveTileBindings[i]);
 }
 
@@ -41396,6 +41554,7 @@ void endUiMutation() {
 }
 
 void renderCurrentPage() {
+  pageSnapshotsInvalidateAll();
   beginUiMutation();
   if (!boundPageUi) bindPageUi(currentPage);
   clearModalObjects();
@@ -41516,6 +41675,7 @@ void configurePageStripDirections() {
 }
 
 void renderAllPageSlots() {
+  pageSnapshotsInvalidateAll();
   if (!pageStrip || pageStripRendering) return;
   beginUiMutation();
   uint8_t active = min(currentPage, (uint8_t)(pageCount - 1));
@@ -42811,6 +42971,7 @@ void enterDisplaySleep() {
 }
 
 void wakeDisplay() {
+  pageSnapshotsInvalidateAll();
   Serial.println("Movement wake");
   // Clear this before applyBluetoothState() runs later in this function -
   // with it still set, bluetoothActivitySessionRequired() would keep
@@ -42895,6 +43056,7 @@ void setupLvgl() {
   dispDrv.ver_res = LCD_H;
   dispDrv.flush_cb = lvFlush;
   dispDrv.monitor_cb = lvMonitor;
+  dispDrv.rounder_cb = lvInvalidateObserver;
   dispDrv.draw_buf = &drawBuf;
   dispDrv.full_refresh = 0;
   lv_disp_drv_register(&dispDrv);
@@ -42974,6 +43136,13 @@ void setupUiRoot() {
     lv_obj_set_style_bg_opa(slot.content, LV_OPA_COVER, 0);
     lv_obj_add_flag(slot.content, LV_OBJ_FLAG_SCROLL_CHAIN_HOR);
 
+    // Above root, so it covers the live page while a swipe shows it.
+    PageSnapshot &snapshot = pageSnapshots[i];
+    snapshot.img = lv_img_create(slot.tile);
+    lv_obj_set_pos(snapshot.img, 0, 0);
+    lv_obj_clear_flag(snapshot.img, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(snapshot.img, LV_OBJ_FLAG_HIDDEN);
+
     // No per-tile topBar or dots any more: one title/pill bar and one dots
     // bar are shared by every page (created below, after this loop), so both
     // stay still while the pages slide beneath them - see renderTopBar() and
@@ -43006,6 +43175,8 @@ void setupUiRoot() {
   lv_obj_clear_flag(pageDotsBar, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_add_flag(pageDotsBar, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_event_cb(pageStrip, pageStripScrollEvent, LV_EVENT_SCROLL, nullptr);
+  lv_obj_add_event_cb(pageStrip, pageStripSnapshotEvent, LV_EVENT_SCROLL_BEGIN, nullptr);
+  lv_obj_add_event_cb(pageStrip, pageStripSnapshotEvent, LV_EVENT_SCROLL_END, nullptr);
 
   bindPageUi(0);
 
@@ -43383,6 +43554,7 @@ void loop() {
     LOOP_TIMED("servicePageStripChange", servicePageStripChange());
     LOOP_TIMED("serviceRemoteIdentify", serviceRemoteIdentify(now));
     LOOP_TIMED("serviceFrameRateLog", serviceFrameRateLog(millis()));
+    LOOP_TIMED("servicePageSnapshots", servicePageSnapshots(millis()));
   }
 
   if (dnsServerStarted) dnsServer.processNextRequest();
