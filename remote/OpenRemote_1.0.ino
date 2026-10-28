@@ -1,6 +1,20 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.85 - 2026-10-28
+    - The Battery widget's "Until empty" estimate no longer learns time spent
+      on the charger. Rev 6 cannot see USB power, so after the TP4056 finished
+      a charge the slow drain on the cable looked like an unplug, and the
+      charger's top-up at about 4.05 V looked like a plug-in: hours on the
+      charger were saved as very light use and the estimate read days too
+      long. A discharge segment that starts above 3.97 V is now provisional.
+      Charging again before the battery falls below 3.97 V throws it away;
+      falling below 3.97 V (which the charger never lets happen) confirms it
+      and it then counts in full from where it started. A provisional segment
+      is left out of the live estimate.
+    - The learned discharge average is reset once on the first 5.85 boot,
+      because what earlier firmware learned includes that charger time.
+
   5.84 - 2026-09-28
     - Added the 26 keyboard letters to the Chromecast device as assignable
       commands, "Keyboard a" to "Keyboard z" (HID usages 0x04-0x1D on the
@@ -7356,7 +7370,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.84"
+#define OPENREMOTE_VERSION_STRING "5.85"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -10433,6 +10447,10 @@ float batteryDischargeHoursTotal = 0.0f;
 bool batteryDischargeSegmentActive = false;
 uint32_t batteryDischargeSegmentEpoch = 0;
 float batteryDischargeSegmentStartPercent = -1.0f;
+// Set while the open segment may still be charger drain after a completed
+// charge (see BATTERY_TOPUP_CONFIRM_VOLTAGE). Never added to the totals.
+bool batteryDischargeSegmentProvisional = false;
+uint8_t batteryProvisionalLowReadings = 0;
 
 lv_obj_t *screenRoot = nullptr;
 lv_obj_t *wallpaper = nullptr;
@@ -12339,28 +12357,80 @@ void saveBatteryDischargeModel() {
   preferences.putBool("dsgOpen", batteryDischargeSegmentActive);
   preferences.putULong("dsgAt", batteryDischargeSegmentEpoch);
   preferences.putFloat("dsgStart", batteryDischargeSegmentStartPercent);
+  preferences.putBool("dsgProv", batteryDischargeSegmentProvisional);
   preferences.end();
 }
 
+/*
+  Rev 6 cannot tell an unplugged cable from a charge the TP4056 has finished,
+  and on the cable the TP4056 lets the battery drain to its recharge threshold
+  (4.05 V nominal, 4.00 V at worst) before topping it up again. A segment that
+  starts above this voltage may therefore be charger time. It stays
+  provisional until the battery is seen below it, which cannot happen on the
+  charger; charging again before then discards it.
+*/
+const float BATTERY_TOPUP_CONFIRM_VOLTAGE = 3.97f;
+const uint8_t BATTERY_TOPUP_CONFIRM_READINGS = 2;
+const unsigned long BATTERY_TOPUP_CHECK_MS = 5000UL;
+
 void startBatteryDischargeSegment(float percent, uint32_t epoch) {
   if (percent < 0.0f) percent = readBatteryPercent();
+  float voltage = readBatteryVoltage();
   batteryDischargeSegmentActive = percent >= 0.0f;
   batteryDischargeSegmentEpoch = epoch;
   batteryDischargeSegmentStartPercent = percent;
+  // An unreadable voltage is treated as provisional: losing one segment is
+  // cheaper than learning a day on the charger.
+  batteryDischargeSegmentProvisional = batteryDischargeSegmentActive &&
+    (voltage < 0.0f || voltage >= BATTERY_TOPUP_CONFIRM_VOLTAGE);
+  batteryProvisionalLowReadings = 0;
   saveBatteryDischargeModel();
-  Serial.printf("Battery model: discharge segment started at %.2f%%, epoch=%lu\n",
-                percent, (unsigned long)epoch);
+  Serial.printf("Battery model: discharge segment started at %.2f%% %.3fV%s, epoch=%lu\n",
+                percent, voltage,
+                batteryDischargeSegmentProvisional ? " (provisional)" : "",
+                (unsigned long)epoch);
 }
 
 void discardBatteryDischargeSegment() {
   batteryDischargeSegmentActive = false;
   batteryDischargeSegmentEpoch = 0;
   batteryDischargeSegmentStartPercent = -1.0f;
+  batteryDischargeSegmentProvisional = false;
   saveBatteryDischargeModel();
+}
+
+/*
+  Called from updateChargingState() while not charging. Two readings below the
+  confirm voltage, BATTERY_TOPUP_CHECK_MS apart, so a brief sag under load
+  cannot confirm a segment that is really on the charger.
+*/
+void serviceProvisionalDischargeSegment(unsigned long now) {
+  static unsigned long nextCheckMs = 0;
+  if (!batteryDischargeSegmentActive || !batteryDischargeSegmentProvisional) return;
+  if ((int32_t)(now - nextCheckMs) < 0) return;
+  nextCheckMs = now + BATTERY_TOPUP_CHECK_MS;
+  float voltage = readBatteryVoltage();
+  if (voltage <= 0.0f || voltage >= BATTERY_TOPUP_CONFIRM_VOLTAGE) {
+    batteryProvisionalLowReadings = 0;
+    return;
+  }
+  if (++batteryProvisionalLowReadings < BATTERY_TOPUP_CONFIRM_READINGS) return;
+  batteryDischargeSegmentProvisional = false;
+  batteryProvisionalLowReadings = 0;
+  saveBatteryDischargeModel();
+  Serial.printf("Battery model: segment confirmed unplugged at %.3fV\n", voltage);
 }
 
 void closeBatteryDischargeSegment(float percent, uint32_t epoch) {
   if (!batteryDischargeSegmentActive) return;
+  if (batteryDischargeSegmentProvisional) {
+    // Charging again before the battery left the top-up range: this was the
+    // TP4056 recharging on the cable, or an unplug too short to matter.
+    Serial.printf("Battery model: discarded provisional segment %.2f%% -> %.2f%%\n",
+                  batteryDischargeSegmentStartPercent, percent);
+    discardBatteryDischargeSegment();
+    return;
+  }
   float dropped = batteryDischargeSegmentStartPercent - percent;
   float hours = batteryDischargeSegmentEpoch && epoch >= batteryDischargeSegmentEpoch
     ? (float)(epoch - batteryDischargeSegmentEpoch) / 3600.0f : 0.0f;
@@ -12380,6 +12450,7 @@ void closeBatteryDischargeSegment(float percent, uint32_t epoch) {
   batteryDischargeSegmentActive = false;
   batteryDischargeSegmentEpoch = 0;
   batteryDischargeSegmentStartPercent = -1.0f;
+  batteryDischargeSegmentProvisional = false;
   saveBatteryDischargeModel();
 }
 
@@ -12407,6 +12478,7 @@ void serviceBatteryDischargeSegment(bool chargerConnected, float percent,
       batteryDischargeSegmentActive = true;
       batteryDischargeSegmentEpoch = batterySinceFullEpoch;
       batteryDischargeSegmentStartPercent = batterySinceFullStartPercent;
+      batteryDischargeSegmentProvisional = true;
       saveBatteryDischargeModel();
       Serial.println("Battery model: migrated the existing full-charge segment");
     } else {
@@ -12429,7 +12501,8 @@ void currentBatteryDischargeTotals(float percent, uint32_t epoch,
                                    float &dropped, float &hours) {
   dropped = batteryDischargePercentTotal;
   hours = batteryDischargeHoursTotal;
-  if (!batteryDischargeSegmentActive || !batteryDischargeSegmentEpoch ||
+  if (!batteryDischargeSegmentActive || batteryDischargeSegmentProvisional ||
+      !batteryDischargeSegmentEpoch ||
       epoch < batteryDischargeSegmentEpoch || percent < 0.0f) return;
   float activeDrop = batteryDischargeSegmentStartPercent - percent;
   float activeHours = (float)(epoch - batteryDischargeSegmentEpoch) / 3600.0f;
@@ -12445,6 +12518,7 @@ void resetBatteryDischargeLearning() {
   batteryDischargeSegmentActive = false;
   batteryDischargeSegmentEpoch = 0;
   batteryDischargeSegmentStartPercent = -1.0f;
+  batteryDischargeSegmentProvisional = false;
 
   if (!chargingState) {
     time_t now = time(nullptr);
@@ -12636,7 +12710,25 @@ void loadBatteryHistory() {
   batteryDischargeSegmentActive = preferences.getBool("dsgOpen", false);
   batteryDischargeSegmentEpoch = preferences.getULong("dsgAt", 0);
   batteryDischargeSegmentStartPercent = preferences.getFloat("dsgStart", -1.0f);
+  batteryDischargeSegmentProvisional = preferences.getBool("dsgProv", false);
+  bool chargerTimeFixed = preferences.getBool("dsg585", false);
   preferences.end();
+  if (!chargerTimeFixed) {
+    // Before 5.85 the model learned charger time after a completed charge
+    // (see BATTERY_TOPUP_CONFIRM_VOLTAGE), so its average is too slow. Start
+    // again once; the open segment cannot be trusted either.
+    batteryDischargePercentTotal = 0.0f;
+    batteryDischargeHoursTotal = 0.0f;
+    batteryDischargeSegmentActive = false;
+    batteryDischargeSegmentEpoch = 0;
+    batteryDischargeSegmentStartPercent = -1.0f;
+    batteryDischargeSegmentProvisional = false;
+    saveBatteryDischargeModel();
+    preferences.begin(PREFERENCES_NAMESPACE, false);
+    preferences.putBool("dsg585", true);
+    preferences.end();
+    Serial.println("Battery model: learned average reset once for 5.85");
+  }
   if (!isfinite(batteryDischargePercentTotal) || batteryDischargePercentTotal < 0.0f ||
       !isfinite(batteryDischargeHoursTotal) || batteryDischargeHoursTotal < 0.0f) {
     batteryDischargePercentTotal = 0.0f;
@@ -32032,6 +32124,7 @@ bool updateChargingState() {
     nextFullCheckMs = now + 1000UL;
     if (readBatteryPercent() >= 99.95f) batteryReachedFullThisSession = true;
   }
+  if (!chargingState) serviceProvisionalDischargeSegment(now);
 
   if (chargerConnected != chargingCandidate) {
     chargingCandidate = chargerConnected;
