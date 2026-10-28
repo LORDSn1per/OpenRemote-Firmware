@@ -15,10 +15,14 @@ html,body{height:100%}
 body{
   margin:0; color:var(--text);
   font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","Segoe UI",Roboto,Arial,sans-serif;
+  /* One fade at the top of the page, then plain black. Without no-repeat
+     the gradients tile down the page every viewport height. */
   background:
     radial-gradient(900px 500px at 25% 10%,rgba(47,140,255,.25),transparent 55%),
     radial-gradient(700px 500px at 85% 20%,rgba(44,89,162,.16),transparent 55%),
-    linear-gradient(180deg,#0c1118,#05070a);
+    linear-gradient(180deg,#0c1118,#05070a 100vh);
+  background-repeat:no-repeat;
+  background-color:#05070a;
 }
 .shell{
   min-height:100%; padding:0; display:block;
@@ -149,7 +153,14 @@ input:focus,textarea:focus{border-color:rgba(47,140,255,.8); box-shadow:0 0 0 3p
 .metaRow{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;color:var(--muted);margin-top:10px}
 .stats{display:grid;grid-template-columns:repeat(5,minmax(120px,1fr));gap:12px;margin:16px 0}
 .stat{border:1px solid var(--line2);border-radius:14px;padding:14px;background:rgba(0,0,0,.15)}
-.stat .num{font-size:24px;font-weight:800;color:var(--blue)}.stat .label{text-transform:uppercase;letter-spacing:.08em;color:var(--muted);font-size:12px}
+.stat .num{font-size:24px;font-weight:800;color:var(--blue)}
+.stats.sourceStats{display:block}
+.sourceTable{width:100%;border-collapse:collapse;margin:14px 0 4px;font-size:14px}
+.sourceTable th{text-align:right;color:var(--muted);font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;padding:8px 12px;border-bottom:1px solid var(--line)}
+.sourceTable td{text-align:right;padding:9px 12px;border-bottom:1px solid var(--line2);font-variant-numeric:tabular-nums}
+.sourceTable th:first-child,.sourceTable td:first-child{text-align:left}
+.sourceTable td:first-child{font-weight:700}
+.sourceTable tr.total td{border-bottom:0;color:var(--blue);font-weight:800}.stat .label{text-transform:uppercase;letter-spacing:.08em;color:var(--muted);font-size:12px}
 .resultsLayout{display:grid;grid-template-columns:1fr 380px;gap:18px}
 .result{border:1px solid var(--line2);border-radius:13px;background:rgba(0,0,0,.16);padding:13px;margin:10px 0;cursor:pointer}
 .result:hover{border-color:rgba(47,140,255,.7)}
@@ -374,12 +385,8 @@ input:focus,textarea:focus{border-color:rgba(47,140,255,.8); box-shadow:0 0 0 3p
               <label class="source"><input type="checkbox" class="src" value="Flipper-Firmware-Official" checked><div><b>Official Flipper Firmware IR</b><br><small>Official bundled Flipper IR files.</small></div></label>
               <label class="source"><input type="checkbox" class="src" value="probonopd-irdb" checked><div><b>probonopd/irdb</b><br><small>Classic compact protocol/device/function database.</small></div></label>
               <label class="source"><input type="checkbox" class="src" value="probonopd-lirc-remotes" checked><div><b>LIRC Remotes</b><br><small>Linux Infrared Remote Control database.</small></div></label>
+              <label class="source"><input type="checkbox" class="src" value="Logitech-Harmony-archive" checked><div><b>Logitech Harmony</b><br><small>About 257,000 devices from the Logitech Harmony IR archive (220 MB download). OpenRemote.irdb grows only from about 120 MB to 130 MB, because code sets are shared and compressed. Needs remote firmware 5.86 and WebConfig 3.45.</small></div></label>
             </div>
-          </div>
-          <div class="card" style="margin-top:22px">
-            <h3>Logitech Harmony IRDB</h3>
-            <p class="detailKV">Builds a separate <b>Logitech.irdb</b> from the Logitech Harmony IR archive: about 258,000 devices, downloaded from GitHub (about 220 MB). It stays on this computer. Do <b>not</b> copy it to the remote: search it in IRDB Browser and send one device at a time over USB.</p>
-            <button class="primary" id="logitechBuildBtn" onclick="startLogitechBuild()">Build Logitech.irdb</button>
           </div>
               <div class="setupProgress">
                 <div id="builderStatus" class="setupStatus">Ready.</div>
@@ -390,14 +397,12 @@ input:focus,textarea:focus{border-color:rgba(47,140,255,.8); box-shadow:0 0 0 3p
 
         <section id="browser" class="view">
           <h2 class="pageTitle">IRDB Browser</h2>
-          <p class="pageLead">Browse <b>OpenRemote.irdb</b> and the Studio-only <b>Logitech.irdb</b>. Search filters live as you type.</p>
+          <p class="pageLead">Browse <b>OpenRemote.irdb</b>. Search filters live as you type.</p>
           <div class="card">
             <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
               <input id="dbFile" type="file" accept=".irdb,.bin">
               <button class="primary" onclick="uploadDb()">Load OpenRemote.irdb</button>
-              <button class="secondary" onclick="uploadDb('logitech')">Load Logitech.irdb</button>
             </div>
-            <div id="logitechInfo" class="detailKV">Logitech.irdb: not loaded. Build it in IRDB Builder.</div>
             <div id="dbInfo" class="detailKV">No database loaded yet.</div>
           <div class="usbPanel" id="irdbInstallHint">
             <b>Installing this database on the remote</b>
@@ -416,9 +421,9 @@ input:focus,textarea:focus{border-color:rgba(47,140,255,.8); box-shadow:0 0 0 3p
             <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
               <input id="searchBox" placeholder="Search e.g. Hisense 85S8, Sony STR, Fetch, volume" oninput="searchDb()">
               <select id="searchDbSelect" onchange="searchDb()" style="margin-top:14px">
-                <option value="all">Both databases</option>
-                <option value="openremote">OpenRemote.irdb</option>
-                <option value="logitech">Logitech.irdb</option>
+                <option value="all">All sources</option>
+                <option value="openremote">Without Logitech Harmony</option>
+                <option value="logitech">Logitech Harmony only</option>
               </select>
             </div>
             <div id="countLine" class="countLine"></div>
@@ -444,7 +449,7 @@ document.querySelectorAll('.navBtn').forEach(btn=>btn.onclick=()=>{
   document.querySelectorAll('.navBtn,.view').forEach(x=>x.classList.remove('active'));
   btn.classList.add('active');
   document.getElementById(btn.dataset.view).classList.add('active');
-  if(btn.dataset.view==='browser'){loadInfo();loadLogitechInfo();syncBrowserDbCard();searchDb();setTimeout(syncBrowserDbCard,300);}
+  if(btn.dataset.view==='browser'){loadInfo();syncBrowserDbCard();searchDb();setTimeout(syncBrowserDbCard,300);}
   if(btn.dataset.view==='recovery'){loadRecoveryPorts();}
   if(btn.dataset.view==='setup'){loadSetupPorts();loadSetupInfo();}
   if(btn.dataset.view==='dock'){loadDockPorts();}
@@ -740,19 +745,6 @@ async function startBuild(){
   let r=await fetch('/start-build',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sources})}).then(r=>r.json());
   if(r.error){alert(r.error);document.getElementById('buildBtn').disabled=false;}
 }
-async function startLogitechBuild(){
-  let btn=document.getElementById('logitechBuildBtn');
-  btn.disabled=true;document.getElementById('buildBtn').disabled=true;
-  let r=await fetch('/start-logitech-build',{method:'POST'}).then(r=>r.json()).catch(e=>({error:e.message}));
-  if(r.error){alert(r.error);btn.disabled=false;document.getElementById('buildBtn').disabled=false;}
-}
-async function loadLogitechInfo(){
-  let el=document.getElementById('logitechInfo'); if(!el) return;
-  let info=await fetch('/logitech-info?ts='+Date.now()).then(r=>r.json()).catch(()=>({error:'Logitech.irdb: could not be read.'}));
-  el.textContent=info.error
-    ? 'Logitech.irdb: not loaded. Build it in IRDB Builder.'
-    : 'Logitech.irdb ('+(info.size_mb||0).toFixed(1)+' MB): '+info.devices+' devices from '+info.brands+' brands, created '+(info.build_date_short||'—')+'. Studio only - send devices to the remote one at a time.';
-}
 async function poll(){
   try{
     let s=await fetch('/status').then(r=>r.json());
@@ -760,13 +752,20 @@ async function poll(){
     bar.style.width=(s.progress||0)+'%';pct.textContent=s.progress||0;mb.textContent=(s.downloaded_mb||0).toFixed(1);
     status.textContent=s.current||'';footerStatus.textContent=s.current||'Ready';records.textContent=s.records||0;binmb.textContent=(s.bin_mb||0).toFixed(1);
     
-    if(s.done){document.getElementById('buildBtn').disabled=false;document.getElementById('logitechBuildBtn').disabled=false;loadInfo();loadLogitechInfo();searchDb();}
-    if(s.error){status.textContent='ERROR: '+s.error;document.getElementById('buildBtn').disabled=false;document.getElementById('logitechBuildBtn').disabled=false;}
+    if(s.done){document.getElementById('buildBtn').disabled=false;loadInfo();searchDb();}
+    if(s.error){status.textContent='ERROR: '+s.error;document.getElementById('buildBtn').disabled=false;}
   }catch(e){}
   setTimeout(poll,500);
 }
 poll();
 function stat(label,num){return `<div class="stat"><div class="num">${num}</div><div class="label">${label}</div></div>`}
+const SOURCE_NAMES={'Lucaslhm-Flipper-IRDB':'Flipper IRDB','Flipper-Firmware-Official':'Official Flipper Firmware IR','probonopd-irdb':'probonopd/irdb','probonopd-lirc-remotes':'LIRC Remotes','Logitech Harmony':'Logitech Harmony'};
+function num(n){return Number(n||0).toLocaleString()}
+// One row per source the database was built from, then the whole database.
+function sourceTable(info){
+  let rows=(info.sources||[]).map(x=>`<tr><td>${esc(SOURCE_NAMES[x.name]||x.name)}</td><td>${num(x.devices)}</td><td>${num(x.brands)}</td><td>${num(x.buttons)}</td></tr>`).join('');
+  return `<table class="sourceTable"><thead><tr><th>Database</th><th>Devices</th><th>Brands</th><th>Buttons</th></tr></thead><tbody>${rows}<tr class="total"><td>Total</td><td>${num(info.devices)}</td><td>${num(info.brands)}</td><td>${num(info.buttons)}</td></tr></tbody></table>`;
+}
 async function loadInfo(){
   let info=await fetch('/db-info?ts='+Date.now()).then(r=>r.json());
   if(info.error){
@@ -792,8 +791,9 @@ async function loadInfo(){
     browserDbName.textContent='OpenRemote.irdb ('+(info.size_mb||0).toFixed(1)+' MB)';
     browserDbDate.textContent='Created: '+(info.build_date_short||'—');
   }
-  stats.innerHTML=stat('Devices',info.devices)+stat('Brands',info.brands)+stat('Buttons',info.buttons)+stat('Version',info.version||'—')+stat('Created',info.build_date_short||'—');
-  countLine.textContent=info.devices+' devices';
+  stats.classList.add('sourceStats');
+  stats.innerHTML=sourceTable(info)+`<div class="detailKV">Version ${esc(info.version||'—')} • Created ${esc(info.build_date_short||'—')}${info.index_version&&info.index_version<3?' • Built before Studio 2.87: rebuild it for firmware 5.86':''}</div>`;
+  countLine.textContent=num(info.devices)+' devices';
   return true;
 }
 
@@ -811,15 +811,13 @@ async function triggerSearchWakeup(){
   },450);
 }
 
-async function uploadDb(kind){
-  let name=kind==='logitech'?'Logitech.irdb':'OpenRemote.irdb';
-  let f=document.getElementById('dbFile').files[0];if(!f){alert('Choose a '+name+' file first');return;}
-  let r=await fetch('/upload-db'+(kind==='logitech'?'?kind=logitech':''),{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:f}).then(r=>r.json());
+async function uploadDb(){
+  let f=document.getElementById('dbFile').files[0];if(!f){alert('Choose an OpenRemote.irdb file first');return;}
+  let r=await fetch('/upload-db',{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:f}).then(r=>r.json());
   if(r.error){
     alert(r.error);
   }else{
     await loadInfo();
-    loadLogitechInfo();
     syncBrowserDbCard();
     triggerSearchWakeup();
   }
@@ -849,7 +847,7 @@ let timer=null;function searchDb(){clearTimeout(timer);timer=setTimeout(async()=
     }
   }).catch(()=>{});
 
-  countLine.textContent=data.total+(data.total===1?' device':' devices')+(q.trim()?' matching "'+q.trim()+'"':'');
+  countLine.textContent=num(data.total)+(data.total===1?' device':' devices')+(q.trim()?' matching "'+q.trim()+'"':'');
   out.innerHTML=(data.results||[]).map(r=>`<div class=result onclick="details('${r.id}')"><div class=resultHead><b>${esc(r.brand)} ${esc(r.model)}</b><small>${esc(r.category)} • ${esc(r.source)} • ${esc(r.format)}</small></div><div>${(r.protocols||[]).map(x=>`<span class=tag>${esc(x)}</span>`).join('')}</div><div>${(r.buttons||[]).slice(0,24).map(x=>`<span class=tag>${esc(x)}</span>`).join('')}</div></div>`).join('')||'<p>No results.</p>';
 },120)}
 
@@ -857,11 +855,8 @@ async function details(id){
   selectedDeviceId=id;
   let d=await fetch('/device?id='+encodeURIComponent(id)).then(r=>r.json()); if(d.error)return;
   let cmds=(d.ir||[]).slice(0,80).map(c=>`<div class=result><b>${esc(c.name||'Command')}</b><div class=detailKV>${c.protocol?'Protocol: '+esc(c.protocol)+' ':''}${c.address?'Address: '+esc(c.address)+' ':''}${c.command?'Command: '+esc(c.command):''}${c.code?'Code: '+esc(c.code):''}${c.playable===false?'Not sent: the remote cannot play this code':''}</div></div>`).join('');
-  // Logitech's power type matters: on a toggle device "PowerOn" may switch it off.
-  let powerNote=d.power?`<div class=detailKV>Power: ${esc(d.power==='toggle'?'toggle (one button flips on/off)':d.power)}</div>`:'';
-  let skippedNote=d.skipped?`<div class=detailKV>${d.skipped} command(s) the remote cannot play will be left out.</div>`:'';
   let limitNote=(d.buttons||[]).length>200?`<div class=detailKV>The remote holds 200 commands per device, so only the first 200 will be sent.</div>`:'';
-  document.getElementById('details').innerHTML=`<div class=detailTitle>${esc(d.brand)} ${esc(d.model)}</div><div class=detailKV>${esc(d.category)} • ${esc(d.source)} • ${esc(d.format)}</div>${powerNote}${skippedNote}${limitNote}<div>${(d.protocols||[]).map(x=>`<span class=tag>${esc(x)}</span>`).join('')}</div><div class=usbPanel><b>Send to OpenRemote over USB</b><div class=detailKV>Choose the remote's USB serial port and close Arduino Serial Monitor before sending this selected IR device.</div><div class=usbRow><select id=usbPortSelect><option>Scanning…</option></select><button class=secondary onclick="loadUsbPorts()">Refresh</button><button class=primary onclick="sendSelectedToUsb()">Send</button></div><div class=usbStatus id=usbStatus>Ready.</div></div><h3>Available buttons (${(d.buttons||[]).length})</h3><div>${(d.buttons||[]).map(x=>`<span class=tag>${esc(x)}</span>`).join('')}</div><h3>IR command preview</h3>${cmds||'<p class=detailKV>No command details stored for this source.</p>'}`;
+  document.getElementById('details').innerHTML=`<div class=detailTitle>${esc(d.brand)} ${esc(d.model)}</div><div class=detailKV>${esc(d.category)} • ${esc(d.source)} • ${esc(d.format)}</div>${limitNote}<div>${(d.protocols||[]).map(x=>`<span class=tag>${esc(x)}</span>`).join('')}</div><div class=usbPanel><b>Send to OpenRemote over USB</b><div class=detailKV>Choose the remote's USB serial port and close Arduino Serial Monitor before sending this selected IR device.</div><div class=usbRow><select id=usbPortSelect><option>Scanning…</option></select><button class=secondary onclick="loadUsbPorts()">Refresh</button><button class=primary onclick="sendSelectedToUsb()">Send</button></div><div class=usbStatus id=usbStatus>Ready.</div></div><h3>Available buttons (${(d.buttons||[]).length})</h3><div>${(d.buttons||[]).map(x=>`<span class=tag>${esc(x)}</span>`).join('')}</div><h3>IR command preview</h3>${cmds||'<p class=detailKV>No command details stored for this source.</p>'}`;
   loadUsbPorts();
 }
 
@@ -905,7 +900,7 @@ function syncBrowserDbCard(){
 setInterval(syncBrowserDbCard,500);
 
 function esc(s){return(s||'').toString().replace(/[&<>"]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[m]));}
-loadInfo();loadLogitechInfo();
+loadInfo();
 
 function formatUsbBytes(n){
   n=Number(n)||0;

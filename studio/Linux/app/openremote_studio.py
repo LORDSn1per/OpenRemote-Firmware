@@ -4,7 +4,7 @@ import contextlib, datetime as dt, glob, hashlib, io, json, os, re, select, shut
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-APP_VERSION="2.86"
+APP_VERSION="2.87"
 SERIAL_BAUD=460800
 # 2.68 adds Linux as a third supported platform. Until now every non-Windows
 # branch in this file assumed macOS outright - AppleScript dialogs, diskutil,
@@ -55,7 +55,8 @@ REPOS=[
 {"name":"Lucaslhm-Flipper-IRDB","owner":"Lucaslhm","repo":"Flipper-IRDB","branch":"main","type":"flipper_ir"},
 {"name":"probonopd-irdb","owner":"probonopd","repo":"irdb","branch":"master","type":"irdb"},
 {"name":"Flipper-Firmware-Official","owner":"flipperdevices","repo":"flipperzero-firmware","branch":"dev","type":"flipper_ir"},
-{"name":"probonopd-lirc-remotes","owner":"probonopd","repo":"lirc-remotes","branch":"master","type":"lirc"}]
+{"name":"probonopd-lirc-remotes","owner":"probonopd","repo":"lirc-remotes","branch":"master","type":"lirc"},
+{"name":"Logitech-Harmony-archive","owner":"pickysysadmin","repo":"logitech-harmony-ir-archive","branch":"main","type":"logitech"}]
 IGNORE={".git",".github","__pycache__","docs","documentation","images","img","metadata","tools","scripts","test","tests"}
 ALIASES={"tv":"TV","tvs":"TV","television":"TV","televisions":"TV","audio":"Audio","receiver":"Audio","receivers":"Audio","avr":"Audio","soundbar":"Audio","soundbars":"Audio","projector":"Projector","projectors":"Projector","set top box":"Set-top Box","set_top_box":"Set-top Box","stb":"Set-top Box","air conditioner":"Air Conditioner","air_conditioner":"Air Conditioner","ac":"Air Conditioner","dvd":"Disc Player","bluray":"Disc Player","blu-ray":"Disc Player","streaming":"Streaming"}
 STATE={"running":False,"done":False,"error":"","progress":0,"downloaded_mb":0.0,"current":"Ready.","log":["Ready."],"records":0,"bin_mb":0.0,"release_path":"","db_path":str(ACTIVE_DB) if ACTIVE_DB.exists() else ""}
@@ -661,104 +662,133 @@ def create_db(records, db_path, metadata, plan):
     cur.execute("PRAGMA journal_mode=OFF"); cur.execute("PRAGMA synchronous=OFF")
     cur.execute("CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT)")
     cur.execute("""CREATE TABLE remotes(id TEXT PRIMARY KEY,category TEXT,brand TEXT,model TEXT,source TEXT,format TEXT,original_path TEXT,button_count INTEGER,buttons_json TEXT,protocols_json TEXT,detail_offset INTEGER,detail_length INTEGER,search TEXT)""")
-    cur.execute("CREATE INDEX idx_search ON remotes(search)"); cur.execute("CREATE INDEX idx_brand_model ON remotes(brand,model)")
+    # No index on search: Studio matches it with LIKE '%term%', which no index
+    # can serve, and at 272,000 rows it cost 16MB for nothing.
+    cur.execute("CREATE INDEX idx_brand_model ON remotes(brand,model)"); cur.execute("CREATE INDEX idx_source ON remotes(source)")
     for k,v in metadata.items(): cur.execute("INSERT INTO metadata VALUES(?,?)",(k,json.dumps(v) if not isinstance(v,str) else v))
     placement=plan["placement"]
     rows=[(r["id"],r["category"],r["brand"],r["model"],r["source"],r["format"],r["original_path"],r["button_count"],json.dumps(r["buttons"],ensure_ascii=False),json.dumps(r["protocols"],ensure_ascii=False),placement[r["id"]][0],placement[r["id"]][1],r["search"]) for r in records]
     cur.executemany("INSERT INTO remotes VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",rows); con.commit(); con.close()
 IRDB_INDEX_MAGIC=b"ORIDX1\x00\x00"
 IRDB_INDEX_FOOTER_SIZE=64
-IRDB_INDEX_FORMAT_VERSION=2
+IRDB_INDEX_FORMAT_VERSION=3
 
-def plan_embedded_index(records):
-    """Builds the two appended sections and every record's place in them.
+def irdb_field(value):
+    """One tab-separated search field: no tabs or newlines, no stray spaces."""
+    return re.sub(r"[\t\r\n]+"," ",str(value or "")).strip()
 
-    Separated from writing so create_db() can store each record's detail offset
-    in its row. That is what lets the IR payload live in exactly one place: the
-    SQLite table keeps the searchable metadata Studio queries, and the appended
-    detail section keeps the codes, which both Studio and the remote read from
-    there by seeking.
+def plan_embedded_index(records, codesets=None):
+    """Builds the appended sections and every record's place in them.
 
-    Storing it twice cost 80MB on a real database - 104.8MB became 207.7MB - and
-    the whole of that duplicate had to be uploaded to the remote over Wi-Fi.
+    Version 3 exists because of the Logitech Harmony archive: 257,000 devices
+    on top of OpenRemote's 14,500. The remote searches by reading the index
+    off the SD card, about 2MB a second, so the size of that index is the
+    search time.
+
+    - Search lines are tab-separated, not JSON. Source and format are small
+      numbers into lists kept in the metadata, and Logitech lines carry no
+      protocol. That is about 60 bytes a device instead of 200.
+    - Lines are sorted by brand, and a brand directory says where each
+      brand's lines are. A query that names a brand reads only that brand's
+      lines - "sony bravia" reads 2,000 lines instead of 272,000.
+    - Detail records are zlib-compressed. A Logitech code set is shared by
+      many devices and stored only once; devices point at it. Pronto hex
+      compresses about 25:1, so 800MB of Logitech code sets become 31MB.
+
+    Columns of a search line, in order: id, source index, format index,
+    category, brand, model, button count, protocol, detail offset, detail
+    length. The offset is relative to the detail section.
     """
-    search_lines=[]
-    detail_blobs=[]
-    placement={}
-    detail_offset=0
+    codesets=codesets or {}
+    records=sorted(records,key=lambda r:(irdb_field(r["brand"]).lower(),irdb_field(r["model"]).lower(),r["id"]))
+    sources=[]; formats=[]
+    search_lines=[]; detail_blobs=[]; placement={}; shared={}
+    brand_rows=[]
+    detail_offset=0; search_offset=0
     for r in records:
-        detail={
-            "id":r["id"],"category":r["category"],"type":r["category"],
-            "brand":r["brand"],"model":r["model"],"source":r["source"],
-            "format":r["format"],"originalPath":r["original_path"],
-            "buttonCount":r["button_count"],"commands":r["buttons"],
-            "protocols":r["protocols"],"protocol":", ".join(r["protocols"]),
-            "search":r["search"],"irJson":json.dumps(r["ir"],ensure_ascii=False)
-        }
-        blob=json.dumps(detail,ensure_ascii=False,separators=(",",":")).encode("utf-8")
-        # The search line is deliberately lean - the remote scans EVERY line of
-        # this section on every keystroke, lowercasing each one to match it, so
-        # each field costs both SD read time and a string allocation on an
-        # ESP32. Measured on the real 14,551-device database: carrying
-        # everything the detail record has costs 12.1MB and about six seconds a
-        # search; this set costs 3.0MB and about 1.4 seconds. All of it remains
-        # in the detail record, fetched only for the device being imported.
-        line={
-            "id":r["id"],"category":r["category"],"brand":r["brand"],
-            "model":r["model"],"source":r["source"],"format":r["format"],
-            "buttonCount":r["button_count"],"protocol":", ".join(r["protocols"]),
-            "o":detail_offset,"l":len(blob)
-        }
-        search_lines.append(json.dumps(line,ensure_ascii=False,separators=(",",":")).encode("utf-8"))
-        detail_blobs.append(blob)
-        placement[r["id"]]=(detail_offset,len(blob))
-        detail_offset+=len(blob)
+        if r["source"] not in sources: sources.append(r["source"])
+        if r["format"] not in formats: formats.append(r["format"])
+        key=r.get("codeset")
+        if key and key in shared:
+            at=shared[key]
+        else:
+            if key:
+                blob=codesets[key]
+            else:
+                detail={
+                    "id":r["id"],"category":r["category"],"type":r["category"],
+                    "brand":r["brand"],"model":r["model"],"source":r["source"],
+                    "format":r["format"],"originalPath":r["original_path"],
+                    "buttonCount":r["button_count"],"commands":r["buttons"],
+                    "protocols":r["protocols"],"protocol":", ".join(r["protocols"]),
+                    "irJson":json.dumps(r["ir"],ensure_ascii=False)
+                }
+                blob=zlib.compress(json.dumps(detail,ensure_ascii=False,separators=(",",":")).encode("utf-8"),9)
+            at=(detail_offset,len(blob))
+            detail_blobs.append(blob); detail_offset+=len(blob)
+            if key: shared[key]=at
+        placement[r["id"]]=at
+        brand=irdb_field(r["brand"]) or "Unknown"
+        protocol="" if key else irdb_field(", ".join(r["protocols"]))[:48]
+        line="\t".join([irdb_field(r["id"]),str(sources.index(r["source"])),str(formats.index(r["format"])),
+            irdb_field(r["category"]),brand,irdb_field(r["model"]),str(int(r["button_count"] or 0)),
+            protocol,str(at[0]),str(at[1])]).encode("utf-8")+b"\n"
+        lower=brand.lower()
+        if brand_rows and brand_rows[-1][0]==lower:
+            brand_rows[-1][2]+=len(line); brand_rows[-1][3]+=1
+        else:
+            brand_rows.append([lower,search_offset,len(line),1])
+        search_lines.append(line); search_offset+=len(line)
+    brand_bytes=b"".join(("\t".join([b,str(o),str(l),str(n)])+"\n").encode("utf-8") for b,o,l,n in brand_rows)
     return {
-        "search_bytes":b"\n".join(search_lines)+(b"\n" if search_lines else b""),
+        "search_bytes":b"".join(search_lines),
         "detail_bytes":b"".join(detail_blobs),
+        "brand_bytes":brand_bytes,
+        "brand_count":len(brand_rows),
+        "sources":sources,"formats":formats,
         "placement":placement,
     }
 
 def append_embedded_index(db_path, records, metadata=None, plan=None):
-    """Append a searchable index to the end of the SQLite .irdb file.
-
-    One file instead of three. The remote used to need OpenRemote.irdb,
-    search.jsonl AND a details/ folder of 14,000-odd files copied to its SD
-    card, and because the Release Notes only ever mentioned the .irdb, the
-    other two were never copied and WebConfig's IRDB search had nothing to read.
+    """Append the searchable index to the end of the SQLite .irdb file.
 
     SQLite takes its database size from the page count in its own header, so
     bytes appended after that are ignored by every reader - the file stays a
     perfectly valid SQLite database that Studio opens exactly as before. The
     remote does not parse SQLite at all; it reads a fixed 64-byte footer at the
-    end of the file, which tells it where the two appended sections start.
+    end of the file, which tells it where the appended sections start.
 
-    Layout:
-        [ SQLite database        ]  unchanged, byte for byte
-        [ search section, JSONL  ]  one compact line per device
-        [ detail section, JSON   ]  full records, concatenated
-        [ 64-byte footer         ]
+    Layout (version 3):
+        [ SQLite database          ]  unchanged, byte for byte
+        [ search section, TSV      ]  one line per device, sorted by brand
+        [ detail section, zlib     ]  device records and shared code sets
+        [ brand directory, TSV     ]  brand, offset, length, device count
+        [ metadata, JSON           ]  under 4KB, the firmware's limit
+        [ 64-byte footer           ]
 
-    Each search line carries the byte offset and length of its own detail
-    record, so importing a device is one scan of the small section followed by
-    a single seek - never a walk of the whole database.
+    The metadata's "index" object names the sources and formats the search
+    lines number, and where the brand directory is.
     """
     if plan is None: plan=plan_embedded_index(records)
     search_bytes=plan["search_bytes"]
     detail_bytes=plan["detail_bytes"]
-    # A third small section carrying what the remote shows about the database
-    # itself - how many devices and when it was built. Without it the remote can
-    # only learn that from a Database Manifest.json copied alongside, and the
-    # whole point of this change is that one file is enough.
-    meta=dict(metadata or {})
-    meta.setdefault("device_count",len(records))
-    meta_bytes=json.dumps(meta,ensure_ascii=False,separators=(",",":")).encode("utf-8")
-
+    brand_bytes=plan["brand_bytes"]
+    full=dict(metadata or {})
     with db_path.open("ab") as f:
         search_start=f.tell()
         f.write(search_bytes)
         detail_start=f.tell()
         f.write(detail_bytes)
+        brand_start=f.tell()
+        f.write(brand_bytes)
+        meta={k:full[k] for k in ("database_name","database_version","created_date","brand_count","button_count","format") if k in full}
+        meta["device_count"]=len(records)
+        meta["index"]={"sources":plan["sources"],"formats":plan["formats"],
+            "brands":{"offset":brand_start,"length":len(brand_bytes),"count":plan["brand_count"]}}
+        if full.get("source_stats"):
+            meta["sourceStats"]=[[x["name"],x["devices"],x["brands"],x["buttons"]] for x in full["source_stats"]]
+        meta_bytes=json.dumps(meta,ensure_ascii=False,separators=(",",":")).encode("utf-8")
+        if len(meta_bytes)>=4096: raise RuntimeError("IRDB metadata grew past the remote's 4KB limit.")
         meta_start=f.tell()
         f.write(meta_bytes)
         footer=bytearray(IRDB_INDEX_FOOTER_SIZE)
@@ -768,51 +798,14 @@ def append_embedded_index(db_path, records, metadata=None, plan=None):
                          detail_start,len(detail_bytes),
                          len(records),IRDB_INDEX_FORMAT_VERSION)
         struct.pack_into("<I",footer,48,zlib.crc32(search_bytes) & 0xFFFFFFFF)
-        # The last twelve bytes of the footer, which version 1 left reserved.
         struct.pack_into("<QI",footer,52,meta_start,len(meta_bytes))
         f.write(bytes(footer))
     return {"search_offset":search_start,"search_bytes":len(search_bytes),
             "detail_offset":detail_start,"detail_bytes":len(detail_bytes),
+            "brand_offset":brand_start,"brand_bytes":len(brand_bytes),
             "meta_offset":meta_start,"meta_bytes":len(meta_bytes),
             "device_count":len(records),"format_version":IRDB_INDEX_FORMAT_VERSION}
 
-def create_search_indexes(records, search_path, details_dir):
-    if search_path.exists(): search_path.unlink()
-    if details_dir.exists(): shutil.rmtree(details_dir)
-    details_dir.mkdir(parents=True,exist_ok=True)
-    search_file=search_path.open("w",encoding="utf-8")
-    try:
-        for r in records:
-            commands=r["buttons"]
-            protocols=r["protocols"]
-            shared={
-                "id":r["id"],"category":r["category"],"type":r["category"],
-                "brand":r["brand"],"model":r["model"],"source":r["source"],
-                "format":r["format"],"originalPath":r["original_path"],
-                "buttonCount":r["button_count"],"commands":commands,
-                "protocols":protocols,"protocol":", ".join(protocols),"search":r["search"]
-            }
-            search_file.write(json.dumps(shared,ensure_ascii=False,separators=(",",":"))+"\n")
-            detail={**shared,"irJson":json.dumps(r["ir"],ensure_ascii=False)}
-            prefix=str(r["id"])[:2] or "xx"
-            folder=details_dir/prefix
-            folder.mkdir(parents=True,exist_ok=True)
-            (folder/(str(r["id"])+".json")).write_text(json.dumps(detail,ensure_ascii=False,separators=(",",":")),encoding="utf-8")
-    finally:
-        search_file.close()
-def create_search_index(records, index_path):
-    if index_path.exists(): index_path.unlink()
-    with index_path.open("w",encoding="utf-8") as f:
-        for r in records:
-            payload={
-                "id":r["id"],"category":r["category"],"type":r["category"],
-                "brand":r["brand"],"model":r["model"],"source":r["source"],
-                "format":r["format"],"originalPath":r["original_path"],
-                "buttonCount":r["button_count"],"commands":r["buttons"],
-                "protocols":r["protocols"],"protocol":", ".join(r["protocols"]),
-                "irJson":json.dumps(r["ir"],ensure_ascii=False),"search":r["search"]
-            }
-            f.write(json.dumps(payload,ensure_ascii=False,separators=(",",":"))+"\n")
 def linux_dialog(prompt,directory=False,file_filter=None):
     # Linux has no single system file dialog the way macOS and Windows do, so
     # this uses whichever of the two near-universal desktop helpers is present:
@@ -1104,10 +1097,19 @@ def build_database(save_parent, selected):
     work=CACHE_DIR; cache=work/"cache"; release=work/"release_v1"
     if release.exists(): shutil.rmtree(release)
     release.mkdir(parents=True,exist_ok=True)
-    records=[]; seen=set()
+    records=[]; seen=set(); codesets={}
     for i,repo in enumerate(repos,1):
         STATE["progress"]=int((i-1)/len(repos)*62)
-        root=extract_zip(download_repo(repo,cache),cache/f"extract_{repo['owner']}_{repo['repo']}_{repo['branch']}")
+        zp=download_repo(repo,cache)
+        if repo["type"]=="logitech":
+            log(f"Reading {repo['name']}...")
+            found,sets=read_logitech_archive(zp)
+            records.extend(found); codesets.update(sets)
+            # 220MB that is never read again; the next build downloads a fresh copy.
+            zp.unlink(missing_ok=True)
+            STATE["records"]=len(records); log(f"Records so far: {len(records)}"); STATE["progress"]=int(i/len(repos)*62)
+            continue
+        root=extract_zip(zp,cache/f"extract_{repo['owner']}_{repo['repo']}_{repo['branch']}")
         log(f"Scanning {repo['name']}...")
         if repo["type"]=="flipper_ir":
             for fp in root.rglob("*.ir"):
@@ -1143,53 +1145,54 @@ def build_database(save_parent, selected):
     records.sort(key=lambda r:(r["category"].lower(),r["brand"].lower(),r["model"].lower()))
     version=dt.datetime.now().astimezone().strftime("%Y.%m.%d.%H%M")
     created=dt.datetime.now().astimezone().isoformat(timespec="seconds")
-    brands=len(set(r["brand"] for r in records)); buttons=sum(r["button_count"] for r in records)
-    metadata={"database_name":"OpenRemote IRDB","database_version":version,"created_date":created,"scrape_date_local":created,"device_count":len(records),"brand_count":brands,"button_count":buttons,"builder_version":APP_VERSION,"format":"sqlite-irdb","sources":[r["name"] for r in repos]}
+    brands=len(set(r["brand"].lower() for r in records)); buttons=sum(r["button_count"] for r in records)
+    source_stats=[]
+    for name in dict.fromkeys(r["source"] for r in records):
+        group=[r for r in records if r["source"]==name]
+        source_stats.append({"name":name,"devices":len(group),"brands":len(set(r["brand"].lower() for r in group)),"buttons":sum(r["button_count"] for r in group)})
+    metadata={"database_name":"OpenRemote IRDB","database_version":version,"created_date":created,"scrape_date_local":created,"device_count":len(records),"brand_count":brands,"button_count":buttons,"builder_version":APP_VERSION,"format":"sqlite-irdb","sources":[r["name"] for r in repos],"source_stats":source_stats}
     db_path=release/"OpenRemote.irdb"
     # Planned first: the rows need to know where their payloads will land.
-    index_plan=plan_embedded_index(records)
+    log("Planning the search index...")
+    index_plan=plan_embedded_index(records,codesets)
     create_db(records,db_path,metadata,index_plan)
-    index_path=release/"search.jsonl"; details_dir=release/"details"; create_search_indexes(records,index_path,details_dir)
     # Appended last, so the SQLite file above is complete and closed first.
     log("Embedding the searchable index into OpenRemote.irdb...")
     embedded=append_embedded_index(db_path,records,metadata,index_plan)
     log(f"Embedded index: {embedded['search_bytes']/1024/1024:.2f} MB searchable, "
-        f"{embedded['detail_bytes']/1024/1024:.1f} MB of device detail, "
+        f"{embedded['detail_bytes']/1024/1024:.1f} MB of compressed device detail, "
         f"{embedded['device_count']} devices")
-    manifest={**metadata,"irdb_sha256":hash_file(db_path,"sha256"),"irdb_size_bytes":db_path.stat().st_size,"search_index_file":"search.jsonl","search_index_sha256":hash_file(index_path,"sha256"),"search_index_size_bytes":index_path.stat().st_size,"detail_dir":"details","detail_file_count":len(records),"embedded_index":embedded}
+    manifest={**metadata,"irdb_sha256":hash_file(db_path,"sha256"),"irdb_size_bytes":db_path.stat().st_size,"embedded_index":embedded}
     (release/"Database Manifest.json").write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding="utf-8")
+    breakdown="".join(f"  {x['name']}: {x['devices']} devices, {x['brands']} brands, {x['buttons']} buttons\n" for x in source_stats)
     (release/"Release Notes.txt").write_text(
         f"OpenRemote.irdb\nVersion: {version}\nCreated: {created}\n"
-        f"Devices: {len(records)}\nBrands: {brands}\nButtons: {buttons}\n\n"
-        f"Copy OpenRemote.irdb to /irdb on the remote SD card. That one file is\n"
-        f"all the remote needs - the searchable index is inside it, so WebConfig\n"
-        f"can search every device and import one without a computer.\n\n"
-        f"search.jsonl and details/ are the older separate-file form of the same\n"
-        f"index. Firmware 4.77 and newer read the copy inside OpenRemote.irdb and\n"
-        f"do not need them; they are kept here only for older firmware.\n",
+        f"Devices: {len(records)}\nBrands: {brands}\nButtons: {buttons}\n\n{breakdown}\n"
+        f"Copy OpenRemote.irdb to /irdb on the remote SD card, or install it from\n"
+        f"WebConfig's Settings. That one file is all the remote needs.\n\n"
+        f"This is index format 3. It needs remote firmware 5.86 and WebConfig 3.45\n"
+        f"or newer; older firmware will report that no database is installed.\n",
         encoding="utf-8")
     shutil.copy2(db_path,ACTIVE_DB); STATE["db_path"]=str(ACTIVE_DB); STATE["bin_mb"]=db_path.stat().st_size/1024/1024
     dest=Path(save_parent)/f"OpenRemote.irdb v{version}"
     if dest.exists(): shutil.rmtree(dest)
     shutil.copytree(release,dest)
+    shutil.rmtree(release,ignore_errors=True)
     STATE.update({"running":False,"done":True,"progress":100,"release_path":str(dest),"records":len(records)})
     log(f"Finished. OpenRemote.irdb release saved to {dest}")
 
-# Logitech Harmony IR archive - a Studio-only database, Logitech.irdb.
+# Logitech Harmony IR archive, a source of OpenRemote.irdb since Studio 2.87.
 #
-# 276,000 devices is nineteen times OpenRemote.irdb. The remote searches its
-# IRDB by reading every line of the index on every keystroke, so a database
-# that size would take ~25 seconds a search there. This one never goes near
-# the remote: Studio searches it and sends the remote ONE device as a .ir file
-# of Pronto codes, which the firmware has played since 3.06.
+# 2.86 kept it in a Studio-only Logitech.irdb, because the remote searched by
+# reading its whole index and 257,000 more devices would have made that ~25
+# seconds. Index format 3 (plan_embedded_index) fixes that, so it is merged.
 #
 # 79% of Harmony devices share a byte-identical code set with another device,
-# so code sets are stored once and devices point at them. Storing a copy per
-# device would be ~5.8GB, past FAT32's 4GB file limit and the Mac's patience.
-LOGITECH_DB=DATA_DIR/"Logitech.irdb"
-LOGITECH_REPO={"name":"Logitech Harmony archive","owner":"pickysysadmin","repo":"logitech-harmony-ir-archive","branch":"main"}
-LOGITECH_FORMAT="logitech-harmony-irdb"
+# so code sets are stored once and devices point at them.
 LOGITECH_SOURCE="Logitech Harmony"
+LOGITECH_FORMAT_ID="logitech_pronto"
+# Studio 2.86's separate database. Refused as OpenRemote.irdb: it has no index.
+LOGITECH_FORMAT="logitech-harmony-irdb"
 # OpenRemote.irdb ids are hex SHA-1 prefixes, so an "lh" id can never collide.
 LOGITECH_ID_PREFIX="lh"
 # The remote's own per-device limit, MAX_DEVICE_COMMANDS in the firmware.
@@ -1219,35 +1222,27 @@ def pronto_playable(pronto):
     if not 1<=once<=1024: return False
     return len(words)>=4+2*(once+repeat)
 
-def logitech_command_label(name):
-    """PowerToggle -> Power_Toggle, Input1 -> Input_1, 3DInvert -> 3D_Invert.
+def logitech_display_name(name):
+    """PowerToggle -> Power Toggle, Input1 -> Input 1, 3DInvert -> 3D Invert.
 
-    The remote turns underscores in a .ir signal name into spaces for its
-    button label, so this is what makes Harmony's CamelCase readable on the LCD.
     A digit followed by a letter is not split, so "3D" and "16x9" stay whole.
     """
-    text=re.sub(r"(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])|(?<=[A-Za-z]{2})(?=[0-9])","_",str(name or ""))
-    return ir_signal_name(text,0)
+    text=re.sub(r"(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])|(?<=[A-Za-z]{2})(?=[0-9])"," ",str(name or ""))
+    return re.sub(r"[\s_]+"," ",text).strip() or "Command"
 
-def build_logitech_database(save_parent):
-    STATE.update({"running":True,"done":False,"error":"","progress":0,"downloaded_mb":0.0,"records":0,"bin_mb":0.0,"release_path":""})
-    cache=CACHE_DIR/"cache"; release=CACHE_DIR/"release_logitech"
-    if release.exists(): shutil.rmtree(release)
-    release.mkdir(parents=True,exist_ok=True)
-    STATE["progress"]=2
-    zp=download_repo(LOGITECH_REPO,cache)
-    STATE["progress"]=30
-    db_path=release/"Logitech.irdb"
-    con=sqlite3.connect(db_path); cur=con.cursor()
-    cur.execute("PRAGMA journal_mode=OFF"); cur.execute("PRAGMA synchronous=OFF")
-    cur.execute("CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT)")
-    # commands is zlib-compressed JSON, [[name,protocol,pronto],...]. Pronto is
-    # "" for a command the remote cannot play, kept so the preview is complete.
-    cur.execute("CREATE TABLE codesets(id INTEGER PRIMARY KEY,path TEXT UNIQUE,command_count INTEGER,playable_count INTEGER,buttons_json TEXT,protocols_json TEXT,commands BLOB)")
-    cur.execute("CREATE TABLE remotes(id TEXT PRIMARY KEY,category TEXT,brand TEXT,model TEXT,device_type INTEGER,codeset_id INTEGER,control_json TEXT,search TEXT)")
-    codeset_ids={}; commands_total=0; playable_total=0
-    # Read straight from the zip: extracting it would put 1.3GB of 347,000
-    # small files on disk just to read each one once.
+def logitech_command_label(name):
+    """The .ir signal name: Power_Toggle. The remote shows "_" as a space."""
+    return ir_signal_name(logitech_display_name(name),0)
+
+def read_logitech_archive(zp):
+    """Records and shared code sets from the archive zip, read in place.
+
+    Extracting it would put 1.3GB of 347,000 small files on disk just to read
+    each one once. A code set keeps only commands the remote can play, under
+    readable names, at most REMOTE_MAX_COMMANDS of them, and is stored as zlib
+    JSON [[name,pronto],...] - exactly what WebConfig and Studio import.
+    """
+    records=[]; codesets={}; info={}
     with zipfile.ZipFile(zp) as z:
         names=z.namelist()
         root=names[0].split("/",1)[0]+"/"
@@ -1255,74 +1250,47 @@ def build_logitech_database(save_parent):
         devices=[n for n in names if n.startswith(root+"devices/") and n.endswith(".json") and not n.endswith("/index.json")]
         if not sets or not devices: raise RuntimeError("The Logitech archive did not contain codesets/ and devices/ - its layout may have changed.")
         log(f"Reading {len(sets)} Logitech code sets...")
+        total=0; kept=0
         for i,name in enumerate(sets,1):
             try: entries=json.loads(z.read(name)).get("commands") or []
             except Exception: continue
-            rows=[]; buttons=[]; protocols=[]; playable=0
+            rows=[]; seen=set(); protocols=[]
             for c in entries:
-                label=str(c.get("name") or "Command"); pronto=str(c.get("pronto") or "")
-                if not pronto_playable(pronto): pronto=""
-                else: playable+=1
-                proto=str(c.get("protocol") or "")
-                rows.append([label,proto,pronto]); buttons.append(label)
+                total+=1
+                pronto=str(c.get("pronto") or "").strip()
+                if not pronto_playable(pronto): continue
+                label=logitech_display_name(c.get("name"))
+                if label.lower() in seen or len(rows)>=REMOTE_MAX_COMMANDS: continue
+                seen.add(label.lower()); rows.append([label,pronto])
+                proto=str(c.get("protocol") or "").strip()
                 if proto and proto not in protocols: protocols.append(proto)
-            commands_total+=len(rows); playable_total+=playable
-            path=name[len(root):]
-            cur.execute("INSERT INTO codesets VALUES(?,?,?,?,?,?,?)",(i,path,len(rows),playable,
-                json.dumps(buttons,ensure_ascii=False),json.dumps(protocols,ensure_ascii=False),
-                zlib.compress(json.dumps(rows,ensure_ascii=False,separators=(",",":")).encode("utf-8"),9)))
-            codeset_ids[path]=(i,playable)
-            if i%2000==0:
-                STATE["progress"]=30+int(i/len(sets)*35); STATE["current"]=f"Code sets: {i} of {len(sets)}"
-        log(f"Code sets stored: {len(codeset_ids)} ({playable_total} of {commands_total} commands playable on the remote)")
-        records=0; no_codes=0; unplayable=0; brands=set()
+            if not rows: continue
+            kept+=len(rows)
+            key="lhc:"+name[len(root):]
+            codesets[key]=zlib.compress(json.dumps(rows,ensure_ascii=False,separators=(",",":")).encode("utf-8"),9)
+            info[name[len(root):]]=(key,len(rows),protocols)
+            if i%2000==0: STATE["current"]=f"Logitech code sets: {i} of {len(sets)}"
+        log(f"Logitech code sets: {len(codesets)} usable, {kept} of {total} commands kept")
+        skipped=0; seen_devices=set()
         for i,name in enumerate(devices,1):
             try: d=json.loads(z.read(name))
             except Exception: continue
-            target=codeset_ids.get(d.get("codeset") or "")
-            if not target: no_codes+=1; continue
-            if not target[1]: unplayable+=1; continue
+            target=info.get(d.get("codeset") or "")
+            if not target: skipped+=1; continue
             brand=re.sub(r"\s+"," ",str(d.get("manufacturer") or "")).strip() or "Unknown"
             model=re.sub(r"\s+"," ",str(d.get("model") or "")).strip() or f"Device {d.get('globalDeviceId')}"
-            dtype=d.get("deviceType"); cat=LOGITECH_TYPES.get(dtype,"Other")
-            control={k:d[k] for k in ("power","timing") if k in d}
-            cur.execute("INSERT OR IGNORE INTO remotes VALUES(?,?,?,?,?,?,?,?)",(LOGITECH_ID_PREFIX+str(d.get("globalDeviceId")),cat,brand,model,dtype,target[0],
-                json.dumps(control,ensure_ascii=False,separators=(",",":")),
-                " ".join([cat,brand,model,"logitech harmony"]).lower()))
-            records+=1; brands.add(brand)
-            if i%10000==0:
-                STATE["progress"]=65+int(i/len(devices)*25); STATE["records"]=records; STATE["current"]=f"Devices: {i} of {len(devices)}"
-    STATE["records"]=records
-    log(f"Devices stored: {records} from {len(brands)} brands. Skipped {no_codes} with no codes and {unplayable} whose codes the remote cannot play.")
-    log("Indexing Logitech.irdb...")
-    STATE["progress"]=92
-    cur.execute("CREATE INDEX idx_brand_model ON remotes(brand,model)")
-    version=dt.datetime.now().astimezone().strftime("%Y.%m.%d.%H%M")
-    created=dt.datetime.now().astimezone().isoformat(timespec="seconds")
-    metadata={"database_name":"Logitech Harmony IRDB","database_version":version,"created_date":created,
-        "device_count":records,"brand_count":len(brands),"codeset_count":len(codeset_ids),"command_count":commands_total,
-        "playable_command_count":playable_total,"builder_version":APP_VERSION,"format":LOGITECH_FORMAT,
-        "sources":[f"https://github.com/{LOGITECH_REPO['owner']}/{LOGITECH_REPO['repo']}"]}
-    for k,v in metadata.items(): cur.execute("INSERT INTO metadata VALUES(?,?)",(k,json.dumps(v) if not isinstance(v,str) else v))
-    con.commit(); con.execute("VACUUM"); con.close()
-    (release/"Release Notes.txt").write_text(
-        f"Logitech.irdb\nVersion: {version}\nCreated: {created}\n"
-        f"Devices: {records}\nBrands: {len(brands)}\nCode sets: {len(codeset_ids)}\n\n"
-        f"This database is for OpenRemote Studio only. Do NOT copy it to the remote.\n"
-        f"Search it in Studio's IRDB Browser and send one device at a time to the\n"
-        f"remote over USB. The remote's own onboard database is OpenRemote.irdb.\n\n"
-        f"Source: the Logitech Harmony IR archive by pickysysadmin, released CC0.\n"
-        f"The underlying codes originate with Logitech; see that project's README.\n",
-        encoding="utf-8")
-    shutil.copy2(db_path,LOGITECH_DB); STATE["bin_mb"]=db_path.stat().st_size/1024/1024
-    dest=Path(save_parent)/f"Logitech.irdb v{version}"
-    if dest.exists(): shutil.rmtree(dest)
-    shutil.copytree(release,dest)
-    shutil.rmtree(release,ignore_errors=True)
-    # 220MB that is never read again; the next build downloads a fresh copy.
-    zp.unlink(missing_ok=True)
-    STATE.update({"running":False,"done":True,"progress":100,"release_path":str(dest),"records":records})
-    log(f"Finished. Logitech.irdb ({STATE['bin_mb']:.1f} MB) saved to {dest}")
+            cat=LOGITECH_TYPES.get(d.get("deviceType"),"Other")
+            # The same model filed twice against the same codes is one device.
+            dup=(brand.lower(),model.lower(),cat,target[0])
+            if dup in seen_devices: continue
+            seen_devices.add(dup)
+            records.append({"id":LOGITECH_ID_PREFIX+str(d.get("globalDeviceId")),"category":cat,"brand":brand,"model":model,
+                "source":LOGITECH_SOURCE,"format":LOGITECH_FORMAT_ID,"original_path":"","button_count":target[1],
+                "buttons":[],"protocols":target[2],"codeset":target[0],
+                "search":" ".join([cat,brand,model,"logitech harmony"]).lower()})
+            if i%10000==0: STATE["current"]=f"Logitech devices: {i} of {len(devices)}"
+        log(f"Logitech devices: {len(records)} added, {skipped} skipped with no playable codes")
+    return records,codesets
 
 def irdb_format(path):
     """The metadata 'format' of an .irdb file, or "" when it has none."""
@@ -1334,48 +1302,18 @@ def irdb_format(path):
     except Exception:
         return ""
 
-def logitech_info():
-    if not LOGITECH_DB.exists(): return {"error":"No Logitech.irdb loaded yet."}
+def read_irdb_blob(db_path,offset,length):
+    """One record's bytes from the detail section, decompressed for format 3."""
+    footer=read_irdb_footer(db_path)
+    if not footer or length<=0: return None
+    if offset<0 or offset+length>footer["detail_length"]: return None
     try:
-        con=sqlite3.connect(f"file:{LOGITECH_DB}?mode=ro",uri=True)
-        meta=dict(con.execute("SELECT key,value FROM metadata").fetchall())
-        devices=con.execute("SELECT COUNT(*) FROM remotes").fetchone()[0]
-        con.close()
-    except Exception as e:
-        return {"error":"Logitech.irdb could not be read: "+str(e)}
-    created=meta.get("created_date","")
-    return {"path":str(LOGITECH_DB),"devices":devices,"brands":int(meta.get("brand_count") or 0),
-        "codesets":int(meta.get("codeset_count") or 0),"version":meta.get("database_version",""),
-        "build_date":created,"build_date_short":created[:10],"size_mb":LOGITECH_DB.stat().st_size/1024/1024}
-
-def search_logitech(query,limit=100):
-    if not LOGITECH_DB.exists(): return {"error":"No Logitech.irdb loaded yet.","results":[],"total":0}
-    terms=[t for t in query.lower().split() if t]; where=" AND ".join(["r.search LIKE ?" for _ in terms]) or "1=1"; params=[f"%{t}%" for t in terms]
-    con=sqlite3.connect(f"file:{LOGITECH_DB}?mode=ro",uri=True); con.row_factory=sqlite3.Row; cur=con.cursor()
-    total=cur.execute(f"SELECT COUNT(*) FROM remotes r WHERE {where}",params).fetchone()[0]
-    rows=cur.execute(f"SELECT r.id,r.category,r.brand,r.model,c.playable_count AS button_count,c.buttons_json,c.protocols_json FROM remotes r JOIN codesets c ON c.id=r.codeset_id WHERE {where} ORDER BY r.brand,r.model LIMIT {int(limit)}",params).fetchall(); con.close()
-    results=[]
-    for row in rows:
-        d=dict(row); d["buttons"]=json.loads(d.pop("buttons_json") or "[]"); d["protocols"]=json.loads(d.pop("protocols_json") or "[]")
-        d["source"]=LOGITECH_SOURCE; d["format"]="pronto"; results.append(d)
-    return {"results":results,"total":total,"shown":len(results)}
-
-def logitech_detail(id):
-    if not LOGITECH_DB.exists(): return {"error":"No Logitech.irdb loaded yet."}
-    con=sqlite3.connect(f"file:{LOGITECH_DB}?mode=ro",uri=True); con.row_factory=sqlite3.Row
-    row=con.execute("SELECT r.*,c.commands,c.protocols_json,c.playable_count FROM remotes r JOIN codesets c ON c.id=r.codeset_id WHERE r.id=?",(id,)).fetchone(); con.close()
-    if not row: return {"error":"Device not found."}
-    d=dict(row)
-    rows=json.loads(zlib.decompress(d.pop("commands")).decode("utf-8"))
-    control=json.loads(d.pop("control_json") or "{}")
-    d["protocols"]=json.loads(d.pop("protocols_json") or "[]")
-    d["ir"]=[{"name":n,"protocol":p,"pronto":code,"playable":bool(code)} for n,p,code in rows]
-    d["buttons"]=[n for n,p,code in rows if code]
-    d["skipped"]=len(rows)-len(d["buttons"])
-    d["power"]=(control.get("power") or {}).get("type","")
-    d["source"]=LOGITECH_SOURCE; d["format"]="pronto"
-    d.pop("search",None); d.pop("codeset_id",None)
-    return d
+        with open(db_path,"rb") as f:
+            f.seek(footer["detail_offset"]+offset)
+            data=f.read(length)
+        return zlib.decompress(data) if footer["version"]>=3 else data
+    except Exception:
+        return None
 
 def logitech_ir_text(d):
     lines=["Filetype: IR signals file","Version: 1"]
@@ -1383,7 +1321,7 @@ def logitech_ir_text(d):
     for entry in d.get("ir") or []:
         if not entry.get("pronto"): continue
         if count>=REMOTE_MAX_COMMANDS: break
-        lines.extend(["#","name: "+logitech_command_label(entry.get("name")),"type: pronto","data: "+entry["pronto"]])
+        lines.extend(["#","name: "+ir_signal_name(entry.get("name"),count),"type: pronto","data: "+entry["pronto"]])
         count+=1
     return "\n".join(lines)+"\n", count
 
@@ -1395,7 +1333,7 @@ def db_info():
         cur=con.cursor()
         devices=cur.execute("SELECT COUNT(*) FROM remotes").fetchone()[0]
         try:
-            brands=cur.execute("SELECT COUNT(DISTINCT brand) FROM remotes").fetchone()[0]
+            brands=cur.execute("SELECT COUNT(DISTINCT LOWER(brand)) FROM remotes").fetchone()[0]
         except Exception:
             brands=0
         try:
@@ -1412,6 +1350,16 @@ def db_info():
 
         version=meta("database_version","")
         created=meta("created_date",meta("scrape_date_local",meta("scrape_date_utc","")))
+        try: sources=json.loads(meta("source_stats","") or "[]")
+        except Exception: sources=[]
+        if not sources:
+            # A database built before Studio 2.87 recorded no breakdown.
+            try:
+                sources=[{"name":n,"devices":d,"brands":b,"buttons":t or 0} for n,d,b,t in cur.execute(
+                    "SELECT source,COUNT(*),COUNT(DISTINCT LOWER(brand)),SUM(button_count) FROM remotes GROUP BY source ORDER BY COUNT(*) DESC")]
+            except Exception:
+                sources=[]
+        footer=read_irdb_footer(ACTIVE_DB)
         con.close()
 
         if not created:
@@ -1425,6 +1373,8 @@ def db_info():
             "devices":devices,
             "brands":brands,
             "buttons":btns,
+            "sources":sources,
+            "index_version":footer["version"] if footer else 0,
             "version":version,
             "build_date":created,
             "build_date_short":created[:10] if created else "",
@@ -1433,23 +1383,27 @@ def db_info():
     except Exception as e:
         return {"error":"OpenRemote.irdb could not be read: "+str(e)}
 
-def search_any(query,which="all"):
-    """Searches OpenRemote.irdb, Logitech.irdb, or both merged by brand/model."""
-    if which=="openremote": return search_db(query)
-    if which=="logitech": return search_logitech(query)
-    parts=[r for r in (search_db(query),search_logitech(query)) if not r.get("error")]
-    if not parts: return {"error":"No database loaded yet. Build or load OpenRemote.irdb or Logitech.irdb.","results":[],"total":0}
-    results=sorted([x for r in parts for x in r["results"]],key=lambda x:(str(x["brand"]).lower(),str(x["model"]).lower()))[:100]
-    return {"results":results,"total":sum(r["total"] for r in parts),"shown":len(results)}
-def search_db(query):
+def search_db(query,which="all"):
+    """which: "all", "openremote" (everything but Logitech) or "logitech"."""
     if not ACTIVE_DB.exists(): return {"error":"No OpenRemote.irdb loaded yet.","results":[],"total":0}
-    terms=[t for t in query.lower().split() if t]; where=" AND ".join(["search LIKE ?" for _ in terms]) or "1=1"; params=[f"%{t}%" for t in terms]
+    terms=[t for t in query.lower().split() if t]
+    clauses=["search LIKE ?" for _ in terms]; params=[f"%{t}%" for t in terms]
+    if which=="logitech": clauses.append("source=?"); params.append(LOGITECH_SOURCE)
+    elif which=="openremote": clauses.append("source<>?"); params.append(LOGITECH_SOURCE)
+    where=" AND ".join(clauses) or "1=1"
     con=sqlite3.connect(ACTIVE_DB); con.row_factory=sqlite3.Row; cur=con.cursor()
     total=cur.execute(f"SELECT COUNT(*) FROM remotes WHERE {where}",params).fetchone()[0]
-    rows=cur.execute(f"SELECT id,category,brand,model,source,format,button_count,buttons_json,protocols_json FROM remotes WHERE {where} ORDER BY brand,model LIMIT 100",params).fetchall(); con.close()
+    rows=cur.execute(f"SELECT * FROM remotes WHERE {where} ORDER BY LOWER(brand),LOWER(model) LIMIT 100",params).fetchall(); con.close()
     results=[]
     for row in rows:
-        d=dict(row); d["buttons"]=json.loads(d.pop("buttons_json") or "[]"); d["protocols"]=json.loads(d.pop("protocols_json") or "[]"); results.append(d)
+        d=dict(row); d["buttons"]=json.loads(d.pop("buttons_json") or "[]"); d["protocols"]=json.loads(d.pop("protocols_json") or "[]")
+        if d.get("format")==LOGITECH_FORMAT_ID and not d["buttons"]:
+            # Logitech rows keep their names in the shared code set only.
+            blob=read_irdb_blob(ACTIVE_DB,d.get("detail_offset") or 0,d.get("detail_length") or 0)
+            try: d["buttons"]=[n for n,_ in json.loads(blob)] if blob else []
+            except Exception: d["buttons"]=[]
+        for k in ("search","detail_offset","detail_length","original_path"): d.pop(k,None)
+        results.append(d)
     return {"results":results,"total":total,"shown":len(results)}
 def read_irdb_footer(db_path):
     """The 64-byte trailer that locates the appended sections, or None."""
@@ -1469,20 +1423,7 @@ def read_irdb_footer(db_path):
     except Exception:
         return None
 
-def read_irdb_detail(db_path,offset,length):
-    """One device's full record, read straight out of the detail section."""
-    footer=read_irdb_footer(db_path)
-    if not footer or length<=0: return None
-    if offset<0 or offset+length>footer["detail_length"]: return None
-    try:
-        with open(db_path,"rb") as f:
-            f.seek(footer["detail_offset"]+offset)
-            return json.loads(f.read(length).decode("utf-8"))
-    except Exception:
-        return None
-
 def device_detail(id):
-    if str(id).startswith(LOGITECH_ID_PREFIX): return logitech_detail(id)
     if not ACTIVE_DB.exists(): return {"error":"No OpenRemote.irdb loaded yet."}
     con=sqlite3.connect(ACTIVE_DB); con.row_factory=sqlite3.Row
     row=con.execute("SELECT * FROM remotes WHERE id=?",(id,)).fetchone(); con.close()
@@ -1497,10 +1438,17 @@ def device_detail(id):
         d["ir"]=json.loads(d.pop("ir_json") or "[]")
         return d
     offset=d.pop("detail_offset",None); length=d.pop("detail_length",None)
-    record=read_irdb_detail(ACTIVE_DB,offset or 0,length or 0) if length else None
+    blob=read_irdb_blob(ACTIVE_DB,offset or 0,length or 0) if length else None
+    try: record=json.loads(blob) if blob else None
+    except Exception: record=None
     if record is None:
         return {"error":"This database's IR payload section is missing or unreadable. Rebuild it in IRDB Builder."}
-    d["ir"]=json.loads(record.get("irJson") or "[]")
+    if d.get("format")==LOGITECH_FORMAT_ID:
+        d["ir"]=[{"name":n,"pronto":p,"playable":True} for n,p in record]
+        d["buttons"]=[n for n,_ in record]
+    else:
+        d["ir"]=json.loads(record.get("irJson") or "[]")
+    d.pop("search",None)
     return d
 
 SUPPORTED_PROTOCOLS={"NEC","NECext","NEC1","Samsung32","RC5","RC5X","RC6","SIRC","SIRC15","SIRC20"}
@@ -1618,7 +1566,7 @@ def ir_file_from_db(id):
         text,count=flipper_ir_text(d)
     elif fmt=="probonopd_irdb_compact":
         text,count=compact_ir_text(d)
-    elif fmt=="pronto":
+    elif fmt==LOGITECH_FORMAT_ID:
         text,count=logitech_ir_text(d)
     else:
         return {"error":"This IRDB record cannot be exported as a .ir file yet."}
@@ -2514,11 +2462,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_data((APP_DIR/"OpenRemote.png").read_bytes(),"image/png")
         elif self.path.startswith("/product.png"):
             p=APP_DIR/"openremote_product.png"; self.send_data(p.read_bytes(),"image/png") if p.exists() else self.send_data("Missing image",code=404)
-        elif self.path.startswith("/logitech-info"): self.send_data(json.dumps(logitech_info()),"application/json")
         elif self.path.startswith("/search"):
             qs=urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             q=qs.get("q",[""])[0]; which=qs.get("db",["all"])[0]
-            self.send_data(json.dumps(search_any(q,which),ensure_ascii=False),"application/json")
+            self.send_data(json.dumps(search_db(q,which),ensure_ascii=False),"application/json")
         elif self.path.startswith("/device"):
             id=urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("id",[""])[0]; self.send_data(json.dumps(device_detail(id),ensure_ascii=False),"application/json")
         elif self.path.startswith("/usb-ports"):
@@ -2689,18 +2636,8 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception as e:
                     STATE["error"]=str(e); STATE["running"]=False; log("ERROR: "+str(e))
             threading.Thread(target=worker,daemon=True).start(); self.send_data(json.dumps({"ok":True}),"application/json")
-        elif self.path.startswith("/start-logitech-build"):
-            if STATE["running"]: self.send_data(json.dumps({"error":"A database build is already running."}),"application/json"); return
-            folder=choose_folder()
-            if not folder: self.send_data(json.dumps({"error":"Save cancelled."}),"application/json"); return
-            def worker():
-                try: build_logitech_database(folder)
-                except Exception as e:
-                    STATE["error"]=str(e); STATE["running"]=False; log("ERROR: "+str(e))
-            threading.Thread(target=worker,daemon=True).start(); self.send_data(json.dumps({"ok":True}),"application/json")
         elif self.path.startswith("/upload-db"):
-            logitech=urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("kind",[""])[0]=="logitech"
-            target=LOGITECH_DB if logitech else ACTIVE_DB
+            target=ACTIVE_DB
             length=int(self.headers.get("Content-Length","0") or 0)
             if length<=0: self.send_data(json.dumps({"error":"No file uploaded."}),"application/json"); return
             # Written beside the live copy and checked before it replaces it, so
@@ -2715,17 +2652,13 @@ class Handler(BaseHTTPRequestHandler):
             if remaining:
                 staging.unlink(missing_ok=True)
                 self.send_data(json.dumps({"error":"The database upload ended early."}),"application/json",400); return
-            # Logitech.irdb is Studio-only. Loaded as OpenRemote.irdb it would be
-            # offered to the remote, which cannot search a database that size.
-            fmt=irdb_format(staging)
-            if logitech and fmt!=LOGITECH_FORMAT:
+            # Studio 2.86's separate Logitech.irdb has no index the remote can
+            # search. Its devices are now inside OpenRemote.irdb itself.
+            if irdb_format(staging)==LOGITECH_FORMAT:
                 staging.unlink(missing_ok=True)
-                self.send_data(json.dumps({"error":"That is not a Logitech.irdb file. Build one in IRDB Builder."}),"application/json",400); return
-            if not logitech and fmt==LOGITECH_FORMAT:
-                staging.unlink(missing_ok=True)
-                self.send_data(json.dumps({"error":"That is Logitech.irdb, which stays in Studio. Load it with Load Logitech.irdb instead."}),"application/json",400); return
+                self.send_data(json.dumps({"error":"That is the old Logitech.irdb from Studio 2.86. Logitech devices are now part of OpenRemote.irdb: rebuild it in IRDB Builder with Logitech Harmony ticked."}),"application/json",400); return
             os.replace(staging,target)
-            if not logitech: STATE["db_path"]=str(ACTIVE_DB); STATE["bin_mb"]=ACTIVE_DB.stat().st_size/1024/1024
+            STATE["db_path"]=str(ACTIVE_DB); STATE["bin_mb"]=ACTIVE_DB.stat().st_size/1024/1024
             self.send_data(json.dumps({"ok":True,"path":str(target)}),"application/json")
         elif self.path.startswith("/usb/factory-reset"):
             length=int(self.headers.get("Content-Length","0") or 0)

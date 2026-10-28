@@ -1,6 +1,23 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.86 - 2026-10-28
+    - Reads IRDB index format 3 from Studio 2.87, which merges the Logitech
+      Harmony archive into OpenRemote.irdb: 271,761 devices where there were
+      14,551, in a 129 MB file. Format 3's search lines are tab-separated and
+      sorted by brand, with a brand directory beside them, so a query that
+      names a brand ("sony kdl") reads only that brand's ~1 MB instead of the
+      whole 15 MB index. A query naming no brand reads until it has 25
+      matches, which for "tv" is the first few hundred lines; only a query
+      matching almost nothing reads it all (about 7 s). Matching runs on the
+      read buffer in place rather than building a String per line.
+    - A search stops reading when WebConfig drops it for the next keystroke.
+    - /api/irdb/detail sends a format 3 record compressed, exactly as stored,
+      and goes straight to it when given the o and l its search result
+      carried. WebConfig 3.45 inflates it. Format 2 databases still work as
+      before.
+    - Search match counts are 32-bit; Sony alone has 19,560 devices.
+
   5.85 - 2026-10-28
     - The Battery widget's "Until empty" estimate no longer learns time spent
       on the charger. Rev 6 cannot see USB power, so after the TP4056 finished
@@ -7370,7 +7387,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.85"
+#define OPENREMOTE_VERSION_STRING "5.86"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -21457,7 +21474,7 @@ bool readIrdbEmbeddedIndex(IrdbEmbeddedIndex &out) {
   // or half-copied database would otherwise send the reader seeking into
   // nothing, and an index that cannot be trusted is worse than no index.
   uint64_t limit = size - IRDB_INDEX_FOOTER_SIZE;
-  if (out.formatVersion < 1 || out.formatVersion > 2) return false;
+  if (out.formatVersion < 1 || out.formatVersion > 3) return false;
   if (out.searchOffset > limit || out.searchLength > limit - out.searchOffset) return false;
   if (out.detailOffset > limit || out.detailLength > limit - out.detailOffset) return false;
   if (out.metaLength && (out.metaOffset > limit || out.metaLength > limit - out.metaOffset)) {
@@ -21604,6 +21621,476 @@ void handleIrdbDelete() {
                 removed ? "removed" : "nothing to remove", freed / 1048576.0);
 }
 
+/*
+  Index format 3 (Studio 2.87), built for the Logitech Harmony merge: 272,000
+  devices where format 2 had 14,500. Format 2's way - read every JSON line of
+  the index and lowercase it into a String - took 1.4 s for 14,500 devices and
+  would take ~25 s for this, so format 3 changes what is read and how:
+
+  - Search lines are tab-separated: id, source#, format#, category, brand,
+    model, buttons, protocol, detail offset, detail length. About 60 bytes a
+    device instead of 200. Source and format names are in the metadata.
+  - Lines are sorted by brand, and a brand directory (brand, offset, length,
+    count) says where each brand's lines are. A query naming a brand reads
+    only those lines.
+  - A query naming no brand reads the whole index, but stops at the first
+    IRDB_SEARCH_MAX_RESULTS matches. Only a query matching almost nothing
+    reads all of it, about 16 MB at the SD card's 2 MB/s.
+  - Matching works on the read buffer in place. No String per line.
+  - Detail records are zlib-compressed and sent as they are; WebConfig
+    inflates them. WebConfig passes each result's offset and length back, so
+    importing a device is one seek, not a scan.
+*/
+static const uint8_t IRDB_SEARCH_MAX_RESULTS = 25;
+static const uint8_t IRDB_V3_MAX_NAMES = 12;
+static const uint16_t IRDB_V3_MAX_RANGES = 256;
+static const size_t IRDB_V3_MAX_LINE = 1024;
+static const uint32_t IRDB_V3_MAX_DETAIL = 4UL * 1024UL * 1024UL;
+
+struct IrdbV3Info {
+  String sources[IRDB_V3_MAX_NAMES];
+  String formats[IRDB_V3_MAX_NAMES];
+  String sourcesLower[IRDB_V3_MAX_NAMES];
+  uint8_t sourceCount = 0;
+  uint8_t formatCount = 0;
+  uint64_t brandOffset = 0;
+  uint64_t brandLength = 0;
+};
+
+bool readIrdbV3Info(const IrdbEmbeddedIndex &index, IrdbV3Info &info) {
+  if (!index.metaLength || index.metaLength >= 4096) return false;
+  File file = SD.open(IRDB_PATH, FILE_READ);
+  if (!file) return false;
+  char *blob = (char *)malloc(index.metaLength + 1);
+  bool ok = blob && file.seek((uint32_t)index.metaOffset) &&
+            file.read((uint8_t *)blob, index.metaLength) == (int)index.metaLength;
+  uint64_t fileSize = (uint64_t)file.size();
+  file.close();
+  if (!ok) { free(blob); return false; }
+  blob[index.metaLength] = 0;
+  JsonDocument doc;
+  DeserializationError error = deserializeJson(doc, blob, index.metaLength);
+  free(blob);
+  if (error) return false;
+  JsonObject idx = doc["index"];
+  for (JsonVariant v : idx["sources"].as<JsonArray>()) {
+    if (info.sourceCount >= IRDB_V3_MAX_NAMES) break;
+    info.sources[info.sourceCount] = (const char *)(v | "");
+    info.sourcesLower[info.sourceCount] = normalizedSearchText(info.sources[info.sourceCount]);
+    info.sourceCount++;
+  }
+  for (JsonVariant v : idx["formats"].as<JsonArray>()) {
+    if (info.formatCount >= IRDB_V3_MAX_NAMES) break;
+    info.formats[info.formatCount++] = (const char *)(v | "");
+  }
+  info.brandOffset = idx["brands"]["offset"] | (uint64_t)0;
+  info.brandLength = idx["brands"]["length"] | (uint64_t)0;
+  // The directory must sit between the detail section and the metadata.
+  if (info.brandLength && (info.brandOffset < index.detailOffset + index.detailLength ||
+                           info.brandOffset + info.brandLength > fileSize)) {
+    info.brandOffset = 0;
+    info.brandLength = 0;
+  }
+  return true;
+}
+
+/*
+  Hands back one line at a time from a byte range of the open file, without
+  copying it. The line is NUL-terminated in the buffer in place of its newline
+  and stays valid until the next call. A line longer than IRDB_V3_MAX_LINE is
+  malformed and skipped whole.
+*/
+struct IrdbLineReader {
+  File *file = nullptr;
+  uint8_t *buffer = nullptr;
+  size_t capacity = 0;
+  size_t filled = 0;
+  size_t cursor = 0;
+  uint64_t remaining = 0;
+  uint32_t blocks = 0;
+
+  bool begin(File &f, uint8_t *buf, size_t cap, uint64_t from, uint64_t length) {
+    file = &f;
+    buffer = buf;
+    capacity = cap;
+    filled = cursor = 0;
+    remaining = length;
+    return f.seek((uint32_t)from);
+  }
+
+  bool refill() {
+    if (cursor) {
+      memmove(buffer, buffer + cursor, filled - cursor);
+      filled -= cursor;
+      cursor = 0;
+    }
+    if (!remaining || filled >= capacity) return false;
+    size_t want = capacity - filled;
+    if ((uint64_t)want > remaining) want = (size_t)remaining;
+    int got = file->read(buffer + filled, want);
+    if (got <= 0) { remaining = 0; return false; }
+    filled += (size_t)got;
+    remaining -= (uint64_t)got;
+    blocks++;
+    return true;
+  }
+
+  bool next(char *&line, size_t &length) {
+    for (;;) {
+      uint8_t *start = buffer + cursor;
+      uint8_t *end = (uint8_t *)memchr(start, '\n', filled - cursor);
+      if (end) {
+        *end = 0;
+        line = (char *)start;
+        length = (size_t)(end - start);
+        cursor = (size_t)(end - buffer) + 1;
+        if (length > IRDB_V3_MAX_LINE) continue;
+        return true;
+      }
+      if (filled - cursor >= capacity - 1) {
+        // No newline in a full buffer: drop it and resynchronise.
+        cursor = filled;
+      }
+      if (!refill()) {
+        // A last line with no newline still counts.
+        if (filled > cursor && filled < capacity) {
+          buffer[filled] = 0;
+          line = (char *)(buffer + cursor);
+          length = filled - cursor;
+          cursor = filled;
+          return length <= IRDB_V3_MAX_LINE;
+        }
+        return false;
+      }
+    }
+  }
+};
+
+// Splits a search line at its tabs. Returns how many fields it found.
+uint8_t splitIrdbV3Line(char *line, size_t length, char *fields[10], size_t lengths[10]) {
+  uint8_t count = 0;
+  char *field = line;
+  char *end = line + length;
+  while (count < 10) {
+    char *tab = (char *)memchr(field, '\t', (size_t)(end - field));
+    fields[count] = field;
+    lengths[count] = tab ? (size_t)(tab - field) : (size_t)(end - field);
+    count++;
+    if (!tab) break;
+    field = tab + 1;
+  }
+  return count;
+}
+
+bool irdbV3LineMatches(char *fields[10], size_t lengths[10], const IrdbV3Info &info,
+                       const String terms[], uint8_t termCount) {
+  // Category, brand, model and protocol, lowercased together. Not the id or
+  // the offsets, which would make every number a match.
+  char haystack[IRDB_V3_MAX_LINE + 8];
+  size_t used = 0;
+  const uint8_t searched[] = {3, 4, 5, 7};
+  for (uint8_t f : searched) {
+    for (size_t i = 0; i < lengths[f] && used < sizeof(haystack) - 2; i++) {
+      haystack[used++] = (char)tolower((unsigned char)fields[f][i]);
+    }
+    haystack[used++] = '\t';
+  }
+  haystack[used] = 0;
+  uint8_t source = (uint8_t)atoi(fields[1]);
+  for (uint8_t t = 0; t < termCount; t++) {
+    if (strstr(haystack, terms[t].c_str())) continue;
+    if (source < info.sourceCount && info.sourcesLower[source].indexOf(terms[t]) >= 0) continue;
+    return false;
+  }
+  return true;
+}
+
+void appendJsonText(String &out, const char *text, size_t length) {
+  out += '"';
+  for (size_t i = 0; i < length; i++) {
+    char c = text[i];
+    if (c == '"' || c == '\\') { out += '\\'; out += c; }
+    else if ((unsigned char)c < 0x20) out += ' ';
+    else out += c;
+  }
+  out += '"';
+}
+
+void appendIrdbV3Result(String &out, char *fields[10], size_t lengths[10], const IrdbV3Info &info) {
+  uint8_t source = (uint8_t)atoi(fields[1]);
+  uint8_t format = (uint8_t)atoi(fields[2]);
+  const String &sourceName = source < info.sourceCount ? info.sources[source] : String("");
+  const String &formatName = format < info.formatCount ? info.formats[format] : String("");
+  out += "{\"id\":"; appendJsonText(out, fields[0], lengths[0]);
+  out += ",\"category\":"; appendJsonText(out, fields[3], lengths[3]);
+  out += ",\"brand\":"; appendJsonText(out, fields[4], lengths[4]);
+  out += ",\"model\":"; appendJsonText(out, fields[5], lengths[5]);
+  out += ",\"source\":"; appendJsonText(out, sourceName.c_str(), sourceName.length());
+  out += ",\"format\":"; appendJsonText(out, formatName.c_str(), formatName.length());
+  out += ",\"buttonCount\":"; out += String(atoi(fields[6]));
+  out += ",\"protocol\":"; appendJsonText(out, fields[7], lengths[7]);
+  out += ",\"o\":"; out += String((unsigned long long)strtoull(fields[8], nullptr, 10));
+  out += ",\"l\":"; out += String((unsigned long)strtoul(fields[9], nullptr, 10));
+  out += "}";
+}
+
+struct IrdbRange {
+  uint32_t offset;
+  uint32_t length;
+};
+
+/*
+  Picks the brands the query names. A term is a brand term when a brand
+  equals it, or (3+ letters) begins with it - "pana" finds Panasonic. A term
+  equal to a brand beats one that only begins one, and among those the term
+  whose brands hold the fewest devices wins. Returns how many ranges were
+  chosen, 0 when the query names no brand (or too many to be worth it).
+*/
+uint16_t chooseIrdbBrandRanges(const IrdbV3Info &info, const String terms[], uint8_t termCount,
+                               IrdbRange *ranges, String &chosenTerm) {
+  if (!info.brandLength || info.brandLength > 2UL * 1024UL * 1024UL) return 0;
+  uint8_t *directory = (uint8_t *)ps_malloc((size_t)info.brandLength + 1);
+  if (!directory) return 0;
+  File file = SD.open(IRDB_PATH, FILE_READ);
+  bool ok = file && file.seek((uint32_t)info.brandOffset) &&
+            file.read(directory, (size_t)info.brandLength) == (int)info.brandLength;
+  if (file) file.close();
+  if (!ok) { free(directory); return 0; }
+  directory[info.brandLength] = 0;
+
+  int8_t bestTerm = -1;
+  bool bestExact = false;
+  uint64_t bestBytes = 0;
+  for (uint8_t t = 0; t < termCount; t++) {
+    const String &term = terms[t];
+    if (term.length() < 2) continue;
+    bool exact = false;
+    uint64_t bytes = 0;
+    uint16_t hits = 0;
+    char *line = (char *)directory;
+    while (*line) {
+      char *end = strchr(line, '\n');
+      if (!end) end = line + strlen(line);
+      char *tab = (char *)memchr(line, '\t', (size_t)(end - line));
+      if (tab) {
+        size_t brandLength = (size_t)(tab - line);
+        bool equal = brandLength == term.length() && !memcmp(line, term.c_str(), brandLength);
+        bool prefix = term.length() >= 3 && brandLength > term.length() &&
+                      !memcmp(line, term.c_str(), term.length());
+        if (equal || (prefix && !exact)) {
+          char *lengthField = strchr(tab + 1, '\t');
+          uint32_t length = lengthField ? strtoul(lengthField + 1, nullptr, 10) : 0;
+          if (equal && !exact) { exact = true; bytes = 0; hits = 0; }
+          if (equal || !exact) { bytes += length; hits++; }
+        }
+      }
+      line = *end ? end + 1 : end;
+    }
+    if (!hits || hits > IRDB_V3_MAX_RANGES) continue;
+    if (bestTerm < 0 || (exact && !bestExact) || (exact == bestExact && bytes < bestBytes)) {
+      bestTerm = (int8_t)t;
+      bestExact = exact;
+      bestBytes = bytes;
+    }
+  }
+
+  uint16_t count = 0;
+  if (bestTerm >= 0) {
+    const String &term = terms[bestTerm];
+    chosenTerm = term;
+    char *line = (char *)directory;
+    while (*line && count < IRDB_V3_MAX_RANGES) {
+      char *end = strchr(line, '\n');
+      if (!end) end = line + strlen(line);
+      char *tab = (char *)memchr(line, '\t', (size_t)(end - line));
+      if (tab) {
+        size_t brandLength = (size_t)(tab - line);
+        bool equal = brandLength == term.length() && !memcmp(line, term.c_str(), brandLength);
+        bool prefix = term.length() >= 3 && brandLength > term.length() &&
+                      !memcmp(line, term.c_str(), term.length());
+        if (bestExact ? equal : prefix) {
+          char *lengthField = strchr(tab + 1, '\t');
+          ranges[count].offset = strtoul(tab + 1, nullptr, 10);
+          ranges[count].length = lengthField ? strtoul(lengthField + 1, nullptr, 10) : 0;
+          if (ranges[count].length) count++;
+        }
+      }
+      line = *end ? end + 1 : end;
+    }
+  }
+  free(directory);
+  return count;
+}
+
+void handleIrdbSearchV3(const IrdbEmbeddedIndex &embedded, const String &query,
+                        const String terms[], uint8_t termCount) {
+  IrdbV3Info info;
+  if (!readIrdbV3Info(embedded, info)) {
+    sendJson(500, "{\"ok\":false,\"error\":\"OpenRemote.irdb's index description is unreadable - rebuild it with OpenRemote Studio\"}");
+    return;
+  }
+  IrdbRange *ranges = (IrdbRange *)ps_malloc(sizeof(IrdbRange) * IRDB_V3_MAX_RANGES);
+  const size_t capacity = 64 * 1024;
+  uint8_t *buffer = (uint8_t *)ps_malloc(capacity + 1);
+  File file = SD.open(IRDB_PATH, FILE_READ);
+  if (!ranges || !buffer || !file) {
+    if (ranges) free(ranges);
+    if (buffer) free(buffer);
+    if (file) file.close();
+    sendJson(500, "{\"ok\":false,\"error\":\"Could not open the IRDB search index\"}");
+    return;
+  }
+
+  String brandTerm;
+  uint16_t rangeCount = chooseIrdbBrandRanges(info, terms, termCount, ranges, brandTerm);
+  bool wholeIndex = rangeCount == 0;
+  if (wholeIndex) {
+    ranges[0].offset = 0;
+    ranges[0].length = (uint32_t)embedded.searchLength;
+    rangeCount = 1;
+  }
+
+  String results;
+  results.reserve(IRDB_SEARCH_MAX_RESULTS * 220);
+  uint32_t total = 0;
+  uint8_t shown = 0;
+  uint32_t lines = 0;
+  bool more = false;
+  bool abandoned = false;
+  unsigned long startedMs = millis();
+  unsigned long lastYieldMs = startedMs;
+  char *fields[10];
+  size_t lengths[10];
+
+  for (uint16_t r = 0; r < rangeCount && !more && !abandoned; r++) {
+    if ((uint64_t)ranges[r].offset + ranges[r].length > embedded.searchLength) continue;
+    IrdbLineReader reader;
+    if (!reader.begin(file, buffer, capacity, embedded.searchOffset + ranges[r].offset, ranges[r].length)) continue;
+    uint32_t lastBlock = 0;
+    char *line;
+    size_t length;
+    while (reader.next(line, length)) {
+      lines++;
+      if (splitIrdbV3Line(line, length, fields, lengths) < 10) continue;
+      if (!irdbV3LineMatches(fields, lengths, info, terms, termCount)) continue;
+      if (shown < IRDB_SEARCH_MAX_RESULTS) {
+        if (shown) results += ',';
+        appendIrdbV3Result(results, fields, lengths, info);
+        shown++;
+        total++;
+      } else if (wholeIndex) {
+        // Counting the rest would mean reading all of it for a number.
+        more = true;
+        break;
+      } else {
+        total++;
+      }
+      if (reader.blocks != lastBlock) {
+        lastBlock = reader.blocks;
+        // WebConfig drops a search when the next keystroke arrives; stop
+        // reading for a page that has stopped listening.
+        if (!webServer.client().connected()) { abandoned = true; break; }
+      }
+      unsigned long now = millis();
+      if (now - lastYieldMs >= 10UL) { lastYieldMs = now; delay(1); }
+    }
+    if (!abandoned && !webServer.client().connected()) abandoned = true;
+  }
+  file.close();
+  free(buffer);
+  free(ranges);
+  Serial.printf("IRDB search v3: \"%s\" %s, %lu lines in %lu ms, %u shown, %lu%s match(es)%s\n",
+                query.c_str(),
+                wholeIndex ? "whole index" : (String("brand \"") + brandTerm + "\"").c_str(),
+                (unsigned long)lines, (unsigned long)(millis() - startedMs),
+                (unsigned)shown, (unsigned long)total, more ? "+" : "",
+                abandoned ? " - abandoned, client gone" : "");
+  if (abandoned) return;
+
+  webServer.sendHeader("Cache-Control", "no-store");
+  webServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  webServer.send(200, "application/json", "");
+  webServer.sendContent("{\"ok\":true,\"results\":[");
+  webServer.sendContent(results);
+  String tail = String("],\"shown\":") + shown + ",\"total\":" + total +
+                ",\"more\":" + (more ? "true" : "false") +
+                ",\"limit\":" + IRDB_SEARCH_MAX_RESULTS + ",\"scanned\":" + lines +
+                ",\"brand\":";
+  webServer.sendContent(tail);
+  String brandJson;
+  if (wholeIndex) brandJson = "null";
+  else appendJsonText(brandJson, brandTerm.c_str(), brandTerm.length());
+  webServer.sendContent(brandJson);
+  webServer.sendContent("}");
+  webServer.sendContent("");
+}
+
+/*
+  Sends one device's compressed record. WebConfig 3.45 passes the offset and
+  length its search result carried; without them the index is scanned for the
+  id, which is slow but keeps an older page working.
+*/
+void handleIrdbDetailV3(const IrdbEmbeddedIndex &embedded, const String &id) {
+  uint64_t offset = 0;
+  uint64_t length = 0;
+  if (webServer.hasArg("o") && webServer.hasArg("l")) {
+    offset = strtoull(webServer.arg("o").c_str(), nullptr, 10);
+    length = strtoull(webServer.arg("l").c_str(), nullptr, 10);
+  } else {
+    const size_t capacity = 64 * 1024;
+    uint8_t *buffer = (uint8_t *)ps_malloc(capacity + 1);
+    File file = SD.open(IRDB_PATH, FILE_READ);
+    IrdbLineReader reader;
+    if (buffer && file && reader.begin(file, buffer, capacity, embedded.searchOffset, embedded.searchLength)) {
+      char *line;
+      size_t lineLength;
+      char *fields[10];
+      size_t lengths[10];
+      unsigned long lastYieldMs = millis();
+      while (reader.next(line, lineLength)) {
+        if (lineLength > id.length() && line[id.length()] == '\t' &&
+            !memcmp(line, id.c_str(), id.length()) &&
+            splitIrdbV3Line(line, lineLength, fields, lengths) >= 10) {
+          offset = strtoull(fields[8], nullptr, 10);
+          length = strtoull(fields[9], nullptr, 10);
+          break;
+        }
+        unsigned long now = millis();
+        if (now - lastYieldMs >= 10UL) { lastYieldMs = now; delay(1); }
+      }
+    }
+    if (file) file.close();
+    if (buffer) free(buffer);
+  }
+  if (!length || length > IRDB_V3_MAX_DETAIL || offset > embedded.detailLength ||
+      length > embedded.detailLength - offset) {
+    sendJson(404, "{\"ok\":false,\"error\":\"Device not found in the IRDB index\"}");
+    return;
+  }
+  File file = SD.open(IRDB_PATH, FILE_READ);
+  if (!file || !file.seek((uint32_t)(embedded.detailOffset + offset))) {
+    if (file) file.close();
+    sendJson(500, "{\"ok\":false,\"error\":\"Could not seek to the device record\"}");
+    return;
+  }
+  webServer.sendHeader("Cache-Control", "no-store");
+  webServer.sendHeader("X-OpenRemote-Encoding", "zlib");
+  webServer.setContentLength((size_t)length);
+  webServer.send(200, "application/octet-stream", "");
+  uint8_t chunk[1024];
+  uint64_t remaining = length;
+  while (remaining) {
+    size_t want = (size_t)min<uint64_t>(remaining, sizeof(chunk));
+    int got = file.read(chunk, want);
+    if (got <= 0) break;
+    webServer.sendContent((const char *)chunk, (size_t)got);
+    remaining -= (uint64_t)got;
+    delay(0);
+  }
+  file.close();
+  Serial.printf("IRDB detail v3 \"%s\": %lu compressed bytes\n", id.c_str(), (unsigned long)length);
+}
+
 void handleIrdbSearch() {
   if (!requestAuthorized()) {
     sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
@@ -21634,6 +22121,11 @@ void handleIrdbSearch() {
     start = space + 1;
   }
 
+  if (useEmbedded && embedded.formatVersion >= 3) {
+    handleIrdbSearchV3(embedded, query, terms, termCount);
+    return;
+  }
+
   // Bounded to the search section when reading the embedded copy; the detail
   // section follows it immediately with no separator of its own.
   IrdbIndexScanner scanner;
@@ -21655,8 +22147,8 @@ void handleIrdbSearch() {
     return;
   }
 
-  const uint8_t maxResults = 25;
-  uint16_t total = 0;
+  const uint8_t maxResults = IRDB_SEARCH_MAX_RESULTS;
+  uint32_t total = 0;
   uint8_t shown = 0;
   uint32_t lines = 0;
   unsigned long startedMs = millis();
@@ -21686,22 +22178,22 @@ void handleIrdbSearch() {
     }
   }
   scanner.end();
-  Serial.printf("IRDB search: \"%s\" scanned %lu entries in %lu ms, %u match(es)\n",
+  Serial.printf("IRDB search: \"%s\" scanned %lu entries in %lu ms, %lu match(es)\n",
                 query.c_str(), (unsigned long)lines,
-                (unsigned long)(millis() - startedMs), (unsigned)total);
+                (unsigned long)(millis() - startedMs), (unsigned long)total);
 
   webServer.sendContent("],\"shown\":");
   webServer.sendContent(String(shown));
   webServer.sendContent(",\"total\":");
-  webServer.sendContent(String(total));
+  webServer.sendContent(String((unsigned long)total));
   webServer.sendContent(",\"limit\":");
   webServer.sendContent(String(maxResults));
   webServer.sendContent(",\"scanned\":");
   webServer.sendContent(String(lines));
   webServer.sendContent("}");
   webServer.sendContent("");
-  Serial.printf("IRDB search \"%s\": %u/%u shown from %u index lines (%s)\n",
-                query.c_str(), (unsigned)shown, (unsigned)total, (unsigned)lines,
+  Serial.printf("IRDB search \"%s\": %u/%lu shown from %lu index lines (%s)\n",
+                query.c_str(), (unsigned)shown, (unsigned long)total, (unsigned long)lines,
                 useEmbedded ? "embedded in OpenRemote.irdb" : "/irdb/search.jsonl");
 }
 
@@ -21729,6 +22221,10 @@ void handleIrdbDetail() {
       sendJson(400, "{\"ok\":false,\"error\":\"Invalid device id\"}");
       return;
     }
+  }
+  if (useEmbedded && embedded.formatVersion >= 3) {
+    handleIrdbDetailV3(embedded, id);
+    return;
   }
   if (useEmbedded) {
     IrdbIndexScanner scanner;
