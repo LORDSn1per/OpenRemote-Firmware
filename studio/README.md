@@ -22,7 +22,7 @@
 > straight from WebConfig.
 >
 > **You need the latest Studio (2.88) and WebConfig (3.45)**, plus remote
-> firmware 5.86. Older versions cannot read the new database format.
+> firmware 5.86 or newer. Older versions cannot read the new database format.
 
 ## Download
 
