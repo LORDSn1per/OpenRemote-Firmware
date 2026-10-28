@@ -1,6 +1,19 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.92 - 2026-10-28
+    - 5.91 measured 10-14 fps: most swipes still slid live pages. Landing on
+      a page re-rendered it, and renderCurrentPage() threw away every page's
+      snapshot, not just its own; and something on the visible page redraws
+      about once a second, so its snapshot was usually stale when the next
+      swipe began.
+    - renderCurrentPage() now invalidates only the page it renders.
+    - A swipe that starts on a page whose snapshot is stale takes it there and
+      then (one ~45 ms render at the start), so the whole slide uses
+      snapshots. The visible page is otherwise retaken at most every 2 s.
+    - The frame-rate line says how many frames slid snapshots, and each swipe
+      logs which pages it used and any snapshot it had to take.
+
   5.91 - 2026-10-28
     - Page swipes slide pictures of the pages instead of the live pages. 5.90
       measured a full-screen frame mid-swipe at 45-82 ms (7-12 fps): every
@@ -7486,7 +7499,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.91"
+#define OPENREMOTE_VERSION_STRING "5.92"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -10807,6 +10820,8 @@ bool pageSnapshotsShown = false;
 // redraw that causes is not mistaken for the page changing.
 bool pageSnapshotsSwapping = false;
 uint32_t pageSnapshotLastChangeMs = 0;
+uint32_t lvFrameStatSnapshotCount = 0;
+bool takePageSnapshot(uint8_t index);
 static const uint32_t PAGE_SNAPSHOT_SETTLE_MS = 250;
 static const uint32_t PAGE_SNAPSHOT_NEIGHBOUR_MAX_AGE_MS = 20000;
 void pageSnapshotsInvalidateAll();
@@ -31108,6 +31123,7 @@ void lvMonitor(lv_disp_drv_t *disp, uint32_t time, uint32_t pixels) {
   (void)pixels;
   debugDisplayFrameCount++;
   lvFrameStatCount++;
+  if (pageSnapshotsShown) lvFrameStatSnapshotCount++;
   lvFrameStatTotalMs += time;
   if (time > lvFrameStatMaxMs) lvFrameStatMaxMs = time;
 }
@@ -31120,11 +31136,14 @@ void serviceFrameRateLog(unsigned long now) {
   uint32_t elapsed = now - windowStartMs;
   windowStartMs = now;
   if (lvFrameStatCount >= 5 && elapsed < 2000UL) {
-    Serial.printf("LVGL: %lu fps, render+flush avg %lu ms, max %lu ms\n",
+    Serial.printf("LVGL: %lu fps, render+flush avg %lu ms, max %lu ms, %lu of %lu frames from snapshots\n",
                   (unsigned long)(lvFrameStatCount * 1000UL / elapsed),
                   (unsigned long)(lvFrameStatTotalMs / lvFrameStatCount),
-                  (unsigned long)lvFrameStatMaxMs);
+                  (unsigned long)lvFrameStatMaxMs,
+                  (unsigned long)lvFrameStatSnapshotCount,
+                  (unsigned long)lvFrameStatCount);
   }
+  lvFrameStatSnapshotCount = 0;
   lvFrameStatCount = 0;
   lvFrameStatTotalMs = 0;
   lvFrameStatMaxMs = 0;
@@ -32665,8 +32684,27 @@ void showPageSnapshots(bool show) {
 
 void pageStripSnapshotEvent(lv_event_t *e) {
   lv_event_code_t code = lv_event_get_code(e);
-  if (code == LV_EVENT_SCROLL_BEGIN && !pageStripRendering) showPageSnapshots(true);
-  else if (code == LV_EVENT_SCROLL_END) showPageSnapshots(false);
+  if (code == LV_EVENT_SCROLL_BEGIN && !pageStripRendering) {
+    // The page under the finger is the one most likely to be stale - its own
+    // widgets redraw while it is shown. One render now beats sliding it live.
+    uint32_t took = 0;
+    if (currentPage < pageCount && currentPage < PAGE_SLOT_COUNT &&
+        !pageSnapshots[currentPage].valid) {
+      uint32_t started = millis();
+      takePageSnapshot(currentPage);
+      took = millis() - started;
+    }
+    showPageSnapshots(true);
+    auto state = [](int i) -> char {
+      if (i < 0 || i >= pageCount || i >= PAGE_SLOT_COUNT) return '-';
+      return pageSnapshots[i].valid ? 'S' : 'L';
+    };
+    Serial.printf("Swipe: page %u, pages %c%c%c (S=snapshot L=live), current retaken in %lu ms\n",
+                  (unsigned)currentPage, state(currentPage - 1), state(currentPage),
+                  state(currentPage + 1), (unsigned long)took);
+  } else if (code == LV_EVENT_SCROLL_END) {
+    showPageSnapshots(false);
+  }
 }
 
 /*
@@ -32747,6 +32785,10 @@ void servicePageSnapshots(uint32_t now) {
     bool stale = !snapshot.valid ||
       (k > 0 && (uint32_t)(now - snapshot.takenMs) > PAGE_SNAPSHOT_NEIGHBOUR_MAX_AGE_MS);
     if (!stale) continue;
+    // The visible page can redraw every second (a ticking widget). A swipe
+    // retakes it anyway when it starts, so this is only to save that first
+    // frame: no more often than every 2 s.
+    if (k == 0 && snapshot.takenMs && (uint32_t)(now - snapshot.takenMs) < 2000UL) continue;
     takePageSnapshot((uint8_t)i);
     return;
   }
@@ -41554,7 +41596,10 @@ void endUiMutation() {
 }
 
 void renderCurrentPage() {
-  pageSnapshotsInvalidateAll();
+  // Only this page changes. Throwing away every snapshot here (5.91) left the
+  // next swipe with none, because landing on a page re-renders it.
+  if (currentPage < PAGE_SLOT_COUNT) pageSnapshots[currentPage].valid = false;
+  pageSnapshotLastChangeMs = millis();
   beginUiMutation();
   if (!boundPageUi) bindPageUi(currentPage);
   clearModalObjects();
