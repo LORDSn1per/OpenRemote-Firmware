@@ -1,6 +1,15 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.96 - 2026-10-28
+    - Settings sliders can be dragged again. The left-to-right "back" swipe
+      in a Settings sub-page is read from the raw touch-down and touch-up
+      points (LVGL withholds the gesture on scrollable pages), and it never
+      asked what the touch started on - so sliding any slider 60 px to the
+      right left the page instead, which is most of every slider's travel.
+      A touch that starts on a slider, arc, roller, switch or dropdown (or
+      inside one) is now never a back swipe or a page flick.
+
   5.95 - 2026-10-28
     - Settings > Display "Swipe time", 50-800 ms in 10 ms steps (default
       350): how long Snap, Stack and Fade take. Replaces their fixed 350/400/
@@ -7545,7 +7554,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.95"
+#define OPENREMOTE_VERSION_STRING "5.96"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -10893,6 +10902,23 @@ bool pageTransitionActive = false;
 bool pageFlickHandled = false;
 int8_t pageFlickPending = 0;
 void startPageTransition(uint8_t target);
+
+// True when the current touch began on a control that is dragged sideways -
+// a slider, arc, roller, switch or dropdown, or anything inside one. Neither
+// the Settings back swipe nor a page flick may take such a touch. Read from
+// lvTouchRead(), before LVGL processes the sample, so act_obj is still the
+// object the finger pressed.
+bool touchStartedOnSidewaysControl() {
+  if (!touchInputDevice) return false;
+  lv_obj_t *obj = touchInputDevice->proc.types.pointer.act_obj;
+  for (uint8_t depth = 0; obj && depth < 4; depth++) {
+    if (lv_obj_check_type(obj, &lv_slider_class) || lv_obj_check_type(obj, &lv_arc_class) ||
+        lv_obj_check_type(obj, &lv_roller_class) || lv_obj_check_type(obj, &lv_switch_class) ||
+        lv_obj_check_type(obj, &lv_dropdown_class)) return true;
+    obj = lv_obj_get_parent(obj);
+  }
+  return false;
+}
 bool takePageSnapshot(uint8_t index);
 static const uint32_t PAGE_SNAPSHOT_SETTLE_MS = 250;
 static const uint32_t PAGE_SNAPSHOT_NEIGHBOUR_MAX_AGE_MS = 20000;
@@ -31613,11 +31639,7 @@ void lvTouchRead(lv_indev_drv_t *drv, lv_indev_data_t *data) {
       int dx = (int)x - (int)touchStartX;
       int dy = abs((int)y - (int)touchStartY);
       if (abs(dx) >= 50 && dy < 35 && abs(dx) > 2 * dy) {
-        lv_obj_t *pressed = touchInputDevice ? touchInputDevice->proc.types.pointer.act_obj : nullptr;
-        bool onControl = pressed &&
-          (lv_obj_check_type(pressed, &lv_slider_class) ||
-           lv_obj_check_type(pressed, &lv_arc_class) ||
-           lv_obj_check_type(pressed, &lv_roller_class));
+        bool onControl = touchStartedOnSidewaysControl();
         lv_dir_t allowed = pageSwipeDirections[currentPage];
         // A finger moving left reveals the page to the right, as Glide does.
         int8_t step = dx < 0 ? 1 : -1;
@@ -31664,7 +31686,8 @@ void lvTouchRead(lv_indev_drv_t *drv, lv_indev_data_t *data) {
       // all, regardless of whether the drag direction matches, which starves
       // gesture detection entirely for those pages. Checking the raw
       // touch-down/touch-up points directly sidesteps that.
-      if (pages[currentPage].kind == PAGE_REMOTE_SETTINGS && settingsView != SETTINGS_HOME) {
+      if (pages[currentPage].kind == PAGE_REMOTE_SETTINGS && settingsView != SETTINGS_HOME &&
+          !touchStartedOnSidewaysControl()) {
         int dx = (int)touchLastX - (int)touchStartX;
         int dy = abs((int)touchLastY - (int)touchStartY);
         if (dx > 60 && dy < 40) backToSettings(nullptr);
