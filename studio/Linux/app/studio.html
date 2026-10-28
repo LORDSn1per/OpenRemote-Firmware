@@ -376,6 +376,11 @@ input:focus,textarea:focus{border-color:rgba(47,140,255,.8); box-shadow:0 0 0 3p
               <label class="source"><input type="checkbox" class="src" value="probonopd-lirc-remotes" checked><div><b>LIRC Remotes</b><br><small>Linux Infrared Remote Control database.</small></div></label>
             </div>
           </div>
+          <div class="card" style="margin-top:22px">
+            <h3>Logitech Harmony IRDB</h3>
+            <p class="detailKV">Builds a separate <b>Logitech.irdb</b> from the Logitech Harmony IR archive: about 258,000 devices, downloaded from GitHub (about 220 MB). It stays on this computer. Do <b>not</b> copy it to the remote: search it in IRDB Browser and send one device at a time over USB.</p>
+            <button class="primary" id="logitechBuildBtn" onclick="startLogitechBuild()">Build Logitech.irdb</button>
+          </div>
               <div class="setupProgress">
                 <div id="builderStatus" class="setupStatus">Ready.</div>
                 <div class="progress usbProgress"><div id="builderBar" class="bar"></div></div>
@@ -385,12 +390,14 @@ input:focus,textarea:focus{border-color:rgba(47,140,255,.8); box-shadow:0 0 0 3p
 
         <section id="browser" class="view">
           <h2 class="pageTitle">IRDB Browser</h2>
-          <p class="pageLead">Browse the currently loaded <b>OpenRemote.irdb</b>. Search filters live as you type.</p>
+          <p class="pageLead">Browse <b>OpenRemote.irdb</b> and the Studio-only <b>Logitech.irdb</b>. Search filters live as you type.</p>
           <div class="card">
             <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
               <input id="dbFile" type="file" accept=".irdb,.bin">
               <button class="primary" onclick="uploadDb()">Load OpenRemote.irdb</button>
+              <button class="secondary" onclick="uploadDb('logitech')">Load Logitech.irdb</button>
             </div>
+            <div id="logitechInfo" class="detailKV">Logitech.irdb: not loaded. Build it in IRDB Builder.</div>
             <div id="dbInfo" class="detailKV">No database loaded yet.</div>
           <div class="usbPanel" id="irdbInstallHint">
             <b>Installing this database on the remote</b>
@@ -406,7 +413,14 @@ input:focus,textarea:focus{border-color:rgba(47,140,255,.8); box-shadow:0 0 0 3p
         <div id="browserDbDate" class="detailKV">Created: —</div>
       </div>
             <div id="stats" class="stats"></div>
-            <input id="searchBox" placeholder="Search e.g. Hisense 85S8, Sony STR, Fetch, volume" oninput="searchDb()">
+            <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+              <input id="searchBox" placeholder="Search e.g. Hisense 85S8, Sony STR, Fetch, volume" oninput="searchDb()">
+              <select id="searchDbSelect" onchange="searchDb()" style="margin-top:14px">
+                <option value="all">Both databases</option>
+                <option value="openremote">OpenRemote.irdb</option>
+                <option value="logitech">Logitech.irdb</option>
+              </select>
+            </div>
             <div id="countLine" class="countLine"></div>
           </div>
           <div class="resultsLayout">
@@ -430,7 +444,7 @@ document.querySelectorAll('.navBtn').forEach(btn=>btn.onclick=()=>{
   document.querySelectorAll('.navBtn,.view').forEach(x=>x.classList.remove('active'));
   btn.classList.add('active');
   document.getElementById(btn.dataset.view).classList.add('active');
-  if(btn.dataset.view==='browser'){loadInfo();syncBrowserDbCard();searchDb();setTimeout(syncBrowserDbCard,300);}
+  if(btn.dataset.view==='browser'){loadInfo();loadLogitechInfo();syncBrowserDbCard();searchDb();setTimeout(syncBrowserDbCard,300);}
   if(btn.dataset.view==='recovery'){loadRecoveryPorts();}
   if(btn.dataset.view==='setup'){loadSetupPorts();loadSetupInfo();}
   if(btn.dataset.view==='dock'){loadDockPorts();}
@@ -726,6 +740,19 @@ async function startBuild(){
   let r=await fetch('/start-build',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sources})}).then(r=>r.json());
   if(r.error){alert(r.error);document.getElementById('buildBtn').disabled=false;}
 }
+async function startLogitechBuild(){
+  let btn=document.getElementById('logitechBuildBtn');
+  btn.disabled=true;document.getElementById('buildBtn').disabled=true;
+  let r=await fetch('/start-logitech-build',{method:'POST'}).then(r=>r.json()).catch(e=>({error:e.message}));
+  if(r.error){alert(r.error);btn.disabled=false;document.getElementById('buildBtn').disabled=false;}
+}
+async function loadLogitechInfo(){
+  let el=document.getElementById('logitechInfo'); if(!el) return;
+  let info=await fetch('/logitech-info?ts='+Date.now()).then(r=>r.json()).catch(()=>({error:'Logitech.irdb: could not be read.'}));
+  el.textContent=info.error
+    ? 'Logitech.irdb: not loaded. Build it in IRDB Builder.'
+    : 'Logitech.irdb ('+(info.size_mb||0).toFixed(1)+' MB): '+info.devices+' devices from '+info.brands+' brands, created '+(info.build_date_short||'—')+'. Studio only - send devices to the remote one at a time.';
+}
 async function poll(){
   try{
     let s=await fetch('/status').then(r=>r.json());
@@ -733,8 +760,8 @@ async function poll(){
     bar.style.width=(s.progress||0)+'%';pct.textContent=s.progress||0;mb.textContent=(s.downloaded_mb||0).toFixed(1);
     status.textContent=s.current||'';footerStatus.textContent=s.current||'Ready';records.textContent=s.records||0;binmb.textContent=(s.bin_mb||0).toFixed(1);
     
-    if(s.done){document.getElementById('buildBtn').disabled=false;loadInfo();searchDb();}
-    if(s.error){status.textContent='ERROR: '+s.error;document.getElementById('buildBtn').disabled=false;}
+    if(s.done){document.getElementById('buildBtn').disabled=false;document.getElementById('logitechBuildBtn').disabled=false;loadInfo();loadLogitechInfo();searchDb();}
+    if(s.error){status.textContent='ERROR: '+s.error;document.getElementById('buildBtn').disabled=false;document.getElementById('logitechBuildBtn').disabled=false;}
   }catch(e){}
   setTimeout(poll,500);
 }
@@ -784,13 +811,15 @@ async function triggerSearchWakeup(){
   },450);
 }
 
-async function uploadDb(){
-  let f=document.getElementById('dbFile').files[0];if(!f){alert('Choose an OpenRemote.irdb file first');return;}
-  let r=await fetch('/upload-db',{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:f}).then(r=>r.json());
+async function uploadDb(kind){
+  let name=kind==='logitech'?'Logitech.irdb':'OpenRemote.irdb';
+  let f=document.getElementById('dbFile').files[0];if(!f){alert('Choose a '+name+' file first');return;}
+  let r=await fetch('/upload-db'+(kind==='logitech'?'?kind=logitech':''),{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:f}).then(r=>r.json());
   if(r.error){
     alert(r.error);
   }else{
     await loadInfo();
+    loadLogitechInfo();
     syncBrowserDbCard();
     triggerSearchWakeup();
   }
@@ -799,7 +828,8 @@ async function uploadDb(){
 let selectedDeviceId=null;
 let timer=null;function searchDb(){clearTimeout(timer);timer=setTimeout(async()=>{
   let q=document.getElementById('searchBox').value;
-  let data=await fetch('/search?q='+encodeURIComponent(q)+'&ts='+Date.now()).then(r=>r.json());
+  let which=(document.getElementById('searchDbSelect')||{}).value||'all';
+  let data=await fetch('/search?q='+encodeURIComponent(q)+'&db='+encodeURIComponent(which)+'&ts='+Date.now()).then(r=>r.json());
   let out=document.getElementById('results');
   if(data.error){out.innerHTML='<p>'+data.error+'</p>';countLine.textContent='';return;}
 
@@ -826,8 +856,12 @@ let timer=null;function searchDb(){clearTimeout(timer);timer=setTimeout(async()=
 async function details(id){
   selectedDeviceId=id;
   let d=await fetch('/device?id='+encodeURIComponent(id)).then(r=>r.json()); if(d.error)return;
-  let cmds=(d.ir||[]).slice(0,80).map(c=>`<div class=result><b>${esc(c.name||'Command')}</b><div class=detailKV>${c.protocol?'Protocol: '+esc(c.protocol)+' ':''}${c.address?'Address: '+esc(c.address)+' ':''}${c.command?'Command: '+esc(c.command):''}${c.code?'Code: '+esc(c.code):''}</div></div>`).join('');
-  document.getElementById('details').innerHTML=`<div class=detailTitle>${esc(d.brand)} ${esc(d.model)}</div><div class=detailKV>${esc(d.category)} • ${esc(d.source)} • ${esc(d.format)}</div><div>${(d.protocols||[]).map(x=>`<span class=tag>${esc(x)}</span>`).join('')}</div><div class=usbPanel><b>Send to OpenRemote over USB</b><div class=detailKV>Choose the remote's USB serial port and close Arduino Serial Monitor before sending this selected IR device.</div><div class=usbRow><select id=usbPortSelect><option>Scanning…</option></select><button class=secondary onclick="loadUsbPorts()">Refresh</button><button class=primary onclick="sendSelectedToUsb()">Send</button></div><div class=usbStatus id=usbStatus>Ready.</div></div><h3>Available buttons (${(d.buttons||[]).length})</h3><div>${(d.buttons||[]).map(x=>`<span class=tag>${esc(x)}</span>`).join('')}</div><h3>IR command preview</h3>${cmds||'<p class=detailKV>No command details stored for this source.</p>'}`;
+  let cmds=(d.ir||[]).slice(0,80).map(c=>`<div class=result><b>${esc(c.name||'Command')}</b><div class=detailKV>${c.protocol?'Protocol: '+esc(c.protocol)+' ':''}${c.address?'Address: '+esc(c.address)+' ':''}${c.command?'Command: '+esc(c.command):''}${c.code?'Code: '+esc(c.code):''}${c.playable===false?'Not sent: the remote cannot play this code':''}</div></div>`).join('');
+  // Logitech's power type matters: on a toggle device "PowerOn" may switch it off.
+  let powerNote=d.power?`<div class=detailKV>Power: ${esc(d.power==='toggle'?'toggle (one button flips on/off)':d.power)}</div>`:'';
+  let skippedNote=d.skipped?`<div class=detailKV>${d.skipped} command(s) the remote cannot play will be left out.</div>`:'';
+  let limitNote=(d.buttons||[]).length>200?`<div class=detailKV>The remote holds 200 commands per device, so only the first 200 will be sent.</div>`:'';
+  document.getElementById('details').innerHTML=`<div class=detailTitle>${esc(d.brand)} ${esc(d.model)}</div><div class=detailKV>${esc(d.category)} • ${esc(d.source)} • ${esc(d.format)}</div>${powerNote}${skippedNote}${limitNote}<div>${(d.protocols||[]).map(x=>`<span class=tag>${esc(x)}</span>`).join('')}</div><div class=usbPanel><b>Send to OpenRemote over USB</b><div class=detailKV>Choose the remote's USB serial port and close Arduino Serial Monitor before sending this selected IR device.</div><div class=usbRow><select id=usbPortSelect><option>Scanning…</option></select><button class=secondary onclick="loadUsbPorts()">Refresh</button><button class=primary onclick="sendSelectedToUsb()">Send</button></div><div class=usbStatus id=usbStatus>Ready.</div></div><h3>Available buttons (${(d.buttons||[]).length})</h3><div>${(d.buttons||[]).map(x=>`<span class=tag>${esc(x)}</span>`).join('')}</div><h3>IR command preview</h3>${cmds||'<p class=detailKV>No command details stored for this source.</p>'}`;
   loadUsbPorts();
 }
 
@@ -871,7 +905,7 @@ function syncBrowserDbCard(){
 setInterval(syncBrowserDbCard,500);
 
 function esc(s){return(s||'').toString().replace(/[&<>"]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[m]));}
-loadInfo();
+loadInfo();loadLogitechInfo();
 
 function formatUsbBytes(n){
   n=Number(n)||0;
