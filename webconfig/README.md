@@ -64,8 +64,9 @@ of commands on a single button.
 Add equipment and its commands, learn a signal from an original remote, or pull
 codes from the infrared database. Assign anything to the physical buttons.
 
-The database lives on the remote's own SD card, so searching 14,000-plus
-devices needs nothing but this page — no computer and no Studio. The search
+The database lives on the remote's own SD card, so searching 271,000-plus
+devices, including all 257,210 from the Logitech Harmony database, needs
+nothing but this page — no computer and no Studio. The search
 runs on the remote and the matching devices come straight from its SD card, with
 no Wi-Fi needed. Click
 any command to fire the real infrared through the remote or the dock, so a code
@@ -109,7 +110,7 @@ itself. The upload is checksummed on arrival **and read back off the SD card
 afterwards**, so a card that drops bytes is caught rather than leaving you with
 a half-written configurator you would need a cable to fix.
 
-[**Download the latest WebConfig →**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-WebConfig-3.43.html)
+[**Download the latest WebConfig →**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-WebConfig-3.45.html)
 
 ---
 
@@ -141,8 +142,8 @@ Every released version is kept here, newest last. They are plain single-file
 HTML with no build step and no external dependencies — open one in a browser
 and it runs.
 
-    webconfig/WebConfig 3.43.html    current
-    webconfig/WebConfig 3.41.html    previous, and so on
+    webconfig/WebConfig 3.45.html    current
+    webconfig/WebConfig 3.44.html    previous, and so on
 
 The whole page — markup, styles, scripts and images — is one file because the
 remote serves it from an SD card over a small embedded web server, where each

@@ -26,6 +26,29 @@ open, not because you are expected to compile it.
 
 ---
 
+## New — the entire Logitech Harmony IR database, on your remote
+
+> **OpenRemote can now store ALL of the Logitech Harmony IR database: 257,210
+> devices with over 13 million IR commands.**
+>
+> It sits on the remote's own SD card alongside the Flipper, IRDB and LIRC
+> devices, giving 271,761 devices in a single 129 MB file. Search it straight
+> from WebConfig, with no computer attached. Type a brand and model, for
+> example *Sony KDL* or *Hisense 85S8*, and the remote answers in about a
+> second.
+>
+> **You need the latest versions for this:**
+> - **OpenRemote Studio 2.88** builds the database. In *IRDB Builder*, tick
+>   *Logitech Harmony* and press *Build*.
+> - **WebConfig 3.45** searches it and adds devices to your remote.
+> - **Remote firmware 5.86** reads it.
+>
+> Older firmware and WebConfig cannot read the new database format, so update
+> all three. Harmony devices with no codes the remote's infrared can send are
+> left out.
+
+---
+
 ## Download
 
 Every link below points to the **newest published build**. The filenames include
@@ -36,9 +59,9 @@ an individual versioned file.
 
 | | Download |
 |---|---|
-| **macOS** — Intel and Apple Silicon | [**OpenRemote Studio for macOS**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-Studio-2.85-macOS.zip) |
-| **Windows** — 10 and 11 | [**OpenRemote Studio for Windows**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-Studio-2.85-Windows.zip) |
-| **Linux** — x86_64 | [**OpenRemote Studio for Linux**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-Studio-2.85-Linux.AppImage) |
+| **macOS** — Intel and Apple Silicon | [**OpenRemote Studio for macOS**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-Studio-2.88-macOS.zip) |
+| **Windows** — 10 and 11 | [**OpenRemote Studio for Windows**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-Studio-2.88-Windows.zip) |
+| **Linux** — x86_64 | [**OpenRemote Studio for Linux**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-Studio-2.88-Linux.AppImage) |
 
 > On Windows, unzip the **whole folder** and run the `.exe` from inside it — the
 > app and runtime folders must stay beside it.
@@ -49,9 +72,9 @@ Studio installs these for you, so you only need them for a manual update.
 
 | | Download |
 |---|---|
-| Remote firmware — ESP32-S3 | [**OpenRemote-Remote-Firmware-5.83.bin**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-Remote-Firmware-5.83.bin) |
+| Remote firmware — ESP32-S3 | [**OpenRemote-Remote-Firmware-5.86.bin**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-Remote-Firmware-5.86.bin) |
 | Dock firmware — ESP32-C3 | [**OpenRemote-Dock-Firmware-1.84.bin**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-Dock-Firmware-1.84.bin) |
-| WebConfig — browser configurator | [**OpenRemote-WebConfig-3.43.html**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-WebConfig-3.43.html) |
+| WebConfig — browser configurator | [**OpenRemote-WebConfig-3.45.html**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-WebConfig-3.45.html) |
 
 **[See all downloads and version numbers →](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest)**
 
@@ -79,7 +102,8 @@ buttons, and change icons and themes — with the remote updating live as you
 work. Nothing to install, and it works on any device with a browser.
 
 **The whole infrared database lives on the remote's own SD card.** Copy it
-across from the browser, then search all 14,000-plus devices straight from
+across from the browser, then search all 271,000-plus devices, including the
+entire Logitech Harmony database, straight from
 WebConfig — no computer and no Studio needed. The searching happens on the
 remote and the matching devices come straight from its SD card, with no Wi-Fi
 needed, so a brand with hundreds of models is a list you scroll, not a download. Click any command to
@@ -296,10 +320,10 @@ infrared database. **WebConfig** does everything else, wirelessly. The
 
 | Component | Version | Source |
 |---|---|---|
-| Remote firmware — ESP32-S3 | 5.83 | [`remote/`](remote/) |
+| Remote firmware — ESP32-S3 | 5.86 | [`remote/`](remote/) |
 | Dock firmware — ESP32-C3 | 1.84 | [`dock/`](dock/) |
-| WebConfig | 3.43 | [`webconfig/`](webconfig/) |
-| OpenRemote Studio | 2.85 | [`studio/`](studio/) |
+| WebConfig | 3.45 | [`webconfig/`](webconfig/) |
+| OpenRemote Studio | 2.88 | [`studio/`](studio/) |
 
     remote/       ESP32-S3 remote firmware (PlatformIO)
     dock/         ESP32-C3 dock firmware (PlatformIO)
