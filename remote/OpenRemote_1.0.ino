@@ -1,6 +1,32 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.87 - 2026-10-28  (battery test build)
+    - The remote can now sleep with a Chromecast connected. The Arduino
+      framework's prebuilt libraries have CONFIG_PM_ENABLE and the Bluetooth
+      controller's modem sleep both off, so a selected BLE activity kept the
+      CPU running at 80 MHz (about 20-30 mA) for as long as the screen was
+      dark: the 1-3 day battery life. platformio.ini now rebuilds the
+      framework with power management, tickless idle and controller modem
+      sleep (main crystal as the sleep clock - Rev 6 has no 32 kHz crystal).
+      configureApplicationPowerMode() configures DFS + automatic light sleep
+      once at boot and holds two locks (CPU max, no light sleep) whenever the
+      remote is awake, so everything outside BLE-connected idle behaves
+      exactly as before. Entering BLE-connected idle releases them: the CPU
+      light-sleeps between connection events and loop()'s 100 ms polls while
+      the HID link stays up - no disconnect, so no Chromecast pause and no
+      3 second cold-boot wake.
+    - FIXED: the idle Bluetooth connection profile was never requested on
+      this build. serviceBluetoothConnectionProfile() required
+      blePeerAddressValid, which only the Bluedroid onConnect sets; this build
+      is NimBLE, so every queued request was dropped. The link therefore
+      stayed on the voice profile it asks for at link setup (7.5-15 ms,
+      latency 0) for its whole life - 66-133 radio events a second, screen on
+      or off. The gate now checks the NimBLE connection handle, the profile
+      actually requested is tracked, and the responsive profile is requested
+      once link setup has settled. Voice still gets its fast interval for the
+      duration of a stream.
+
   5.86 - 2026-10-28
     - Reads IRDB index format 3 from Studio 2.87, which merges the Logitech
       Harmony archive into OpenRemote.irdb: 271,761 devices where there were
@@ -7387,7 +7413,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.86"
+#define OPENREMOTE_VERSION_STRING "5.87"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -9861,6 +9887,14 @@ bool bleIdleConnectionProfileRequested = false;
 bool bleConnProfilePending = false;
 bool bleConnProfileTargetIdle = false;
 uint32_t bleConnProfileApplyAtMs = 0;
+// The BleConnectionProfile last asked of the peer, 0xFF for none yet on this
+// link. bleIdleConnectionProfileRequested alone could not tell "voice" from
+// "responsive", so after link setup asked for voice a queued responsive
+// request looked already done and was skipped.
+uint8_t bleRequestedConnProfile = 0xFF;
+// How long after link setup the fast voice interval is handed back. Voice
+// capabilities are normally answered within a second or two of connecting.
+static const uint32_t BLE_CONN_PROFILE_SETTLE_MS = 10000;
 bool blePairingMode = false;
 // Settings > Debug "Bluetooth Sleep". Off (default) keeps the idle
 // connection profile from requestBluetoothConnectionProfile()/2.95 - the
@@ -13617,6 +13651,7 @@ void requestBluetoothConnectionProfileMode(BleConnectionProfile profile) {
 #error "No supported BLE stack: connection parameters cannot be negotiated"
 #endif
   bleIdleConnectionProfileRequested = (profile == BLE_PROFILE_IDLE);
+  bleRequestedConnProfile = (uint8_t)profile;
   Serial.printf("BLE HID: %s connection profile requested (%u.%u-%u.%u ms, latency %u)\n",
                 name, minInterval * 5 / 4, (minInterval * 5 % 4) * 25,
                 maxInterval * 5 / 4, (maxInterval * 5 % 4) * 25, latency);
@@ -13649,9 +13684,22 @@ void serviceBluetoothConnectionProfile(unsigned long now) {
   bleConnProfilePending = false;
   // A link that dropped or re-formed in the meantime gets its parameters from
   // whichever path brought it up, not from a request queued for the old one.
+  // Before 5.87 this also required blePeerAddressValid, which only the
+  // Bluedroid onConnect sets - on this NimBLE build it was always false, so
+  // not one queued request was ever sent.
+#if defined(CONFIG_NIMBLE_ENABLED)
+  if (!bleConnected || !bleServer || !bleConnHandleValid) return;
+#else
   if (!bleConnected || !bleServer || !blePeerAddressValid) return;
-  if (bleIdleConnectionProfileRequested == bleConnProfileTargetIdle) return;
-  requestBluetoothConnectionProfile(bleConnProfileTargetIdle);
+#endif
+  // A voice stream owns the interval until atvvStopAudio() hands it back.
+  if (atvvAudioStarted) return;
+  // What the remote is doing now decides, not what it was doing when the
+  // request was queued: link setup queues one before the screen may sleep.
+  bool idle = bleConnectedIdleActive;
+  BleConnectionProfile wanted = idle ? BLE_PROFILE_IDLE : BLE_PROFILE_RESPONSIVE;
+  if (bleRequestedConnProfile == (uint8_t)wanted) return;
+  requestBluetoothConnectionProfile(idle);
 }
 
 // 0x0A means two different things depending on which way the packet is going:
@@ -14743,6 +14791,7 @@ class OpenRemoteBleServerCallbacks : public BLEServerCallbacks {
     atvvInteractionModel = ATVV_INTERACTION_ON_REQUEST;
     blePeerAddressValid = false;
     bleIdleConnectionProfileRequested = false;
+    bleRequestedConnProfile = 0xFF;
     // Drop any queued profile change with the link. Otherwise an idle request
     // queued moments before a drop could land on the next connection - which
     // may well be the user picking the remote back up.
@@ -15373,6 +15422,10 @@ void serviceBluetoothLinkSetup(unsigned long now) {
     // chosen against the interval we actually got instead of the one we hoped
     // for.
     requestBluetoothConnectionProfileMode(BLE_PROFILE_VOICE);
+    // ...and hand it back once capabilities have had time to be answered.
+    // Nothing did before 5.87, so the link stayed at 7.5-15 ms, latency 0,
+    // from connection to the next voice stream - or for ever.
+    scheduleBluetoothConnectionProfile(bleConnectedIdleActive, BLE_CONN_PROFILE_SETTLE_MS);
     // 251 octets is the LL maximum; 2120us is its air time on the 1M PHY.
     int rc = ble_gap_set_data_len(bleConnHandle, 251, 2120);
     bleDataLenExtended = (rc == 0);
@@ -42200,14 +42253,63 @@ bool enterDeepPowerSleep(bool allowQrPage) {
   return true;
 }
 
+/*
+  Automatic light sleep, for BLE-connected idle only (5.87).
+
+  Configured once, at boot, before Bluetooth or Wi-Fi starts - the previous
+  note here recorded that reconfiguring DFS under a live UART/BLE stack was
+  unsafe, and nothing reconfigures it afterwards. The two locks are taken
+  before light sleep is enabled and held whenever the remote is awake, so
+  outside BLE-connected idle the CPU runs at 240 MHz and never sleeps on its
+  own: the screen, IR, Wi-Fi, ESP-NOW, USB and the explicit light/deep sleep
+  paths all see exactly the conditions they were written for.
+
+  connectedIdle=true releases both. The CPU then drops to 80 MHz and
+  light-sleeps whenever every task is blocked - between Bluetooth connection
+  events and between loop()'s polls - while the controller's modem sleep
+  keeps the HID link up. Returns false when the framework was built without
+  CONFIG_PM_ENABLE, and the caller falls back to a fixed 80 MHz clock.
+*/
 bool configureApplicationPowerMode(bool connectedIdle) {
-  (void)connectedIdle;
-  // The pinned Arduino framework already enables tickless idle and Bluetooth
-  // controller modem sleep. Reconfiguring global DFS after the live UART/BLE
-  // stack starts is unsafe on Rev 5, so BLE idle uses the proven fixed 80 MHz
-  // clock and IR-only activities retain explicit light/deep sleep.
-  powerManagementReady = false;
-  return false;
+  static bool attempted = false;
+  if (!attempted) {
+    attempted = true;
+#if CONFIG_PM_ENABLE
+    esp_err_t err = esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX, 0, "awake-cpu",
+                                       &awakeCpuFrequencyLock);
+    if (err == ESP_OK) {
+      err = esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "awake-sleep",
+                               &awakeNoLightSleepLock);
+    }
+    if (err == ESP_OK) {
+      esp_pm_lock_acquire(awakeCpuFrequencyLock);
+      esp_pm_lock_acquire(awakeNoLightSleepLock);
+      awakePowerLocksHeld = true;
+      esp_pm_config_t config = {};
+      config.max_freq_mhz = 240;
+      // Not the 40 MHz crystal: the APB clock follows the CPU below 80 MHz,
+      // and the UART, I2C and Bluetooth all want 80 when they run.
+      config.min_freq_mhz = 80;
+      config.light_sleep_enable = true;
+      err = esp_pm_configure(&config);
+    }
+    powerManagementReady = err == ESP_OK;
+    if (!powerManagementReady) {
+      Serial.printf("Power manager: unavailable (%s)\n", esp_err_to_name(err));
+    }
+#endif
+  }
+  if (!powerManagementReady) return false;
+  if (connectedIdle && awakePowerLocksHeld) {
+    awakePowerLocksHeld = false;
+    esp_pm_lock_release(awakeNoLightSleepLock);
+    esp_pm_lock_release(awakeCpuFrequencyLock);
+  } else if (!connectedIdle && !awakePowerLocksHeld) {
+    esp_pm_lock_acquire(awakeCpuFrequencyLock);
+    esp_pm_lock_acquire(awakeNoLightSleepLock);
+    awakePowerLocksHeld = true;
+  }
+  return true;
 }
 
 void enterBleConnectedIdle() {
@@ -42238,8 +42340,17 @@ void enterBleConnectedIdle() {
   bleConnectedIdleActive = true;
   nextBleConnectedIdleMotionMs = millis();
   bleIdleMotionAboveSinceMs = 0;
+  if (powerManagementReady) {
+    // Studio's first bytes must wake a light-sleeping CPU, as they already do
+    // in enterLowPowerWait(). The keypad and accelerometer need no wake source
+    // here: loop() polls both every BLE_CONNECTED_IDLE_POLL_MS, and that
+    // delay's own timer is what wakes it. A level-triggered keypad wake would
+    // only re-wake the CPU until loop() next read the keypad.
+    uart_set_wakeup_threshold(UART_NUM_0, 3);
+    bleIdleUartWake = esp_sleep_enable_uart_wakeup(UART_NUM_0) == ESP_OK;
+  }
   Serial.printf("BLE connected idle: HID retained, PM=%s, motion=%s angle=%u deg keypad=%s USB=on\n",
-                powerManagementReady ? "DFS/modem" : "80MHz/modem",
+                powerManagementReady ? "auto light sleep" : "80MHz/modem",
                 bleIdleAccelerometerWake ? "on" : "off",
                 motionWakeAngleDegrees(),
                 bleIdleKeypadWake ? "on" : "off");
@@ -42266,6 +42377,7 @@ void leaveBleConnectedIdle() {
   if (!bleConnectedIdleActive) return;
   bleIdleAccelerometerWake = false;
   bleIdleKeypadWake = false;
+  if (bleIdleUartWake) esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_UART);
   bleIdleUartWake = false;
 
   uint32_t restoreMhz = bleConnectedIdleRestoreCpuMhz
@@ -42861,7 +42973,7 @@ void setup() {
   loadSettings();
   loadBatteryHistory();
   if (configureApplicationPowerMode(false)) {
-    Serial.println("Power manager: DFS, tickless idle and BLE modem sleep ready");
+    Serial.println("Power manager: 240 MHz awake; auto light sleep + BLE modem sleep in BLE idle");
   } else {
     Serial.println("Power manager: tickless, BLE modem sleep and safe 80 MHz idle ready");
   }
@@ -43339,6 +43451,23 @@ void loop() {
       nextDeepSleepAttemptMs = now + 5000UL;
       enterDeepPowerSleep(true);
     }
+#if CONFIG_PM_PROFILING
+    // Test builds: once a minute in BLE-connected idle, print how the time
+    // since the last report divided between active, 80 MHz and light sleep.
+    // On USB the battery is charging, so this is the only evidence the CPU
+    // is really sleeping.
+    static uint32_t nextPmReportMs = 0;
+    if (bleConnectedIdleActive && powerManagementReady &&
+        (int32_t)(now - nextPmReportMs) >= 0) {
+      if (nextPmReportMs) {
+        Serial.println("Power manager: time per mode since the last report");
+        Serial.flush();
+        esp_pm_dump_locks(stdout);
+        fflush(stdout);
+      }
+      nextPmReportMs = now + 60000UL;
+    }
+#endif
     delay(connectedActivityIdle ? BLE_CONNECTED_IDLE_POLL_MS : 30);
     return;
   }
