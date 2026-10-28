@@ -1,6 +1,12 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.98 - 2026-10-29
+    - ORUSB READ now serves /logs/battery.csv and /logs/battery.prev.csv.
+      5.97's note said it already did; it did not - USB reads are limited to
+      an explicit list of paths, which held only WebConfig, runtime.json and
+      the screenshot.
+
   5.97 - 2026-10-29
     - Battery log. Phillip saw 100% to 94% overnight with everything off
       and the remote had woken from deep sleep, but nothing on the remote
@@ -7569,7 +7575,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.97"
+#define OPENREMOTE_VERSION_STRING "5.98"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -21101,7 +21107,8 @@ void clearUsbDownload(UsbSerialSession &session) {
 void beginUsbSdFileDownload(Stream &port, UsbSerialSession &session, const String &path) {
   clearUsbDownload(session);
   bool allowedPath = path == WEB_CONFIG_PATH || path == RUNTIME_CONFIG_PATH ||
-                     path == LCD_SCREENSHOT_PATH;
+                     path == LCD_SCREENSHOT_PATH ||
+                     path == BATTERY_LOG_PATH || path == BATTERY_LOG_OLD_PATH;
   if (!sdReady || !allowedPath || !SD.exists(path)) {
     usbImportReply(port, "{\"ok\":false,\"error\":\"Requested SD file is unavailable\"}");
     return;
