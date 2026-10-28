@@ -1,6 +1,19 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.90 - 2026-10-28  (swipe diagnostic)
+    - 5.89 measured on hardware: page swipes ran at 4-21 fps, nowhere near
+      the new 66 fps cap, and hesitated mid-swipe. The screen redraws only
+      when loop() reaches lv_timer_handler(), so the cause is a slow job
+      somewhere else in the pass.
+    - LVGL now reads millis() itself (LV_TICK_CUSTOM). It used to be handed
+      the loop's elapsed time once per pass, so its clock stood still during a
+      slow pass - an animation jumped after every one - and lvMonitor() timed
+      every frame as 0 ms, which is why 5.89's frame-rate line read 0 ms.
+    - Loop timing probe: the main loop's jobs are wrapped in LOOP_TIMED(), and
+      any pass taking 25 ms or more with the screen on logs "Loop: N ms pass,
+      slowest <job> M ms", at most four times a second.
+
   5.89 - 2026-10-28
     - A hand-set clock no longer jumps back at every WebConfig sync.
       applySettingsJson() ends in applyClockMode(), whose manual branch wrote
@@ -7455,7 +7468,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.89"
+#define OPENREMOTE_VERSION_STRING "5.90"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -43313,20 +43326,63 @@ void setup() {
   Serial.printf("Setup finished in %lu ms.\n", (unsigned long)(millis() - bootStartMs));
 }
 
+/*
+  Loop timing probe (5.90). The screen redraws only when loop() reaches
+  lv_timer_handler(), so one slow job anywhere in a pass freezes a swipe for
+  that long - "starts, hesitates, continues". LOOP_TIMED() records the
+  slowest job of each pass, and reportSlowLoopIteration() names it whenever a
+  pass with the screen on took longer than SLOW_LOOP_MS.
+*/
+static const uint32_t SLOW_LOOP_MS = 25;
+uint32_t loopIterationStartMs = 0;
+const char *loopSlowestName = nullptr;
+uint32_t loopSlowestMs = 0;
+#define LOOP_TIMED(name, call) do { \
+    uint32_t _loopTimedStart = millis(); \
+    call; \
+    uint32_t _loopTimedMs = millis() - _loopTimedStart; \
+    if (_loopTimedMs > loopSlowestMs) { loopSlowestMs = _loopTimedMs; loopSlowestName = name; } \
+  } while (0)
+
+void reportSlowLoopIteration() {
+  static uint32_t lastReportMs = 0;
+  static uint32_t suppressed = 0;
+  uint32_t now = millis();
+  uint32_t total = now - loopIterationStartMs;
+  if (total >= SLOW_LOOP_MS && !displaySleeping) {
+    // At most four lines a second, so the probe cannot become the stall.
+    if ((uint32_t)(now - lastReportMs) >= 250UL) {
+      Serial.printf("Loop: %lu ms pass, slowest %s %lu ms%s\n",
+                    (unsigned long)total,
+                    loopSlowestName ? loopSlowestName : "(untimed code)",
+                    (unsigned long)loopSlowestMs,
+                    suppressed ? " (+more)" : "");
+      lastReportMs = now;
+      suppressed = 0;
+    } else {
+      suppressed++;
+    }
+  }
+  loopSlowestName = nullptr;
+  loopSlowestMs = 0;
+}
+
 void loop() {
-  serviceWallClockSteps();
+  LOOP_TIMED("serviceWallClockSteps", serviceWallClockSteps());
   unsigned long now = millis();
-  uint32_t elapsed = now - lastTickMs;
-  lastTickMs = now;
-  lv_tick_inc(elapsed);
+  loopIterationStartMs = now;
+  // LVGL reads millis() itself (LV_TICK_CUSTOM, 5.90). Feeding it the loop's
+  // elapsed time once per pass stood its clock still for as long as a pass
+  // took, so an animation jumped after every slow one and lvMonitor() timed
+  // every frame as 0 ms.
 
   // Service touch, scrolling and animation before storage, radio and command
   // work so input cadence remains smooth even when those subsystems are busy.
   if (!displaySleeping) {
-    lv_timer_handler();
-    servicePageStripChange();
-    serviceRemoteIdentify(now);
-    serviceFrameRateLog(millis());
+    LOOP_TIMED("lv_timer_handler", lv_timer_handler());
+    LOOP_TIMED("servicePageStripChange", servicePageStripChange());
+    LOOP_TIMED("serviceRemoteIdentify", serviceRemoteIdentify(now));
+    LOOP_TIMED("serviceFrameRateLog", serviceFrameRateLog(millis()));
   }
 
   if (dnsServerStarted) dnsServer.processNextRequest();
@@ -43341,29 +43397,29 @@ void loop() {
       )) {
     leaveBleConnectedIdle();
   }
-  serviceUsbSerialImport(Serial, usbCdcSession);
+  LOOP_TIMED("serviceUsbSerialImport", serviceUsbSerialImport(Serial, usbCdcSession));
 #if defined(ARDUINO_USB_CDC_ON_BOOT) && ARDUINO_USB_CDC_ON_BOOT
-  serviceUsbSerialImport(Serial0, uart0Session);
+  LOOP_TIMED("serviceUsbSerialImport", serviceUsbSerialImport(Serial0, uart0Session));
 #endif
-  serviceIrLearning(now);
-  serviceKeypad(now);
-  serviceHardwarePowerHold(now);
-  serviceDisplayRescueCombo(now);
-  serviceHeldIrRepeat(now);
-  serviceButtonTest(now);
-  serviceActivitySequence(now);
-  serviceCommandFeedback(now);
-  serviceEspNowCommandFeedback(now);
-  serviceButtonTestFeedback(now);
-  serviceBluetooth(now);
-  serviceBluetoothConnectionProfile(now);
-  serviceEspNow(now);
-  serviceDockOta(now);
-  serviceDockPairAck(now);
-  serviceDockLink(now);
-  serviceMediaArtwork(now);
-  serviceEspNowLinkLog(now);
-  serviceDockSettingsSync();
+  LOOP_TIMED("serviceIrLearning", serviceIrLearning(now));
+  LOOP_TIMED("serviceKeypad", serviceKeypad(now));
+  LOOP_TIMED("serviceHardwarePowerHold", serviceHardwarePowerHold(now));
+  LOOP_TIMED("serviceDisplayRescueCombo", serviceDisplayRescueCombo(now));
+  LOOP_TIMED("serviceHeldIrRepeat", serviceHeldIrRepeat(now));
+  LOOP_TIMED("serviceButtonTest", serviceButtonTest(now));
+  LOOP_TIMED("serviceActivitySequence", serviceActivitySequence(now));
+  LOOP_TIMED("serviceCommandFeedback", serviceCommandFeedback(now));
+  LOOP_TIMED("serviceEspNowCommandFeedback", serviceEspNowCommandFeedback(now));
+  LOOP_TIMED("serviceButtonTestFeedback", serviceButtonTestFeedback(now));
+  LOOP_TIMED("serviceBluetooth", serviceBluetooth(now));
+  LOOP_TIMED("serviceBluetoothConnectionProfile", serviceBluetoothConnectionProfile(now));
+  LOOP_TIMED("serviceEspNow", serviceEspNow(now));
+  LOOP_TIMED("serviceDockOta", serviceDockOta(now));
+  LOOP_TIMED("serviceDockPairAck", serviceDockPairAck(now));
+  LOOP_TIMED("serviceDockLink", serviceDockLink(now));
+  LOOP_TIMED("serviceMediaArtwork", serviceMediaArtwork(now));
+  LOOP_TIMED("serviceEspNowLinkLog", serviceEspNowLinkLog(now));
+  LOOP_TIMED("serviceDockSettingsSync", serviceDockSettingsSync());
   if (homebridgeConfigPushWanted) {
     homebridgeConfigPushWanted = false;
     if (homebridgeViaDock) sendHomebridgeConfigToDock();
@@ -43383,38 +43439,38 @@ void loop() {
     }
   }
   if (dockLinkIndicatorDirty) { dockLinkIndicatorDirty = false; refreshDockLinkIndicator(); }
-  serviceEspNowDevicesModal(now);
-  serviceEspNowSearchOverlay(now);
-  servicePhysicalNavIdleHide(now);
-  serviceFaceDownSleep(now);
-  serviceChargeOverlay(millis());
+  LOOP_TIMED("serviceEspNowDevicesModal", serviceEspNowDevicesModal(now));
+  LOOP_TIMED("serviceEspNowSearchOverlay", serviceEspNowSearchOverlay(now));
+  LOOP_TIMED("servicePhysicalNavIdleHide", servicePhysicalNavIdleHide(now));
+  LOOP_TIMED("serviceFaceDownSleep", serviceFaceDownSleep(now));
+  LOOP_TIMED("serviceChargeOverlay", serviceChargeOverlay(millis()));
   now = millis();
-  serviceAtvvVoice(now);
+  LOOP_TIMED("serviceAtvvVoice", serviceAtvvVoice(now));
   if (microphoneStopPending && !atvvAudioStarted) {
     microphoneStopPending = false;
     stopRealMicrophoneCapture();
     now = millis();
   }
-  servicePhysicalVoiceOverlay();
-  serviceBlePairingOverlay(millis());
-  serviceAtvvDebug(now);
+  LOOP_TIMED("servicePhysicalVoiceOverlay", servicePhysicalVoiceOverlay());
+  LOOP_TIMED("serviceBlePairingOverlay", serviceBlePairingOverlay(millis()));
+  LOOP_TIMED("serviceAtvvDebug", serviceAtvvDebug(now));
   if (!displaySleeping) {
     serviceDebugOverlay(now);
     updateSplitDiagnostic();
   }
-  serviceInternetTime(now);
-  serviceNetworkPower(now);
-  serviceBatteryHistory(now);
-  if (!displaySleeping) serviceWidgets(now);
-  serviceMediaTarget(now);
-  serviceMediaRadio(now);
-  serviceWeatherWidget(now);
-  serviceDockData(now);
-  serviceMqtt(now);
-  serviceHomeAssistantLive(now);
+  LOOP_TIMED("serviceInternetTime", serviceInternetTime(now));
+  LOOP_TIMED("serviceNetworkPower", serviceNetworkPower(now));
+  LOOP_TIMED("serviceBatteryHistory", serviceBatteryHistory(now));
+  if (!displaySleeping) LOOP_TIMED("serviceWidgets", serviceWidgets(now));
+  LOOP_TIMED("serviceMediaTarget", serviceMediaTarget(now));
+  LOOP_TIMED("serviceMediaRadio", serviceMediaRadio(now));
+  LOOP_TIMED("serviceWeatherWidget", serviceWeatherWidget(now));
+  LOOP_TIMED("serviceDockData", serviceDockData(now));
+  LOOP_TIMED("serviceMqtt", serviceMqtt(now));
+  LOOP_TIMED("serviceHomeAssistantLive", serviceHomeAssistantLive(now));
   if (liveStateDirty && !displaySleeping) {
     liveStateDirty = false;
-    refreshLiveTiles();
+    LOOP_TIMED("refreshLiveTiles", refreshLiveTiles());
   }
   if (pendingRuntimeReload && (int32_t)(now - runtimeReloadAfterMs) >= 0) {
     pendingRuntimeReload = false;
@@ -43465,8 +43521,8 @@ void loop() {
     pendingBluetoothApply = false;
     applyBluetoothState();
   }
-  serviceUsbWebConfigRequest();
-  serviceQueuedBackup();
+  LOOP_TIMED("serviceUsbWebConfigRequest", serviceUsbWebConfigRequest());
+  LOOP_TIMED("serviceQueuedBackup", serviceQueuedBackup());
   now = millis();
   if (runtimeSettingsSavePending &&
       (int32_t)(now - runtimeSettingsSaveAtMs) >= 0) {
@@ -43475,9 +43531,9 @@ void loop() {
     now = millis();
   }
 
-  serviceWebControlRequests(now);
+  LOOP_TIMED("serviceWebControlRequests", serviceWebControlRequests(now));
   now = millis();
-  serviceWifiScan(now);
+  LOOP_TIMED("serviceWifiScan", serviceWifiScan(now));
 
   if (settingsView == SETTINGS_WIFI_QR && setupApStatusLabel &&
       (int32_t)(now - nextSetupApStatusRefreshMs) >= 0) {
@@ -43658,27 +43714,27 @@ void loop() {
   if (pendingDeviceOpen >= 0 && pageUiSettled) {
     int8_t deviceIndex = pendingDeviceOpen;
     pendingDeviceOpen = -1;
-    openDevice((uint8_t)deviceIndex);
+    LOOP_TIMED("openDevice", openDevice((uint8_t)deviceIndex));
     now = millis();
   }
 
   if (pendingActivityOpen >= 0 && pageUiSettled) {
     int8_t activityIndex = pendingActivityOpen;
     pendingActivityOpen = -1;
-    activateActivity((uint8_t)activityIndex);
+    LOOP_TIMED("activateActivity", activateActivity((uint8_t)activityIndex));
     now = millis();
   }
 
   if (pendingUiRefresh && pageUiSettled) {
     pendingUiRefresh = false;
-    bindPageUi(currentPage);
-    renderCurrentPage();
+    LOOP_TIMED("bindPageUi", bindPageUi(currentPage));
+    LOOP_TIMED("renderCurrentPage", renderCurrentPage());
     now = millis();
   }
 
   if (pageStripRebuildPending && pageUiSettled) {
     pageStripRebuildPending = false;
-    renderAllPageSlots();
+    LOOP_TIMED("renderAllPageSlots", renderAllPageSlots());
     now = millis();
   }
 
@@ -43699,7 +43755,7 @@ void loop() {
   }
 
   if (now >= nextStatusRefreshMs) {
-    refreshStatusPill();
+    LOOP_TIMED("refreshStatusPill", refreshStatusPill());
     nextStatusRefreshMs = now + STATUS_REFRESH_MS;
   }
 
@@ -43707,7 +43763,7 @@ void loop() {
   bool liveBatteryPage = pages[currentPage].kind == PAGE_REMOTE_SETTINGS &&
                          settingsView == SETTINGS_BATTERY;
   if (liveBatteryPage && (int32_t)(now - nextBatteryPageRefreshMs) >= 0) {
-    updateBatteryMetricLabels(currentBatteryMetrics());
+    LOOP_TIMED("updateBatteryMetricLabels", updateBatteryMetricLabels(currentBatteryMetrics()));
     nextBatteryPageRefreshMs = now + 1000UL;
   }
 
@@ -43731,5 +43787,6 @@ void loop() {
     enterDisplaySleep();
   }
 
+  reportSlowLoopIteration();
   delay(5);
 }

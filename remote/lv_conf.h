@@ -10,7 +10,11 @@
 #define LV_MEM_CUSTOM_FREE free
 #define LV_MEM_CUSTOM_REALLOC ps_realloc
 
-#define LV_TICK_CUSTOM 0
+/* LVGL reads the millisecond clock itself (firmware 5.90) instead of being
+   fed the loop's elapsed time once per pass. */
+#define LV_TICK_CUSTOM 1
+#define LV_TICK_CUSTOM_INCLUDE "Arduino.h"
+#define LV_TICK_CUSTOM_SYS_TIME_EXPR (millis())
 
 /* Firmware 5.89. LVGL's defaults are 30 ms for both: at most 33 frames a
    second, and a finger sampled 33 times a second, which is what made a page
