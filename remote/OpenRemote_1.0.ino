@@ -1,6 +1,21 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.97 - 2026-10-29
+    - Battery log. Phillip saw 100% to 94% overnight with everything off
+      and the remote had woken from deep sleep, but nothing on the remote
+      recorded what it did in between. /logs/battery.csv on the SD card now
+      gets one line per power event - boot (reset reason and wake cause),
+      screen on/off, BLE-connected idle in/out, light sleep and its wake
+      cause, deep sleep, charger in/out - plus a sample every 10 minutes
+      while the firmware runs. Each line: trusted epoch (0 until the clock
+      is real), uptime, event, percent, millivolts, gauge rate %/h, charging,
+      detail. Rotated to battery.prev.csv at 256 KB.
+    - Readable over Wi-Fi while WebConfig's server is up: GET
+      /api/battery/log (CSV) and /api/battery/history (the 49 samples kept in
+      NVS), both behind the usual token. Over USB, ORUSB READ
+      /logs/battery.csv already works.
+
   5.96 - 2026-10-28
     - Settings sliders can be dragged again. The left-to-right "back" swipe
       in a Settings sub-page is read from the raw touch-down and touch-up
@@ -7554,7 +7569,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.96"
+#define OPENREMOTE_VERSION_STRING "5.97"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -11258,6 +11273,8 @@ bool restoreLcdFullBackup(const char *name, String &error, bool reloadNow = true
 bool performFactoryReset();
 void scheduleRuntimeReloadAfterSync();
 const char *resetReasonText(esp_reset_reason_t reason);
+const char *wakeCauseText(esp_sleep_wakeup_cause_t cause);
+void batteryLog(const char *event, const char *detail = "");
 void clearPageIconCache();
 const void *cachedPageIconSource(const char *path);
 void invalidateWallpaperCacheForPath(const String &path);
@@ -13087,6 +13104,55 @@ void saveBatteryHistory() {
   preferences.begin(PREFERENCES_NAMESPACE, false);
   preferences.putBytes("batHist", &batteryHistory, sizeof(batteryHistory));
   preferences.end();
+}
+
+/*
+  The battery log (5.97). One CSV line per power event, so a night's drain
+  can be attributed to deep sleep, light sleep, Bluetooth idle or wakes:
+
+    epoch,uptime_s,event,percent,millivolts,rate_pct_per_h,charging,detail
+
+  epoch is the trusted wall clock, 0 until NTP, the dock or the user has set
+  it. The file is opened, appended and closed per line, so nothing is lost
+  when the remote goes to sleep straight afterwards.
+*/
+static const char *BATTERY_LOG_PATH = "/logs/battery.csv";
+static const char *BATTERY_LOG_OLD_PATH = "/logs/battery.prev.csv";
+static const size_t BATTERY_LOG_MAX_BYTES = 256UL * 1024UL;
+static const uint32_t BATTERY_LOG_SAMPLE_MS = 10UL * 60UL * 1000UL;
+
+void batteryLog(const char *event, const char *detail) {
+  if (!sdReady) return;
+  float percent = readBatteryPercent();
+  float voltage = readBatteryVoltage();
+  float rate = readBatteryRatePerHour();
+  char line[192];
+  snprintf(line, sizeof(line), "%lu,%lu,%s,%.2f,%d,%.2f,%d,%s\n",
+           (unsigned long)batteryClockEpoch(), (unsigned long)(millis() / 1000UL),
+           event, percent, voltage > 0.0f ? (int)roundf(voltage * 1000.0f) : -1,
+           isnan(rate) ? 0.0f : rate, chargingState ? 1 : 0, detail ? detail : "");
+  File log = SD.open(BATTERY_LOG_PATH, FILE_APPEND);
+  if (!log) return;
+  if (log.size() >= BATTERY_LOG_MAX_BYTES) {
+    log.close();
+    SD.remove(BATTERY_LOG_OLD_PATH);
+    SD.rename(BATTERY_LOG_PATH, BATTERY_LOG_OLD_PATH);
+    log = SD.open(BATTERY_LOG_PATH, FILE_APPEND);
+    if (!log) return;
+  }
+  if (log.size() == 0) {
+    log.print("epoch,uptime_s,event,percent,millivolts,rate_pct_per_h,charging,detail\n");
+  }
+  log.print(line);
+  log.close();
+}
+
+void serviceBatteryLog(unsigned long now) {
+  static unsigned long nextSampleMs = 0;
+  if (nextSampleMs && (int32_t)(now - nextSampleMs) < 0) return;
+  bool first = nextSampleMs == 0;
+  nextSampleMs = now + BATTERY_LOG_SAMPLE_MS;
+  if (!first) batteryLog("sample", displaySleeping ? (bleConnectedIdleActive ? "ble-idle" : "screen-off") : "awake");
 }
 
 void serviceBatteryHistory(unsigned long now, bool force) {
@@ -21959,6 +22025,44 @@ struct IrdbIndexScanner {
   it removes the database and the older separate index files and touches
   nothing else, so a mistaken press costs a re-copy, never a configuration.
 */
+// The battery log (batteryLog()), as CSV. ?old=1 for the rotated file.
+void handleBatteryLog() {
+  if (!requestAuthorized()) {
+    sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
+    return;
+  }
+  const char *path = webServer.hasArg("old") ? BATTERY_LOG_OLD_PATH : BATTERY_LOG_PATH;
+  File file = sdReady ? SD.open(path, FILE_READ) : File();
+  if (!file) {
+    sendJson(404, "{\"ok\":false,\"error\":\"No battery log yet\"}");
+    return;
+  }
+  streamSdFileCooperatively(file, "text/csv");
+  file.close();
+}
+
+// The samples kept in NVS for the Battery page's last-hour / last-24-hours
+// figures, oldest first.
+void handleBatteryHistory() {
+  if (!requestAuthorized()) {
+    sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
+    return;
+  }
+  JsonDocument doc;
+  doc["ok"] = true;
+  JsonArray samples = doc["samples"].to<JsonArray>();
+  uint8_t count = batteryHistory.count;
+  for (uint8_t k = 0; k < count && k < 49; k++) {
+    uint8_t i = count < 49 ? k : (uint8_t)((batteryHistory.next + k) % 49);
+    JsonObject sample = samples.add<JsonObject>();
+    sample["epoch"] = batteryHistory.samples[i].epoch;
+    sample["percent"] = roundf(batteryHistory.samples[i].percent * 100.0f) / 100.0f;
+  }
+  String body;
+  serializeJson(doc, body);
+  sendJson(200, body);
+}
+
 void handleIrdbDelete() {
   if (!requestAuthorized()) {
     sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
@@ -28934,6 +29038,8 @@ void configureWebServer() {
                     : "{\"ok\":false,\"error\":\"Widget Wallpaper upload failed\"}");
   }, handleWidgetWallpaperUploadData);
   webServer.on("/api/widget-wallpapers", HTTP_DELETE, handleWidgetWallpaperDelete);
+  webServer.on("/api/battery/log", HTTP_GET, handleBatteryLog);
+  webServer.on("/api/battery/history", HTTP_GET, handleBatteryHistory);
   webServer.on("/api/irdb/search", HTTP_GET, handleIrdbSearch);
   webServer.on("/api/irdb/detail", HTTP_GET, handleIrdbDetail);
   webServer.on("/api/irdb", HTTP_GET, handleIrdbDownload);
@@ -33405,6 +33511,7 @@ bool updateChargingState() {
     bool wasCharging = chargingState;
     chargingState = chargingCandidate;
     Serial.printf("Charging state: %s\n", chargingState ? "charging" : "not charging");
+    batteryLog(chargingState ? "charger-on" : "charger-off");
     if (chargingState) chargingAnimationStartMs = now;
     resetBatteryMeasurementWindow(chargingState);
 
@@ -42960,6 +43067,7 @@ bool enterDeepPowerSleep(bool allowQrPage) {
   }
   saveDeepSleepRuntimeState();
   serviceBatteryHistory(millis(), true);
+  batteryLog("deep-sleep", clockUseInternetTime ? "wake=motion/button/charger/3am" : "wake=motion/button/charger");
   if (bleReady) stopBluetoothRadio("deep sleep");
   stopNetworkStack();
   IrReceiver.stop();
@@ -43117,6 +43225,7 @@ void enterBleConnectedIdle() {
   bleConnectedIdleActive = true;
   nextBleConnectedIdleMotionMs = millis();
   bleIdleMotionAboveSinceMs = 0;
+  batteryLog("ble-idle", powerManagementReady ? "auto-light-sleep" : "80MHz");
   if (powerManagementReady) {
     // Studio's first bytes must wake a light-sleeping CPU, as they already do
     // in enterLowPowerWait(). The keypad and accelerometer need no wake source
@@ -43152,6 +43261,7 @@ void enterBleConnectedIdle() {
 
 void leaveBleConnectedIdle() {
   if (!bleConnectedIdleActive) return;
+  batteryLog("ble-idle-exit");
   bleIdleAccelerometerWake = false;
   bleIdleKeypadWake = false;
   if (bleIdleUartWake) esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_UART);
@@ -43297,6 +43407,11 @@ void enterLowPowerWait() {
   uint64_t remainingUs = idleMs >= deepSleepAfterMs
     ? 5000000ULL : (uint64_t)(deepSleepAfterMs - idleMs) * 1000ULL;
   esp_sleep_enable_timer_wakeup(remainingUs);
+  {
+    char detail[48];
+    snprintf(detail, sizeof(detail), "timer=%lus", (unsigned long)(remainingUs / 1000000ULL));
+    batteryLog("light-sleep", detail);
+  }
   lightSleepArmed = true;
   Serial.printf("Light sleep: motion=%s keypad=%s\n",
                 accelerometerWake ? "on" : "off", keypadWake ? "on" : "off");
@@ -43326,6 +43441,7 @@ void enterLowPowerWait() {
     if (!waitForWakeInputsIdle(accelerometerWake, keypadWake, 600)) break;
   } while (true);
   lightSleepArmed = false;
+  batteryLog("light-wake", wakeCauseText(cause));
 
   if (accelerometerWake) gpio_wakeup_disable((gpio_num_t)PIN_ACC_INT);
   if (keypadWake) gpio_wakeup_disable((gpio_num_t)PIN_TCA_INT);
@@ -43379,6 +43495,7 @@ void enterLowPowerWait() {
 
 void enterDisplaySleep() {
   if (displaySleeping) return;
+  batteryLog("screen-off");
   Serial.println("Display sleep: controller and backlights off");
   // The screen going dark means nobody is pressing anything, so there is no
   // reason to keep a radio powered waiting for a command that cannot come.
@@ -43414,6 +43531,7 @@ void enterDisplaySleep() {
 
 void wakeDisplay() {
   pageSnapshotsMarkStale();
+  if (displaySleeping) batteryLog("screen-on");
   Serial.println("Movement wake");
   // Clear this before applyBluetoothState() runs later in this function -
   // with it still set, bluetoothActivitySessionRequired() would keep
@@ -43869,6 +43987,12 @@ void setup() {
   // from it with a clock that was real when the remote went to sleep.
   wallClockTrusted = rtcWallClockTrusted && time(nullptr) >= 1700000000;
   applyClockMode();
+  {
+    char detail[64];
+    snprintf(detail, sizeof(detail), "reset=%s wake=%s",
+             resetReasonText(esp_reset_reason()), wakeCauseText(esp_sleep_get_wakeup_cause()));
+    batteryLog("boot", detail);
+  }
 
   ensureDisplayFlushBuffers();
   // A successful loadRuntimeConfig() already built this: loadRuntimeModel()
@@ -44086,6 +44210,7 @@ void loop() {
   LOOP_TIMED("serviceInternetTime", serviceInternetTime(now));
   LOOP_TIMED("serviceNetworkPower", serviceNetworkPower(now));
   LOOP_TIMED("serviceBatteryHistory", serviceBatteryHistory(now));
+  LOOP_TIMED("serviceBatteryLog", serviceBatteryLog(now));
   if (!displaySleeping) LOOP_TIMED("serviceWidgets", serviceWidgets(now));
   LOOP_TIMED("serviceMediaTarget", serviceMediaTarget(now));
   LOOP_TIMED("serviceMediaRadio", serviceMediaRadio(now));
