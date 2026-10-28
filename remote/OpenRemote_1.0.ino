@@ -1,6 +1,25 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.89 - 2026-10-28
+    - A hand-set clock no longer jumps back at every WebConfig sync.
+      applySettingsJson() ends in applyClockMode(), whose manual branch wrote
+      manualClockEpoch - the moment the user set, not the time now - into the
+      clock every time it ran, so each sync, and each change on the Clock
+      settings page, rewound a manual clock. It now sets the clock only when
+      the user has just given a time (LCD picker, WebConfig "Set") or when a
+      boot has no running clock to keep.
+    - Smoother page swipes. LVGL's display refresh and touch read periods were
+      its 30 ms defaults: at most 33 frames a second, and the finger sampled
+      33 times a second. Now 15 ms and 10 ms (lv_conf.h). A still screen
+      draws nothing either way.
+    - lvFlush() no longer copies every band into the PSRAM screenshot mirror,
+      about 150 KB a frame during a swipe. ORUSB SCREENSHOT now turns the
+      mirror on, redraws the whole screen into it, and turns it off.
+    - New serial line while the screen animates: "LVGL: N fps, render+flush
+      avg X ms, max Y ms", once a second, only when at least five frames were
+      drawn in it - so a swipe can be measured rather than judged by eye.
+
   5.88 - 2026-10-28
     - The battery estimate no longer reads "12750d 13h" after a reboot. A
       cold boot seeds the clock with a placeholder (1pm 1 January 2026, or
@@ -7436,7 +7455,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.88"
+#define OPENREMOTE_VERSION_STRING "5.89"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -10651,6 +10670,14 @@ unsigned long nextDebugCpuRamRefreshMs = 0;
 unsigned long nextDebugAccelerometerRefreshMs = 0;
 unsigned long nextDebugFpsRefreshMs = 0;
 volatile uint32_t debugDisplayFrameCount = 0;
+// lvFlush() fills the screenshot mirror only while this is set
+// (saveLcdScreenshot()); copying every band during normal drawing cost about
+// 150 KB of PSRAM writes per frame.
+bool lcdFrameMirrorCapture = false;
+// lvMonitor() totals for the once-a-second frame-rate line.
+uint32_t lvFrameStatCount = 0;
+uint32_t lvFrameStatTotalMs = 0;
+uint32_t lvFrameStatMaxMs = 0;
 uint32_t debugLastDisplayFrameCount = 0;
 unsigned long debugLastFpsSampleMs = 0;
 unsigned long nextBatteryPageRefreshMs = 0;
@@ -13442,12 +13469,19 @@ void applyClockMode(bool userSetTime) {
   setenv("TZ", timezone.c_str(), 1);
   tzset();
   if (!clockUseInternetTime && manualClockEpoch > 0) {
-    timeval now = {(time_t)manualClockEpoch, 0};
-    settimeofday(&now, nullptr);
-    // Real only at the moment the user sets it. Re-applied at boot or by a
-    // settings sync it is the time they set back then, not now.
-    setWallClockTrusted(userSetTime, userSetTime ? "set by hand" : "stale hand-set time");
-    serviceWallClockSteps();
+    // manualClockEpoch is the moment the user set, not the time now. Writing
+    // it back on every call is what made a hand-set clock jump back to that
+    // moment at each WebConfig sync (applySettingsJson ends here) and at every
+    // Clock settings change. Only a new time from the user, or a boot with no
+    // running clock to keep, sets it.
+    if (userSetTime || time(nullptr) < 1700000000) {
+      timeval now = {(time_t)manualClockEpoch, 0};
+      settimeofday(&now, nullptr);
+      // Real only at the moment the user sets it. Restored at boot it is the
+      // time they set back then, not now.
+      setWallClockTrusted(userSetTime, userSetTime ? "set by hand" : "stale hand-set time");
+      serviceWallClockSteps();
+    }
     return;
   }
   // Internet time is the default, so on a remote where Wi-Fi has never been
@@ -25076,7 +25110,13 @@ void jumpToSettingsView(SettingsView view);
 bool saveLcdScreenshot(String &error, size_t &bytes, uint16_t &width, uint16_t &height) {
   if (displaySleeping) { error = "The screen is asleep"; return false; }
   if (!sdReady) { error = "SD card unavailable"; return false; }
-  lv_refr_now(nullptr);   // flush anything still pending into the mirror
+  // The mirror is filled only while capturing, so redraw the whole screen -
+  // the active screen and the top layer the overlays live on - into it.
+  lcdFrameMirrorCapture = true;
+  lv_obj_invalidate(lv_scr_act());
+  lv_obj_invalidate(lv_layer_top());
+  lv_refr_now(nullptr);
+  lcdFrameMirrorCapture = false;
   if (!lcdFrameMirror) { error = "No frame has been drawn yet"; return false; }
   if (!SD.exists("/tmp")) SD.mkdir("/tmp");
   SD.remove(LCD_SCREENSHOT_PATH);
@@ -30970,13 +31010,13 @@ void lvFlush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *colour) {
   const uint32_t pixelCount = (uint32_t)w * h;
   uint16_t *source = reinterpret_cast<uint16_t *>(colour);
 
-  // Keep the frame mirror in step for screenshots, before any colour
-  // calibration swaps the source for the corrected buffer.
-  if (!lcdFrameMirror) {
+  // Fill the frame mirror for a screenshot, before any colour calibration
+  // swaps the source for the corrected buffer. Only while one is being taken.
+  if (lcdFrameMirrorCapture && !lcdFrameMirror) {
     lcdFrameMirror = static_cast<uint16_t *>(ps_malloc((size_t)LCD_W * LCD_H * sizeof(uint16_t)));
     if (lcdFrameMirror) memset(lcdFrameMirror, 0, (size_t)LCD_W * LCD_H * sizeof(uint16_t));
   }
-  if (lcdFrameMirror && area->x1 >= 0 && area->y1 >= 0 &&
+  if (lcdFrameMirrorCapture && lcdFrameMirror && area->x1 >= 0 && area->y1 >= 0 &&
       area->x2 < LCD_W && area->y2 < LCD_H) {
     for (int32_t row = 0; row < h; row++) {
       memcpy(lcdFrameMirror + (area->y1 + row) * LCD_W + area->x1,
@@ -31012,9 +31052,29 @@ void lvFlush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *colour) {
 
 void lvMonitor(lv_disp_drv_t *disp, uint32_t time, uint32_t pixels) {
   (void)disp;
-  (void)time;
   (void)pixels;
   debugDisplayFrameCount++;
+  lvFrameStatCount++;
+  lvFrameStatTotalMs += time;
+  if (time > lvFrameStatMaxMs) lvFrameStatMaxMs = time;
+}
+
+// Once a second while the screen is animating: frames drawn and how long
+// LVGL took to render and flush each (lvMonitor's time). Quiet otherwise.
+void serviceFrameRateLog(unsigned long now) {
+  static unsigned long windowStartMs = 0;
+  if ((uint32_t)(now - windowStartMs) < 1000UL) return;
+  uint32_t elapsed = now - windowStartMs;
+  windowStartMs = now;
+  if (lvFrameStatCount >= 5 && elapsed < 2000UL) {
+    Serial.printf("LVGL: %lu fps, render+flush avg %lu ms, max %lu ms\n",
+                  (unsigned long)(lvFrameStatCount * 1000UL / elapsed),
+                  (unsigned long)(lvFrameStatTotalMs / lvFrameStatCount),
+                  (unsigned long)lvFrameStatMaxMs);
+  }
+  lvFrameStatCount = 0;
+  lvFrameStatTotalMs = 0;
+  lvFrameStatMaxMs = 0;
 }
 
 bool lvSdReady(lv_fs_drv_t *drv) {
@@ -43266,6 +43326,7 @@ void loop() {
     lv_timer_handler();
     servicePageStripChange();
     serviceRemoteIdentify(now);
+    serviceFrameRateLog(millis());
   }
 
   if (dnsServerStarted) dnsServer.processNextRequest();

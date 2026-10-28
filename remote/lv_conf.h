@@ -11,6 +11,13 @@
 #define LV_MEM_CUSTOM_REALLOC ps_realloc
 
 #define LV_TICK_CUSTOM 0
+
+/* Firmware 5.89. LVGL's defaults are 30 ms for both: at most 33 frames a
+   second, and a finger sampled 33 times a second, which is what made a page
+   swipe feel like it lagged behind the finger. A frame is only drawn when
+   something changed, so a shorter period costs nothing on a still screen. */
+#define LV_DISP_DEF_REFR_PERIOD 15
+#define LV_INDEV_DEF_READ_PERIOD 10
 #define LV_USE_LOG 0
 #define LV_USE_ASSERT_NULL 0
 #define LV_USE_ASSERT_MALLOC 0
