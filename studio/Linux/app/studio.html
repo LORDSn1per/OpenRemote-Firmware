@@ -745,6 +745,10 @@ async function startBuild(){
   let r=await fetch('/start-build',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sources})}).then(r=>r.json());
   if(r.error){alert(r.error);document.getElementById('buildBtn').disabled=false;}
 }
+// The server's "done" stays true after a build until the next one starts, so
+// act on it once. Reloading on every poll made the IRDB Browser's count flip
+// between the search's matches and the whole database twice a second.
+let buildDoneSeen=null;
 async function poll(){
   try{
     let s=await fetch('/status').then(r=>r.json());
@@ -752,7 +756,9 @@ async function poll(){
     bar.style.width=(s.progress||0)+'%';pct.textContent=s.progress||0;mb.textContent=(s.downloaded_mb||0).toFixed(1);
     status.textContent=s.current||'';footerStatus.textContent=s.current||'Ready';records.textContent=s.records||0;binmb.textContent=(s.bin_mb||0).toFixed(1);
     
-    if(s.done){document.getElementById('buildBtn').disabled=false;loadInfo();searchDb();}
+    if(s.done && buildDoneSeen===false){loadInfo();searchDb();}
+    if(s.done) document.getElementById('buildBtn').disabled=false;
+    buildDoneSeen=!!s.done;
     if(s.error){status.textContent='ERROR: '+s.error;document.getElementById('buildBtn').disabled=false;}
   }catch(e){}
   setTimeout(poll,500);
@@ -793,7 +799,8 @@ async function loadInfo(){
   }
   stats.classList.add('sourceStats');
   stats.innerHTML=sourceTable(info)+`<div class="detailKV">Version ${esc(info.version||'—')} • Created ${esc(info.build_date_short||'—')}${info.index_version&&info.index_version<3?' • Built before Studio 2.87: rebuild it for firmware 5.86':''}</div>`;
-  countLine.textContent=num(info.devices)+' devices';
+  // A search's own count stays; the total belongs to an empty search box.
+  if(!document.getElementById('searchBox').value.trim()) countLine.textContent=num(info.devices)+' devices';
   return true;
 }
 
