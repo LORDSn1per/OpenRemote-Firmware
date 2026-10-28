@@ -1,6 +1,29 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.88 - 2026-10-28
+    - The battery estimate no longer reads "12750d 13h" after a reboot. A
+      cold boot seeds the clock with a placeholder (1pm 1 January 2026, or
+      the last hand-set time) until the dock or NTP supplies the real one,
+      and every battery check accepted any date after late 2023 as real. So
+      a discharge segment opened on the placeholder, the real time then
+      jumped the clock ~300 days forward, and the model saw ~2% used over
+      ~7,200 hours. The battery model, its history and the since-full counter
+      now use the clock only once it is known to be real
+      (wallClockTrusted): set by NTP, by the dock, or by the user setting the
+      time; kept across deep sleep in RTC memory; never by the boot seed or
+      by re-applying a stale hand-set time.
+    - A clock step of more than two minutes while the clock is real (a manual
+      change, a large NTP correction) moves the open segment, the since-full
+      start and the power-mode window by the same amount, since they were
+      measured correctly on the old timeline. A step from a real clock to an
+      untrusted one drops them instead.
+    - The learned average is reset once on the first 5.88 boot, because any
+      reboot before it may have stored a placeholder-length segment.
+    - Test builds: the once-a-minute power-manager report in BLE-connected
+      idle holds off light sleep until it has been sent. Without that the CPU
+      slept again before the UART finished and the report never arrived.
+
   5.87 - 2026-10-28  (battery test build)
     - The remote can now sleep with a Chromecast connected. The Arduino
       framework's prebuilt libraries have CONFIG_PM_ENABLE and the Bluetooth
@@ -7413,7 +7436,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.87"
+#define OPENREMOTE_VERSION_STRING "5.88"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -9058,6 +9081,15 @@ bool displayRgb666 = false;
 bool displayInverted = false;
 bool lcdControllerReady = false;
 uint64_t manualClockEpoch = 0;
+/*
+  Whether the wall clock holds the real time (5.88). time() >= 1700000000 is
+  not enough: a cold boot seeds a placeholder date that passes that test, and
+  the battery model measured a ~300 day "discharge" across the jump to the
+  real time. Set only by NTP, the dock, or the user setting the time; carried
+  across deep sleep, where the RTC keeps counting, and lost on any other boot.
+*/
+RTC_DATA_ATTR bool rtcWallClockTrusted = false;
+bool wallClockTrusted = false;
 int16_t clockUtcOffsetMinutes = 600;
 char irdbBuildDate[28] = "Not installed";
 uint32_t irdbDeviceCount = 0;
@@ -10797,7 +10829,9 @@ void startBluetoothPairing();
 void forgetBluetoothPairing();
 void serviceBluetooth(unsigned long now);
 bool ensureBluetoothRuntimeDevice();
-void applyClockMode();
+void applyClockMode(bool userSetTime = false);
+void setWallClockTrusted(bool trusted, const char *why);
+void serviceWallClockSteps();
 void startNetworkStack();
 void stopNetworkStack();
 void parkNetworkStackForBle();
@@ -12384,6 +12418,59 @@ struct BatteryMetrics {
   bool sinceFullKnown = false;
 };
 
+// The wall clock as the battery model may use it: 0 until it is known to be
+// real. Every battery timestamp goes through this, so a placeholder date can
+// never be stored as the start of anything.
+uint32_t batteryClockEpoch() {
+  time_t now = time(nullptr);
+  return (wallClockTrusted && now >= 1700000000) ? (uint32_t)now : 0;
+}
+
+void saveBatteryPowerMode();
+void saveBatterySinceFull();
+void saveBatteryDischargeModel();
+
+/*
+  Notices the wall clock being stepped, by watching its offset from the
+  monotonic esp_timer. Called from loop() and straight after every place that
+  sets the time, so nothing measures across a step before it is handled.
+*/
+void serviceWallClockSteps() {
+  static bool primed = false;
+  static int64_t lastOffset = 0;
+  static bool lastTrusted = false;
+  int64_t offset = (int64_t)time(nullptr) - esp_timer_get_time() / 1000000LL;
+  if (!primed) {
+    primed = true;
+    lastOffset = offset;
+    lastTrusted = wallClockTrusted;
+    return;
+  }
+  int64_t delta = offset - lastOffset;
+  bool wasTrusted = lastTrusted;
+  lastOffset = offset;
+  lastTrusted = wallClockTrusted;
+  if (delta > -120 && delta < 120) return;
+  // Before the clock was real nothing was timestamped, so there is nothing
+  // to move. A real clock replaced by an untrusted one leaves the stored
+  // starts on a timeline that no longer exists: drop them.
+  if (!wasTrusted) return;
+  bool shift = wallClockTrusted;
+  auto adjust = [&](uint32_t &epoch) {
+    if (!epoch) return;
+    int64_t moved = (int64_t)epoch + delta;
+    epoch = (shift && moved >= 1700000000LL) ? (uint32_t)moved : 0;
+  };
+  adjust(batteryDischargeSegmentEpoch);
+  adjust(batterySinceFullEpoch);
+  adjust(batteryPowerModeChangedEpoch);
+  saveBatteryDischargeModel();
+  saveBatterySinceFull();
+  saveBatteryPowerMode();
+  Serial.printf("Clock: stepped %+lld s; battery timestamps %s\n",
+                (long long)delta, shift ? "moved with it" : "dropped");
+}
+
 void saveBatteryPowerMode() {
   preferences.begin(PREFERENCES_NAMESPACE, false);
   preferences.putBool("batModeKnown", batteryPowerModeKnown);
@@ -12572,9 +12659,7 @@ void resetBatteryDischargeLearning() {
   batteryDischargeSegmentProvisional = false;
 
   if (!chargingState) {
-    time_t now = time(nullptr);
-    startBatteryDischargeSegment(readBatteryPercent(),
-      now >= 1700000000 ? (uint32_t)now : 0);
+    startBatteryDischargeSegment(readBatteryPercent(), batteryClockEpoch());
   } else {
     saveBatteryDischargeModel();
   }
@@ -12582,10 +12667,9 @@ void resetBatteryDischargeLearning() {
 }
 
 void resetBatteryMeasurementWindow(bool chargerConnected) {
-  time_t epoch = time(nullptr);
   batteryPowerModeKnown = true;
   batteryPowerModeCharging = chargerConnected;
-  batteryPowerModeChangedEpoch = epoch >= 1700000000 ? (uint32_t)epoch : 0;
+  batteryPowerModeChangedEpoch = batteryClockEpoch();
   batteryPowerModeStartPercent = readBatteryPercent();
   saveBatteryPowerMode();
   Serial.printf("Battery hour reset: charger=%s level=%.2f%% epoch=%lu\n",
@@ -12680,8 +12764,9 @@ BatteryMetrics currentBatteryMetrics() {
     metrics.learnedDischargePerHour =
       batteryDischargePercentTotal / batteryDischargeHoursTotal;
   }
-  time_t nowTime = time(nullptr);
-  if (metrics.percent < 0.0f || nowTime < 1700000000) return metrics;
+  uint32_t trustedNow = batteryClockEpoch();
+  if (metrics.percent < 0.0f || !trustedNow) return metrics;
+  time_t nowTime = (time_t)trustedNow;
 
   if (!batteryPowerModeKnown || !batteryPowerModeChangedEpoch) {
     resetBatteryMeasurementWindow(metrics.chargerConnected);
@@ -12762,7 +12847,9 @@ void loadBatteryHistory() {
   batteryDischargeSegmentEpoch = preferences.getULong("dsgAt", 0);
   batteryDischargeSegmentStartPercent = preferences.getFloat("dsgStart", -1.0f);
   batteryDischargeSegmentProvisional = preferences.getBool("dsgProv", false);
-  bool chargerTimeFixed = preferences.getBool("dsg585", false);
+  // Reset once per fix that invalidated what was learned: 5.85 (charger
+  // time) and 5.88 (placeholder-clock segments). One key, renamed per fix.
+  bool chargerTimeFixed = preferences.getBool("dsg588", false);
   preferences.end();
   if (!chargerTimeFixed) {
     // Before 5.85 the model learned charger time after a completed charge
@@ -12776,9 +12863,9 @@ void loadBatteryHistory() {
     batteryDischargeSegmentProvisional = false;
     saveBatteryDischargeModel();
     preferences.begin(PREFERENCES_NAMESPACE, false);
-    preferences.putBool("dsg585", true);
+    preferences.putBool("dsg588", true);
     preferences.end();
-    Serial.println("Battery model: learned average reset once for 5.85");
+    Serial.println("Battery model: learned average reset once for 5.88");
   }
   if (!isfinite(batteryDischargePercentTotal) || batteryDischargePercentTotal < 0.0f ||
       !isfinite(batteryDischargeHoursTotal) || batteryDischargeHoursTotal < 0.0f) {
@@ -12808,9 +12895,9 @@ void saveBatteryHistory() {
 void serviceBatteryHistory(unsigned long now, bool force) {
   if (!force && (int32_t)(now - nextBatteryHistoryCheckMs) < 0) return;
   nextBatteryHistoryCheckMs = now + 60000UL;
-  time_t epoch = time(nullptr);
+  time_t epoch = (time_t)batteryClockEpoch();
   float percent = readBatteryPercent();
-  if (epoch < 1700000000 || percent < 0.0f) return;
+  if (!epoch || percent < 0.0f) return;
   if (!batteryPowerModeKnown || !batteryPowerModeChangedEpoch) {
     resetBatteryMeasurementWindow(chargingState);
   }
@@ -13350,13 +13437,17 @@ time_t defaultClockSeedEpoch() {
   return mktime(&fallback);
 }
 
-void applyClockMode() {
+void applyClockMode(bool userSetTime) {
   String timezone = clockTimezoneRule();
   setenv("TZ", timezone.c_str(), 1);
   tzset();
   if (!clockUseInternetTime && manualClockEpoch > 0) {
     timeval now = {(time_t)manualClockEpoch, 0};
     settimeofday(&now, nullptr);
+    // Real only at the moment the user sets it. Re-applied at boot or by a
+    // settings sync it is the time they set back then, not now.
+    setWallClockTrusted(userSetTime, userSetTime ? "set by hand" : "stale hand-set time");
+    serviceWallClockSteps();
     return;
   }
   // Internet time is the default, so on a remote where Wi-Fi has never been
@@ -13370,6 +13461,16 @@ void applyClockMode() {
   time_t seed = manualClockEpoch > 0 ? (time_t)manualClockEpoch : defaultClockSeedEpoch();
   timeval seeded = {seed, 0};
   settimeofday(&seeded, nullptr);
+  setWallClockTrusted(false, "boot placeholder");
+  serviceWallClockSteps();
+}
+
+void setWallClockTrusted(bool trusted, const char *why) {
+  if (trusted != wallClockTrusted) {
+    Serial.printf("Clock: %s (%s)\n", trusted ? "real time" : "not yet real", why);
+  }
+  wallClockTrusted = trusted;
+  rtcWallClockTrusted = trusted;
 }
 
 void requestInternetTimeSync() {
@@ -13425,6 +13526,8 @@ void serviceInternetTime(unsigned long now) {
       localtime_r(&epoch, &local);
       lastNtpSyncYDay = local.tm_yday;
       ntpSyncPending = false;
+      setWallClockTrusted(true, "NTP");
+      serviceWallClockSteps();
       serviceBatteryHistory(now, true);
       scheduleNetworkShutdown();
       timeSyncUseOwnWifi = false;
@@ -32695,10 +32798,10 @@ bool updateChargingState() {
       it closes before charging and resumes with all completed history afterward.
     */
     if (wasCharging && !chargingState) {
-      time_t epoch = time(nullptr);
+      uint32_t epoch = batteryClockEpoch();
       if (batteryReachedFullThisSession) {
         batterySinceFullKnown = true;
-        batterySinceFullEpoch = epoch >= 1700000000 ? (uint32_t)epoch : 0;
+        batterySinceFullEpoch = epoch;
         batterySinceFullStartPercent = 100.0f;
         Serial.println("Battery: full-charge discharge counter started");
       } else {
@@ -32708,13 +32811,10 @@ bool updateChargingState() {
         Serial.println("Battery: partial recharge reset full-charge counter to zero");
       }
       saveBatterySinceFull();
-      startBatteryDischargeSegment(readBatteryPercent(),
-        epoch >= 1700000000 ? (uint32_t)epoch : 0);
+      startBatteryDischargeSegment(readBatteryPercent(), epoch);
       batteryReachedFullThisSession = false;
     } else if (!wasCharging && chargingState) {
-      time_t epoch = time(nullptr);
-      closeBatteryDischargeSegment(readBatteryPercent(),
-        epoch >= 1700000000 ? (uint32_t)epoch : 0);
+      closeBatteryDischargeSegment(readBatteryPercent(), batteryClockEpoch());
       // The old discharge is no longer uninterrupted from a full charge.
       // Clear it immediately so the Battery page reads zero throughout the
       // new charging session, whether this charge later reaches 100% or not.
@@ -34135,7 +34235,7 @@ void serviceWebControlRequests(unsigned long now) {
     if (!clockUseInternetTime && clockRequest.hasManualEpoch) {
       manualClockEpoch = clockRequest.manualEpoch;
     }
-    applyClockMode();
+    applyClockMode(!clockUseInternetTime && clockRequest.hasManualEpoch);
     saveSettings();
     scheduleRuntimeSettingsSave();
     if (clockUseInternetTime) requestInternetTimeSync();
@@ -34748,7 +34848,7 @@ void setManualClockEvent(lv_event_t *e) {
     clockUseInternetTime = false;
     saveSettings();
     scheduleRuntimeSettingsSave();
-    applyClockMode();
+    applyClockMode(true);
     pendingUiRefresh = true;
   }
 }
@@ -40780,6 +40880,8 @@ void serviceDockData(uint32_t now) {
       time_t before = time(nullptr);
       timeval tv = {(time_t)packet.epoch, 0};
       settimeofday(&tv, nullptr);
+      setWallClockTrusted(true, "dock");
+      serviceWallClockSteps();
       time_t epoch = (time_t)packet.epoch;
       tm local = {};
       localtime_r(&epoch, &local);
@@ -43073,6 +43175,9 @@ void setup() {
                 (unsigned long)(millis() - runtimeConfigStartMs));
   uint32_t configLoadedMs = millis();
 
+  // RTC memory survives only deep sleep, so this is true only when waking
+  // from it with a clock that was real when the remote went to sleep.
+  wallClockTrusted = rtcWallClockTrusted && time(nullptr) >= 1700000000;
   applyClockMode();
 
   ensureDisplayFlushBuffers();
@@ -43149,6 +43254,7 @@ void setup() {
 }
 
 void loop() {
+  serviceWallClockSteps();
   unsigned long now = millis();
   uint32_t elapsed = now - lastTickMs;
   lastTickMs = now;
@@ -43460,10 +43566,15 @@ void loop() {
     if (bleConnectedIdleActive && powerManagementReady &&
         (int32_t)(now - nextPmReportMs) >= 0) {
       if (nextPmReportMs) {
+        // Stay awake until the UART has sent it: otherwise the CPU light-
+        // sleeps again mid-line and the report is lost.
+        esp_pm_lock_acquire(awakeNoLightSleepLock);
         Serial.println("Power manager: time per mode since the last report");
         Serial.flush();
         esp_pm_dump_locks(stdout);
         fflush(stdout);
+        uart_wait_tx_idle_polling(UART_NUM_0);
+        esp_pm_lock_release(awakeNoLightSleepLock);
       }
       nextPmReportMs = now + 60000UL;
     }
