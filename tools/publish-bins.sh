@@ -17,7 +17,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-NAS="/Volumes/home/Documents/Arduino/OpenRemote"
+NAS="/Volumes/home/Documents/Coding/OpenRemote"
 
 sourceVersion() {                 # sourceVersion <file> <macro>
   grep -o "$2 \"[0-9.]*\"" "$1" | head -1 | sed 's/.*"\(.*\)"/\1/'
