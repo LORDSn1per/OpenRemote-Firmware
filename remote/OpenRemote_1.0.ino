@@ -1,6 +1,52 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.95 - 2026-10-28
+    - Settings > Display "Swipe time", 50-800 ms in 10 ms steps (default
+      350): how long Snap, Stack and Fade take. Replaces their fixed 350/400/
+      300 ms; each keeps its own easing. None is instant and Glide follows
+      the finger, so neither uses it. Saved to NVS ("swipeMs") and
+      runtime.json ("pageSwipeMs").
+
+  5.94 - 2026-10-28
+    - FIXED: with a Page swipe style other than Glide, a flick did nothing on
+      any page whose content can scroll - a device page, for one - so the
+      remote could be stuck on it. 5.93 relied on LV_EVENT_GESTURE, which
+      LVGL never sends once any scrollable ancestor has claimed the touch
+      (the reason the Settings back-swipe reads raw touch points too). The
+      flick is now recognised in lvTouchRead() from the raw points: 50 px
+      sideways, mostly horizontal, not on an activity slide, a slider, an arc
+      or a roller. lv_indev_wait_release() then stops the release from
+      pressing whatever button the flick started on.
+    - The visible page is no longer retaken in the background every 2 s.
+      Something on it redraws constantly, so it was always stale again and
+      each retake cost ~40 ms of CPU. It is retaken only when a swipe or
+      transition starts and needs it; neighbours are still kept ready in the
+      background. A rate-limited log names the redrawing area.
+
+  5.93 - 2026-10-28
+    - New Settings > Display "Page swipe" choice, applied immediately:
+        Glide  the page follows the finger, then glides into place (as before)
+        None   the next page appears at once
+        Snap   a flick sends the next page in, fast then easing, 350 ms
+        Stack  the next page slides in over the old one, which dims behind
+               it, with a small overshoot, 400 ms
+        Fade   the old page fades into the new one, 300 ms
+      Snap, Stack and Fade are flick gestures, not finger-following, and run
+      on a transition layer of two page snapshots above the strip, so each
+      frame is two image copies whatever the pages hold. The strip itself
+      switches instantly underneath, and the page change is applied when the
+      transition ends. Saved to NVS and runtime.json ("pageSwipeStyle").
+    - Neighbouring pages are now ready when a swipe starts. 5.92 logged most
+      swipes sliding at least one live page (40-75 ms frames): leaving a
+      device page rebuilds the whole strip, and every wake threw all
+      snapshots away. A snapshot is now either invalid (the page really
+      changed: re-render, rebuild, a visible redraw) or merely stale (a wake,
+      a live-tile refresh, 20 s of age), and a stale one is still used. After
+      a strip rebuild the visible page and its neighbours are retaken at once,
+      while the screen is still, instead of waiting for the next idle passes.
+      A swipe that still meets an invalid neighbour retakes it first.
+
   5.92 - 2026-10-28
     - 5.91 measured 10-14 fps: most swipes still slid live pages. Landing on
       a page re-rendered it, and renderCurrentPage() threw away every page's
@@ -7499,7 +7545,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.92"
+#define OPENREMOTE_VERSION_STRING "5.95"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -8240,6 +8286,21 @@ void applyLcdDriveStrength() {
 // choice - every render*Page() function reads this live, so unlike the
 // display/touch driver options this applies immediately, no reboot needed.
 uint8_t menuStyle = 0;
+// Settings > Display "Page swipe" (5.93): how a swipe moves between pages.
+enum PageSwipeStyle : uint8_t {
+  PAGE_SWIPE_GLIDE = 0,
+  PAGE_SWIPE_NONE,
+  PAGE_SWIPE_SNAP,
+  PAGE_SWIPE_STACK,
+  PAGE_SWIPE_FADE,
+  PAGE_SWIPE_STYLE_COUNT
+};
+uint8_t pageSwipeStyle = PAGE_SWIPE_GLIDE;
+// Settings > Display "Swipe time" (5.95): duration of Snap, Stack and Fade.
+static const uint16_t PAGE_SWIPE_MS_MIN = 50;
+static const uint16_t PAGE_SWIPE_MS_MAX = 800;
+static const uint16_t PAGE_SWIPE_MS_DEFAULT = 350;
+uint16_t pageSwipeMs = PAGE_SWIPE_MS_DEFAULT;
 
 // Persistent native LVGL tiles are transferred through two DMA-safe 32-row
 // buffers. This remains true double buffering, while keeping each parallel-bus
@@ -10703,7 +10764,7 @@ bool lcdRebootConfirmHard = false;
 lv_obj_t *batteryLearningResetConfirmBox = nullptr;
 // 0=Year, 1=Month, 2=Day, 3=Hour(1-12 or 00-23), 4=AM/PM, 5=Minute.
 lv_obj_t *clockRollers[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
-lv_obj_t *displayValueLabels[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+lv_obj_t *displayValueLabels[7] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
 lv_obj_t *buttonValueLabels[3] = {nullptr, nullptr, nullptr};
 lv_obj_t *debugRowDropdowns[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
 int16_t debugRowDropdownMinimums[5] = {0, 0, 0, 0, 0};
@@ -10811,9 +10872,13 @@ struct PageSnapshot {
   uint16_t *pixels = nullptr;
   lv_img_dsc_t dsc = {};
   lv_obj_t *img = nullptr;
+  // valid: usable for a swipe. stale: probably still right, but retake it
+  // when the screen is next still (a wake, a live-tile refresh, age).
   bool valid = false;
+  bool stale = false;
   uint32_t takenMs = 0;
 };
+lv_dir_t pageSwipeDirections[PAGE_SLOT_COUNT] = {};
 PageSnapshot pageSnapshots[PAGE_SLOT_COUNT];
 bool pageSnapshotsShown = false;
 // Set while the firmware itself is swapping snapshots and live pages, so the
@@ -10821,10 +10886,19 @@ bool pageSnapshotsShown = false;
 bool pageSnapshotsSwapping = false;
 uint32_t pageSnapshotLastChangeMs = 0;
 uint32_t lvFrameStatSnapshotCount = 0;
+bool pageTransitionSwitching = false;
+bool pageTransitionActive = false;
+// Set by lvTouchRead() when a press becomes a page flick (5.94); acted on
+// from loop() by servicePageFlick(). +1 the page to the right, -1 the left.
+bool pageFlickHandled = false;
+int8_t pageFlickPending = 0;
+void startPageTransition(uint8_t target);
 bool takePageSnapshot(uint8_t index);
 static const uint32_t PAGE_SNAPSHOT_SETTLE_MS = 250;
 static const uint32_t PAGE_SNAPSHOT_NEIGHBOUR_MAX_AGE_MS = 20000;
 void pageSnapshotsInvalidateAll();
+void pageSnapshotsMarkStale();
+void refreshPageSnapshotsNow();
 PageUi *boundPageUi = nullptr;
 lv_obj_t *uiRoot = nullptr;
 lv_obj_t *pageStrip = nullptr;
@@ -11118,6 +11192,8 @@ void applyStormyBackground();
 // Defined with Settings > Debug, used earlier by Settings > Display, where the
 // Menu option now lives.
 void menuStyleDropdownEvent(lv_event_t *e);
+void pageSwipeStyleDropdownEvent(lv_event_t *e);
+static const char *PAGE_SWIPE_STYLE_OPTIONS = "Glide\nNone\nSnap\nStack\nFade";
 // Also used by serviceQueuedBackup(), which runs well before this is defined.
 void setLcdBackupStatus(const String &message);
 void hideBackupOverlay();
@@ -13221,6 +13297,10 @@ void loadSettings() {
   menuStyle = preferences.getUChar("menuStyle", 0);
   // 0 OpenRemote, 1 OMOTE. 2 was the Stormy preview, which became OpenRemote.
   if (menuStyle > 1) menuStyle = 0;
+  pageSwipeStyle = preferences.getUChar("swipeStyle", PAGE_SWIPE_GLIDE);
+  if (pageSwipeStyle >= PAGE_SWIPE_STYLE_COUNT) pageSwipeStyle = PAGE_SWIPE_GLIDE;
+  pageSwipeMs = constrain((int)preferences.getUShort("swipeMs", PAGE_SWIPE_MS_DEFAULT),
+                          (int)PAGE_SWIPE_MS_MIN, (int)PAGE_SWIPE_MS_MAX);
   bool legacyRepeatEnabled = preferences.getBool("btnRpt", true);
   irRepeatEnabled = preferences.getBool("irRpt", legacyRepeatEnabled);
   chromecastRepeatEnabled = preferences.getBool("castRpt", legacyRepeatEnabled);
@@ -13428,6 +13508,8 @@ void saveSettings() {
   // old NVS value back over the restored one, because loadSettings() runs long
   // before the SD copy is consulted.
   preferences.putUChar("menuStyle", menuStyle);
+  preferences.putUChar("swipeStyle", pageSwipeStyle);
+  preferences.putUShort("swipeMs", pageSwipeMs);
   preferences.putUChar("dispMod", displayModuleChoice);
   preferences.putUChar("dispDrv", displayDriverChoice);
   preferences.putULong("lcdFreqHz", lcdFreqHz);
@@ -16515,13 +16597,21 @@ void applySettingsJson(JsonVariantConst settings) {
   bool settingsIncomplete = false;
   static const char *ownedSettingKeys[] = {
     "menuStyle", "displayModule", "displayDriver", "lcdBusHz", "lcdBufferMode",
-    "lcdDriveStrength", "backlightPwmHz", "debugMenuVisible", "espNowTxPower"
+    "lcdDriveStrength", "backlightPwmHz", "debugMenuVisible", "espNowTxPower",
+    "pageSwipeStyle", "pageSwipeMs"
   };
   for (const char *key : ownedSettingKeys) {
     if (settings[key].isNull()) { settingsIncomplete = true; break; }
   }
   // 2 was the Stormy preview, which is now the OpenRemote style (0).
   menuStyle = ((int)(settings["menuStyle"] | menuStyle)) == 1 ? 1 : 0;
+  {
+    int style = settings["pageSwipeStyle"] | (int)pageSwipeStyle;
+    pageSwipeStyle = (style >= 0 && style < PAGE_SWIPE_STYLE_COUNT)
+      ? (uint8_t)style : (uint8_t)PAGE_SWIPE_GLIDE;
+    pageSwipeMs = constrain((int)(settings["pageSwipeMs"] | (int)pageSwipeMs),
+                            (int)PAGE_SWIPE_MS_MIN, (int)PAGE_SWIPE_MS_MAX);
+  }
   displayModuleChoice = constrain(
     (int)(settings["displayModule"] | displayModuleChoice),
     (int)DISPLAY_MODULE_ADAFRUIT, (int)DISPLAY_MODULE_ST7789);
@@ -20052,6 +20142,8 @@ bool persistSettingsToRuntimeConfig() {
     rescue combo exists to undo, and why it is safe to back these up at all.
   */
   settings["menuStyle"] = menuStyle;
+  settings["pageSwipeStyle"] = pageSwipeStyle;
+  settings["pageSwipeMs"] = pageSwipeMs;
   settings["displayModule"] = displayModuleChoice;
   settings["displayDriver"] = displayDriverChoice;
   settings["lcdBusHz"] = lcdFreqHz;
@@ -26510,6 +26602,8 @@ bool performFactoryReset() {
   uint8_t savedLcdDriveStrength = preferences.getUChar("lcdDriveStr", 2);
   uint32_t savedBacklightPwmHz = preferences.getULong("blPwmHz", BACKLIGHT_PWM_HZ);
   uint8_t savedMenuStyle = preferences.getUChar("menuStyle", 0);
+  uint8_t savedSwipeStyle = preferences.getUChar("swipeStyle", PAGE_SWIPE_GLIDE);
+  uint16_t savedSwipeMs = preferences.getUShort("swipeMs", PAGE_SWIPE_MS_DEFAULT);
   bool savedDbgSplit = preferences.getBool("dbgSplit", false);
   bool savedBleSleep = preferences.getBool("bleSleep", false);
   bool savedDbgTouch = preferences.getBool("dbgTouch", false);
@@ -26525,6 +26619,8 @@ bool performFactoryReset() {
   preferences.putUChar("lcdDriveStr", savedLcdDriveStrength);
   preferences.putULong("blPwmHz", savedBacklightPwmHz);
   preferences.putUChar("menuStyle", savedMenuStyle);
+  preferences.putUChar("swipeStyle", savedSwipeStyle);
+  preferences.putUShort("swipeMs", savedSwipeMs);
   preferences.putBool("dbgSplit", savedDbgSplit);
   preferences.putBool("bleSleep", savedBleSleep);
   preferences.putBool("dbgTouch", savedDbgTouch);
@@ -31503,9 +31599,36 @@ void lvTouchRead(lv_indev_drv_t *drv, lv_indev_data_t *data) {
       touchWasDown = true;
       touchStartX = x;
       touchStartY = y;
+      pageFlickHandled = false;
     }
     touchLastX = x;
     touchLastY = y;
+
+    // Page flick for every swipe style but Glide (5.94). From the raw points,
+    // not LV_EVENT_GESTURE: LVGL withholds the gesture whenever a scrollable
+    // ancestor owns the touch, which is every device page.
+    if (pageSwipeStyle != PAGE_SWIPE_GLIDE && !pageFlickHandled &&
+        !activityDragActive && !pageTransitionActive && currentPage < pageCount &&
+        currentPage < PAGE_SLOT_COUNT) {
+      int dx = (int)x - (int)touchStartX;
+      int dy = abs((int)y - (int)touchStartY);
+      if (abs(dx) >= 50 && dy < 35 && abs(dx) > 2 * dy) {
+        lv_obj_t *pressed = touchInputDevice ? touchInputDevice->proc.types.pointer.act_obj : nullptr;
+        bool onControl = pressed &&
+          (lv_obj_check_type(pressed, &lv_slider_class) ||
+           lv_obj_check_type(pressed, &lv_arc_class) ||
+           lv_obj_check_type(pressed, &lv_roller_class));
+        lv_dir_t allowed = pageSwipeDirections[currentPage];
+        // A finger moving left reveals the page to the right, as Glide does.
+        int8_t step = dx < 0 ? 1 : -1;
+        bool permitted = step > 0 ? (allowed & LV_DIR_RIGHT) : (allowed & LV_DIR_LEFT);
+        pageFlickHandled = true;   // decided once per press, either way
+        if (!onControl && permitted) {
+          pageFlickPending = step;
+          if (touchInputDevice) lv_indev_wait_release(touchInputDevice);
+        }
+      }
+    }
 
     if (brightnessOverlay) brightnessLastActivityMs = millis();
     // Diagnostic only (3.24) - addTouchTrailPoint()'s trail dots are
@@ -32660,6 +32783,24 @@ void pageSnapshotsInvalidateAll() {
   pageSnapshotLastChangeMs = millis();
 }
 
+// Probably unchanged - keep using them, but retake them when the screen is
+// next still. Throwing them away on every wake (5.91, 5.92) is why most swipes
+// found their neighbours missing.
+void pageSnapshotsMarkStale() {
+  for (uint8_t i = 0; i < PAGE_SLOT_COUNT; i++) pageSnapshots[i].stale = true;
+}
+
+// The visible page and its neighbours, now, while nothing moves. After a
+// strip rebuild the next swipe may come within half a second, before the
+// one-per-pass background retakes could have caught up.
+void refreshPageSnapshotsNow() {
+  if (displaySleeping || currentPage >= pageCount) return;
+  for (int i = (int)currentPage - 1; i <= (int)currentPage + 1; i++) {
+    if (i < 0 || i >= pageCount || i >= PAGE_SLOT_COUNT) continue;
+    if (!pageSnapshots[i].valid || pageSnapshots[i].stale) takePageSnapshot((uint8_t)i);
+  }
+}
+
 // Shows the snapshots (true) or the live pages (false). A slot without a
 // current snapshot stays live either way.
 void showPageSnapshots(bool show) {
@@ -32683,23 +32824,26 @@ void showPageSnapshots(bool show) {
 }
 
 void pageStripSnapshotEvent(lv_event_t *e) {
+  // A transition layer switching the strip underneath itself is not a swipe.
+  if (pageTransitionSwitching) return;
   lv_event_code_t code = lv_event_get_code(e);
   if (code == LV_EVENT_SCROLL_BEGIN && !pageStripRendering) {
     // The page under the finger is the one most likely to be stale - its own
     // widgets redraw while it is shown. One render now beats sliding it live.
     uint32_t took = 0;
-    if (currentPage < pageCount && currentPage < PAGE_SLOT_COUNT &&
-        !pageSnapshots[currentPage].valid) {
-      uint32_t started = millis();
-      takePageSnapshot(currentPage);
-      took = millis() - started;
+    uint32_t started = millis();
+    for (int i = (int)currentPage - 1; i <= (int)currentPage + 1; i++) {
+      if (i < 0 || i >= pageCount || i >= PAGE_SLOT_COUNT) continue;
+      bool visibleStale = i == (int)currentPage && pageSnapshots[i].stale;
+      if (!pageSnapshots[i].valid || visibleStale) takePageSnapshot((uint8_t)i);
     }
+    took = millis() - started;
     showPageSnapshots(true);
     auto state = [](int i) -> char {
       if (i < 0 || i >= pageCount || i >= PAGE_SLOT_COUNT) return '-';
       return pageSnapshots[i].valid ? 'S' : 'L';
     };
-    Serial.printf("Swipe: page %u, pages %c%c%c (S=snapshot L=live), current retaken in %lu ms\n",
+    Serial.printf("Swipe: page %u, pages %c%c%c (S=snapshot L=live), retakes took %lu ms\n",
                   (unsigned)currentPage, state(currentPage - 1), state(currentPage),
                   state(currentPage + 1), (unsigned long)took);
   } else if (code == LV_EVENT_SCROLL_END) {
@@ -32729,6 +32873,13 @@ void lvInvalidateObserver(lv_disp_drv_t *drv, lv_area_t *area) {
   }
   if (currentPage < PAGE_SLOT_COUNT) pageSnapshots[currentPage].valid = false;
   pageSnapshotLastChangeMs = millis();
+  // Names whatever keeps redrawing the visible page, once a minute at most.
+  static uint32_t lastLogMs = 0;
+  if (!lastLogMs || (uint32_t)(pageSnapshotLastChangeMs - lastLogMs) >= 60000UL) {
+    lastLogMs = pageSnapshotLastChangeMs;
+    Serial.printf("Snapshot: page %u redrew (%d,%d)-(%d,%d)\n", (unsigned)currentPage,
+                  area->x1, area->y1, area->x2, area->y2);
+  }
 }
 
 bool takePageSnapshot(uint8_t index) {
@@ -32751,6 +32902,7 @@ bool takePageSnapshot(uint8_t index) {
   }
   pageSnapshotsSwapping = false;
   snapshot.valid = res == LV_RES_OK;
+  snapshot.stale = false;
   snapshot.takenMs = millis();
   return snapshot.valid;
 }
@@ -32762,6 +32914,176 @@ bool takePageSnapshot(uint8_t index) {
   invalidation is reported). One per pass keeps a touch from waiting on more
   than a single page render (~60 ms).
 */
+/*
+  Page transitions for every swipe style but Glide (5.93). A layer above the
+  strip (below the title bar and dots) holds two images, the page being left
+  and the page arriving, both snapshots, plus a shade for Stack. The strip
+  switches instantly underneath it; the animation then moves only the images,
+  and the page change itself is applied by servicePageStripChange() once the
+  layer is gone. Each frame is two image copies, whatever the pages contain.
+*/
+lv_obj_t *pageTransitionLayer = nullptr;
+lv_obj_t *pageTransitionFrom = nullptr;
+lv_obj_t *pageTransitionShade = nullptr;
+lv_obj_t *pageTransitionTo = nullptr;
+int8_t pageTransitionDirection = 1;
+int16_t pageTransitionDotFromX = 0;
+int16_t pageTransitionDotToX = 0;
+
+void createPageTransitionLayer(lv_obj_t *parent) {
+  pageTransitionLayer = lv_obj_create(parent);
+  lv_obj_remove_style_all(pageTransitionLayer);
+  lv_obj_set_size(pageTransitionLayer, LCD_W, LCD_H);
+  lv_obj_set_pos(pageTransitionLayer, 0, 0);
+  lv_obj_set_style_bg_color(pageTransitionLayer, lv_color_black(), 0);
+  lv_obj_set_style_bg_opa(pageTransitionLayer, LV_OPA_COVER, 0);
+  lv_obj_clear_flag(pageTransitionLayer, LV_OBJ_FLAG_SCROLLABLE);
+  // Clickable, so a tap during a transition lands here and not on a page.
+  lv_obj_add_flag(pageTransitionLayer, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_flag(pageTransitionLayer, LV_OBJ_FLAG_HIDDEN);
+
+  pageTransitionFrom = lv_img_create(pageTransitionLayer);
+  pageTransitionShade = lv_obj_create(pageTransitionLayer);
+  lv_obj_remove_style_all(pageTransitionShade);
+  lv_obj_set_size(pageTransitionShade, LCD_W, LCD_H);
+  lv_obj_set_style_bg_color(pageTransitionShade, lv_color_black(), 0);
+  lv_obj_set_style_bg_opa(pageTransitionShade, LV_OPA_TRANSP, 0);
+  pageTransitionTo = lv_img_create(pageTransitionLayer);
+  lv_obj_t *parts[] = {pageTransitionFrom, pageTransitionShade, pageTransitionTo};
+  for (lv_obj_t *part : parts) {
+    lv_obj_clear_flag(part, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(part, LV_OBJ_FLAG_SCROLLABLE);
+  }
+}
+
+// Moves the strip to `target` without animation and queues the page change,
+// as pageStripEvent() would. LVGL's tileview ignores a scroll end while the
+// finger is still down - and a flick is reported while it is - so the active
+// tile is set here as well.
+void switchPageStripInstantly(uint8_t target) {
+  pageTransitionSwitching = true;
+  lv_obj_set_tile(pageStrip, pageUi[target].tile, LV_ANIM_OFF);
+  reinterpret_cast<lv_tileview_t *>(pageStrip)->tile_act = pageUi[target].tile;
+  pageTransitionSwitching = false;
+  pageStripPendingPage = target;
+  pageStripChangePending = true;
+}
+
+void pageTransitionAnimExec(void *var, int32_t value) {
+  (void)var;
+  float t = (float)value / 1024.0f;   // may pass 1.0 on Stack's overshoot
+  int dir = pageTransitionDirection;
+  switch (pageSwipeStyle) {
+    case PAGE_SWIPE_SNAP:
+      lv_obj_set_x(pageTransitionFrom, (lv_coord_t)(-dir * LCD_W * t));
+      lv_obj_set_x(pageTransitionTo, (lv_coord_t)(dir * LCD_W * (1.0f - t)));
+      break;
+    case PAGE_SWIPE_STACK: {
+      // The old page eases back a quarter of the way and darkens; the new one
+      // arrives over it.
+      float under = t > 1.0f ? 1.0f : t;
+      lv_obj_set_x(pageTransitionFrom, (lv_coord_t)(-dir * LCD_W * 0.25f * under));
+      lv_obj_set_style_bg_opa(pageTransitionShade, (lv_opa_t)(150.0f * under), 0);
+      lv_obj_set_x(pageTransitionTo, (lv_coord_t)(dir * LCD_W * (1.0f - t)));
+      break;
+    }
+    case PAGE_SWIPE_FADE:
+      lv_obj_set_style_img_opa(pageTransitionTo, (lv_opa_t)(255.0f * (t > 1.0f ? 1.0f : t)), 0);
+      break;
+    default:
+      break;
+  }
+  if (pageDotsActive && lv_obj_is_valid(pageDotsActive)) {
+    float d = t > 1.0f ? 1.0f : t;
+    lv_obj_set_x(pageDotsActive, pageTransitionDotFromX +
+                 (lv_coord_t)((pageTransitionDotToX - pageTransitionDotFromX) * d));
+  }
+}
+
+void pageTransitionAnimReady(lv_anim_t *a) {
+  (void)a;
+  lv_obj_add_flag(pageTransitionLayer, LV_OBJ_FLAG_HIDDEN);
+  pageTransitionActive = false;
+  positionPageDotsActive();
+  lastWakeMs = millis();
+}
+
+/*
+  Goes to `target` in the chosen style. Glide keeps the strip's own animated
+  scroll. If either snapshot cannot be had, it falls back to an instant change
+  rather than slide live pages.
+*/
+void startPageTransition(uint8_t target) {
+  if (!pageStrip || target >= pageCount || target == currentPage ||
+      pageTransitionActive || pageStripRendering) return;
+  if (pageSwipeStyle == PAGE_SWIPE_GLIDE) {
+    pageStripPendingPage = target;
+    lv_obj_set_tile(pageStrip, pageUi[target].tile, LV_ANIM_ON);
+    return;
+  }
+  uint8_t from = currentPage;
+  bool animate = pageSwipeStyle != PAGE_SWIPE_NONE && pageTransitionLayer &&
+                 from < PAGE_SLOT_COUNT && target < PAGE_SLOT_COUNT;
+  if (animate) {
+    uint32_t started = millis();
+    if (!pageSnapshots[from].valid || pageSnapshots[from].stale) takePageSnapshot(from);
+    if (!pageSnapshots[target].valid) takePageSnapshot(target);
+    animate = pageSnapshots[from].valid && pageSnapshots[target].valid;
+    uint32_t took = millis() - started;
+    if (took) Serial.printf("Page transition: snapshots retaken in %lu ms\n", (unsigned long)took);
+  }
+  if (!animate) {
+    switchPageStripInstantly(target);
+    return;
+  }
+
+  pageTransitionDirection = target > from ? 1 : -1;
+  lv_img_set_src(pageTransitionFrom, &pageSnapshots[from].dsc);
+  lv_img_set_src(pageTransitionTo, &pageSnapshots[target].dsc);
+  lv_obj_set_pos(pageTransitionFrom, 0, 0);
+  lv_obj_set_pos(pageTransitionTo,
+                 pageSwipeStyle == PAGE_SWIPE_FADE ? 0 : pageTransitionDirection * LCD_W, 0);
+  lv_obj_set_style_img_opa(pageTransitionTo,
+                           pageSwipeStyle == PAGE_SWIPE_FADE ? LV_OPA_TRANSP : LV_OPA_COVER, 0);
+  lv_obj_set_style_bg_opa(pageTransitionShade, LV_OPA_TRANSP, 0);
+  pageTransitionDotFromX = PAGE_DOT_INSET + from * PAGE_DOT_PITCH;
+  pageTransitionDotToX = PAGE_DOT_INSET + target * PAGE_DOT_PITCH;
+  lv_obj_clear_flag(pageTransitionLayer, LV_OBJ_FLAG_HIDDEN);
+  pageTransitionActive = true;
+  switchPageStripInstantly(target);
+
+  lv_anim_t a;
+  lv_anim_init(&a);
+  lv_anim_set_var(&a, pageTransitionLayer);
+  lv_anim_set_values(&a, 0, 1024);
+  lv_anim_set_exec_cb(&a, pageTransitionAnimExec);
+  lv_anim_set_ready_cb(&a, pageTransitionAnimReady);
+  lv_anim_set_time(&a, pageSwipeMs);
+  switch (pageSwipeStyle) {
+    case PAGE_SWIPE_SNAP:  lv_anim_set_path_cb(&a, lv_anim_path_ease_out); break;
+    case PAGE_SWIPE_STACK: lv_anim_set_path_cb(&a, lv_anim_path_overshoot); break;
+    default:               lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out); break;   // Fade
+  }
+  lv_anim_start(&a);
+}
+
+void pageStripGestureEvent(lv_event_t *e) {
+  (void)e;
+  if (pageSwipeStyle == PAGE_SWIPE_GLIDE || pageTransitionActive || activityDragActive) return;
+  lv_indev_t *indev = lv_indev_get_act();
+  if (!indev || currentPage >= pageCount || currentPage >= PAGE_SLOT_COUNT) return;
+  lv_dir_t dir = lv_indev_get_gesture_dir(indev);
+  lv_dir_t allowed = pageSwipeDirections[currentPage];
+  int target = -1;
+  // A flick to the left reveals the page to the right, as Glide does.
+  if (dir == LV_DIR_LEFT && (allowed & LV_DIR_RIGHT)) target = currentPage + 1;
+  if (dir == LV_DIR_RIGHT && (allowed & LV_DIR_LEFT)) target = currentPage - 1;
+  if (target < 0 || target >= pageCount) return;
+  // The flick is complete; do not let its release click whatever is under it.
+  lv_indev_wait_release(indev);
+  startPageTransition((uint8_t)target);
+}
+
 void servicePageSnapshots(uint32_t now) {
   // Safety net: the live pages must come back even if LV_EVENT_SCROLL_END
   // never arrives, or nothing on them could be pressed.
@@ -32782,13 +33104,13 @@ void servicePageSnapshots(uint32_t now) {
     int i = order[k];
     if (i < 0 || i >= pageCount || i >= PAGE_SLOT_COUNT) continue;
     PageSnapshot &snapshot = pageSnapshots[i];
-    bool stale = !snapshot.valid ||
+    bool stale = !snapshot.valid || snapshot.stale ||
       (k > 0 && (uint32_t)(now - snapshot.takenMs) > PAGE_SNAPSHOT_NEIGHBOUR_MAX_AGE_MS);
     if (!stale) continue;
-    // The visible page can redraw every second (a ticking widget). A swipe
-    // retakes it anyway when it starts, so this is only to save that first
-    // frame: no more often than every 2 s.
-    if (k == 0 && snapshot.takenMs && (uint32_t)(now - snapshot.takenMs) < 2000UL) continue;
+    // Not the visible page: something on it can redraw every second, and
+    // retaking it each time cost ~40 ms of CPU for nothing. A swipe or
+    // transition retakes it when it starts, if it needs to.
+    if (k == 0) continue;
     takePageSnapshot((uint8_t)i);
     return;
   }
@@ -35380,12 +35702,17 @@ void displaySliderEvent(lv_event_t *e) {
   } else if (setting == 5) {
     displaySaturation = constrain(value, 0, 200);
     value = displaySaturation;
+  } else if (setting == 6) {
+    // 10 ms steps: finer than anyone can feel, and a round number to read.
+    pageSwipeMs = constrain((value + 5) / 10 * 10, (int)PAGE_SWIPE_MS_MIN, (int)PAGE_SWIPE_MS_MAX);
+    value = pageSwipeMs;
   }
-  if (setting >= 0 && setting < 6 && displayValueLabels[setting]) {
+  if (setting >= 0 && setting < 7 && displayValueLabels[setting]) {
     char valueText[12];
     if (setting == 4) snprintf(valueText, sizeof(valueText), "%.2f", value / 100.0f);
     else if (setting == 2) snprintf(valueText, sizeof(valueText), "%dmin", value);
     else if (setting == 3) snprintf(valueText, sizeof(valueText), "%udeg", motionWakeAngleDegrees());
+    else if (setting == 6) snprintf(valueText, sizeof(valueText), "%dms", value);
     else snprintf(valueText, sizeof(valueText), "%d%s", value, setting == 1 ? "s" : "%");
     lv_label_set_text(displayValueLabels[setting], valueText);
   }
@@ -35422,16 +35749,18 @@ void makeDisplaySlider(const char *label, int y, int minValue, int maxValue, int
   if (setting == 4) snprintf(valueText, sizeof(valueText), "%.2f", value / 100.0f);
   else if (setting == 2) snprintf(valueText, sizeof(valueText), "%dmin", value);
   else if (setting == 3) snprintf(valueText, sizeof(valueText), "%udeg", motionWakeAngleDegrees());
+  else if (setting == 6) snprintf(valueText, sizeof(valueText), "%dms", value);
   else snprintf(valueText, sizeof(valueText), "%d%s", value, setting == 1 ? "s" : "%");
   // OpenRemote_2.0's real accent colour (0x2196F3, LVGL default theme blue)
   // in Omote mode instead of the OpenRemote-style page's own lighter blue.
   // Stormy wins over the OMOTE flag: Stormy pages reuse the OMOTE layouts.
   bool stormy = menuStyle == 0;
-  lv_obj_t *number = makeLabel(parent, valueText, x + width - 38, y, &lv_font_montserrat_12,
+  // 46, not 38: "800ms" is the widest value any of these shows.
+  lv_obj_t *number = makeLabel(parent, valueText, x + width - 46, y, &lv_font_montserrat_12,
                                 stormy ? lvRgb(90, 162, 255)
                                        : (omoteStyle ? lvRgb(0x21, 0x96, 0xF3) : lvRgb(95, 180, 255)));
   displayValueLabels[setting] = number;
-  lv_obj_set_width(number, 38);
+  lv_obj_set_width(number, 46);
   lv_obj_set_style_text_align(number, LV_TEXT_ALIGN_RIGHT, 0);
   lv_obj_t *slider = lv_slider_create(parent);
   // Two pixels lower in Stormy, so its 26px knob clears the label above.
@@ -35517,15 +35846,25 @@ void renderDisplayPageOmote() {
 
   // Menu style, moved here from Settings > Debug in 5.65. Labelled just
   // "Menu" so the dropdown has room; the explanation above is unchanged.
-  lv_obj_t *menuLabel = makeLabel(content, "Menu style (applies immediately)", 8, y,
+  lv_obj_t *menuLabel = makeLabel(content, "Menu and page swipe (apply immediately)", 8, y,
                                   &lv_font_montserrat_12, textPrimary());
   lv_obj_set_style_text_opa(menuLabel, LV_OPA_60, 0);
   y += 22;
-  lv_obj_t *menuCard = makeOmoteCard(content, y, rowH);
+  lv_obj_t *menuCard = makeOmoteCard(content, y, 2 * rowH + 2 + sliderH);
   lv_obj_t *menuDropdown = makeOmoteDropdownRow(menuCard, "Menu", 0, rowH, 150);
   lv_dropdown_set_options(menuDropdown, "OpenRemote\nOMOTE");
   lv_dropdown_set_selected(menuDropdown, menuStyle == 1 ? 1 : 0);
   lv_obj_add_event_cb(menuDropdown, menuStyleDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
+  makeOmoteDivider(menuCard, rowH);
+  // 96, not the Menu row's 150: the style names are short, and at 150 the
+  // dropdown covered the "Page swipe" label.
+  lv_obj_t *swipeDropdown = makeOmoteDropdownRow(menuCard, "Page swipe", rowH + 1, rowH, 96);
+  lv_dropdown_set_options(swipeDropdown, PAGE_SWIPE_STYLE_OPTIONS);
+  lv_dropdown_set_selected(swipeDropdown, pageSwipeStyle);
+  lv_obj_add_event_cb(swipeDropdown, pageSwipeStyleDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
+  makeOmoteDivider(menuCard, 2 * rowH + 1);
+  makeDisplaySlider("Swipe time", 2 * rowH + 2 + 8, PAGE_SWIPE_MS_MIN,
+                    PAGE_SWIPE_MS_MAX, pageSwipeMs, 6, menuCard, 14, 196, true);
 }
 
 void renderDisplayPageStormy() {
@@ -35583,14 +35922,24 @@ void renderDisplayPageStormy() {
 
   // Menu style, moved here from Settings > Debug in 5.65. Labelled just
   // "Menu" so the dropdown has room; the explanation above is unchanged.
-  makeLabel(content, "Menu style (applies immediately)", 12, y, &lv_font_montserrat_12,
+  makeLabel(content, "Menu and page swipe (apply immediately)", 12, y, &lv_font_montserrat_12,
             lvRgb(142, 155, 180));
   y += 20;
-  lv_obj_t *menuCard = makeStormyCard(content, y, rowH);
+  lv_obj_t *menuCard = makeStormyCard(content, y, 2 * rowH + 2 + sliderH);
   lv_obj_t *menuDropdown = makeStormyDropdownRow(menuCard, "Menu", 0, rowH, 150);
   lv_dropdown_set_options(menuDropdown, "OpenRemote\nOMOTE");
   lv_dropdown_set_selected(menuDropdown, menuStyle == 1 ? 1 : 0);
   lv_obj_add_event_cb(menuDropdown, menuStyleDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
+  makeStormyDivider(menuCard, rowH);
+  // 96, not the Menu row's 150: the style names are short, and at 150 the
+  // dropdown covered the "Page swipe" label.
+  lv_obj_t *swipeDropdown = makeStormyDropdownRow(menuCard, "Page swipe", rowH + 1, rowH, 96);
+  lv_dropdown_set_options(swipeDropdown, PAGE_SWIPE_STYLE_OPTIONS);
+  lv_dropdown_set_selected(swipeDropdown, pageSwipeStyle);
+  lv_obj_add_event_cb(swipeDropdown, pageSwipeStyleDropdownEvent, LV_EVENT_VALUE_CHANGED, nullptr);
+  makeStormyDivider(menuCard, 2 * rowH + 1);
+  makeDisplaySlider("Swipe time", 2 * rowH + 2 + 8, PAGE_SWIPE_MS_MIN,
+                    PAGE_SWIPE_MS_MAX, pageSwipeMs, 6, menuCard, 14, 194, false);
 }
 
 void renderDisplayPage() {
@@ -36270,6 +36619,23 @@ void menuStyleDropdownEvent(lv_event_t *e) {
   scheduleRuntimeSettingsSave();
   lastWakeMs = millis();
   pendingUiRefresh = true;
+}
+
+// Like the menu style, a pure behaviour choice: no reboot and no redraw. The
+// strip's finger scrolling is switched on or off to match.
+void pageSwipeStyleDropdownEvent(lv_event_t *e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  uint16_t selected = lv_dropdown_get_selected(lv_event_get_target(e));
+  pageSwipeStyle = selected < PAGE_SWIPE_STYLE_COUNT ? (uint8_t)selected : (uint8_t)PAGE_SWIPE_GLIDE;
+  configurePageStripDirections();
+  saveSettings();
+  scheduleRuntimeSettingsSave();
+  lastWakeMs = millis();
+  Serial.printf("Page swipe: %s\n",
+                pageSwipeStyle == PAGE_SWIPE_NONE ? "None" :
+                pageSwipeStyle == PAGE_SWIPE_SNAP ? "Snap" :
+                pageSwipeStyle == PAGE_SWIPE_STACK ? "Stack" :
+                pageSwipeStyle == PAGE_SWIPE_FADE ? "Fade" : "Glide");
 }
 
 void makeMenuStyleRow(int y) {
@@ -38064,7 +38430,10 @@ void applyLiveTileState(const LiveTileBinding &binding) {
 }
 
 void refreshLiveTiles() {
-  pageSnapshotsInvalidateAll();
+  // A tile's state text or colour changes, maybe off screen where no
+  // invalidation is reported. Retake soon; meanwhile the old picture differs
+  // by one tile at most.
+  pageSnapshotsMarkStale();
   for (uint8_t i = 0; i < liveTileBindingCount; i++) applyLiveTileState(liveTileBindings[i]);
 }
 
@@ -41710,6 +42079,11 @@ void configurePageStripDirections() {
       if (i + 1 < pageCount) direction = (lv_dir_t)(direction | LV_DIR_RIGHT);
       if (i == 0 && settingsView != SETTINGS_HOME) direction = LV_DIR_NONE;
     }
+    // Every style but Glide moves on a flick, not under the finger: the strip
+    // must not scroll, or LVGL never reports the gesture. The directions a
+    // flick may go are kept for pageStripGestureEvent().
+    pageSwipeDirections[i] = direction;
+    if (pageSwipeStyle != PAGE_SWIPE_GLIDE) direction = LV_DIR_NONE;
     reinterpret_cast<lv_tileview_tile_t *>(pageUi[i].tile)->dir = direction;
   }
   lv_obj_t *activeTile = lv_tileview_get_tile_act(pageStrip);
@@ -41766,6 +42140,7 @@ void renderAllPageSlots() {
   // to remain around an undrawn content region.
   lv_obj_invalidate(lv_scr_act());
   lv_refr_now(nullptr);
+  refreshPageSnapshotsNow();
 
   lv_area_t tileArea;
   lv_obj_get_coords(pageUi[active].tile, &tileArea);
@@ -41795,7 +42170,7 @@ void pageStripEvent(lv_event_t *event) {
 }
 
 void servicePageStripChange() {
-  if (!pageStripChangePending || touchWasDown || lvTouchDown ||
+  if (!pageStripChangePending || touchWasDown || lvTouchDown || pageTransitionActive ||
       (pageStrip && lv_obj_is_scrolling(pageStrip))) return;
   pageStripChangePending = false;
   uint8_t previous = currentPage;
@@ -42423,8 +42798,7 @@ void changePage(int delta) {
   if (next < 0) next = 0;
   if (next >= pageCount) next = pageCount - 1;
   if (next == currentPage) return;
-  pageStripPendingPage = (uint8_t)next;
-  lv_obj_set_tile(pageStrip, pageUi[next].tile, LV_ANIM_ON);
+  startPageTransition((uint8_t)next);
 }
 
 void rootGestureEvent(lv_event_t *e) {
@@ -43016,7 +43390,7 @@ void enterDisplaySleep() {
 }
 
 void wakeDisplay() {
-  pageSnapshotsInvalidateAll();
+  pageSnapshotsMarkStale();
   Serial.println("Movement wake");
   // Clear this before applyBluetoothState() runs later in this function -
   // with it still set, bluetoothActivitySessionRequired() would keep
@@ -43199,6 +43573,9 @@ void setupUiRoot() {
   // not the tile at the strip's initial x=0 position.
   lv_obj_update_layout(pageStrip);
 
+  // Above the strip, below the title bar and dots created next.
+  createPageTransitionLayer(uiRoot);
+
   // Created after the strip so it draws above the sliding tiles, and on uiRoot
   // rather than lv_layer_top() so the charging and backup overlays still cover
   // it. Not clickable itself, so a tap not on the title or the pill (both
@@ -43222,6 +43599,7 @@ void setupUiRoot() {
   lv_obj_add_event_cb(pageStrip, pageStripScrollEvent, LV_EVENT_SCROLL, nullptr);
   lv_obj_add_event_cb(pageStrip, pageStripSnapshotEvent, LV_EVENT_SCROLL_BEGIN, nullptr);
   lv_obj_add_event_cb(pageStrip, pageStripSnapshotEvent, LV_EVENT_SCROLL_END, nullptr);
+  lv_obj_add_event_cb(pageStrip, pageStripGestureEvent, LV_EVENT_GESTURE, nullptr);
 
   bindPageUi(0);
 
@@ -43600,6 +43978,13 @@ void loop() {
     LOOP_TIMED("serviceRemoteIdentify", serviceRemoteIdentify(now));
     LOOP_TIMED("serviceFrameRateLog", serviceFrameRateLog(millis()));
     LOOP_TIMED("servicePageSnapshots", servicePageSnapshots(millis()));
+    if (pageFlickPending) {
+      int target = (int)currentPage + pageFlickPending;
+      pageFlickPending = 0;
+      if (target >= 0 && target < pageCount) {
+        LOOP_TIMED("startPageTransition", startPageTransition((uint8_t)target));
+      }
+    }
   }
 
   if (dnsServerStarted) dnsServer.processNextRequest();
