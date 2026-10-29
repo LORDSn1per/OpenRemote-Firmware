@@ -106,17 +106,27 @@ struct PowerGraphModel {
   column gets the time-weighted average current and the state that filled
   most of it; the totals are exact over the whole range.
 */
+// Working space for computePowerGraph(), allocated through LVGL so the
+// firmware's goes to PSRAM. As static arrays it was 6 KB of the ESP32-S3's
+// internal RAM, which the Bluetooth stack runs short of (6.06).
+struct PowerScratch {
+  double energy[POWER_GRAPH_MAX_COLUMNS];
+  float cover[POWER_GRAPH_MAX_COLUMNS];
+  float catTime[POWER_GRAPH_MAX_COLUMNS][POWER_CAT_COUNT];
+  float chargeTime[POWER_GRAPH_MAX_COLUMNS];
+};
+static PowerScratch *powerScratch = nullptr;
+
 static void computePowerGraph(PowerGraphModel &m, const PowerSeries &series) {
-  static double energy[POWER_GRAPH_MAX_COLUMNS];
-  static float cover[POWER_GRAPH_MAX_COLUMNS];
-  static float catTime[POWER_GRAPH_MAX_COLUMNS][POWER_CAT_COUNT];
-  static float chargeTime[POWER_GRAPH_MAX_COLUMNS];
+  if (!powerScratch) powerScratch = (PowerScratch *)lv_mem_alloc(sizeof(PowerScratch));
+  if (!powerScratch) return;
+  double *energy = powerScratch->energy;
+  float *cover = powerScratch->cover;
+  float (*catTime)[POWER_CAT_COUNT] = powerScratch->catTime;
+  float *chargeTime = powerScratch->chargeTime;
   uint16_t cols = m.columns > POWER_GRAPH_MAX_COLUMNS ? POWER_GRAPH_MAX_COLUMNS : m.columns;
   if (!cols) cols = 1;
-  memset(energy, 0, sizeof(energy));
-  memset(cover, 0, sizeof(cover));
-  memset(catTime, 0, sizeof(catTime));
-  memset(chargeTime, 0, sizeof(chargeTime));
+  memset(powerScratch, 0, sizeof(*powerScratch));
   for (uint8_t c = 0; c < POWER_CAT_COUNT; c++) { m.seconds[c] = 0; m.mAh[c] = 0; }
   m.coveredSeconds = 0;
   m.totalMah = 0;

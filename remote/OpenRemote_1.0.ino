@@ -1,6 +1,18 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  6.06 - 2026-10-30
+    - Fixed: starting Chromecast within seconds of a cold boot restarted the
+      remote (6.03-6.05). Wi-Fi was still up for the boot clock sync, the
+      Bluetooth stack's ~72 KB start left 11 KB of internal RAM, and it
+      asserted creating a queue. The Power widget's buffers (6 KB graph
+      scratch, 8 KB log-rebuild chunk, 1.5 KB PM dump) had moved that close
+      to the edge; they are in PSRAM now (RAM 134.6 KB, below 5.99's).
+    - And a margin: below 105 KB of free internal RAM with Wi-Fi up only for
+      background work, Bluetooth waits up to 10 s for a clock sync in
+      progress, then stops Wi-Fi before it starts. WebConfig, transfers and
+      dock updates keep their Wi-Fi.
+
   6.05 - 2026-10-30
     - Power widget history of 1 day, 3 days and 1 week (WebConfig 3.48 and
       the full-screen menu). The history holds 32768 points (256 KB PSRAM,
@@ -7658,7 +7670,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "6.05"
+#define OPENREMOTE_VERSION_STRING "6.06"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -13251,13 +13263,17 @@ void batteryLog(const char *event, const char *detail) {
 */
 bool readPmModeTimes(uint64_t &sleepUs, uint64_t &cpuMaxUs, uint64_t &totalUs) {
 #if CONFIG_PM_PROFILING
-  static char dump[1536];
-  FILE *stream = fmemopen(dump, sizeof(dump) - 1, "w");
+  // In PSRAM: internal RAM is what the Bluetooth stack runs short of.
+  static const size_t dumpSize = 1536;
+  static char *dump = nullptr;
+  if (!dump) dump = (char *)ps_malloc(dumpSize);
+  if (!dump) return false;
+  FILE *stream = fmemopen(dump, dumpSize - 1, "w");
   if (!stream) return false;
   esp_pm_dump_locks(stream);
   long used = ftell(stream);
   fclose(stream);
-  dump[used > 0 && used < (long)sizeof(dump) ? used : sizeof(dump) - 1] = 0;
+  dump[used > 0 && used < (long)dumpSize ? used : dumpSize - 1] = 0;
 
   sleepUs = cpuMaxUs = totalUs = 0;
   for (char *line = strtok(dump, "\n"); line; line = strtok(nullptr, "\n")) {
@@ -13567,8 +13583,12 @@ void servicePowerSeed() {
     return;
   }
   if (!powerSeed.end) powerSeed.end = log.size();
-  static char chunk[8192];
-  size_t want = min((uint32_t)sizeof(chunk), powerSeed.end - powerSeed.offset);
+  // 8 KB of PSRAM for the rebuild only, freed when it finishes.
+  static const size_t chunkSize = 8192;
+  static char *chunk = nullptr;
+  if (!chunk) chunk = (char *)ps_malloc(chunkSize);
+  if (!chunk) { log.close(); finishPowerSeed(); return; }
+  size_t want = min((uint32_t)chunkSize, powerSeed.end - powerSeed.offset);
   size_t got = 0;
   if (want && log.seek(powerSeed.offset)) got = log.read((uint8_t *)chunk, want);
   log.close();
@@ -13586,7 +13606,7 @@ void servicePowerSeed() {
   if (!got || powerSeed.offset >= powerSeed.end) {
     powerSeed.carryLength = 0;
     if (powerSeed.file == 0) { powerSeed.file = 1; powerSeed.offset = 0; powerSeed.end = 0; }
-    else finishPowerSeed();
+    else { finishPowerSeed(); free(chunk); chunk = nullptr; }
   }
 }
 
@@ -15879,6 +15899,50 @@ bool bluetoothRuntimeRequired() {
   return bluetoothActivitySessionRequired();
 }
 
+/*
+  The Bluetooth stack takes about 72 KB of internal RAM to start, and Wi-Fi
+  holds about 40 KB while it is up. 6.05 crashed on exactly that: Chromecast
+  started a few seconds after a cold boot, while Wi-Fi was still up for the
+  boot NTP sync, left 11 KB, and the stack asserted creating a queue
+  (xQueueGenericSend, pxQueue). So when internal RAM is short and Wi-Fi is
+  only doing background work, Bluetooth waits for a clock sync in progress
+  (it is usually a few seconds; abandoning it leaves the clock untrusted
+  until 3am) and then stops Wi-Fi before starting. Returns false while
+  waiting; loop() retries through serviceDeferredBleStart().
+*/
+static const size_t BLE_START_MIN_INTERNAL_HEAP = 105UL * 1024UL;
+static const uint32_t BLE_START_NTP_WAIT_MS = 10000UL;
+bool bleStartDeferred = false;
+
+bool makeInternalRamForBle() {
+  size_t internalFree = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  bool backgroundWifi = WiFi.getMode() != WIFI_OFF && !webConfigQrPageActive() &&
+                        !webConfigTransferBusy() && !dockOtaBusy();
+  if (internalFree >= BLE_START_MIN_INTERNAL_HEAP || !backgroundWifi) {
+    bleStartDeferred = false;
+    return true;
+  }
+  if (ntpSyncPending && (uint32_t)(millis() - ntpSyncStartedMs) < BLE_START_NTP_WAIT_MS) {
+    if (!bleStartDeferred) {
+      Serial.printf("BLE HID: waiting for the clock sync before starting (internal heap %u)\n",
+                    (unsigned)internalFree);
+    }
+    bleStartDeferred = true;
+    return false;
+  }
+  bleStartDeferred = false;
+  Serial.printf("BLE HID: internal heap %u - stopping background Wi-Fi first\n",
+                (unsigned)internalFree);
+  parkNetworkStackForBle();
+  return true;
+}
+
+void serviceDeferredBleStart() {
+  if (!bleStartDeferred) return;
+  if (ntpSyncPending && (uint32_t)(millis() - ntpSyncStartedMs) < BLE_START_NTP_WAIT_MS) return;
+  applyBluetoothState();
+}
+
 void applyBluetoothState() {
   bool shouldRun = bluetoothOn && (blePairingMode || bleBonded) &&
                    bluetoothRuntimeRequired() && !scheduledNtpWake &&
@@ -15898,6 +15962,8 @@ void applyBluetoothState() {
                   (int)bluetoothRuntimeRequired(), (int)webConfigPausedBle,
                   (int)setupApActive, (int)scheduledNtpWake);
   }
+  if (shouldRun && !bleReady && !setupApActive && !setupApPausedBle &&
+      !makeInternalRamForBle()) return;
   if (shouldRun && !bleReady && !setupApActive && !setupApPausedBle) {
     unsigned long initStart = millis();
     Serial.println("BLE HID: initialising stack...");
@@ -44862,6 +44928,7 @@ void loop() {
   LOOP_TIMED("serviceBatteryLog", serviceBatteryLog(now));
   servicePowerHistory(now);
   servicePowerSeed();
+  serviceDeferredBleStart();
   serviceBluetoothLinkLog();
   serviceSettingsBatteryCard(now);
   if (!displaySleeping) LOOP_TIMED("serviceWidgets", serviceWidgets(now));
