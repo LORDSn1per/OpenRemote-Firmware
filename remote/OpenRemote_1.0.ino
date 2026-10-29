@@ -1,6 +1,18 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  6.05 - 2026-10-30
+    - Power widget history of 1 day, 3 days and 1 week (WebConfig 3.48 and
+      the full-screen menu). The history holds 32768 points (256 KB PSRAM,
+      was 8192 - about 11 hours of BLE idle at one point per 5 s); BLE idle
+      is now averaged over 30 s windows.
+    - After a reboot or deep sleep the week is rebuilt from battery.prev.csv
+      and battery.csv 8 KB per loop pass, then joined ahead of the points
+      recorded meanwhile, so the up-to-half-megabyte read never delays a wake.
+    - Long ranges redraw every 30 s; the graph skips straight to the range's
+      first point. A charge of 1000 mAh or more reads in Ah ("1.40 Ah"), and
+      the full-screen menu's nine rows fit without scrolling.
+
   6.04 - 2026-10-30
     - Power widget colours are chosen in WebConfig 3.47 (widgets.power.colours:
       inUse, light, deep, charging, line as "#rrggbb"); 6.03's colours remain
@@ -7646,7 +7658,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "6.04"
+#define OPENREMOTE_VERSION_STRING "6.05"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -13304,10 +13316,10 @@ int pmLightSleepPercentSinceLast() {
 /* ------------------------------------------------------- power history *
    What the Power widget draws (power_widget.h): estimated current and the
    power state, one point per change, in PSRAM. Points are taken every
-   second while awake and every five in BLE idle - plain RAM writes, never
+   second while awake and every 30 s in BLE idle - plain RAM writes, never
    the SD card and never a wake-up - and at every logged power event. A
-   deep sleep wipes RAM, so boot rebuilds the last 12 hours from
-   /logs/battery.csv (seedPowerHistoryFromLog()).
+   deep sleep wipes RAM, so the last week is rebuilt from the battery log
+   (see PowerSeed).
 
    The milliamps are a model, not a measurement: Rev 6 has no current sense.
    The figures below are rounded datasheet values checked against what the
@@ -13323,17 +13335,79 @@ static const float POWER_MA_CPU_MAX = 45.0f;         // BLE idle time held at 24
 static const float POWER_MA_CPU_80 = 20.0f;          // ... at 80 MHz, awake
 static const float POWER_MA_LIGHT_SLEEP = 1.8f;      // CPU stopped, XTAL kept up for BLE
 static const float POWER_MA_DEEP_SLEEP = 0.25f;
-static const float POWER_MA_BLE_IDLE_GUESS = 6.0f;   // until the first 5 s window
+static const float POWER_MA_BLE_IDLE_GUESS = 6.0f;   // until the first 30 s window
 
-static const uint32_t POWER_HISTORY_CAPACITY = 8192;
-PowerPoint *powerHistory = nullptr;
-uint32_t powerHistoryStart = 0;   // index of the oldest point
-uint32_t powerHistoryCount = 0;
+/*
+  A week of history (6.05). Points are kept only on a change, BLE idle is
+  averaged over 30 s windows, and the awake estimate only moves with the
+  screen, brightness and radios - a week fits comfortably in 32768 points,
+  256 KB of PSRAM.
+*/
+static const uint32_t POWER_HISTORY_CAPACITY = 32768;
+static const uint32_t POWER_BLE_IDLE_WINDOW_MS = 30000UL;
 
-// The log is read into the history once, on the first point with a trusted
-// clock - at boot after a deep sleep, or once NTP lands after a cold start.
-bool powerHistorySeeded = false;
-void seedPowerHistoryFromLog();
+struct PowerRing {
+  PowerPoint *points;
+  uint32_t start;   // index of the oldest point
+  uint32_t count;
+};
+PowerRing powerHistory = {};
+
+// Appends with the history's rules: a point only on a change, time never
+// running backwards. False if the ring could not be allocated.
+bool pushPowerPoint(PowerRing &ring, uint32_t t, uint16_t mA10, uint8_t category,
+                    uint8_t charging) {
+  if (!ring.points) {
+    ring.points = (PowerPoint *)ps_malloc(POWER_HISTORY_CAPACITY * sizeof(PowerPoint));
+    if (!ring.points) return false;
+    ring.start = ring.count = 0;
+  }
+  if (ring.count) {
+    PowerPoint &last = ring.points[(ring.start + ring.count - 1) % POWER_HISTORY_CAPACITY];
+    // A clock stepping backwards would fold the history over itself; hold
+    // the new point at the last time instead.
+    if (t < last.t) t = last.t;
+    // Nothing worth a point: same state, within 3% (or 0.2 mA).
+    if (last.category == category && last.charging == charging &&
+        abs((int)mA10 - (int)last.mA10) <= max(2, (int)last.mA10 * 3 / 100)) return true;
+    if (t == last.t) {
+      last = {t, mA10, category, charging};
+      return true;
+    }
+  }
+  if (ring.count == POWER_HISTORY_CAPACITY) {
+    ring.start = (ring.start + 1) % POWER_HISTORY_CAPACITY;
+    ring.count--;
+  }
+  ring.points[(ring.start + ring.count) % POWER_HISTORY_CAPACITY] = {t, mA10, category, charging};
+  ring.count++;
+  return true;
+}
+
+/*
+  Rebuilding from the log after a reboot or deep sleep. A week of log is up
+  to half a megabyte (battery.prev.csv then battery.csv), so it is read 8 KB
+  per loop pass rather than all at once - waking and the first frame are
+  never held up - into a ring of its own, then joined in front of whatever
+  was recorded live meanwhile. Starts on the first point with a trusted
+  clock: at boot after a deep sleep, or once NTP lands after a cold start.
+*/
+struct PowerSeed {
+  bool started;
+  bool active;
+  uint8_t file;        // 0 = battery.prev.csv, 1 = battery.csv
+  uint32_t offset;
+  uint32_t end;        // the file's size when the seed began; later lines are live
+  uint32_t since;
+  uint8_t category;
+  float mA;
+  PowerRing ring;
+  char carry[192];     // a line split across two slices
+  size_t carryLength;
+  uint32_t lines;
+} powerSeed = {};
+
+void startPowerSeed(uint32_t now);
 
 float bleIdleEstimateMa(float sleepShare, float cpuMaxShare) {
   float awake80 = 1.0f - sleepShare - cpuMaxShare;
@@ -13350,48 +13424,24 @@ float awakeEstimateMa() {
   return mA;
 }
 
+uint16_t powerMa10(float mA) {
+  return (uint16_t)constrain(lroundf(mA * 10.0f), 1L, 65000L);
+}
+
 void appendPowerPoint(uint32_t t, float mA, uint8_t category, bool charging) {
   if (!t || category >= POWER_CAT_COUNT) return;
-  if (!powerHistorySeeded) {
-    powerHistorySeeded = true;   // first: seeding appends through here too
-    seedPowerHistoryFromLog();
-  }
-  if (!powerHistory) {
-    powerHistory = (PowerPoint *)ps_malloc(POWER_HISTORY_CAPACITY * sizeof(PowerPoint));
-    if (!powerHistory) return;
-  }
-  uint16_t mA10 = (uint16_t)constrain(lroundf(mA * 10.0f), 1L, 65000L);
-  if (powerHistoryCount) {
-    PowerPoint &last = powerHistory[(powerHistoryStart + powerHistoryCount - 1) %
-                                    POWER_HISTORY_CAPACITY];
-    // A clock stepping backwards would fold the history over itself; hold
-    // the new point at the last time instead.
-    if (t < last.t) t = last.t;
-    // Nothing worth a point: same state, within 3% (or 0.2 mA).
-    if (last.category == category && last.charging == (uint8_t)charging &&
-        abs((int)mA10 - (int)last.mA10) <= max(2, (int)last.mA10 * 3 / 100)) return;
-    if (t == last.t) {
-      last = {t, mA10, category, (uint8_t)charging};
-      return;
-    }
-  }
-  if (powerHistoryCount == POWER_HISTORY_CAPACITY) {
-    powerHistoryStart = (powerHistoryStart + 1) % POWER_HISTORY_CAPACITY;
-    powerHistoryCount--;
-  }
-  powerHistory[(powerHistoryStart + powerHistoryCount) % POWER_HISTORY_CAPACITY] =
-    {t, mA10, category, (uint8_t)charging};
-  powerHistoryCount++;
+  if (!powerSeed.started) startPowerSeed(t);
+  pushPowerPoint(powerHistory, t, powerMa10(mA), category, charging ? 1 : 0);
 }
 
 bool powerHistoryAt(uint32_t index, PowerPoint &out) {
-  if (!powerHistory || index >= powerHistoryCount) return false;
-  out = powerHistory[(powerHistoryStart + index) % POWER_HISTORY_CAPACITY];
+  if (!powerHistory.points || index >= powerHistory.count) return false;
+  out = powerHistory.points[(powerHistory.start + index) % POWER_HISTORY_CAPACITY];
   return true;
 }
 
 PowerSeries firmwarePowerSeries() {
-  return PowerSeries{powerHistoryCount, powerHistoryAt, batteryClockEpoch()};
+  return PowerSeries{powerHistory.count, powerHistoryAt, batteryClockEpoch()};
 }
 
 float lastBleIdleEstimateMa = POWER_MA_BLE_IDLE_GUESS;
@@ -13417,7 +13467,7 @@ void servicePowerHistory(unsigned long now) {
   if ((int32_t)(now - nextMs) < 0) return;
   uint32_t t = batteryClockEpoch();
   if (bleConnectedIdleActive) {
-    nextMs = now + 5000UL;
+    nextMs = now + POWER_BLE_IDLE_WINDOW_MS;
     float sleepShare, cpuMaxShare;
     if (pmWindowShares(window, sleepShare, cpuMaxShare)) {
       lastBleIdleEstimateMa = bleIdleEstimateMa(sleepShare, cpuMaxShare);
@@ -13430,74 +13480,114 @@ void servicePowerHistory(unsigned long now) {
   }
 }
 
-/*
-  Rebuilds up to 12 hours from the battery log after a reboot or deep sleep.
-  Only the tail is read (64 KB is well over a busy day's events); every line
-  becomes a point in the state its event leaves the remote in.
-*/
-void seedPowerHistoryFromLog() {
-  uint32_t now = batteryClockEpoch();
+void startPowerSeed(uint32_t now) {
+  powerSeed.started = true;
   if (!sdReady || !now) return;
-  File log = SD.open(BATTERY_LOG_PATH, FILE_READ);
-  if (!log) return;
-  const uint32_t tail = 64UL * 1024UL;
-  if (log.size() > tail) {
-    log.seek(log.size() - tail);
-    log.readStringUntil('\n');   // a partial line
+  powerSeed.active = true;
+  powerSeed.file = 0;
+  powerSeed.offset = 0;
+  powerSeed.end = 0;
+  powerSeed.since = now - POWER_RANGE_SECONDS[POWER_RANGE_COUNT - 1];
+  powerSeed.category = POWER_CAT_IN_USE;
+  powerSeed.mA = POWER_MA_AWAKE_BASE;
+  powerSeed.carryLength = 0;
+  powerSeed.lines = 0;
+  powerSeed.ring.start = powerSeed.ring.count = 0;
+}
+
+// One log line into the seed ring, in the state its event leaves the remote in.
+void seedPowerLine(char *line) {
+  // epoch,uptime_s,event,percent,millivolts,rate_pct_per_h,charging,detail
+  char *fields[8] = {};
+  uint8_t count = 0;
+  for (char *p = line; count < 8; ) {
+    fields[count++] = p;
+    char *comma = strchr(p, ',');
+    if (!comma) break;
+    *comma = 0;
+    p = comma + 1;
   }
-  uint32_t since = now - POWER_RANGE_SECONDS[POWER_RANGE_COUNT - 1];
-  uint8_t category = POWER_CAT_IN_USE;
-  float mA = POWER_MA_AWAKE_BASE;
-  uint32_t seeded = 0;
-  char line[192];
-  while (log.available()) {
-    size_t length = log.readBytesUntil('\n', line, sizeof(line) - 1);
-    line[length] = 0;
-    // epoch,uptime_s,event,percent,millivolts,rate_pct_per_h,charging,detail
-    char *fields[8] = {};
-    uint8_t count = 0;
-    for (char *p = line; count < 8; ) {
-      fields[count++] = p;
-      char *comma = strchr(p, ',');
-      if (!comma) break;
-      *comma = 0;
-      p = comma + 1;
+  if (count < 7) return;
+  uint32_t t = strtoul(fields[0], nullptr, 10);
+  if (!t || t < powerSeed.since) return;
+  const char *event = fields[2];
+  bool charging = fields[6][0] == '1';
+  const char *detail = count > 7 ? fields[7] : "";
+  uint8_t &category = powerSeed.category;
+  float &mA = powerSeed.mA;
+  float screenOn = POWER_MA_AWAKE_BASE + POWER_MA_BACKLIGHT_FULL * brightness / 100.0f;
+  if (strcmp(event, "deep-sleep") == 0) { category = POWER_CAT_DEEP; mA = POWER_MA_DEEP_SLEEP; }
+  else if (strcmp(event, "light-sleep") == 0) { category = POWER_CAT_LIGHT; mA = POWER_MA_LIGHT_SLEEP; }
+  else if (strcmp(event, "ble-idle") == 0) { category = POWER_CAT_LIGHT; mA = POWER_MA_BLE_IDLE_GUESS; }
+  else if (strcmp(event, "screen-off") == 0) { category = POWER_CAT_IN_USE; mA = POWER_MA_SCREEN_OFF_AWAKE; }
+  else if (strcmp(event, "sample") == 0) {
+    const char *share = strstr(detail, "sleep=");
+    if (strncmp(detail, "ble-idle", 8) == 0) {
+      category = POWER_CAT_LIGHT;
+      int percent = share ? atoi(share + 6) : -1;
+      // The log keeps only the sleep share, so time not asleep is taken as
+      // the 80 MHz/240 MHz mix 5.99's PM report showed.
+      if (percent >= 0) mA = bleIdleEstimateMa(percent / 100.0f, (1.0f - percent / 100.0f) * 0.5f);
+    } else if (strcmp(detail, "screen-off") == 0) {
+      category = POWER_CAT_IN_USE; mA = POWER_MA_SCREEN_OFF_AWAKE;
+    } else {
+      category = POWER_CAT_IN_USE; mA = screenOn;
     }
-    if (count < 7) continue;
-    uint32_t t = strtoul(fields[0], nullptr, 10);
-    if (!t || t < since || t > now) continue;
-    const char *event = fields[2];
-    bool charging = fields[6][0] == '1';
-    const char *detail = count > 7 ? fields[7] : "";
-    if (strcmp(event, "deep-sleep") == 0) { category = POWER_CAT_DEEP; mA = POWER_MA_DEEP_SLEEP; }
-    else if (strcmp(event, "light-sleep") == 0) { category = POWER_CAT_LIGHT; mA = POWER_MA_LIGHT_SLEEP; }
-    else if (strcmp(event, "ble-idle") == 0) { category = POWER_CAT_LIGHT; mA = POWER_MA_BLE_IDLE_GUESS; }
-    else if (strcmp(event, "screen-off") == 0) { category = POWER_CAT_IN_USE; mA = POWER_MA_SCREEN_OFF_AWAKE; }
-    else if (strcmp(event, "sample") == 0) {
-      const char *share = strstr(detail, "sleep=");
-      if (strncmp(detail, "ble-idle", 8) == 0) {
-        category = POWER_CAT_LIGHT;
-        int percent = share ? atoi(share + 6) : -1;
-        // The log keeps only the sleep share, so time not asleep is taken as
-        // the 80 MHz/240 MHz mix 5.99's PM report showed.
-        if (percent >= 0) mA = bleIdleEstimateMa(percent / 100.0f, (1.0f - percent / 100.0f) * 0.5f);
-      } else if (strcmp(detail, "screen-off") == 0) {
-        category = POWER_CAT_IN_USE; mA = POWER_MA_SCREEN_OFF_AWAKE;
-      } else {
-        category = POWER_CAT_IN_USE;
-        mA = POWER_MA_AWAKE_BASE + POWER_MA_BACKLIGHT_FULL * brightness / 100.0f;
-      }
-    } else if (strcmp(event, "ble-idle-exit") == 0 || strcmp(event, "screen-on") == 0 ||
-               strcmp(event, "boot") == 0 || strcmp(event, "light-wake") == 0) {
-      category = POWER_CAT_IN_USE;
-      mA = POWER_MA_AWAKE_BASE + POWER_MA_BACKLIGHT_FULL * brightness / 100.0f;
-    }
-    // Other events (charger, Bluetooth link) keep the state and update charging.
-    appendPowerPoint(t, mA, category, charging);
-    seeded++;
+  } else if (strcmp(event, "ble-idle-exit") == 0 || strcmp(event, "screen-on") == 0 ||
+             strcmp(event, "boot") == 0 || strcmp(event, "light-wake") == 0) {
+    category = POWER_CAT_IN_USE; mA = screenOn;
   }
+  // Other events (charger, Bluetooth link) keep the state and update charging.
+  pushPowerPoint(powerSeed.ring, t, powerMa10(mA), category, charging ? 1 : 0);
+  powerSeed.lines++;
+}
+
+// The seed ring, then every live point after it, becomes the history.
+void finishPowerSeed() {
+  powerSeed.active = false;
+  if (!powerSeed.ring.points) return;
+  for (uint32_t i = 0; i < powerHistory.count; i++) {
+    const PowerPoint &p = powerHistory.points[(powerHistory.start + i) % POWER_HISTORY_CAPACITY];
+    pushPowerPoint(powerSeed.ring, p.t, p.mA10, p.category, p.charging);
+  }
+  if (powerHistory.points) free(powerHistory.points);
+  powerHistory = powerSeed.ring;
+  powerSeed.ring = {};
+  Serial.printf("Power history: %lu log lines, %lu points\n",
+                (unsigned long)powerSeed.lines, (unsigned long)powerHistory.count);
+}
+
+void servicePowerSeed() {
+  if (!powerSeed.active) return;
+  const char *path = powerSeed.file == 0 ? BATTERY_LOG_OLD_PATH : BATTERY_LOG_PATH;
+  File log = SD.open(path, FILE_READ);
+  if (!log) {
+    if (powerSeed.file == 0) { powerSeed.file = 1; powerSeed.offset = 0; powerSeed.end = 0; }
+    else finishPowerSeed();
+    return;
+  }
+  if (!powerSeed.end) powerSeed.end = log.size();
+  static char chunk[8192];
+  size_t want = min((uint32_t)sizeof(chunk), powerSeed.end - powerSeed.offset);
+  size_t got = 0;
+  if (want && log.seek(powerSeed.offset)) got = log.read((uint8_t *)chunk, want);
   log.close();
-  Serial.printf("Power history: %lu points from the battery log\n", (unsigned long)seeded);
+  powerSeed.offset += got;
+  for (size_t i = 0; i < got; i++) {
+    char c = chunk[i];
+    if (c == '\n') {
+      powerSeed.carry[powerSeed.carryLength] = 0;
+      seedPowerLine(powerSeed.carry);
+      powerSeed.carryLength = 0;
+    } else if (c != '\r' && powerSeed.carryLength < sizeof(powerSeed.carry) - 1) {
+      powerSeed.carry[powerSeed.carryLength++] = c;
+    }
+  }
+  if (!got || powerSeed.offset >= powerSeed.end) {
+    powerSeed.carryLength = 0;
+    if (powerSeed.file == 0) { powerSeed.file = 1; powerSeed.offset = 0; powerSeed.end = 0; }
+    else finishPowerSeed();
+  }
 }
 
 /*
@@ -19514,7 +19604,8 @@ uint8_t widgetKindFromName(const char *name) {
 
 // WebConfig's names for the power history lengths.
 uint8_t powerRangeFromName(const char *name, uint8_t fallback) {
-  static const char *const names[POWER_RANGE_COUNT] = {"1m", "5m", "10m", "60m", "6h", "12h"};
+  static const char *const names[POWER_RANGE_COUNT] = {"1m", "5m", "10m", "60m", "6h", "12h",
+                                                       "1d", "3d", "7d"};
   if (!name) return fallback;
   for (uint8_t i = 0; i < POWER_RANGE_COUNT; i++) {
     if (strcmp(name, names[i]) == 0) return i;
@@ -40975,7 +41066,7 @@ void refreshWidgetInstance(WidgetInstance &instance) {
     PowerWidgetUi *ui = instance.power;
     if (!ui) return;
     uint32_t now = millis();
-    uint32_t every = ui->model.range <= 2 ? 1000UL : 5000UL;
+    uint32_t every = ui->model.range <= 2 ? 1000UL : ui->model.range <= 5 ? 5000UL : 30000UL;
     if (ui->refreshedMs && now - ui->refreshedMs < every) return;
     ui->refreshedMs = now;
     refreshPowerWidget(ui);
@@ -44770,6 +44861,7 @@ void loop() {
   LOOP_TIMED("serviceBatteryHistory", serviceBatteryHistory(now));
   LOOP_TIMED("serviceBatteryLog", serviceBatteryLog(now));
   servicePowerHistory(now);
+  servicePowerSeed();
   serviceBluetoothLinkLog();
   serviceSettingsBatteryCard(now);
   if (!displaySleeping) LOOP_TIMED("serviceWidgets", serviceWidgets(now));

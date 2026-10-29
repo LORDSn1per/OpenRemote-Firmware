@@ -85,28 +85,44 @@ static void fill(uint32_t from, uint32_t to, float mA, float spread, uint8_t cat
     add(t, v < 0.05f ? 0.05f : v, cat, charging);
   }
 }
-static void makeHistory() {
-  uint32_t n = nowEpoch;
-  uint32_t t = n - 13 * 3600;
-  fill(t, n - 34200, 0.25f, 0.0f, POWER_CAT_DEEP, false, 3600);           // overnight
-  t = n - 34200;
-  uint32_t charge0 = n - 4 * 3600, charge1 = n - 9000;
-  int burst = 0;
-  while (t < n - 720) {
-    bool chg = t >= charge0 && t < charge1;
+// A day of use: BLE idle with spells of use, and once in a while a spell
+// of plain light sleep. Charging on the given days for two hours.
+static void dayOfUse(uint32_t from, uint32_t to, bool chargeToday, int &burst) {
+  uint32_t t = from;
+  uint32_t charge0 = from + 4 * 3600, charge1 = charge0 + 7200;
+  while (t < to) {
+    bool chg = chargeToday && t >= charge0 && t < charge1;
     uint32_t use = 60 + (burst * 97) % 180;
+    if (t + use > to) use = to - t;
     fill(t, t + use, 118.0f, 14.0f, POWER_CAT_IN_USE, chg, 5);
     t += use;
-    if (t >= n - 6 * 3600 && t < n - 6 * 3600 + 1800) {     // a spell of plain light sleep
+    if (burst % 9 == 4 && t + 1800 < to) {
       fill(t, t + 1800, 2.0f, 0.1f, POWER_CAT_LIGHT, chg, 300);
       t += 1800;
     }
     uint32_t idle = 900 + (burst * 523) % 2400;
-    if (t + idle > n - 720) idle = n - 720 - t;
-    fill(t, t + idle, 5.6f, 1.2f, POWER_CAT_LIGHT, chg, 5);
+    if (t + idle > to) idle = to - t;
+    fill(t, t + idle, 5.6f, 1.2f, POWER_CAT_LIGHT, chg, 30);
     t += idle;
     burst++;
   }
+}
+
+static void makeHistory() {
+  uint32_t n = nowEpoch;
+  int burst = 0;
+  // Eight days back: each night 23:00-07:00 in deep sleep, then a day of use.
+  uint32_t day0 = n - 8 * 86400UL - (n % 86400UL) + 13 * 3600UL;   // a 23:00 start
+  for (int d = 0; d < 9; d++) {
+    uint32_t night = day0 + d * 86400UL;
+    if (night >= n - 720) break;
+    uint32_t morning = night + 8 * 3600UL;
+    fill(night, morning < n - 720 ? morning : n - 720, 0.25f, 0.0f, POWER_CAT_DEEP, false, 3600);
+    if (morning >= n - 720) break;
+    uint32_t evening = night + 86400UL;
+    dayOfUse(morning, evening < n - 720 ? evening : n - 720, d % 2 == 1, burst);
+  }
+  uint32_t t = n - 720;
   // The last twelve minutes, second by second.
   fill(t, t + 180, 120.0f, 18.0f, POWER_CAT_IN_USE, false, 1); t += 180;
   fill(t, t + 25, 185.0f, 10.0f, POWER_CAT_IN_USE, false, 1); t += 25;    // Wi-Fi up
@@ -375,6 +391,21 @@ int main() {
     buildPowerWidget(box(o, 0, 6 + rowH, 228, rowH), 228, rowH, POWER_LAYOUT_ROW, 3);
     tapToClose(o);
     render("9_custom_expanded_battery_power");
+  }
+  // 11-12. A week and a day.
+  {
+    lv_obj_t *s = screen();
+    lv_obj_t *o = overlay(s);
+    buildPowerWidget(o, 228, 268, POWER_LAYOUT_FULL, 8);
+    tapToClose(o);
+    render("11_full_1week");
+  }
+  {
+    lv_obj_t *s = screen();
+    lv_obj_t *o = overlay(s);
+    buildPowerWidget(o, 228, 268, POWER_LAYOUT_FULL, 6);
+    tapToClose(o);
+    render("12_full_1day");
   }
   // 10. Custom colours, as WebConfig 3.47 would set them.
   {

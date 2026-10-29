@@ -42,15 +42,17 @@ struct PowerSeries {
 // Supplied by whoever owns the history (the firmware, or the preview tool).
 static PowerSeries (*powerSeriesSource)() = nullptr;
 
-static const uint8_t POWER_RANGE_COUNT = 6;
+static const uint8_t POWER_RANGE_COUNT = 9;
 static const uint32_t POWER_RANGE_SECONDS[POWER_RANGE_COUNT] = {
-  60, 300, 600, 3600, 6UL * 3600UL, 12UL * 3600UL };
+  60, 300, 600, 3600, 6UL * 3600UL, 12UL * 3600UL,
+  86400UL, 3UL * 86400UL, 7UL * 86400UL };
 static const char *const POWER_RANGE_NAME[POWER_RANGE_COUNT] = {
-  "1 min", "5 min", "10 min", "1 hour", "6 hours", "12 hours" };
+  "1 min", "5 min", "10 min", "1 hour", "6 hours", "12 hours",
+  "1 day", "3 days", "1 week" };
 static const char *const POWER_RANGE_AXIS[POWER_RANGE_COUNT] = {
-  "-1 min", "-5 min", "-10 min", "-1 h", "-6 h", "-12 h" };
+  "-1 min", "-5 min", "-10 min", "-1 h", "-6 h", "-12 h", "-1 day", "-3 days", "-7 days" };
 static const char *const POWER_RANGE_OPTIONS =
-  "1 minute\n5 minutes\n10 minutes\n1 hour\n6 hours\n12 hours";
+  "1 minute\n5 minutes\n10 minutes\n1 hour\n6 hours\n12 hours\n1 day\n3 days\n1 week";
 static const uint8_t POWER_RANGE_DEFAULT = 3;
 
 static const uint16_t POWER_GRAPH_MAX_COLUMNS = 220;
@@ -124,10 +126,23 @@ static void computePowerGraph(PowerGraphModel &m, const PowerSeries &series) {
   double start = end - span;
   double colSpan = (double)span / cols;
 
+  // Skip to the last point at or before the range start: a week of history
+  // is tens of thousands of points, and a one-minute view needs a handful.
+  uint32_t first = 0;
+  if (series.count && series.at) {
+    uint32_t lo = 0, hi = series.count;
+    PowerPoint probe = {};
+    while (lo + 1 < hi) {
+      uint32_t mid = lo + (hi - lo) / 2;
+      if (series.at(mid, probe) && probe.t <= start) lo = mid;
+      else hi = mid;
+    }
+    first = lo;
+  }
   PowerPoint p = {};
   PowerPoint next = {};
-  bool haveNext = series.count && series.at && series.now && series.at(0, next);
-  for (uint32_t i = 0; haveNext; i++) {
+  bool haveNext = series.count && series.at && series.now && series.at(first, next);
+  for (uint32_t i = first; haveNext; i++) {
     p = next;
     haveNext = i + 1 < series.count && series.at(i + 1, next);
     double segStart = p.t > start ? p.t : start;
@@ -331,11 +346,14 @@ static void formatPowerMa(char *out, size_t size, float mA) {
   else snprintf(out, size, "%.0f", mA);
 }
 
+// A charge with its unit: "0.52 mAh", "838 mAh", or "1.40 Ah" from 1000 up,
+// which is what a week can reach and what fits the full-screen headline.
 static void formatPowerMah(char *out, size_t size, float mAh) {
-  if (isnan(mAh)) snprintf(out, size, "--");
-  else if (mAh < 0.1f) snprintf(out, size, "%.2f", mAh);
-  else if (mAh < 10.0f) snprintf(out, size, "%.1f", mAh);
-  else snprintf(out, size, "%.0f", mAh);
+  if (isnan(mAh)) snprintf(out, size, "-- mAh");
+  else if (mAh < 0.1f) snprintf(out, size, "%.2f mAh", mAh);
+  else if (mAh < 10.0f) snprintf(out, size, "%.1f mAh", mAh);
+  else if (mAh < 1000.0f) snprintf(out, size, "%.0f mAh", mAh);
+  else snprintf(out, size, "%.2f Ah", mAh / 1000.0f);
 }
 
 static int powerCategoryPercent(const PowerGraphModel &m, uint8_t category) {
@@ -513,6 +531,10 @@ static PowerWidgetUi *buildPowerWidget(lv_obj_t *parent, int width, int height,
     lv_obj_t *list = lv_dropdown_get_list(ui->dropdown);
     if (list) {
       lv_obj_set_style_text_font(list, &lv_font_montserrat_14, 0);
+      // Nine lengths: tight enough rows that all of them fit below the button.
+      lv_obj_set_style_text_line_space(list, 9, 0);
+      lv_obj_set_style_pad_ver(list, 6, 0);
+      lv_obj_set_style_max_height(list, 300, 0);
       lv_obj_set_style_text_color(list, white, 0);
       lv_obj_set_style_bg_color(list, lv_color_make(30, 42, 58), 0);
       lv_obj_set_style_bg_opa(list, LV_OPA_COVER, 0);
@@ -582,7 +604,7 @@ static void refreshPowerWidget(PowerWidgetUi *ui) {
   if (ui->layout == POWER_LAYOUT_FULL) {
     snprintf(text, sizeof(text), "%s mA", ma);
     lv_label_set_text(ui->value, text);
-    snprintf(text, sizeof(text), "%s mAh", mah);
+    snprintf(text, sizeof(text), "%s", mah);
     lv_label_set_text(ui->detail, text);
     snprintf(text, sizeof(text), "used in %s", range);
     lv_label_set_text(ui->shareMah[0], text);
@@ -591,7 +613,7 @@ static void refreshPowerWidget(PowerWidgetUi *ui) {
       lv_label_set_text(ui->share[c], text);
       char part[16];
       formatPowerMah(part, sizeof(part), m.mAh[c]);
-      snprintf(text, sizeof(text), "%s mAh", part);
+      snprintf(text, sizeof(text), "%s", part);
       if (ui->shareMahLabel[c]) lv_label_set_text(ui->shareMahLabel[c], text);
     }
   } else {
@@ -600,7 +622,7 @@ static void refreshPowerWidget(PowerWidgetUi *ui) {
     if (ui->detail) {
       if (ui->layout == POWER_LAYOUT_SLIM) snprintf(text, sizeof(text), "avg %s", range);
       else if (ui->layout == POWER_LAYOUT_COLUMN) snprintf(text, sizeof(text), "avg \xE2\x80\xA2 %s", range);
-      else snprintf(text, sizeof(text), "%s mAh \xE2\x80\xA2 %s", mah, range);
+      else snprintf(text, sizeof(text), "%s \xE2\x80\xA2 %s", mah, range);
       lv_label_set_text(ui->detail, text);
     }
     for (uint8_t c = 0; c < POWER_CAT_COUNT; c++) {
