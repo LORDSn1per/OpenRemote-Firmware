@@ -59,10 +59,20 @@ static const uint16_t POWER_GRAPH_MAX_COLUMNS = 220;
 static const float POWER_GRAPH_MIN_MA = 0.05f;
 static const float POWER_GRAPH_MAX_MA = 400.0f;
 
+/*
+  The graph's colours, as 0xRRGGBB. These are the defaults; the firmware
+  replaces them from WebConfig's Power widget settings, and faces built
+  afterwards draw in the new ones.
+*/
+static const uint32_t POWER_DEFAULT_COLOURS[POWER_CAT_COUNT] = {0xFF9F0A, 0x0A84FF, 0x7C5CF0};
+static const uint32_t POWER_DEFAULT_CHARGING_COLOUR = 0x30D158;
+static const uint32_t POWER_DEFAULT_LINE_COLOUR = 0xFFFFFF;
+static uint32_t powerColours[POWER_CAT_COUNT] = {0xFF9F0A, 0x0A84FF, 0x7C5CF0};
+static uint32_t powerChargingColour = POWER_DEFAULT_CHARGING_COLOUR;
+static uint32_t powerLineColour = POWER_DEFAULT_LINE_COLOUR;
+
 static inline lv_color_t powerCategoryColour(uint8_t category) {
-  if (category == POWER_CAT_IN_USE) return lv_color_make(255, 159, 10);
-  if (category == POWER_CAT_LIGHT) return lv_color_make(10, 132, 255);
-  return lv_color_make(124, 92, 240);
+  return lv_color_hex(powerColours[category < POWER_CAT_COUNT ? category : POWER_CAT_DEEP]);
 }
 
 static inline const char *powerCategoryName(uint8_t category) {
@@ -248,27 +258,13 @@ static void powerGraphDrawEvent(lv_event_t *e) {
     }
   }
 
-  // Charging: a green strip along the foot of the graph.
-  lv_draw_rect_dsc_t strip;
-  lv_draw_rect_dsc_init(&strip);
-  strip.bg_color = lv_color_make(48, 209, 88);
-  strip.bg_opa = LV_OPA_COVER;
-  for (int c = 0; c < cols;) {
-    if (!m->charging[c]) { c++; continue; }
-    int run = c + 1;
-    while (run < cols && m->charging[run]) run++;
-    lv_area_t a = {colX(c), (lv_coord_t)(plot.y2 - 2), (lv_coord_t)(colX(run) - 1), plot.y2};
-    lv_draw_rect(ctx, &strip, &a);
-    c = run;
-  }
-
   // The line, with the area beneath it filled in its state's colour.
   lv_draw_rect_dsc_t fill;
   lv_draw_rect_dsc_init(&fill);
   fill.bg_opa = (lv_opa_t)165;
   lv_draw_line_dsc_t line;
   lv_draw_line_dsc_init(&line);
-  line.color = lv_color_white();
+  line.color = lv_color_hex(powerLineColour);
   line.width = m->lineWidth ? m->lineWidth : 2;
   line.round_start = 1;
   line.round_end = 1;
@@ -289,6 +285,21 @@ static void powerGraphDrawEvent(lv_event_t *e) {
     if (havePrev) lv_draw_line(ctx, &line, &prev, &here);
     prev = here;
     havePrev = true;
+  }
+
+  // Charging: a strip along the foot of the graph, drawn over the fill so it
+  // keeps its own colour.
+  lv_draw_rect_dsc_t strip;
+  lv_draw_rect_dsc_init(&strip);
+  strip.bg_color = lv_color_hex(powerChargingColour);
+  strip.bg_opa = LV_OPA_COVER;
+  for (int c = 0; c < cols;) {
+    if (!m->charging[c]) { c++; continue; }
+    int run = c + 1;
+    while (run < cols && m->charging[run]) run++;
+    lv_area_t a = {colX(c), (lv_coord_t)(plot.y2 - 2), (lv_coord_t)(colX(run) - 1), plot.y2};
+    lv_draw_rect(ctx, &strip, &a);
+    c = run;
   }
 
   if (m->axisLabels) {

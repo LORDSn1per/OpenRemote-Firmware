@@ -1,6 +1,13 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  6.04 - 2026-10-30
+    - Power widget colours are chosen in WebConfig 3.47 (widgets.power.colours:
+      inUse, light, deep, charging, line as "#rrggbb"); 6.03's colours remain
+      the defaults for any that are not set.
+    - The charging strip is drawn over the graph's fill; underneath it, the
+      fill tinted it (a green strip read as teal over light sleep).
+
   6.03 - 2026-10-30
     - Power widget (WebConfig 3.46 to place it): estimated current over the
       last 1, 5 or 10 minutes, 1, 6 or 12 hours, as a line over shading for
@@ -7639,7 +7646,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "6.03"
+#define OPENREMOTE_VERSION_STRING "6.04"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -19714,6 +19721,17 @@ void applyWidgetSettingsJson(JsonObjectConst widgets, JsonArrayConst wallpapers)
       widgetSettings.powerExpandedWallpaper, sizeof(widgetSettings.powerExpandedWallpaper),
       widgetContentPanels[WIDGET_POWER]);
     widgetSettings.powerRange = powerRangeFromName(power["range"] | "", POWER_RANGE_DEFAULT);
+    // Colours chosen in WebConfig; an absent or malformed one is the default.
+    JsonObjectConst colours = power["colours"].as<JsonObjectConst>();
+    const char *stateKeys[POWER_CAT_COUNT] = {"inUse", "light", "deep"};
+    for (uint8_t c = 0; c < POWER_CAT_COUNT; c++) {
+      powerColours[c] = widgetWallpaperHexColour(colours[stateKeys[c]] | "",
+                                                 POWER_DEFAULT_COLOURS[c]);
+    }
+    powerChargingColour = widgetWallpaperHexColour(colours["charging"] | "",
+                                                   POWER_DEFAULT_CHARGING_COLOUR);
+    powerLineColour = widgetWallpaperHexColour(colours["line"] | "",
+                                               POWER_DEFAULT_LINE_COLOUR);
   }
 
   JsonObjectConst media = widgets["media"].as<JsonObjectConst>();

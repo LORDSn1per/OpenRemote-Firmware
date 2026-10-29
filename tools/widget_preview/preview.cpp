@@ -376,5 +376,16 @@ int main() {
     tapToClose(o);
     render("9_custom_expanded_battery_power");
   }
+  // 10. Custom colours, as WebConfig 3.47 would set them.
+  {
+    powerColours[POWER_CAT_IN_USE] = 0xFF2D55;
+    powerColours[POWER_CAT_DEEP] = 0xFFD60A;
+    powerLineColour = 0x00E5FF;
+    lv_obj_t *s = screen();
+    lv_obj_t *o = overlay(s);
+    buildPowerWidget(o, 228, 268, POWER_LAYOUT_FULL, 5);
+    tapToClose(o);
+    render("10_full_custom_colours");
+  }
   return 0;
 }
