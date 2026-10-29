@@ -1,6 +1,12 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  6.09 - 2026-10-30
+    - Power graph colours are drawn solid under the line. At 65% opacity the
+      widget's wallpaper showed through and shifted every chosen colour (an
+      orange-red read as brick, cyan as teal, a dark purple almost vanished),
+      so the chart no longer matched its own legend.
+
   6.08 - 2026-10-30
     - Power graph: nothing above the line. The state colours now fill only
       the area under it; the tint of the same colour above it, and the faint
@@ -7686,7 +7692,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "6.08"
+#define OPENREMOTE_VERSION_STRING "6.09"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =

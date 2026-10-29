@@ -261,10 +261,12 @@ static void powerGraphDrawEvent(lv_event_t *e) {
     }
   }
 
-  // The line, with the area beneath it filled in its state's colour.
+  // The line, with the area beneath it filled in its state's colour - solid,
+  // so the chart shows exactly the colour chosen, as the legend chips do
+  // (6.09: at 65% the wallpaper behind turned orange to brick and cyan to teal).
   lv_draw_rect_dsc_t fill;
   lv_draw_rect_dsc_init(&fill);
-  fill.bg_opa = (lv_opa_t)165;
+  fill.bg_opa = LV_OPA_COVER;
   lv_draw_line_dsc_t line;
   lv_draw_line_dsc_init(&line);
   line.color = lv_color_hex(powerLineColour);
