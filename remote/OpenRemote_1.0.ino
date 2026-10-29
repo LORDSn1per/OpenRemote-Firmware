@@ -1,6 +1,13 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  6.08 - 2026-10-30
+    - Power graph: nothing above the line. The state colours now fill only
+      the area under it; the tint of the same colour above it, and the faint
+      grey well behind the whole graph, are gone (Phillip's call).
+    - The charging strip is an eighth of the graph's height (at least 4 px)
+      instead of 3 px.
+
   6.07 - 2026-10-30
     - The Power widget keeps the history length chosen in its full-screen
       menu. It used to apply to that one view only, so closing it and opening
@@ -7679,7 +7686,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "6.07"
+#define OPENREMOTE_VERSION_STRING "6.08"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =

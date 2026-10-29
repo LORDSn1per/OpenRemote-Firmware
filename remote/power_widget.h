@@ -98,7 +98,6 @@ struct PowerGraphModel {
   bool axisLabels;      // 1/10/100 mA labels and the time axis
   bool grid;
   uint8_t lineWidth;
-  lv_opa_t bandOpa;
 };
 
 /*
@@ -231,29 +230,8 @@ static void powerGraphDrawEvent(lv_event_t *e) {
   lv_coord_t cols = m->columns ? m->columns : 1;
   auto colX = [&](int c) { return (lv_coord_t)(plot.x1 + (c * plotW) / cols); };
 
-  // A faint well behind everything, so empty time still reads as graph.
-  lv_draw_rect_dsc_t well;
-  lv_draw_rect_dsc_init(&well);
-  well.bg_color = lv_color_white();
-  well.bg_opa = (lv_opa_t)14;
-  well.radius = 4;
-  lv_draw_rect(ctx, &well, &plot);
-
-  // State bands: one rectangle per run of the same state.
-  lv_draw_rect_dsc_t band;
-  lv_draw_rect_dsc_init(&band);
-  band.bg_opa = m->bandOpa;
-  for (int c = 0; c < cols;) {
-    uint8_t cat = m->category[c];
-    int run = c + 1;
-    while (run < cols && m->category[run] == cat) run++;
-    if (cat < POWER_CAT_COUNT) {
-      lv_area_t a = {colX(c), plot.y1, (lv_coord_t)(colX(run) - 1), plot.y2};
-      band.bg_color = powerCategoryColour(cat);
-      lv_draw_rect(ctx, &band, &a);
-    }
-    c = run;
-  }
+  // Nothing is drawn above the line: the state colours fill only the area
+  // under it, and the rest of the graph is the card itself (6.08).
 
   lv_draw_label_dsc_t text;
   lv_draw_label_dsc_init(&text);
@@ -317,12 +295,16 @@ static void powerGraphDrawEvent(lv_event_t *e) {
   lv_draw_rect_dsc_t strip;
   lv_draw_rect_dsc_init(&strip);
   strip.bg_color = lv_color_hex(powerChargingColour);
+  // An eighth of the graph, at least 4 px: about 11 px full screen, 6 on a
+  // large tile (6.08 - 3 px was too thin to notice).
+  lv_coord_t stripHeight = lv_area_get_height(&plot) / 8;
+  if (stripHeight < 4) stripHeight = 4;
   strip.bg_opa = LV_OPA_COVER;
   for (int c = 0; c < cols;) {
     if (!m->charging[c]) { c++; continue; }
     int run = c + 1;
     while (run < cols && m->charging[run]) run++;
-    lv_area_t a = {colX(c), (lv_coord_t)(plot.y2 - 2), (lv_coord_t)(colX(run) - 1), plot.y2};
+    lv_area_t a = {colX(c), (lv_coord_t)(plot.y2 - stripHeight + 1), (lv_coord_t)(colX(run) - 1), plot.y2};
     lv_draw_rect(ctx, &strip, &a);
     c = run;
   }
@@ -505,7 +487,6 @@ static PowerWidgetUi *buildPowerWidget(lv_obj_t *parent, int width, int height,
   ui->layout = layout;
   ui->model.range = range < POWER_RANGE_COUNT ? range : POWER_RANGE_DEFAULT;
   ui->model.lineWidth = 2;
-  ui->model.bandOpa = (lv_opa_t)48;
   lv_obj_add_event_cb(parent, powerWidgetDeleted, LV_EVENT_DELETE, ui);
   const lv_color_t white = lv_color_white();
 
