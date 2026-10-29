@@ -1,6 +1,17 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  6.00 - 2026-10-29
+    - BLE-connected idle really light-sleeps now. IRremote's receive timer
+      was created at boot and only ever stopped, never deleted, and an
+      enabled ESP32 gptimer holds an APB_FREQ_MAX power lock, so automatic
+      light sleep never happened once: 5.99's battery log read sleep=0% in
+      every BLE-idle stretch, and the PM report over USB showed gptimer_0_0
+      held 100% since boot with light_sleep_counts:0. The CPU sat at 80 MHz
+      the whole time - the ~1-3 %/h (roughly 20-60 mA) seen with Chromecast.
+      stopIrReceiver() now deletes the timer after every IrReceiver.stop();
+      IR learning's IrReceiver.start() recreates it.
+
   5.99 - 2026-10-29
     - The battery figure at the top of Settings updates while you look at
       it. The Settings page has been built once and kept since 5.91 (for
@@ -7596,7 +7607,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.99"
+#define OPENREMOTE_VERSION_STRING "6.00"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -7685,6 +7696,24 @@ static_assert(ARDUINOJSON_SLOT_ID_SIZE >= 4,
 #define IR_RECEIVE_PIN 4
 #define RAW_BUFFER_LENGTH 750
 #include <IRremote.hpp>
+
+/*
+  IrReceiver.stop() only halts the 50 us sample timer's counter. The ESP32
+  gptimer underneath stays enabled, and an enabled gptimer holds an
+  APB_FREQ_MAX power-management lock - so from the boot-time begin()/stop()
+  onwards the CPU could never auto light-sleep. In BLE-connected idle that
+  was the whole drain: 5.99's log read sleep=0% in every stretch and the PM
+  report showed gptimer_0_0 held 100% since boot, light_sleep_counts:0.
+  Deleting the timer releases the lock; IrReceiver.start() (IR learning)
+  creates a new one through timerConfigForReceive().
+*/
+void stopIrReceiver() {
+  IrReceiver.stop();
+  if (s50usTimer) {
+    timerEnd(s50usTimer);
+    s50usTimer = nullptr;
+  }
+}
 #include <LovyanGFX.hpp>
 #include <Arduino_GFX_Library.h>
 #include <lvgl.h>
@@ -27084,7 +27113,7 @@ void handleIrdbUploadData() {
 void serviceIrLearning(unsigned long now) {
   if (!irLearningActive) return;
   if ((int32_t)(now - irLearningStartedMs) >= (int32_t)IR_LEARN_TIMEOUT_MS) {
-    IrReceiver.stop();
+    stopIrReceiver();
     irLearningActive = false;
     irLearningError = "No IR signal received within 12 seconds";
     return;
@@ -27092,7 +27121,7 @@ void serviceIrLearning(unsigned long now) {
   if (!IrReceiver.decode()) return;
 
   if (IrReceiver.decodedIRData.flags & IRDATA_FLAGS_WAS_OVERFLOW) {
-    IrReceiver.stop();
+    stopIrReceiver();
     irLearningActive = false;
     irLearningError = "IR signal exceeded the receiver buffer";
     return;
@@ -27124,7 +27153,7 @@ void serviceIrLearning(unsigned long now) {
   capture["timingCount"] = captured;
   capture["protocol"] = getProtocolString(IrReceiver.decodedIRData.protocol);
   serializeJson(capture, irLearningResult);
-  IrReceiver.stop();
+  stopIrReceiver();
   irLearningActive = false;
   irLearningError = "";
   Serial.printf("IR learn: captured %u timing(s), protocol %s\n", captured,
@@ -27186,7 +27215,7 @@ void handleIrLearnCancel() {
     sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
     return;
   }
-  IrReceiver.stop();
+  stopIrReceiver();
   irLearningActive = false;
   irLearningResult = "";
   irLearningError = "";
@@ -43199,7 +43228,7 @@ bool enterDeepPowerSleep(bool allowQrPage) {
   batteryLog("deep-sleep", clockUseInternetTime ? "wake=motion/button/charger/3am" : "wake=motion/button/charger");
   if (bleReady) stopBluetoothRadio("deep sleep");
   stopNetworkStack();
-  IrReceiver.stop();
+  stopIrReceiver();
   pinMode(PIN_IR_RX, INPUT);
   digitalWrite(PIN_IR_LED, HIGH);
   digitalWrite(PIN_IR_VCC, LOW);
@@ -43647,7 +43676,7 @@ void enterDisplaySleep() {
   lv_refr_now(nullptr);
   if (displayDriverChoice == 1) agfx->fillScreen(0x0000); else tft.fillScreen(TFT_BLACK);
   setLcdControllerSleeping(true);
-  IrReceiver.stop();
+  stopIrReceiver();
   digitalWrite(PIN_IR_VCC, LOW);
   suspendBacklightPwmForSleep();
   displaySleeping = true;
@@ -44072,7 +44101,7 @@ void setup() {
   uint32_t panelBlackMs = millis();
   IrSender.begin();
   IrReceiver.begin(PIN_IR_RX, DISABLE_LED_FEEDBACK);
-  IrReceiver.stop();
+  stopIrReceiver();
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
   Wire.setClock(400000);
   initialiseChargingState();
