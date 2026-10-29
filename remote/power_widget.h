@@ -392,7 +392,12 @@ struct PowerWidgetUi {
   lv_obj_t *shareMahLabel[POWER_CAT_COUNT]; // full screen: mAh per state
   uint8_t layout;
   uint32_t refreshedMs;  // the firmware's refresh throttle
+  uint8_t owner;         // the firmware's: which widget's setting this face shows
 };
+
+// Called after the full-screen menu changes the history length, so the owner
+// can keep the choice (the firmware saves it as the widget's setting).
+static void (*powerRangeChosenHook)(PowerWidgetUi *ui) = nullptr;
 
 static lv_obj_t *powerLabel(lv_obj_t *parent, const char *text, int x, int y,
                             const lv_font_t *font, lv_color_t colour, int width = 0,
@@ -427,6 +432,7 @@ static void powerRangeChanged(lv_event_t *e) {
   uint16_t selected = lv_dropdown_get_selected(lv_event_get_target(e));
   ui->model.range = selected < POWER_RANGE_COUNT ? (uint8_t)selected : POWER_RANGE_DEFAULT;
   refreshPowerWidget(ui);
+  if (powerRangeChosenHook) powerRangeChosenHook(ui);
 }
 
 static lv_obj_t *makePowerGraph(PowerWidgetUi *ui, lv_obj_t *parent, int x, int y, int w, int h) {

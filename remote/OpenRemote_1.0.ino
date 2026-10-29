@@ -1,6 +1,15 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  6.07 - 2026-10-30
+    - The Power widget keeps the history length chosen in its full-screen
+      menu. It used to apply to that one view only, so closing it and opening
+      it again went back to the WebConfig setting. The choice now becomes the
+      setting itself - the Power widget's, or the custom widget's it is part
+      of - updates the tile behind it, and is saved to runtime.json
+      (widgets.power.range / customWidgets[].powerRange), so it survives a
+      reboot and WebConfig shows it.
+
   6.06 - 2026-10-30
     - Fixed: starting Chromecast within seconds of a cold boot restarted the
       remote (6.03-6.05). Wi-Fi was still up for the boot clock sync, the
@@ -7670,7 +7679,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "6.06"
+#define OPENREMOTE_VERSION_STRING "6.07"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -19669,12 +19678,13 @@ uint8_t widgetKindFromName(const char *name) {
 }
 
 // WebConfig's names for the power history lengths.
+static const char *const POWER_RANGE_KEYS[POWER_RANGE_COUNT] = {
+  "1m", "5m", "10m", "60m", "6h", "12h", "1d", "3d", "7d"};
+
 uint8_t powerRangeFromName(const char *name, uint8_t fallback) {
-  static const char *const names[POWER_RANGE_COUNT] = {"1m", "5m", "10m", "60m", "6h", "12h",
-                                                       "1d", "3d", "7d"};
   if (!name) return fallback;
   for (uint8_t i = 0; i < POWER_RANGE_COUNT; i++) {
-    if (strcmp(name, names[i]) == 0) return i;
+    if (strcmp(name, POWER_RANGE_KEYS[i]) == 0) return i;
   }
   return fallback;
 }
@@ -20678,6 +20688,19 @@ bool persistSettingsToRuntimeConfig() {
 
   JsonObject settings = doc["settings"].as<JsonObject>();
   if (settings.isNull()) settings = doc["settings"].to<JsonObject>();
+  // The Power widget's history length, which the LCD's full-screen menu
+  // can change (6.07) - written back so WebConfig shows the same choice.
+  JsonObject widgetsOut = doc["widgets"].as<JsonObject>();
+  if (widgetsOut.isNull()) widgetsOut = doc["widgets"].to<JsonObject>();
+  JsonObject powerOut = widgetsOut["power"].as<JsonObject>();
+  if (powerOut.isNull()) powerOut = widgetsOut["power"].to<JsonObject>();
+  powerOut["range"] = POWER_RANGE_KEYS[widgetSettings.powerRange % POWER_RANGE_COUNT];
+  for (JsonObject row : doc["customWidgets"].as<JsonArray>()) {
+    uint8_t index = findCustomWidgetIndex(row["id"] | "");
+    if (index >= customWidgetCount) continue;
+    uint8_t range = customWidgets[index].powerRange;
+    row["powerRange"] = range < POWER_RANGE_COUNT ? POWER_RANGE_KEYS[range] : "inherit";
+  }
   settings["wifiEnabled"] = wifiOn;
   settings["bluetoothEnabled"] = bluetoothOn;
   settings["clockEnabled"] = clockEnabled;
@@ -41043,6 +41066,7 @@ uint8_t buildAnimatedWidgetContents(lv_obj_t *card, uint8_t kind, uint8_t custom
     instances[i].tile = card;
     instances[i].ownerKind = kind;
     instances[i].custom = custom;
+    if (instances[i].power) instances[i].power->owner = custom;
   }
   if (!expanded) widgetMotionCount++;
   return used;
@@ -41098,6 +41122,7 @@ uint8_t buildWidgetContents(lv_obj_t *card, uint8_t kind, uint8_t custom, int wi
     instances[i].tile = card;
     instances[i].ownerKind = kind;
     instances[i].custom = custom;
+    if (instances[i].power) instances[i].power->owner = custom;
   }
   return count;
 }
@@ -41285,6 +41310,28 @@ void refreshWidgetInstance(WidgetInstance &instance) {
       lv_label_set_text(instance.secondary, weatherReading.condition);
     }
   }
+}
+
+/*
+  The full-screen menu's history length is kept (6.07): it becomes the
+  widget's own setting - the Power widget's, or the custom widget's it sits
+  in - so the tile behind it, the next full-screen view and the next boot
+  all show it, and it is written to runtime.json where WebConfig reads it.
+*/
+void powerRangeChosenOnLcd(PowerWidgetUi *ui) {
+  if (!ui) return;
+  uint8_t range = ui->model.range;
+  if (ui->owner < customWidgetCount) customWidgets[ui->owner].powerRange = range;
+  else widgetSettings.powerRange = range;
+  for (uint8_t i = 0; i < widgetInstanceCount; i++) {
+    PowerWidgetUi *other = widgetInstances[i].power;
+    if (!other || other == ui || other->owner != ui->owner ||
+        !widgetInstances[i].card || !lv_obj_is_valid(widgetInstances[i].card)) continue;
+    other->model.range = range;
+    refreshPowerWidget(other);
+  }
+  Serial.printf("Power widget: history %s saved\n", POWER_RANGE_NAME[range % POWER_RANGE_COUNT]);
+  scheduleRuntimeSettingsSave();
 }
 
 void refreshExpandedWidgetInstances() {
@@ -44702,6 +44749,7 @@ void setup() {
   wallClockTrusted = rtcWallClockTrusted && time(nullptr) >= 1700000000;
   applyClockMode();
   powerSeriesSource = firmwarePowerSeries;
+  powerRangeChosenHook = powerRangeChosenOnLcd;
   {
     char detail[64];
     snprintf(detail, sizeof(detail), "reset=%s wake=%s",
