@@ -1,6 +1,27 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  5.99 - 2026-10-29
+    - The battery figure at the top of Settings updates while you look at
+      it. The Settings page has been built once and kept since 5.91 (for
+      instant swipes), so its percentage, bar and charging chip stayed at
+      whatever they were when it was built until a sub-page was opened and
+      closed. They are now refreshed in place every 2 s when they change,
+      and at once when a swipe lands on Settings or the screen wakes on it.
+    - "Until empty" shows a figure straight away. A discharge only counted
+      once the battery fell below 3.97 V (5.85's guard against learning
+      charger top-ups), which from full took most of a day, so it read
+      "Collecting data" all day. The charging state already holds "charging"
+      through a completed charge, so its drop is a real unplug: segments now
+      count from then. Before the model has 0.3% over half an hour, the
+      measured drop or the fuel gauge's own rate fills in. A segment saved
+      as provisional by 5.98 is kept and counted.
+    - Battery log: BLE-idle samples and ble-idle-exit lines carry the share
+      of time the CPU spent light-sleeping ("sleep=NN%", from the power
+      manager's profiling counters). The 5.98 log showed 1-3%/h in BLE idle,
+      far above what light sleep should cost, but not whether the CPU was
+      failing to sleep or something drew current while it slept.
+
   5.98 - 2026-10-29
     - ORUSB READ now serves /logs/battery.csv and /logs/battery.prev.csv.
       5.97's note said it already did; it did not - USB reads are limited to
@@ -7575,7 +7596,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "5.98"
+#define OPENREMOTE_VERSION_STRING "5.99"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -10684,10 +10705,6 @@ float batteryDischargeHoursTotal = 0.0f;
 bool batteryDischargeSegmentActive = false;
 uint32_t batteryDischargeSegmentEpoch = 0;
 float batteryDischargeSegmentStartPercent = -1.0f;
-// Set while the open segment may still be charger drain after a completed
-// charge (see BATTERY_TOPUP_CONFIRM_VOLTAGE). Never added to the totals.
-bool batteryDischargeSegmentProvisional = false;
-uint8_t batteryProvisionalLowReadings = 0;
 
 lv_obj_t *screenRoot = nullptr;
 lv_obj_t *wallpaper = nullptr;
@@ -12715,80 +12732,36 @@ void saveBatteryDischargeModel() {
   preferences.putBool("dsgOpen", batteryDischargeSegmentActive);
   preferences.putULong("dsgAt", batteryDischargeSegmentEpoch);
   preferences.putFloat("dsgStart", batteryDischargeSegmentStartPercent);
-  preferences.putBool("dsgProv", batteryDischargeSegmentProvisional);
   preferences.end();
 }
 
 /*
-  Rev 6 cannot tell an unplugged cable from a charge the TP4056 has finished,
-  and on the cable the TP4056 lets the battery drain to its recharge threshold
-  (4.05 V nominal, 4.00 V at worst) before topping it up again. A segment that
-  starts above this voltage may therefore be charger time. It stays
-  provisional until the battery is seen below it, which cannot happen on the
-  charger; charging again before then discards it.
+  A segment opens when the charging state drops. updateChargingState() holds
+  "charging" through a completed charge (full and steady), so that drop is a
+  real unplug and the segment counts from its first minute. 5.85-5.98 also
+  waited for the battery to fall below 3.97 V before learning it, which from
+  a full charge took most of a day; the charging state already answers the
+  question that wait was asking.
 */
-const float BATTERY_TOPUP_CONFIRM_VOLTAGE = 3.97f;
-const uint8_t BATTERY_TOPUP_CONFIRM_READINGS = 2;
-const unsigned long BATTERY_TOPUP_CHECK_MS = 5000UL;
-
 void startBatteryDischargeSegment(float percent, uint32_t epoch) {
   if (percent < 0.0f) percent = readBatteryPercent();
-  float voltage = readBatteryVoltage();
   batteryDischargeSegmentActive = percent >= 0.0f;
   batteryDischargeSegmentEpoch = epoch;
   batteryDischargeSegmentStartPercent = percent;
-  // An unreadable voltage is treated as provisional: losing one segment is
-  // cheaper than learning a day on the charger.
-  batteryDischargeSegmentProvisional = batteryDischargeSegmentActive &&
-    (voltage < 0.0f || voltage >= BATTERY_TOPUP_CONFIRM_VOLTAGE);
-  batteryProvisionalLowReadings = 0;
   saveBatteryDischargeModel();
-  Serial.printf("Battery model: discharge segment started at %.2f%% %.3fV%s, epoch=%lu\n",
-                percent, voltage,
-                batteryDischargeSegmentProvisional ? " (provisional)" : "",
-                (unsigned long)epoch);
+  Serial.printf("Battery model: discharge segment started at %.2f%%, epoch=%lu\n",
+                percent, (unsigned long)epoch);
 }
 
 void discardBatteryDischargeSegment() {
   batteryDischargeSegmentActive = false;
   batteryDischargeSegmentEpoch = 0;
   batteryDischargeSegmentStartPercent = -1.0f;
-  batteryDischargeSegmentProvisional = false;
   saveBatteryDischargeModel();
-}
-
-/*
-  Called from updateChargingState() while not charging. Two readings below the
-  confirm voltage, BATTERY_TOPUP_CHECK_MS apart, so a brief sag under load
-  cannot confirm a segment that is really on the charger.
-*/
-void serviceProvisionalDischargeSegment(unsigned long now) {
-  static unsigned long nextCheckMs = 0;
-  if (!batteryDischargeSegmentActive || !batteryDischargeSegmentProvisional) return;
-  if ((int32_t)(now - nextCheckMs) < 0) return;
-  nextCheckMs = now + BATTERY_TOPUP_CHECK_MS;
-  float voltage = readBatteryVoltage();
-  if (voltage <= 0.0f || voltage >= BATTERY_TOPUP_CONFIRM_VOLTAGE) {
-    batteryProvisionalLowReadings = 0;
-    return;
-  }
-  if (++batteryProvisionalLowReadings < BATTERY_TOPUP_CONFIRM_READINGS) return;
-  batteryDischargeSegmentProvisional = false;
-  batteryProvisionalLowReadings = 0;
-  saveBatteryDischargeModel();
-  Serial.printf("Battery model: segment confirmed unplugged at %.3fV\n", voltage);
 }
 
 void closeBatteryDischargeSegment(float percent, uint32_t epoch) {
   if (!batteryDischargeSegmentActive) return;
-  if (batteryDischargeSegmentProvisional) {
-    // Charging again before the battery left the top-up range: this was the
-    // TP4056 recharging on the cable, or an unplug too short to matter.
-    Serial.printf("Battery model: discarded provisional segment %.2f%% -> %.2f%%\n",
-                  batteryDischargeSegmentStartPercent, percent);
-    discardBatteryDischargeSegment();
-    return;
-  }
   float dropped = batteryDischargeSegmentStartPercent - percent;
   float hours = batteryDischargeSegmentEpoch && epoch >= batteryDischargeSegmentEpoch
     ? (float)(epoch - batteryDischargeSegmentEpoch) / 3600.0f : 0.0f;
@@ -12808,7 +12781,6 @@ void closeBatteryDischargeSegment(float percent, uint32_t epoch) {
   batteryDischargeSegmentActive = false;
   batteryDischargeSegmentEpoch = 0;
   batteryDischargeSegmentStartPercent = -1.0f;
-  batteryDischargeSegmentProvisional = false;
   saveBatteryDischargeModel();
 }
 
@@ -12836,7 +12808,6 @@ void serviceBatteryDischargeSegment(bool chargerConnected, float percent,
       batteryDischargeSegmentActive = true;
       batteryDischargeSegmentEpoch = batterySinceFullEpoch;
       batteryDischargeSegmentStartPercent = batterySinceFullStartPercent;
-      batteryDischargeSegmentProvisional = true;
       saveBatteryDischargeModel();
       Serial.println("Battery model: migrated the existing full-charge segment");
     } else {
@@ -12859,8 +12830,7 @@ void currentBatteryDischargeTotals(float percent, uint32_t epoch,
                                    float &dropped, float &hours) {
   dropped = batteryDischargePercentTotal;
   hours = batteryDischargeHoursTotal;
-  if (!batteryDischargeSegmentActive || batteryDischargeSegmentProvisional ||
-      !batteryDischargeSegmentEpoch ||
+  if (!batteryDischargeSegmentActive || !batteryDischargeSegmentEpoch ||
       epoch < batteryDischargeSegmentEpoch || percent < 0.0f) return;
   float activeDrop = batteryDischargeSegmentStartPercent - percent;
   float activeHours = (float)(epoch - batteryDischargeSegmentEpoch) / 3600.0f;
@@ -12876,7 +12846,6 @@ void resetBatteryDischargeLearning() {
   batteryDischargeSegmentActive = false;
   batteryDischargeSegmentEpoch = 0;
   batteryDischargeSegmentStartPercent = -1.0f;
-  batteryDischargeSegmentProvisional = false;
 
   if (!chargingState) {
     startBatteryDischargeSegment(readBatteryPercent(), batteryClockEpoch());
@@ -12974,6 +12943,23 @@ bool oldestBatterySample(BatteryHistorySample &found) {
   return have;
 }
 
+/*
+  "Until empty" before the learned model qualifies (0.3% over half an hour):
+  the measured drop once there is any, and the fuel gauge's own rate in the
+  first minutes after unplugging, rather than "Collecting data".
+*/
+void applyQuickBatteryEstimate(BatteryMetrics &metrics, float dropped, float hours) {
+  if (metrics.percent <= 0.0f || !isnan(metrics.estimatedHours)) return;
+  float rate = NAN;
+  if (dropped >= 0.1f && hours >= 0.1f) {
+    rate = dropped / hours;
+    if (isnan(metrics.learnedDischargePerHour)) metrics.learnedDischargePerHour = rate;
+  } else if (!metrics.chargerConnected && metrics.ratePerHour < -0.05f) {
+    rate = -metrics.ratePerHour;
+  }
+  if (rate > 0.0f) metrics.estimatedHours = metrics.percent / rate;
+}
+
 BatteryMetrics currentBatteryMetrics() {
   BatteryMetrics metrics;
   metrics.chargerConnected = updateChargingState();
@@ -12985,7 +12971,10 @@ BatteryMetrics currentBatteryMetrics() {
       batteryDischargePercentTotal / batteryDischargeHoursTotal;
   }
   uint32_t trustedNow = batteryClockEpoch();
-  if (metrics.percent < 0.0f || !trustedNow) return metrics;
+  if (metrics.percent < 0.0f || !trustedNow) {
+    applyQuickBatteryEstimate(metrics, 0.0f, 0.0f);
+    return metrics;
+  }
   time_t nowTime = (time_t)trustedNow;
 
   if (!batteryPowerModeKnown || !batteryPowerModeChangedEpoch) {
@@ -13044,6 +13033,12 @@ BatteryMetrics currentBatteryMetrics() {
       metrics.estimatedHours = metrics.percent / metrics.learnedDischargePerHour;
     }
   }
+  if (isnan(metrics.estimatedHours)) {
+    float quickDrop = 0.0f;
+    float quickHours = 0.0f;
+    currentBatteryDischargeTotals(metrics.percent, nowEpoch, quickDrop, quickHours);
+    applyQuickBatteryEstimate(metrics, quickDrop, quickHours);
+  }
   return metrics;
 }
 
@@ -13066,21 +13061,19 @@ void loadBatteryHistory() {
   batteryDischargeSegmentActive = preferences.getBool("dsgOpen", false);
   batteryDischargeSegmentEpoch = preferences.getULong("dsgAt", 0);
   batteryDischargeSegmentStartPercent = preferences.getFloat("dsgStart", -1.0f);
-  batteryDischargeSegmentProvisional = preferences.getBool("dsgProv", false);
   // Reset once per fix that invalidated what was learned: 5.85 (charger
   // time) and 5.88 (placeholder-clock segments). One key, renamed per fix.
   bool chargerTimeFixed = preferences.getBool("dsg588", false);
   preferences.end();
   if (!chargerTimeFixed) {
     // Before 5.85 the model learned charger time after a completed charge
-    // (see BATTERY_TOPUP_CONFIRM_VOLTAGE), so its average is too slow. Start
+    // (the TP4056 topping up on the cable), so its average is too slow. Start
     // again once; the open segment cannot be trusted either.
     batteryDischargePercentTotal = 0.0f;
     batteryDischargeHoursTotal = 0.0f;
     batteryDischargeSegmentActive = false;
     batteryDischargeSegmentEpoch = 0;
     batteryDischargeSegmentStartPercent = -1.0f;
-    batteryDischargeSegmentProvisional = false;
     saveBatteryDischargeModel();
     preferences.begin(PREFERENCES_NAMESPACE, false);
     preferences.putBool("dsg588", true);
@@ -13153,12 +13146,62 @@ void batteryLog(const char *event, const char *detail) {
   log.close();
 }
 
+/*
+  Share of the time since the previous call that the CPU spent light-sleeping,
+  from the power manager's profiling counters (cumulative since boot, so the
+  difference is taken here). -1 without CONFIG_PM_PROFILING. This is what says
+  whether a BLE-idle drain is the CPU failing to sleep or something drawing
+  current while it does - the gauge cannot tell the two apart.
+*/
+int pmLightSleepPercentSinceLast() {
+#if CONFIG_PM_PROFILING
+  static char dump[1536];
+  static uint64_t lastSleepUs = 0;
+  static uint64_t lastTotalUs = 0;
+  FILE *stream = fmemopen(dump, sizeof(dump) - 1, "w");
+  if (!stream) return -1;
+  esp_pm_dump_locks(stream);
+  long used = ftell(stream);
+  fclose(stream);
+  dump[used > 0 && used < (long)sizeof(dump) ? used : sizeof(dump) - 1] = 0;
+
+  uint64_t sleepUs = 0;
+  uint64_t totalUs = 0;
+  for (char *line = strtok(dump, "\n"); line; line = strtok(nullptr, "\n")) {
+    char mode[16];
+    long long timeUs = 0;
+    if (sscanf(line, "%15s %*s %lld", mode, &timeUs) != 2) continue;
+    bool sleep = strcmp(mode, "SLEEP") == 0;
+    if (!sleep && strcmp(mode, "APB_MIN") && strcmp(mode, "APB_MAX") &&
+        strcmp(mode, "CPU_MAX")) continue;
+    totalUs += (uint64_t)timeUs;
+    if (sleep) sleepUs += (uint64_t)timeUs;
+  }
+  int percent = -1;
+  if (totalUs > lastTotalUs && sleepUs >= lastSleepUs) {
+    percent = (int)((sleepUs - lastSleepUs) * 100ULL / (totalUs - lastTotalUs));
+  }
+  lastSleepUs = sleepUs;
+  lastTotalUs = totalUs;
+  return percent;
+#else
+  return -1;
+#endif
+}
+
 void serviceBatteryLog(unsigned long now) {
   static unsigned long nextSampleMs = 0;
   if (nextSampleMs && (int32_t)(now - nextSampleMs) < 0) return;
   bool first = nextSampleMs == 0;
   nextSampleMs = now + BATTERY_LOG_SAMPLE_MS;
-  if (!first) batteryLog("sample", displaySleeping ? (bleConnectedIdleActive ? "ble-idle" : "screen-off") : "awake");
+  if (first) return;
+  if (!bleConnectedIdleActive) {
+    batteryLog("sample", displaySleeping ? "screen-off" : "awake");
+    return;
+  }
+  char detail[32];
+  snprintf(detail, sizeof(detail), "ble-idle sleep=%d%%", pmLightSleepPercentSinceLast());
+  batteryLog("sample", detail);
 }
 
 void serviceBatteryHistory(unsigned long now, bool force) {
@@ -33506,7 +33549,6 @@ bool updateChargingState() {
     nextFullCheckMs = now + 1000UL;
     if (readBatteryPercent() >= 99.95f) batteryReachedFullThisSession = true;
   }
-  if (!chargingState) serviceProvisionalDischargeSegment(now);
 
   if (chargerConnected != chargingCandidate) {
     chargingCandidate = chargerConnected;
@@ -34303,6 +34345,83 @@ lv_obj_t *makeStormyDropdownRow(lv_obj_t *card, const char *name, int y, int hei
   return dropdown;
 }
 
+/*
+  The battery summary atop Settings. Since 5.91 the Settings page is built
+  once and kept for instant swipes, so a figure drawn at build time stayed
+  frozen until the menu was rebuilt by opening and closing a sub-page.
+  Remembered here and refreshed in place by serviceSettingsBatteryCard().
+*/
+struct SettingsBatteryCardUi {
+  lv_obj_t *card = nullptr;
+  lv_obj_t *percent = nullptr;
+  lv_obj_t *fill = nullptr;
+  lv_obj_t *chip = nullptr;
+  lv_obj_t *chipLabel = nullptr;
+  bool stormy = false;
+  int level = -1;
+  bool charging = false;
+};
+SettingsBatteryCardUi settingsBatteryCardUi;
+
+void settingsBatteryCardDeleted(lv_event_t *e) {
+  // A rebuild creates the new card before the old one is deleted; only forget
+  // the card that is actually going.
+  if (settingsBatteryCardUi.card == lv_event_get_target(e)) {
+    settingsBatteryCardUi = SettingsBatteryCardUi();
+  }
+}
+
+void registerSettingsBatteryCard(lv_obj_t *card, lv_obj_t *percent, lv_obj_t *fill,
+                                 lv_obj_t *chip, lv_obj_t *chipLabel, bool stormy,
+                                 float percentValue) {
+  SettingsBatteryCardUi &ui = settingsBatteryCardUi;
+  ui.card = card;
+  ui.percent = percent;
+  ui.fill = fill;
+  ui.chip = chip;
+  ui.chipLabel = chipLabel;
+  ui.stormy = stormy;
+  ui.level = percentValue < 0.0f ? -1 : (int)roundf(percentValue);
+  ui.charging = chargingState;
+  lv_obj_add_event_cb(card, settingsBatteryCardDeleted, LV_EVENT_DELETE, nullptr);
+}
+
+// force: the page has just come into view (swiped to, or the screen woke on
+// it), so read the gauge now rather than at the next 2 s check. Whatever it
+// changes marks the page's snapshot stale, and the next one is retaken.
+void serviceSettingsBatteryCard(unsigned long now, bool force = false) {
+  static unsigned long nextCheckMs = 0;
+  SettingsBatteryCardUi &ui = settingsBatteryCardUi;
+  if (!ui.card || displaySleeping || (!force && (int32_t)(now - nextCheckMs) < 0)) return;
+  nextCheckMs = now + 2000UL;
+  float percent = readBatteryPercent();
+  int level = percent < 0.0f ? -1 : (int)roundf(percent);
+  if (level == ui.level && chargingState == ui.charging) return;
+  ui.level = level;
+  ui.charging = chargingState;
+
+  if (level < 0) lv_label_set_text(ui.percent, "--%");
+  else lv_label_set_text_fmt(ui.percent, "%d%%", level);
+  int barLevel = level < 0 ? 0 : level;
+  lv_obj_set_width(ui.fill, max(6, 114 * barLevel / 100));
+  lv_label_set_text(ui.chipLabel, chargingState ? "CHARGING" : "ON BATTERY");
+  if (ui.stormy) {
+    lv_color_t chipColour = chargingState ? lvRgb(61, 214, 140) : lvRgb(90, 162, 255);
+    lv_obj_set_style_bg_color(ui.chip, chipColour, 0);
+    lv_obj_set_style_border_color(ui.chip, chipColour, 0);
+    lv_obj_set_style_text_color(ui.chipLabel, chipColour, 0);
+    lv_obj_set_style_bg_color(ui.fill, barLevel < 10 ? lvRgb(255, 77, 94)
+                                     : barLevel < 20 ? lvRgb(245, 165, 36)
+                                                     : lvRgb(61, 214, 140), 0);
+  } else {
+    const lv_color_t accent = lvRgb(0x21, 0x96, 0xF3);
+    lv_obj_set_style_bg_color(ui.chip, chargingState ? accent : lvRgb(0x50, 0x50, 0x50), 0);
+    lv_obj_set_style_bg_color(ui.fill, barLevel < 10 ? lvRgb(255, 69, 58)
+                                     : barLevel < 20 ? lvRgb(245, 165, 36)
+                                                     : accent, 0);
+  }
+}
+
 void renderSettingsHomeStormy() {
   // The page dots float over the list on a small pill here (drawDots()), so
   // the list runs to the bottom edge instead of stopping short of them.
@@ -34327,7 +34446,7 @@ void renderSettingsHomeStormy() {
   char percentText[8];
   if (percent < 0.0f) strlcpy(percentText, "--%", sizeof(percentText));
   else snprintf(percentText, sizeof(percentText), "%d%%", level);
-  makeLabel(hero, percentText, 12, 22, &lv_font_montserrat_24, textPrimary());
+  lv_obj_t *percentLabel = makeLabel(hero, percentText, 12, 22, &lv_font_montserrat_24, textPrimary());
 
   lv_color_t chipColour = chargingState ? lvRgb(61, 214, 140) : lvRgb(90, 162, 255);
   lv_obj_t *chip = lv_obj_create(hero);
@@ -34366,6 +34485,7 @@ void renderSettingsHomeStormy() {
   lv_obj_set_style_bg_color(fill, barColour, 0);
   lv_obj_set_style_bg_opa(fill, LV_OPA_COVER, 0);
   lv_obj_clear_flag(fill, LV_OBJ_FLAG_CLICKABLE);
+  registerSettingsBatteryCard(hero, percentLabel, fill, chip, chipLabel, true, percent);
 
   int y = 78;
   makeStormySection(content, "Connections", y);
@@ -34455,7 +34575,7 @@ void makeOmoteBatteryCard(int y) {
   char percentText[8];
   if (percent < 0.0f) strlcpy(percentText, "--%", sizeof(percentText));
   else snprintf(percentText, sizeof(percentText), "%d%%", level);
-  makeLabel(card, percentText, 14, 22, &lv_font_montserrat_24, textPrimary());
+  lv_obj_t *percentLabel = makeLabel(card, percentText, 14, 22, &lv_font_montserrat_24, textPrimary());
 
   lv_color_t chipColour = chargingState ? accent : grey;
   lv_obj_t *chip = lv_obj_create(card);
@@ -34491,6 +34611,7 @@ void makeOmoteBatteryCard(int y) {
   lv_obj_set_style_bg_color(fill, barColour, 0);
   lv_obj_set_style_bg_opa(fill, LV_OPA_COVER, 0);
   lv_obj_clear_flag(fill, LV_OBJ_FLAG_CLICKABLE);
+  registerSettingsBatteryCard(card, percentLabel, fill, chip, chipLabel, false, percent);
 }
 
 void renderSettingsHomeOmote() {
@@ -42348,6 +42469,7 @@ void servicePageStripChange() {
     configurePageStripDirections();
     drawDots();   // the new page may show or hide the bar
   }
+  if (pages[currentPage].kind == PAGE_REMOTE_SETTINGS) serviceSettingsBatteryCard(millis(), true);
   applyBluetoothState();
   lastWakeMs = millis();
 }
@@ -43233,6 +43355,7 @@ void enterBleConnectedIdle() {
   nextBleConnectedIdleMotionMs = millis();
   bleIdleMotionAboveSinceMs = 0;
   batteryLog("ble-idle", powerManagementReady ? "auto-light-sleep" : "80MHz");
+  pmLightSleepPercentSinceLast();   // starts the window the exit line reports
   if (powerManagementReady) {
     // Studio's first bytes must wake a light-sleeping CPU, as they already do
     // in enterLowPowerWait(). The keypad and accelerometer need no wake source
@@ -43268,7 +43391,9 @@ void enterBleConnectedIdle() {
 
 void leaveBleConnectedIdle() {
   if (!bleConnectedIdleActive) return;
-  batteryLog("ble-idle-exit");
+  char sleepDetail[16];
+  snprintf(sleepDetail, sizeof(sleepDetail), "sleep=%d%%", pmLightSleepPercentSinceLast());
+  batteryLog("ble-idle-exit", sleepDetail);
   bleIdleAccelerometerWake = false;
   bleIdleKeypadWake = false;
   if (bleIdleUartWake) esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_UART);
@@ -43569,6 +43694,7 @@ void wakeDisplay() {
   lastWakeMs = millis();
   bindPageUi(currentPage);
   refreshStatusPill();
+  serviceSettingsBatteryCard(millis(), true);
   lv_obj_invalidate(pageUi[currentPage].tile);
   lv_refr_now(nullptr);
   lcdBacklight(true);
@@ -44218,6 +44344,7 @@ void loop() {
   LOOP_TIMED("serviceNetworkPower", serviceNetworkPower(now));
   LOOP_TIMED("serviceBatteryHistory", serviceBatteryHistory(now));
   LOOP_TIMED("serviceBatteryLog", serviceBatteryLog(now));
+  serviceSettingsBatteryCard(now);
   if (!displaySleeping) LOOP_TIMED("serviceWidgets", serviceWidgets(now));
   LOOP_TIMED("serviceMediaTarget", serviceMediaTarget(now));
   LOOP_TIMED("serviceMediaRadio", serviceMediaRadio(now));
