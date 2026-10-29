@@ -1,6 +1,12 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  6.01 - 2026-10-29
+    - Battery log: "ble-link-up" / "ble-link-down" lines (detail: in
+      ble-idle, screen off or awake). With 6.00's working light sleep the
+      Chromecast dropped the link once after ~4 minutes of BLE idle, and
+      nothing recorded it; tonight's log should say whether that repeats.
+
   6.00 - 2026-10-29
     - BLE-connected idle really light-sleeps now. IRremote's receive timer
       was created at boot and only ever stopped, never deleted, and an
@@ -7607,7 +7613,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "6.00"
+#define OPENREMOTE_VERSION_STRING "6.01"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -13218,6 +13224,22 @@ int pmLightSleepPercentSinceLast() {
 #endif
 }
 
+/*
+  Bluetooth link up/down, for the battery log. The callbacks run on the BLE
+  host task, which must not touch the SD card, so they only count; loop()
+  writes the line. 6.00's first real light sleep saw the Chromecast drop the
+  link after four minutes of BLE idle with no record of it anywhere.
+*/
+volatile uint32_t bleLinkEventsForLog = 0;
+
+void serviceBluetoothLinkLog() {
+  static uint32_t logged = 0;
+  if (logged == bleLinkEventsForLog) return;
+  logged = bleLinkEventsForLog;
+  batteryLog(bleConnected ? "ble-link-up" : "ble-link-down",
+             bleConnectedIdleActive ? "in ble-idle" : displaySleeping ? "screen off" : "awake");
+}
+
 void serviceBatteryLog(unsigned long now) {
   static unsigned long nextSampleMs = 0;
   if (nextSampleMs && (int32_t)(now - nextSampleMs) < 0) return;
@@ -15125,6 +15147,7 @@ void serviceAtvvDebug(unsigned long now) {
 class OpenRemoteBleServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer *server) override {
     bleConnected = true;
+    bleLinkEventsForLog++;
     bleBonded = true;
     bleSuspended = false;
     blePairingMode = false;
@@ -15239,6 +15262,7 @@ class OpenRemoteBleServerCallbacks : public BLEServerCallbacks {
 
   void onDisconnect(BLEServer *server) override {
     bleConnected = false;
+    bleLinkEventsForLog++;
     if (realMicrophoneActive) microphoneStopPending = true;
     heldBleHidCommand = nullptr;
     heldVoiceSearchCommand = nullptr;
@@ -44373,6 +44397,7 @@ void loop() {
   LOOP_TIMED("serviceNetworkPower", serviceNetworkPower(now));
   LOOP_TIMED("serviceBatteryHistory", serviceBatteryHistory(now));
   LOOP_TIMED("serviceBatteryLog", serviceBatteryLog(now));
+  serviceBluetoothLinkLog();
   serviceSettingsBatteryCard(now);
   if (!displaySleeping) LOOP_TIMED("serviceWidgets", serviceWidgets(now));
   LOOP_TIMED("serviceMediaTarget", serviceMediaTarget(now));
