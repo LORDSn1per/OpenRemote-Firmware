@@ -1,6 +1,26 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  6.03 - 2026-10-30
+    - Power widget (WebConfig 3.46 to place it): estimated current over the
+      last 1, 5 or 10 minutes, 1, 6 or 12 hours, as a line over shading for
+      in use (orange), light sleep including BLE idle (blue) and deep sleep
+      (purple), with a green strip while charging. Slim, large and full
+      screen, and as an element of a custom widget beside any other. Shows
+      the average mA, mAh used and each state's share of time; full screen
+      adds a history-length dropdown, mA gridlines and mAh per state. The
+      drawing lives in power_widget.h, shared with tools/widget_preview,
+      which renders it on a desktop for review.
+    - The history: a point per change in PSRAM (8192), sampled every second
+      awake and every five in BLE idle - RAM only, never a wake-up - plus
+      one per logged power event; rebuilt from the last 12 hours of
+      /logs/battery.csv at boot, so a deep sleep keeps its place.
+    - The milliamps are a model (Rev 6 has no current sense): screen and
+      backlight by brightness, Wi-Fi, the BLE link, and in BLE idle the
+      power manager's own share of time asleep / at 80 / at 240 MHz.
+    - Battery widget option "percentInIcon": the level drawn inside the cell
+      on the large tile and full screen, white over a dimmed fill.
+
   6.02 - 2026-10-29
     - Battery log "sleep=NN%" is right. The power manager prints the 80 MHz
       modes' frequency as "80 M" (padded before the M), which 5.99-6.01 read
@@ -7619,7 +7639,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "6.02"
+#define OPENREMOTE_VERSION_STRING "6.03"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -7729,6 +7749,7 @@ void stopIrReceiver() {
 #include <LovyanGFX.hpp>
 #include <Arduino_GFX_Library.h>
 #include <lvgl.h>
+#include "power_widget.h"
 #include "cinema_wallpaper_rgb565.h"
 #if defined(CONFIG_NIMBLE_ENABLED)
 #include "host/ble_store.h"
@@ -8879,12 +8900,15 @@ enum WidgetKind : uint8_t {
   WIDGET_MEDIA = 0,
   WIDGET_WEATHER = 1,
   WIDGET_BATTERY = 2,
-  WIDGET_KIND_COUNT = 3,
+  // Estimated current over time (power_widget.h). Added in 6.03; kinds are
+  // only ever stored by name, so the numbers after it could move up.
+  WIDGET_POWER = 3,
+  WIDGET_KIND_COUNT = 4,
   // The time and date. Not a library widget of its own - it only appears as
   // an element of a custom widget.
-  WIDGET_CLOCK = 3,
+  WIDGET_CLOCK = 4,
   // A widget the user built; which one travels beside it as a custom index.
-  WIDGET_CUSTOM = 4
+  WIDGET_CUSTOM = 5
 };
 
 static const int WIDGET_TILE_WIDTH = 224;
@@ -8943,6 +8967,13 @@ struct WidgetSettings {
   bool mediaViaDock;
   bool mediaAutoExpand;
   bool mediaArtwork;
+
+  // The level drawn inside the battery cell, so a statistic such as "Until
+  // empty" can take the headline without losing the percentage.
+  bool batteryPercentInIcon;
+  char powerWallpaper[96];
+  char powerExpandedWallpaper[96];
+  uint8_t powerRange;   // index into POWER_RANGE_SECONDS
 };
 
 /* Defaults must match defaultWidgetSettings() in WebConfig, so a remote that
@@ -8950,7 +8981,8 @@ struct WidgetSettings {
 WidgetSettings widgetSettings = {
   false, "", "", "", 0.0f, 0.0f, false, false, true, 6,
   false, "", "", true, false, 20, 0,
-  false, "", "", false, "", "", true, true, true
+  false, "", "", false, "", "", true, true, true,
+  false, "", "", POWER_RANGE_DEFAULT
 };
 
 struct WidgetContentPanelStyle {
@@ -8988,7 +9020,10 @@ struct CustomWidget {
   // The time element puts its date first: left of the time on a slim widget,
   // above it on a large one.
   bool dateFirst;
+  // A custom power element's own history length, or POWER_RANGE_INHERIT.
+  uint8_t powerRange;
 };
+static const uint8_t POWER_RANGE_INHERIT = 0xFF;
 
 CustomWidget customWidgets[MAX_CUSTOM_WIDGETS] = {};
 uint8_t customWidgetCount = 0;
@@ -11339,6 +11374,7 @@ void scheduleRuntimeReloadAfterSync();
 const char *resetReasonText(esp_reset_reason_t reason);
 const char *wakeCauseText(esp_sleep_wakeup_cause_t cause);
 void batteryLog(const char *event, const char *detail = "");
+void powerHistoryEvent(const char *event);
 void clearPageIconCache();
 const void *cachedPageIconSource(const char *path);
 void invalidateWallpaperCacheForPath(const String &path);
@@ -13162,6 +13198,7 @@ static const size_t BATTERY_LOG_MAX_BYTES = 256UL * 1024UL;
 static const uint32_t BATTERY_LOG_SAMPLE_MS = 10UL * 60UL * 1000UL;
 
 void batteryLog(const char *event, const char *detail) {
+  powerHistoryEvent(event);
   if (!sdReady) return;
   float percent = readBatteryPercent();
   float voltage = readBatteryVoltage();
@@ -13188,51 +13225,272 @@ void batteryLog(const char *event, const char *detail) {
 }
 
 /*
-  Share of the time since the previous call that the CPU spent light-sleeping,
-  from the power manager's profiling counters (cumulative since boot, so the
-  difference is taken here). -1 without CONFIG_PM_PROFILING. This is what says
-  whether a BLE-idle drain is the CPU failing to sleep or something drawing
-  current while it does - the gauge cannot tell the two apart.
+  Cumulative time in each power-manager mode since boot, from its profiling
+  counters. False without CONFIG_PM_PROFILING. This is what says whether a
+  BLE-idle drain is the CPU failing to sleep or something drawing current
+  while it does - the gauge cannot tell the two apart.
 */
-int pmLightSleepPercentSinceLast() {
+bool readPmModeTimes(uint64_t &sleepUs, uint64_t &cpuMaxUs, uint64_t &totalUs) {
 #if CONFIG_PM_PROFILING
   static char dump[1536];
-  static uint64_t lastSleepUs = 0;
-  static uint64_t lastTotalUs = 0;
   FILE *stream = fmemopen(dump, sizeof(dump) - 1, "w");
-  if (!stream) return -1;
+  if (!stream) return false;
   esp_pm_dump_locks(stream);
   long used = ftell(stream);
   fclose(stream);
   dump[used > 0 && used < (long)sizeof(dump) ? used : sizeof(dump) - 1] = 0;
 
-  uint64_t sleepUs = 0;
-  uint64_t totalUs = 0;
+  sleepUs = cpuMaxUs = totalUs = 0;
   for (char *line = strtok(dump, "\n"); line; line = strtok(nullptr, "\n")) {
     char mode[16];
     if (sscanf(line, "%15s", mode) != 1) continue;
     bool sleep = strcmp(mode, "SLEEP") == 0;
-    if (!sleep && strcmp(mode, "APB_MIN") && strcmp(mode, "APB_MAX") &&
-        strcmp(mode, "CPU_MAX")) continue;
+    bool cpuMax = strcmp(mode, "CPU_MAX") == 0;
+    if (!sleep && !cpuMax && strcmp(mode, "APB_MIN") && strcmp(mode, "APB_MAX")) continue;
     // The frequency column is "80 M" or "240M" - padded before the M, so it
     // is one token or two. The time follows the M either way. (6.00 read it
     // as one token, skipped every 80 MHz row and always logged sleep=0%.)
     const char *freqUnit = strchr(line + strlen(mode), 'M');
     if (!freqUnit) continue;
-    long long timeUs = strtoll(freqUnit + 1, nullptr, 10);
-    totalUs += (uint64_t)timeUs;
-    if (sleep) sleepUs += (uint64_t)timeUs;
+    uint64_t timeUs = (uint64_t)strtoll(freqUnit + 1, nullptr, 10);
+    totalUs += timeUs;
+    if (sleep) sleepUs += timeUs;
+    if (cpuMax) cpuMaxUs += timeUs;
   }
-  int percent = -1;
-  if (totalUs > lastTotalUs && sleepUs >= lastSleepUs) {
-    percent = (int)((sleepUs - lastSleepUs) * 100ULL / (totalUs - lastTotalUs));
-  }
-  lastSleepUs = sleepUs;
-  lastTotalUs = totalUs;
-  return percent;
+  return totalUs > 0;
 #else
-  return -1;
+  (void)sleepUs; (void)cpuMaxUs; (void)totalUs;
+  return false;
 #endif
+}
+
+// A window over those counters: each reader keeps its own and gets the
+// shares of the time since it last looked.
+struct PmWindow {
+  uint64_t sleepUs;
+  uint64_t cpuMaxUs;
+  uint64_t totalUs;
+};
+
+bool pmWindowShares(PmWindow &window, float &sleepShare, float &cpuMaxShare) {
+  uint64_t sleepUs, cpuMaxUs, totalUs;
+  if (!readPmModeTimes(sleepUs, cpuMaxUs, totalUs)) return false;
+  bool valid = window.totalUs && totalUs > window.totalUs &&
+               sleepUs >= window.sleepUs && cpuMaxUs >= window.cpuMaxUs;
+  if (valid) {
+    double span = (double)(totalUs - window.totalUs);
+    sleepShare = (float)((sleepUs - window.sleepUs) / span);
+    cpuMaxShare = (float)((cpuMaxUs - window.cpuMaxUs) / span);
+  }
+  window = {sleepUs, cpuMaxUs, totalUs};
+  return valid;
+}
+
+// The battery log's "sleep=NN%": the share since the previous call, or -1.
+int pmLightSleepPercentSinceLast() {
+  static PmWindow window = {};
+  float sleepShare = 0.0f, cpuMaxShare = 0.0f;
+  if (!pmWindowShares(window, sleepShare, cpuMaxShare)) return -1;
+  return (int)lroundf(sleepShare * 100.0f);
+}
+
+/* ------------------------------------------------------- power history *
+   What the Power widget draws (power_widget.h): estimated current and the
+   power state, one point per change, in PSRAM. Points are taken every
+   second while awake and every five in BLE idle - plain RAM writes, never
+   the SD card and never a wake-up - and at every logged power event. A
+   deep sleep wipes RAM, so boot rebuilds the last 12 hours from
+   /logs/battery.csv (seedPowerHistoryFromLog()).
+
+   The milliamps are a model, not a measurement: Rev 6 has no current sense.
+   The figures below are rounded datasheet values checked against what the
+   battery log showed (about 1.5 %/h, ~30 mA, in BLE idle with the CPU never
+   sleeping; 6-13 %/h with the screen and Wi-Fi on).
+ * ---------------------------------------------------------------------- */
+static const float POWER_MA_AWAKE_BASE = 50.0f;      // 240 MHz, LCD controller, touch, SD idle
+static const float POWER_MA_BACKLIGHT_FULL = 85.0f;  // both backlights at 100%
+static const float POWER_MA_SCREEN_OFF_AWAKE = 42.0f;
+static const float POWER_MA_WIFI = 70.0f;
+static const float POWER_MA_BLE_LINK = 2.0f;
+static const float POWER_MA_CPU_MAX = 45.0f;         // BLE idle time held at 240 MHz
+static const float POWER_MA_CPU_80 = 20.0f;          // ... at 80 MHz, awake
+static const float POWER_MA_LIGHT_SLEEP = 1.8f;      // CPU stopped, XTAL kept up for BLE
+static const float POWER_MA_DEEP_SLEEP = 0.25f;
+static const float POWER_MA_BLE_IDLE_GUESS = 6.0f;   // until the first 5 s window
+
+static const uint32_t POWER_HISTORY_CAPACITY = 8192;
+PowerPoint *powerHistory = nullptr;
+uint32_t powerHistoryStart = 0;   // index of the oldest point
+uint32_t powerHistoryCount = 0;
+
+// The log is read into the history once, on the first point with a trusted
+// clock - at boot after a deep sleep, or once NTP lands after a cold start.
+bool powerHistorySeeded = false;
+void seedPowerHistoryFromLog();
+
+float bleIdleEstimateMa(float sleepShare, float cpuMaxShare) {
+  float awake80 = 1.0f - sleepShare - cpuMaxShare;
+  if (awake80 < 0.0f) awake80 = 0.0f;
+  return sleepShare * POWER_MA_LIGHT_SLEEP + cpuMaxShare * POWER_MA_CPU_MAX +
+         awake80 * POWER_MA_CPU_80 + POWER_MA_BLE_LINK;
+}
+
+float awakeEstimateMa() {
+  float mA = displaySleeping ? POWER_MA_SCREEN_OFF_AWAKE
+    : POWER_MA_AWAKE_BASE + POWER_MA_BACKLIGHT_FULL * brightness / 100.0f;
+  if (WiFi.getMode() != WIFI_OFF) mA += POWER_MA_WIFI;
+  if (bleConnected) mA += POWER_MA_BLE_LINK;
+  return mA;
+}
+
+void appendPowerPoint(uint32_t t, float mA, uint8_t category, bool charging) {
+  if (!t || category >= POWER_CAT_COUNT) return;
+  if (!powerHistorySeeded) {
+    powerHistorySeeded = true;   // first: seeding appends through here too
+    seedPowerHistoryFromLog();
+  }
+  if (!powerHistory) {
+    powerHistory = (PowerPoint *)ps_malloc(POWER_HISTORY_CAPACITY * sizeof(PowerPoint));
+    if (!powerHistory) return;
+  }
+  uint16_t mA10 = (uint16_t)constrain(lroundf(mA * 10.0f), 1L, 65000L);
+  if (powerHistoryCount) {
+    PowerPoint &last = powerHistory[(powerHistoryStart + powerHistoryCount - 1) %
+                                    POWER_HISTORY_CAPACITY];
+    // A clock stepping backwards would fold the history over itself; hold
+    // the new point at the last time instead.
+    if (t < last.t) t = last.t;
+    // Nothing worth a point: same state, within 3% (or 0.2 mA).
+    if (last.category == category && last.charging == (uint8_t)charging &&
+        abs((int)mA10 - (int)last.mA10) <= max(2, (int)last.mA10 * 3 / 100)) return;
+    if (t == last.t) {
+      last = {t, mA10, category, (uint8_t)charging};
+      return;
+    }
+  }
+  if (powerHistoryCount == POWER_HISTORY_CAPACITY) {
+    powerHistoryStart = (powerHistoryStart + 1) % POWER_HISTORY_CAPACITY;
+    powerHistoryCount--;
+  }
+  powerHistory[(powerHistoryStart + powerHistoryCount) % POWER_HISTORY_CAPACITY] =
+    {t, mA10, category, (uint8_t)charging};
+  powerHistoryCount++;
+}
+
+bool powerHistoryAt(uint32_t index, PowerPoint &out) {
+  if (!powerHistory || index >= powerHistoryCount) return false;
+  out = powerHistory[(powerHistoryStart + index) % POWER_HISTORY_CAPACITY];
+  return true;
+}
+
+PowerSeries firmwarePowerSeries() {
+  return PowerSeries{powerHistoryCount, powerHistoryAt, batteryClockEpoch()};
+}
+
+float lastBleIdleEstimateMa = POWER_MA_BLE_IDLE_GUESS;
+
+// A logged power event, as a point. Called by batteryLog() for every event.
+void powerHistoryEvent(const char *event) {
+  uint32_t t = batteryClockEpoch();
+  if (!t) return;
+  if (strcmp(event, "deep-sleep") == 0) {
+    appendPowerPoint(t, POWER_MA_DEEP_SLEEP, POWER_CAT_DEEP, chargingState);
+  } else if (strcmp(event, "light-sleep") == 0) {
+    appendPowerPoint(t, POWER_MA_LIGHT_SLEEP, POWER_CAT_LIGHT, chargingState);
+  } else if (strcmp(event, "ble-idle") == 0) {
+    appendPowerPoint(t, lastBleIdleEstimateMa, POWER_CAT_LIGHT, chargingState);
+  } else if (strcmp(event, "sample") != 0) {
+    appendPowerPoint(t, awakeEstimateMa(), POWER_CAT_IN_USE, chargingState);
+  }
+}
+
+void servicePowerHistory(unsigned long now) {
+  static unsigned long nextMs = 0;
+  static PmWindow window = {};
+  if ((int32_t)(now - nextMs) < 0) return;
+  uint32_t t = batteryClockEpoch();
+  if (bleConnectedIdleActive) {
+    nextMs = now + 5000UL;
+    float sleepShare, cpuMaxShare;
+    if (pmWindowShares(window, sleepShare, cpuMaxShare)) {
+      lastBleIdleEstimateMa = bleIdleEstimateMa(sleepShare, cpuMaxShare);
+    }
+    appendPowerPoint(t, lastBleIdleEstimateMa, POWER_CAT_LIGHT, chargingState);
+  } else {
+    nextMs = now + 1000UL;
+    window.totalUs = 0;   // the next BLE-idle window starts fresh
+    appendPowerPoint(t, awakeEstimateMa(), POWER_CAT_IN_USE, chargingState);
+  }
+}
+
+/*
+  Rebuilds up to 12 hours from the battery log after a reboot or deep sleep.
+  Only the tail is read (64 KB is well over a busy day's events); every line
+  becomes a point in the state its event leaves the remote in.
+*/
+void seedPowerHistoryFromLog() {
+  uint32_t now = batteryClockEpoch();
+  if (!sdReady || !now) return;
+  File log = SD.open(BATTERY_LOG_PATH, FILE_READ);
+  if (!log) return;
+  const uint32_t tail = 64UL * 1024UL;
+  if (log.size() > tail) {
+    log.seek(log.size() - tail);
+    log.readStringUntil('\n');   // a partial line
+  }
+  uint32_t since = now - POWER_RANGE_SECONDS[POWER_RANGE_COUNT - 1];
+  uint8_t category = POWER_CAT_IN_USE;
+  float mA = POWER_MA_AWAKE_BASE;
+  uint32_t seeded = 0;
+  char line[192];
+  while (log.available()) {
+    size_t length = log.readBytesUntil('\n', line, sizeof(line) - 1);
+    line[length] = 0;
+    // epoch,uptime_s,event,percent,millivolts,rate_pct_per_h,charging,detail
+    char *fields[8] = {};
+    uint8_t count = 0;
+    for (char *p = line; count < 8; ) {
+      fields[count++] = p;
+      char *comma = strchr(p, ',');
+      if (!comma) break;
+      *comma = 0;
+      p = comma + 1;
+    }
+    if (count < 7) continue;
+    uint32_t t = strtoul(fields[0], nullptr, 10);
+    if (!t || t < since || t > now) continue;
+    const char *event = fields[2];
+    bool charging = fields[6][0] == '1';
+    const char *detail = count > 7 ? fields[7] : "";
+    if (strcmp(event, "deep-sleep") == 0) { category = POWER_CAT_DEEP; mA = POWER_MA_DEEP_SLEEP; }
+    else if (strcmp(event, "light-sleep") == 0) { category = POWER_CAT_LIGHT; mA = POWER_MA_LIGHT_SLEEP; }
+    else if (strcmp(event, "ble-idle") == 0) { category = POWER_CAT_LIGHT; mA = POWER_MA_BLE_IDLE_GUESS; }
+    else if (strcmp(event, "screen-off") == 0) { category = POWER_CAT_IN_USE; mA = POWER_MA_SCREEN_OFF_AWAKE; }
+    else if (strcmp(event, "sample") == 0) {
+      const char *share = strstr(detail, "sleep=");
+      if (strncmp(detail, "ble-idle", 8) == 0) {
+        category = POWER_CAT_LIGHT;
+        int percent = share ? atoi(share + 6) : -1;
+        // The log keeps only the sleep share, so time not asleep is taken as
+        // the 80 MHz/240 MHz mix 5.99's PM report showed.
+        if (percent >= 0) mA = bleIdleEstimateMa(percent / 100.0f, (1.0f - percent / 100.0f) * 0.5f);
+      } else if (strcmp(detail, "screen-off") == 0) {
+        category = POWER_CAT_IN_USE; mA = POWER_MA_SCREEN_OFF_AWAKE;
+      } else {
+        category = POWER_CAT_IN_USE;
+        mA = POWER_MA_AWAKE_BASE + POWER_MA_BACKLIGHT_FULL * brightness / 100.0f;
+      }
+    } else if (strcmp(event, "ble-idle-exit") == 0 || strcmp(event, "screen-on") == 0 ||
+               strcmp(event, "boot") == 0 || strcmp(event, "light-wake") == 0) {
+      category = POWER_CAT_IN_USE;
+      mA = POWER_MA_AWAKE_BASE + POWER_MA_BACKLIGHT_FULL * brightness / 100.0f;
+    }
+    // Other events (charger, Bluetooth link) keep the state and update charging.
+    appendPowerPoint(t, mA, category, charging);
+    seeded++;
+  }
+  log.close();
+  Serial.printf("Power history: %lu points from the battery log\n", (unsigned long)seeded);
 }
 
 /*
@@ -19243,7 +19501,18 @@ uint8_t widgetKindFromName(const char *name) {
   if (!name) return WIDGET_MEDIA;
   if (strcmp(name, "weather") == 0) return WIDGET_WEATHER;
   if (strcmp(name, "battery") == 0) return WIDGET_BATTERY;
+  if (strcmp(name, "power") == 0) return WIDGET_POWER;
   return WIDGET_MEDIA;
+}
+
+// WebConfig's names for the power history lengths.
+uint8_t powerRangeFromName(const char *name, uint8_t fallback) {
+  static const char *const names[POWER_RANGE_COUNT] = {"1m", "5m", "10m", "60m", "6h", "12h"};
+  if (!name) return fallback;
+  for (uint8_t i = 0; i < POWER_RANGE_COUNT; i++) {
+    if (strcmp(name, names[i]) == 0) return i;
+  }
+  return fallback;
 }
 
 uint8_t batteryStatisticFromName(const char *name) {
@@ -19261,6 +19530,7 @@ uint8_t batteryStatisticFromName(const char *name) {
 const char *widgetKindName(uint8_t kind) {
   if (kind == WIDGET_WEATHER) return "weather";
   if (kind == WIDGET_BATTERY) return "battery";
+  if (kind == WIDGET_POWER) return "power";
   return "media";
 }
 
@@ -19271,6 +19541,7 @@ uint8_t widgetElementFromName(const char *name) {
   if (strcmp(name, "weather") == 0) return WIDGET_WEATHER;
   if (strcmp(name, "battery") == 0) return WIDGET_BATTERY;
   if (strcmp(name, "media") == 0) return WIDGET_MEDIA;
+  if (strcmp(name, "power") == 0) return WIDGET_POWER;
   return 0xFF;
 }
 
@@ -19369,6 +19640,7 @@ void applyCustomWidgetsJson(JsonArrayConst rows, JsonArrayConst wallpapers) {
     widget.mediaTakeover = row["mediaTakeover"] | false;
     widget.dateFirst = row["dateFirst"] | false;
     widget.batteryStatistic = batteryStatisticFromName(row["batteryStatistic"] | "");
+    widget.powerRange = powerRangeFromName(row["powerRange"] | "", POWER_RANGE_INHERIT);
     strlcpy(widget.id, id, sizeof(widget.id));
     copyDisplayTextAscii(row["name"] | "Widget", widget.name, sizeof(widget.name));
     resolveWidgetWallpaperPaths(row["background"] | "theme", wallpapers,
@@ -19432,6 +19704,16 @@ void applyWidgetSettingsJson(JsonObjectConst widgets, JsonArrayConst wallpapers)
     widgetSettings.batteryWarnBelow =
       (uint8_t)constrain((int)(battery["warnBelow"] | 20), 5, 50);
     widgetSettings.batteryStatistic = batteryStatisticFromName(battery["statistic"] | "");
+    widgetSettings.batteryPercentInIcon = battery["percentInIcon"] | false;
+  }
+
+  JsonObjectConst power = widgets["power"].as<JsonObjectConst>();
+  if (!power.isNull()) {
+    resolveWidgetWallpaperPaths(power["background"] | "theme", wallpapers,
+      widgetSettings.powerWallpaper, sizeof(widgetSettings.powerWallpaper),
+      widgetSettings.powerExpandedWallpaper, sizeof(widgetSettings.powerExpandedWallpaper),
+      widgetContentPanels[WIDGET_POWER]);
+    widgetSettings.powerRange = powerRangeFromName(power["range"] | "", POWER_RANGE_DEFAULT);
   }
 
   JsonObjectConst media = widgets["media"].as<JsonObjectConst>();
@@ -23467,8 +23749,8 @@ bool convertWebBackupToRuntime(JsonDocument &backup, String &error) {
         JsonObject target = runtimeCustomWidgets.add<JsonObject>();
         target.set(row);
         target.remove("kind");
-      } else if (strcmp(kind, "weather") == 0 ||
-                 strcmp(kind, "battery") == 0 || strcmp(kind, "media") == 0) {
+      } else if (strcmp(kind, "weather") == 0 || strcmp(kind, "battery") == 0 ||
+                 strcmp(kind, "media") == 0 || strcmp(kind, "power") == 0) {
         JsonObject target = runtimeWidgets[kind].to<JsonObject>();
         target.set(row);
         target.remove("kind");
@@ -23879,7 +24161,7 @@ bool createLcdFullBackup(String &createdName, String &error) {
   data["themes"].set(runtime["themes"]);
   JsonArray widgetRows = data["widgets"].to<JsonArray>();
   JsonObjectConst runtimeWidgets = runtime["widgets"].as<JsonObjectConst>();
-  const char *widgetKinds[] = {"weather", "battery", "media"};
+  const char *widgetKinds[] = {"weather", "battery", "media", "power"};
   for (const char *kind : widgetKinds) {
     JsonObject row = widgetRows.add<JsonObject>();
     row.set(runtimeWidgets[kind]);
@@ -38892,6 +39174,8 @@ struct WidgetInstance {
   // The statistic selected for this particular Battery face/cell. Custom
   // widgets can override the Battery library widget without changing it.
   uint8_t batteryStatistic;
+  lv_obj_t *iconPercent;   // the level inside the battery cell, when enabled
+  PowerWidgetUi *power;    // a power face's graph and labels
 };
 
 // A page of custom widgets holds up to three live elements per widget, plus a
@@ -39032,6 +39316,10 @@ const char *widgetWallpaperPath(uint8_t kind, bool expanded) {
   if (kind == WIDGET_BATTERY) {
     return expanded ? widgetSettings.batteryExpandedWallpaper
                     : widgetSettings.batteryWallpaper;
+  }
+  if (kind == WIDGET_POWER) {
+    return expanded ? widgetSettings.powerExpandedWallpaper
+                    : widgetSettings.powerWallpaper;
   }
   return expanded ? widgetSettings.mediaExpandedWallpaper
                   : widgetSettings.mediaWallpaper;
@@ -39718,6 +40006,16 @@ void buildWidgetBatteryFace(WidgetInstance &instance, lv_obj_t *parent,
   lv_obj_set_style_bg_opa(instance.fill, LV_OPA_COVER, 0);
   lv_obj_clear_flag(instance.fill, LV_OBJ_FLAG_CLICKABLE);
   instance.fillTrackWidth = innerWidth;
+  if (widgetSettings.batteryPercentInIcon && percent >= 0.0f) {
+    // White over a dimmed fill reads across both the filled and the empty
+    // part of the cell (approved from the 6.03 design screenshots).
+    lv_obj_set_style_bg_opa(instance.fill, (lv_opa_t)150, 0);
+    char inside[8];
+    snprintf(inside, sizeof(inside), "%d%%", level);
+    instance.iconPercent = makeLabel(cell, inside, 0, 0,
+      expanded ? &lv_font_montserrat_24 : &lv_font_montserrat_14, textPrimary());
+    lv_obj_center(instance.iconPercent);
+  }
 
   // The nub on the end of the cell, drawn as its own object so the outline
   // above stays a plain rounded rectangle.
@@ -39818,6 +40116,17 @@ enum WidgetCellStyle : uint8_t {
 // Whether the widget being built puts its date before its time. Set by
 // buildWidgetContents() for the one widget it is building.
 bool widgetBuildDateFirst = false;
+// And the power history length it starts on.
+uint8_t widgetBuildPowerRange = POWER_RANGE_DEFAULT;
+
+uint8_t resolvedPowerRange(uint8_t kind, uint8_t custom) {
+  if (kind == WIDGET_CUSTOM && custom < customWidgetCount &&
+      customWidgets[custom].powerRange < POWER_RANGE_COUNT) {
+    return customWidgets[custom].powerRange;
+  }
+  return widgetSettings.powerRange < POWER_RANGE_COUNT ? widgetSettings.powerRange
+                                                       : POWER_RANGE_DEFAULT;
+}
 
 void initWidgetInstance(WidgetInstance &instance, lv_obj_t *parent, uint8_t kind,
                         int width, int height, bool expanded) {
@@ -40036,6 +40345,17 @@ void buildWidgetCell(WidgetInstance &instance, lv_obj_t *cell, uint8_t element,
         textWidth, LV_TEXT_ALIGN_CENTER);
       if (widgetBuildDateFirst) lv_obj_move_to_index(instance.secondary, 0);
     }
+    return;
+  }
+
+  if (element == WIDGET_POWER) {
+    // Laid out absolutely by power_widget.h, edge to edge in its cell.
+    lv_obj_set_style_pad_all(cell, 0, 0);
+    uint8_t layout = style == CELL_COLUMN ? POWER_LAYOUT_COLUMN
+                   : style == CELL_SLIM ? POWER_LAYOUT_SLIM_CELL
+                   : style == CELL_SLIM_SINGLE ? POWER_LAYOUT_SLIM
+                   : POWER_LAYOUT_ROW;
+    instance.power = buildPowerWidget(cell, width, height, layout, widgetBuildPowerRange);
     return;
   }
 
@@ -40567,6 +40887,7 @@ uint8_t buildWidgetContents(lv_obj_t *card, uint8_t kind, uint8_t custom, int wi
 
   widgetBuildDateFirst = kind == WIDGET_CUSTOM && custom < customWidgetCount &&
                          customWidgets[custom].dateFirst;
+  widgetBuildPowerRange = resolvedPowerRange(kind, custom);
   uint8_t batteryStatistic = resolvedBatteryStatistic(kind, custom);
   uint8_t animated = buildAnimatedWidgetContents(card, kind, custom, width, height,
                                                  expanded, slim, instances, capacity);
@@ -40615,6 +40936,10 @@ void buildWidgetFace(WidgetInstance &instance, lv_obj_t *parent, uint8_t kind,
     buildWidgetBatteryFace(instance, parent, width, height, expanded, batteryStatistic);
   }
   else if (kind == WIDGET_CLOCK) buildWidgetClockFace(instance, parent, width, height, expanded);
+  else if (kind == WIDGET_POWER) {
+    instance.power = buildPowerWidget(parent, width, height,
+      expanded ? POWER_LAYOUT_FULL : POWER_LAYOUT_LARGE, widgetBuildPowerRange);
+  }
   else buildWidgetMediaFace(instance, parent, width, height, expanded);
 }
 
@@ -40626,6 +40951,18 @@ void buildWidgetFace(WidgetInstance &instance, lv_obj_t *parent, uint8_t kind,
 */
 void refreshWidgetInstance(WidgetInstance &instance) {
   if (!instance.card || !lv_obj_is_valid(instance.card)) return;
+
+  if (instance.kind == WIDGET_POWER) {
+    // Short ranges move every second; hours of history every five.
+    PowerWidgetUi *ui = instance.power;
+    if (!ui) return;
+    uint32_t now = millis();
+    uint32_t every = ui->model.range <= 2 ? 1000UL : 5000UL;
+    if (ui->refreshedMs && now - ui->refreshedMs < every) return;
+    ui->refreshedMs = now;
+    refreshPowerWidget(ui);
+    return;
+  }
 
   if (instance.kind == WIDGET_CLOCK) {
     char timeText[8];
@@ -40649,6 +40986,11 @@ void refreshWidgetInstance(WidgetInstance &instance) {
       lv_obj_set_width(instance.fill, (instance.fillTrackWidth * level) / 100);
       lv_obj_set_style_bg_color(instance.fill,
         low ? lvRgb(255, 69, 58) : lvRgb(48, 209, 88), 0);
+    }
+    if (instance.iconPercent && lv_obj_is_valid(instance.iconPercent)) {
+      char inside[8];
+      snprintf(inside, sizeof(inside), "%d%%", level);
+      setWidgetLabelText(instance.iconPercent, inside);
     }
     // The glyph above always follows the level, whichever statistic is
     // chosen - a single statistic replaces only the text.
@@ -44184,6 +44526,7 @@ void setup() {
   // from it with a clock that was real when the remote went to sleep.
   wallClockTrusted = rtcWallClockTrusted && time(nullptr) >= 1700000000;
   applyClockMode();
+  powerSeriesSource = firmwarePowerSeries;
   {
     char detail[64];
     snprintf(detail, sizeof(detail), "reset=%s wake=%s",
@@ -44408,6 +44751,7 @@ void loop() {
   LOOP_TIMED("serviceNetworkPower", serviceNetworkPower(now));
   LOOP_TIMED("serviceBatteryHistory", serviceBatteryHistory(now));
   LOOP_TIMED("serviceBatteryLog", serviceBatteryLog(now));
+  servicePowerHistory(now);
   serviceBluetoothLinkLog();
   serviceSettingsBatteryCard(now);
   if (!displaySleeping) LOOP_TIMED("serviceWidgets", serviceWidgets(now));
