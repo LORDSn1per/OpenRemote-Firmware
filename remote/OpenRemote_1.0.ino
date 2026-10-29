@@ -1,6 +1,12 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  6.02 - 2026-10-29
+    - Battery log "sleep=NN%" is right. The power manager prints the 80 MHz
+      modes' frequency as "80 M" (padded before the M), which 5.99-6.01 read
+      as one token, so SLEEP and APB rows never parsed and every line said
+      sleep=0% - even on 6.00, where serial showed ~88% light sleep.
+
   6.01 - 2026-10-29
     - Battery log: "ble-link-up" / "ble-link-down" lines (detail: in
       ble-idle, screen off or awake). With 6.00's working light sleep the
@@ -7613,7 +7619,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "6.01"
+#define OPENREMOTE_VERSION_STRING "6.02"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -13204,11 +13210,16 @@ int pmLightSleepPercentSinceLast() {
   uint64_t totalUs = 0;
   for (char *line = strtok(dump, "\n"); line; line = strtok(nullptr, "\n")) {
     char mode[16];
-    long long timeUs = 0;
-    if (sscanf(line, "%15s %*s %lld", mode, &timeUs) != 2) continue;
+    if (sscanf(line, "%15s", mode) != 1) continue;
     bool sleep = strcmp(mode, "SLEEP") == 0;
     if (!sleep && strcmp(mode, "APB_MIN") && strcmp(mode, "APB_MAX") &&
         strcmp(mode, "CPU_MAX")) continue;
+    // The frequency column is "80 M" or "240M" - padded before the M, so it
+    // is one token or two. The time follows the M either way. (6.00 read it
+    // as one token, skipped every 80 MHz row and always logged sleep=0%.)
+    const char *freqUnit = strchr(line + strlen(mode), 'M');
+    if (!freqUnit) continue;
+    long long timeUs = strtoll(freqUnit + 1, nullptr, 10);
     totalUs += (uint64_t)timeUs;
     if (sleep) sleepUs += (uint64_t)timeUs;
   }
