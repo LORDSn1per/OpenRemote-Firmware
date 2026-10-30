@@ -597,19 +597,20 @@ static PowerWidgetUi *buildPowerWidget(lv_obj_t *parent, int width, int height,
   const lv_color_t white = lv_color_white();
 
   if (layout == POWER_LAYOUT_SLIM) {
-    ui->value = powerLabel(parent, "--", 10, 5, &lv_font_montserrat_16, white, 56);
-    ui->detail = powerLabel(parent, "", 10, 25, &lv_font_montserrat_10, powerMuted(), 56);
+    ui->value = powerLabel(parent, "--", 10, 5, &lv_font_montserrat_16, white, 70);
+    ui->detail = powerLabel(parent, "", 10, 25, &lv_font_montserrat_10, powerMuted(), 70);
     ui->model.lineWidth = 1;
-    makePowerGraph(ui, parent, 70, 6, width - 70 - 8, height - 12);
+    makePowerGraph(ui, parent, 84, 6, width - 84 - 8, height - 12);
   } else if (layout == POWER_LAYOUT_LARGE || layout == POWER_LAYOUT_ROW) {
     int pad = layout == POWER_LAYOUT_ROW ? 14 : 9;
     bool tall = height >= 110;
+    // Room for "9,240 mAh" at full size; the small lines take the rest.
     ui->value = powerLabel(parent, "--", pad, 5, tall ? &lv_font_montserrat_20 : &lv_font_montserrat_16,
-                           white, tall ? 78 : 62);
+                           white, tall ? 110 : 96);
     // Right of the headline, two small lines: charge and range, then the
     // battery level where the graph starts and where it ends (6.10).
     // From just past the headline ("107 mA") to the right edge.
-    int linesX = pad + (tall ? 80 : 64);
+    int linesX = pad + (tall ? 112 : 98);
     ui->detail = powerLabel(parent, "", linesX, tall ? 6 : 4, &lv_font_montserrat_10,
                             powerMuted(), width - pad - linesX, LV_TEXT_ALIGN_RIGHT);
     ui->levels = powerLabel(parent, "", linesX, tall ? 19 : 16, &lv_font_montserrat_10,
@@ -725,22 +726,29 @@ static void refreshPowerWidget(PowerWidgetUi *ui) {
       if (ui->shareMahLabel[c]) setPowerLabelFitted(ui->shareMahLabel[c], part, POWER_SMALL_FONTS, 1);
     }
   } else {
-    snprintf(text, sizeof(text), "%s mA", ma);
+    // Off full screen the headline is the charge used over the range
+    // (6.11, Phillip); the average current moves to the small line.
     if (ui->value) {
       const lv_font_t *fonts[7];
       uint8_t count = powerFontsFrom(ui->valueFont, fonts);
-      if (count) setPowerLabelFitted(ui->value, text, fonts, count);
-      else lv_label_set_text(ui->value, text);
+      if (count) setPowerLabelFitted(ui->value, mah, fonts, count);
+      else lv_label_set_text(ui->value, mah);
     }
     if (ui->detail) {
-      if (ui->layout == POWER_LAYOUT_SLIM) snprintf(text, sizeof(text), "avg %s", range);
-      else if (ui->layout == POWER_LAYOUT_COLUMN) snprintf(text, sizeof(text), "avg \xE2\x80\xA2 %s", range);
-      else snprintf(text, sizeof(text), "%s \xE2\x80\xA2 %s", mah, range);
-      // The charge is never shortened: if charge and range will not both fit,
-      // the range goes (the full-screen view still names it).
+      if (ui->layout == POWER_LAYOUT_SLIM || ui->layout == POWER_LAYOUT_COLUMN) {
+        snprintf(text, sizeof(text), "in %s", range);
+      } else {
+        snprintf(text, sizeof(text), "%s mA avg \xE2\x80\xA2 %s", ma, range);
+      }
+      // Never cut short: a line that will not fit at 10 pt loses "avg" first,
+      // then the range.
       if (!setPowerLabelFitted(ui->detail, text, POWER_SMALL_FONTS, 1) &&
           ui->layout != POWER_LAYOUT_SLIM && ui->layout != POWER_LAYOUT_COLUMN) {
-        setPowerLabelFitted(ui->detail, mah, POWER_SMALL_FONTS, 1);
+        snprintf(text, sizeof(text), "%s mA \xE2\x80\xA2 %s", ma, range);
+        if (!setPowerLabelFitted(ui->detail, text, POWER_SMALL_FONTS, 1)) {
+          snprintf(text, sizeof(text), "%s mA avg", ma);
+          setPowerLabelFitted(ui->detail, text, POWER_SMALL_FONTS, 1);
+        }
       }
     }
     if (ui->levels) {

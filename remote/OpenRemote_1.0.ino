@@ -1,6 +1,14 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  6.11 - 2026-10-30
+    - Power widget off full screen: the headline is the charge used over the
+      range ("29 mAh") rather than the average current. The large tile's
+      small line reads "29 mA avg • 1 hour" (losing "avg", then the range,
+      before ever being cut short); the slim tile and custom-widget cells say
+      "in 1 hour". The headline has room for "9,240 mAh" at full size.
+      Full screen is unchanged.
+
   6.10 - 2026-10-30
     - The brightness panel opens above a full-screen widget. It was built on
       the page's own root, and the full-screen widget is a later child of
@@ -7709,7 +7717,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "6.10"
+#define OPENREMOTE_VERSION_STRING "6.11"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
