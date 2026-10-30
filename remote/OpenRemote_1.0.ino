@@ -1,6 +1,23 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  6.10 - 2026-10-30
+    - The brightness panel opens above a full-screen widget. It was built on
+      the page's own root, and the full-screen widget is a later child of
+      uiRoot drawn over every page, so it covered the panel; the panel is
+      on uiRoot now.
+    - Power widget: the battery level where the graph starts and where it
+      ends - in full screen beside "-1 h" and "now", on the large tile as a
+      second line under the mAh. History points carry the level (packed into
+      the same 8 bytes), a new point is kept whenever it moves a whole
+      percent, the start is interpolated between the points around it, and
+      the end is the gauge now. Rebuilt histories take it from the log.
+    - Charge figures are never cut short: "2,340 mAh" up to 9,999 mAh, then
+      "10.34 Ah" (6.05's "1.40 Ah" from 1000 mAh is gone), and the
+      full-screen figures and tile headlines step down a font size when a
+      number would not fit - a week read "35..." on the large tile. If the
+      large tile cannot fit the charge and the range, it drops the range.
+
   6.09 - 2026-10-30
     - Power graph colours are drawn solid under the line. At 65% opacity the
       widget's wallpaper showed through and shifted every chosen colour (an
@@ -7692,7 +7709,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "6.09"
+#define OPENREMOTE_VERSION_STRING "6.10"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -13394,7 +13411,7 @@ PowerRing powerHistory = {};
 // Appends with the history's rules: a point only on a change, time never
 // running backwards. False if the ring could not be allocated.
 bool pushPowerPoint(PowerRing &ring, uint32_t t, uint16_t mA10, uint8_t category,
-                    uint8_t charging) {
+                    uint8_t charging, uint8_t percent) {
   if (!ring.points) {
     ring.points = (PowerPoint *)ps_malloc(POWER_HISTORY_CAPACITY * sizeof(PowerPoint));
     if (!ring.points) return false;
@@ -13405,11 +13422,17 @@ bool pushPowerPoint(PowerRing &ring, uint32_t t, uint16_t mA10, uint8_t category
     // A clock stepping backwards would fold the history over itself; hold
     // the new point at the last time instead.
     if (t < last.t) t = last.t;
-    // Nothing worth a point: same state, within 3% (or 0.2 mA).
+    // Nothing worth a point: same state, within 3% (or 0.2 mA), and the
+    // battery level has not moved a whole percent.
     if (last.category == category && last.charging == charging &&
-        abs((int)mA10 - (int)last.mA10) <= max(2, (int)last.mA10 * 3 / 100)) return true;
+        abs((int)mA10 - (int)last.mA10) <= max(2, (int)last.mA10 * 3 / 100) &&
+        (percent == POWER_PERCENT_UNKNOWN || last.percent == POWER_PERCENT_UNKNOWN ||
+         abs((int)percent - (int)last.percent) < 1)) return true;
     if (t == last.t) {
-      last = {t, mA10, category, charging};
+      last.mA10 = mA10;
+      last.category = category;
+      last.charging = charging;
+      last.percent = percent;
       return true;
     }
   }
@@ -13417,7 +13440,12 @@ bool pushPowerPoint(PowerRing &ring, uint32_t t, uint16_t mA10, uint8_t category
     ring.start = (ring.start + 1) % POWER_HISTORY_CAPACITY;
     ring.count--;
   }
-  ring.points[(ring.start + ring.count) % POWER_HISTORY_CAPACITY] = {t, mA10, category, charging};
+  PowerPoint &point = ring.points[(ring.start + ring.count) % POWER_HISTORY_CAPACITY];
+  point.t = t;
+  point.mA10 = mA10;
+  point.category = category;
+  point.charging = charging;
+  point.percent = percent;
   ring.count++;
   return true;
 }
@@ -13466,10 +13494,15 @@ uint16_t powerMa10(float mA) {
   return (uint16_t)constrain(lroundf(mA * 10.0f), 1L, 65000L);
 }
 
+uint8_t powerPercentNow() {
+  float percent = readBatteryPercent();
+  return percent < 0.0f ? POWER_PERCENT_UNKNOWN : (uint8_t)lroundf(percent);
+}
+
 void appendPowerPoint(uint32_t t, float mA, uint8_t category, bool charging) {
   if (!t || category >= POWER_CAT_COUNT) return;
   if (!powerSeed.started) startPowerSeed(t);
-  pushPowerPoint(powerHistory, t, powerMa10(mA), category, charging ? 1 : 0);
+  pushPowerPoint(powerHistory, t, powerMa10(mA), category, charging ? 1 : 0, powerPercentNow());
 }
 
 bool powerHistoryAt(uint32_t index, PowerPoint &out) {
@@ -13479,7 +13512,9 @@ bool powerHistoryAt(uint32_t index, PowerPoint &out) {
 }
 
 PowerSeries firmwarePowerSeries() {
-  return PowerSeries{powerHistory.count, powerHistoryAt, batteryClockEpoch()};
+  float percent = readBatteryPercent();
+  return PowerSeries{powerHistory.count, powerHistoryAt, batteryClockEpoch(),
+                     percent < 0.0f ? NAN : percent};
 }
 
 float lastBleIdleEstimateMa = POWER_MA_BLE_IDLE_GUESS;
@@ -13576,7 +13611,10 @@ void seedPowerLine(char *line) {
     category = POWER_CAT_IN_USE; mA = screenOn;
   }
   // Other events (charger, Bluetooth link) keep the state and update charging.
-  pushPowerPoint(powerSeed.ring, t, powerMa10(mA), category, charging ? 1 : 0);
+  float percent = atof(fields[3]);
+  pushPowerPoint(powerSeed.ring, t, powerMa10(mA), category, charging ? 1 : 0,
+                 percent > 0.0f && percent <= 100.0f ? (uint8_t)lroundf(percent)
+                                                     : POWER_PERCENT_UNKNOWN);
   powerSeed.lines++;
 }
 
@@ -13586,7 +13624,7 @@ void finishPowerSeed() {
   if (!powerSeed.ring.points) return;
   for (uint32_t i = 0; i < powerHistory.count; i++) {
     const PowerPoint &p = powerHistory.points[(powerHistory.start + i) % POWER_HISTORY_CAPACITY];
-    pushPowerPoint(powerSeed.ring, p.t, p.mA10, p.category, p.charging);
+    pushPowerPoint(powerSeed.ring, p.t, p.mA10, p.category, p.charging, p.percent);
   }
   if (powerHistory.points) free(powerHistory.points);
   powerHistory = powerSeed.ring;
@@ -43487,7 +43525,10 @@ void toggleBrightnessPanel() {
     return;
   }
 
-  brightnessOverlay = lv_obj_create(screenRoot);
+  // On uiRoot, not the page's own root (screenRoot): a full-screen widget is
+  // a child of uiRoot drawn above every page, and it covered the panel (6.10).
+  // Created last, so it is above that and the page alike.
+  brightnessOverlay = lv_obj_create(uiRoot);
   lv_obj_remove_style_all(brightnessOverlay);
   lv_obj_set_pos(brightnessOverlay, 0, 0);
   lv_obj_set_size(brightnessOverlay, LCD_W, LCD_H);

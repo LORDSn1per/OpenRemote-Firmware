@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <vector>
 
 #include "../../remote/power_widget.h"
@@ -74,8 +75,25 @@ static float jitter(float spread) {
   rng = rng * 1103515245u + 12345u;
   return ((rng >> 8) % 1000 / 1000.0f - 0.5f) * 2.0f * spread;
 }
+// A 2000 mAh cell drained by each point's current until the next, and
+// charged at about 40% an hour.
+static double simPercent = 96.0;
 static void add(uint32_t t, float mA, uint8_t cat, bool charging) {
-  history.push_back({t, (uint16_t)(mA * 10.0f), cat, (uint8_t)charging});
+  if (!history.empty()) {
+    const PowerPoint &last = history.back();
+    double hours = (t - last.t) / 3600.0;
+    if (last.charging) simPercent += 40.0 * hours;
+    else simPercent -= last.mA10 / 10.0 * hours / 2000.0 * 100.0;
+    if (simPercent > 100.0) simPercent = 100.0;
+    if (simPercent < 3.0) simPercent = 3.0;
+  }
+  PowerPoint point = {};
+  point.t = t;
+  point.mA10 = (uint16_t)(mA * 10.0f);
+  point.category = cat;
+  point.charging = charging;
+  point.percent = (uint8_t)lround(simPercent);
+  history.push_back(point);
 }
 // Fills [from, to) with one state, a sample every `step` seconds.
 static void fill(uint32_t from, uint32_t to, float mA, float spread, uint8_t cat,
@@ -137,7 +155,7 @@ static bool historyAt(uint32_t index, PowerPoint &out) {
   return true;
 }
 static PowerSeries historySource() {
-  return PowerSeries{(uint32_t)history.size(), historyAt, nowEpoch};
+  return PowerSeries{(uint32_t)history.size(), historyAt, nowEpoch, (float)simPercent};
 }
 
 // ------------------------------------------------------------- page chrome
@@ -406,6 +424,31 @@ int main() {
     buildPowerWidget(o, 228, 268, POWER_LAYOUT_FULL, 6);
     tapToClose(o);
     render("12_full_1day");
+  }
+  // 13-16. Long figures: a week at a steady 55 mA (9,240 mAh) and at 150 mA
+  // (25.2 Ah), and a slim tile reading three digits of mA.
+  {
+    std::vector<PowerPoint> saved = history;
+    double savedPercent = simPercent;
+    const struct { float mA; const char *full; const char *large; } cases[] = {
+      {55.0f, "13_full_week_9240mAh", "15_large_week_9240mAh"},
+      {150.0f, "14_full_week_25Ah", "16_large_week_25Ah"}};
+    for (const auto &c : cases) {
+      history.clear();
+      simPercent = 100.0;
+      fill(nowEpoch - 7 * 86400UL - 60, nowEpoch + 1, c.mA, 0.0f, POWER_CAT_IN_USE, false, 600);
+      lv_obj_t *s = screen();
+      lv_obj_t *o = overlay(s);
+      buildPowerWidget(o, 228, 268, POWER_LAYOUT_FULL, 8);
+      tapToClose(o);
+      render(c.full);
+      s = screen();
+      buildPowerWidget(card(s, 52, 96), 224, 96, POWER_LAYOUT_LARGE, 8);
+      buildPowerWidget(card(s, 156, 44), 224, 44, POWER_LAYOUT_SLIM, 0);
+      render(c.large);
+    }
+    history = saved;
+    simPercent = savedPercent;
   }
   // 10. Custom colours, as WebConfig 3.47 would set them.
   {

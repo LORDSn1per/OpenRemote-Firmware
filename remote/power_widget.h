@@ -26,17 +26,22 @@ enum PowerCategory : uint8_t {
 };
 
 // One step of the history. It holds from t until the next point's t.
+// Eight bytes: the battery level fits beside the state by packing those two.
 struct PowerPoint {
-  uint32_t t;          // epoch seconds
-  uint16_t mA10;       // estimated current, tenths of a milliamp
-  uint8_t category;    // PowerCategory
-  uint8_t charging;
+  uint32_t t;            // epoch seconds
+  uint16_t mA10;         // estimated current, tenths of a milliamp
+  uint8_t category : 2;  // PowerCategory
+  uint8_t charging : 1;
+  uint8_t percent;       // battery level then, 0-100; POWER_PERCENT_UNKNOWN
 };
+static const uint8_t POWER_PERCENT_UNKNOWN = 0xFF;
+static_assert(sizeof(PowerPoint) == 8, "a week of history is sized for 8-byte points");
 
 struct PowerSeries {
   uint32_t count;
   bool (*at)(uint32_t index, PowerPoint &out);   // 0 is the oldest
   uint32_t now;                                  // epoch seconds; 0 = unknown
+  float nowPercent;                              // the level now; NAN = unknown
 };
 
 // Supplied by whoever owns the history (the firmware, or the preview tool).
@@ -94,6 +99,8 @@ struct PowerGraphModel {
   float coveredSeconds;
   float totalMah;
   float averageMa;                              // NAN with no data
+  float startPercent;   // battery level where the graph starts, NAN unknown
+  float endPercent;     // ... and where it ends (now)
   // How it is drawn.
   bool axisLabels;      // 1/10/100 mA labels and the time axis
   bool grid;
@@ -150,10 +157,24 @@ static void computePowerGraph(PowerGraphModel &m, const PowerSeries &series) {
   }
   PowerPoint p = {};
   PowerPoint next = {};
+  m.startPercent = NAN;
+  m.endPercent = NAN;
+  uint8_t lastPercent = POWER_PERCENT_UNKNOWN;
   bool haveNext = series.count && series.at && series.now && series.at(first, next);
   for (uint32_t i = first; haveNext; i++) {
     p = next;
     haveNext = i + 1 < series.count && series.at(i + 1, next);
+    if (p.percent != POWER_PERCENT_UNKNOWN) lastPercent = p.percent;
+    // The level where the graph starts: interpolated between the points on
+    // either side of the start, or the first point when the history begins
+    // inside the range.
+    if (i == first && p.percent != POWER_PERCENT_UNKNOWN) {
+      m.startPercent = p.percent;
+      if (p.t < start && haveNext && next.t > start && next.percent != POWER_PERCENT_UNKNOWN) {
+        double f = (start - p.t) / (double)(next.t - p.t);
+        m.startPercent = (float)(p.percent + (next.percent - p.percent) * f);
+      }
+    }
     double segStart = p.t > start ? p.t : start;
     double segEnd = haveNext ? (next.t < end ? next.t : end) : end;
     if (segEnd <= segStart || p.category >= POWER_CAT_COUNT) continue;
@@ -199,8 +220,20 @@ static void computePowerGraph(PowerGraphModel &m, const PowerSeries &series) {
     m.charging[c] = chargeTime[c] * 2 > cover[c];
   }
   m.columns = cols;
+  m.endPercent = !isnan(series.nowPercent) ? series.nowPercent
+               : lastPercent != POWER_PERCENT_UNKNOWN ? (float)lastPercent : NAN;
   m.totalMah = (float)(totalEnergy / 3600.0);
   m.averageMa = m.coveredSeconds > 0 ? (float)(totalEnergy / m.coveredSeconds) : NAN;
+}
+
+// A battery level with the matching battery symbol, or "" when unknown.
+static void formatPowerBatteryLevel(char *out, size_t size, float percent) {
+  if (isnan(percent)) { out[0] = 0; return; }
+  int level = (int)lroundf(percent);
+  const char *symbol = level > 80 ? LV_SYMBOL_BATTERY_FULL : level > 60 ? LV_SYMBOL_BATTERY_3
+                     : level > 35 ? LV_SYMBOL_BATTERY_2 : level > 12 ? LV_SYMBOL_BATTERY_1
+                     : LV_SYMBOL_BATTERY_EMPTY;
+  snprintf(out, size, "%s %d%%", symbol, level);
 }
 
 static inline lv_coord_t powerGraphY(float mA, lv_coord_t top, lv_coord_t bottom) {
@@ -312,12 +345,33 @@ static void powerGraphDrawEvent(lv_event_t *e) {
   }
 
   if (m->axisLabels) {
-    lv_area_t left = {plot.x1, (lv_coord_t)(plot.y2 + 2), (lv_coord_t)(plot.x1 + 60), box.y2};
+    // The time at each end, and beside it the battery level then (6.10).
+    const char *startName = POWER_RANGE_AXIS[m->range % POWER_RANGE_COUNT];
+    lv_point_t size;
+    lv_draw_label_dsc_t level;
+    lv_draw_label_dsc_init(&level);
+    level.font = &lv_font_montserrat_10;
+    level.color = lv_color_white();
+    char startLevel[24];
+    char endLevel[24];
+    formatPowerBatteryLevel(startLevel, sizeof(startLevel), m->startPercent);
+    formatPowerBatteryLevel(endLevel, sizeof(endLevel), m->endPercent);
+
+    lv_area_t left = {plot.x1, (lv_coord_t)(plot.y2 + 2), (lv_coord_t)(plot.x1 + 90), box.y2};
     text.align = LV_TEXT_ALIGN_LEFT;
-    lv_draw_label(ctx, &text, &left, POWER_RANGE_AXIS[m->range % POWER_RANGE_COUNT], nullptr);
-    lv_area_t right = {(lv_coord_t)(plot.x2 - 60), (lv_coord_t)(plot.y2 + 2), plot.x2, box.y2};
+    lv_draw_label(ctx, &text, &left, startName, nullptr);
+    lv_txt_get_size(&size, startName, text.font, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+    left.x1 += size.x + 6;
+    level.align = LV_TEXT_ALIGN_LEFT;
+    if (startLevel[0]) lv_draw_label(ctx, &level, &left, startLevel, nullptr);
+
+    lv_area_t right = {(lv_coord_t)(plot.x2 - 90), (lv_coord_t)(plot.y2 + 2), plot.x2, box.y2};
     text.align = LV_TEXT_ALIGN_RIGHT;
     lv_draw_label(ctx, &text, &right, "now", nullptr);
+    lv_txt_get_size(&size, "now", text.font, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+    right.x2 -= size.x + 6;
+    level.align = LV_TEXT_ALIGN_RIGHT;
+    if (endLevel[0]) lv_draw_label(ctx, &level, &right, endLevel, nullptr);
   }
 
   if (!anyData) {
@@ -340,14 +394,62 @@ static void formatPowerMa(char *out, size_t size, float mA) {
   else snprintf(out, size, "%.0f", mA);
 }
 
-// A charge with its unit: "0.52 mAh", "838 mAh", or "1.40 Ah" from 1000 up,
-// which is what a week can reach and what fits the full-screen headline.
+// A charge with its unit, never shortened (Phillip, 6.10): "0.52 mAh",
+// "838 mAh", "2,340 mAh" up to 9,999, then amp-hours - "10.34 Ah", and one
+// decimal from 100 Ah. Replaces 6.05's "1.40 Ah" from 1000 mAh.
 static void formatPowerMah(char *out, size_t size, float mAh) {
   if (isnan(mAh)) snprintf(out, size, "-- mAh");
   else if (mAh < 0.1f) snprintf(out, size, "%.2f mAh", mAh);
   else if (mAh < 10.0f) snprintf(out, size, "%.1f mAh", mAh);
   else if (mAh < 1000.0f) snprintf(out, size, "%.0f mAh", mAh);
-  else snprintf(out, size, "%.2f Ah", mAh / 1000.0f);
+  else if (mAh < 9999.5f) {
+    long whole = lroundf(mAh);
+    snprintf(out, size, "%ld,%03ld mAh", whole / 1000, whole % 1000);
+  } else if (mAh < 99995.0f) snprintf(out, size, "%.2f Ah", mAh / 1000.0f);
+  else snprintf(out, size, "%.1f Ah", mAh / 1000.0f);
+}
+
+/*
+  Sets a label's text in the largest of `fonts` (largest first) that fits its
+  width, so a long figure steps down a size rather than being cut short.
+  Returns false when even the smallest is too wide.
+*/
+static bool setPowerLabelFitted(lv_obj_t *label, const char *text,
+                                const lv_font_t *const *fonts, uint8_t count) {
+  if (!label || !count) return false;
+  lv_coord_t width = lv_obj_get_style_width(label, LV_PART_MAIN);
+  const lv_font_t *chosen = fonts[count - 1];
+  bool fits = false;
+  for (uint8_t i = 0; i < count; i++) {
+    lv_point_t size;
+    lv_txt_get_size(&size, text, fonts[i], 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+    if (width <= 0 || size.x <= width) { chosen = fonts[i]; fits = true; break; }
+  }
+  if (lv_obj_get_style_text_font(label, LV_PART_MAIN) != chosen) {
+    lv_obj_set_style_text_font(label, chosen, 0);
+  }
+  lv_label_set_text(label, text);
+  return fits;
+}
+
+static const lv_font_t *const POWER_HEADLINE_FONTS[] = {
+  &lv_font_montserrat_24, &lv_font_montserrat_20, &lv_font_montserrat_18,
+  &lv_font_montserrat_16, &lv_font_montserrat_14 };
+static const lv_font_t *const POWER_SMALL_FONTS[] = { &lv_font_montserrat_10 };
+
+// Every size from `largest` down to 10, for a headline that may step down.
+static uint8_t powerFontsFrom(const lv_font_t *largest, const lv_font_t **out) {
+  static const lv_font_t *const all[] = {
+    &lv_font_montserrat_24, &lv_font_montserrat_20, &lv_font_montserrat_18,
+    &lv_font_montserrat_16, &lv_font_montserrat_14, &lv_font_montserrat_12,
+    &lv_font_montserrat_10 };
+  uint8_t count = 0;
+  bool started = false;
+  for (const lv_font_t *font : all) {
+    if (font == largest) started = true;
+    if (started) out[count++] = font;
+  }
+  return count;
 }
 
 static int powerCategoryPercent(const PowerGraphModel &m, uint8_t category) {
@@ -371,6 +473,8 @@ struct PowerWidgetUi {
   lv_obj_t *value;       // average current
   lv_obj_t *detail;      // mAh and range, or "avg" and range
   lv_obj_t *dropdown;
+  lv_obj_t *levels;      // large tile: battery level at the start and end
+  const lv_font_t *valueFont;   // the headline's size; it only ever steps down
   lv_obj_t *share[POWER_CAT_COUNT];    // "12%" per state
   lv_obj_t *shareMah[POWER_CAT_COUNT]; // full screen: [0] is "used in <range>"
   lv_obj_t *shareMahLabel[POWER_CAT_COUNT]; // full screen: mAh per state
@@ -501,10 +605,16 @@ static PowerWidgetUi *buildPowerWidget(lv_obj_t *parent, int width, int height,
     int pad = layout == POWER_LAYOUT_ROW ? 14 : 9;
     bool tall = height >= 110;
     ui->value = powerLabel(parent, "--", pad, 5, tall ? &lv_font_montserrat_20 : &lv_font_montserrat_16,
-                           white, 100);
-    ui->detail = powerLabel(parent, "", width / 2 - 10, tall ? 10 : 7, &lv_font_montserrat_12,
-                            powerMuted(), width / 2 + 10 - pad, LV_TEXT_ALIGN_RIGHT);
-    int graphTop = tall ? 34 : 26;
+                           white, tall ? 78 : 62);
+    // Right of the headline, two small lines: charge and range, then the
+    // battery level where the graph starts and where it ends (6.10).
+    // From just past the headline ("107 mA") to the right edge.
+    int linesX = pad + (tall ? 80 : 64);
+    ui->detail = powerLabel(parent, "", linesX, tall ? 6 : 4, &lv_font_montserrat_10,
+                            powerMuted(), width - pad - linesX, LV_TEXT_ALIGN_RIGHT);
+    ui->levels = powerLabel(parent, "", linesX, tall ? 19 : 16, &lv_font_montserrat_10,
+                            lv_color_white(), width - pad - linesX, LV_TEXT_ALIGN_RIGHT);
+    int graphTop = tall ? 36 : 30;
     int graphBottom = height - (tall ? 24 : 20);
     ui->model.grid = tall;
     makePowerGraph(ui, parent, pad, graphTop, width - pad * 2, graphBottom - graphTop);
@@ -584,13 +694,14 @@ static PowerWidgetUi *buildPowerWidget(lv_obj_t *parent, int width, int height,
     ui->model.lineWidth = 1;
     makePowerGraph(ui, parent, 5, 22, width - 10, 16);
   }
+  if (ui->value) ui->valueFont = lv_obj_get_style_text_font(ui->value, LV_PART_MAIN);
   refreshPowerWidget(ui);
   return ui;
 }
 
 static void refreshPowerWidget(PowerWidgetUi *ui) {
   if (!ui) return;
-  PowerSeries series = powerSeriesSource ? powerSeriesSource() : PowerSeries{0, nullptr, 0};
+  PowerSeries series = powerSeriesSource ? powerSeriesSource() : PowerSeries{0, nullptr, 0, NAN};
   computePowerGraph(ui->model, series);
   const PowerGraphModel &m = ui->model;
   char ma[16];
@@ -602,9 +713,8 @@ static void refreshPowerWidget(PowerWidgetUi *ui) {
 
   if (ui->layout == POWER_LAYOUT_FULL) {
     snprintf(text, sizeof(text), "%s mA", ma);
-    lv_label_set_text(ui->value, text);
-    snprintf(text, sizeof(text), "%s", mah);
-    lv_label_set_text(ui->detail, text);
+    setPowerLabelFitted(ui->value, text, POWER_HEADLINE_FONTS, 5);
+    setPowerLabelFitted(ui->detail, mah, POWER_HEADLINE_FONTS, 5);
     snprintf(text, sizeof(text), "used in %s", range);
     lv_label_set_text(ui->shareMah[0], text);
     for (uint8_t c = 0; c < POWER_CAT_COUNT; c++) {
@@ -612,17 +722,44 @@ static void refreshPowerWidget(PowerWidgetUi *ui) {
       lv_label_set_text(ui->share[c], text);
       char part[16];
       formatPowerMah(part, sizeof(part), m.mAh[c]);
-      snprintf(text, sizeof(text), "%s", part);
-      if (ui->shareMahLabel[c]) lv_label_set_text(ui->shareMahLabel[c], text);
+      if (ui->shareMahLabel[c]) setPowerLabelFitted(ui->shareMahLabel[c], part, POWER_SMALL_FONTS, 1);
     }
   } else {
     snprintf(text, sizeof(text), "%s mA", ma);
-    if (ui->value) lv_label_set_text(ui->value, text);
+    if (ui->value) {
+      const lv_font_t *fonts[7];
+      uint8_t count = powerFontsFrom(ui->valueFont, fonts);
+      if (count) setPowerLabelFitted(ui->value, text, fonts, count);
+      else lv_label_set_text(ui->value, text);
+    }
     if (ui->detail) {
       if (ui->layout == POWER_LAYOUT_SLIM) snprintf(text, sizeof(text), "avg %s", range);
       else if (ui->layout == POWER_LAYOUT_COLUMN) snprintf(text, sizeof(text), "avg \xE2\x80\xA2 %s", range);
       else snprintf(text, sizeof(text), "%s \xE2\x80\xA2 %s", mah, range);
-      lv_label_set_text(ui->detail, text);
+      // The charge is never shortened: if charge and range will not both fit,
+      // the range goes (the full-screen view still names it).
+      if (!setPowerLabelFitted(ui->detail, text, POWER_SMALL_FONTS, 1) &&
+          ui->layout != POWER_LAYOUT_SLIM && ui->layout != POWER_LAYOUT_COLUMN) {
+        setPowerLabelFitted(ui->detail, mah, POWER_SMALL_FONTS, 1);
+      }
+    }
+    if (ui->levels) {
+      char from[24];
+      char to[24];
+      formatPowerBatteryLevel(from, sizeof(from), m.startPercent);
+      formatPowerBatteryLevel(to, sizeof(to), m.endPercent);
+      // One battery symbol (the current level's), then "92% > 78%".
+      if (from[0] && to[0]) {
+        const char *fromNumber = strchr(from, ' ');
+        const char *toNumber = strchr(to, ' ');
+        char symbol[8] = {};
+        memcpy(symbol, to, toNumber ? (size_t)(toNumber - to) : 0);
+        snprintf(text, sizeof(text), "%s %s  " LV_SYMBOL_RIGHT "  %s", symbol,
+                 fromNumber ? fromNumber + 1 : from, toNumber ? toNumber + 1 : to);
+      } else {
+        snprintf(text, sizeof(text), "%s", to);
+      }
+      lv_label_set_text(ui->levels, text);
     }
     for (uint8_t c = 0; c < POWER_CAT_COUNT; c++) {
       if (!ui->share[c]) continue;
