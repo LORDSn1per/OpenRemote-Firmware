@@ -40,7 +40,7 @@ open, not because you are expected to compile it.
 > **You need the latest versions for this:**
 > - **OpenRemote Studio 2.88** builds the database. In *IRDB Builder*, tick
 >   *Logitech Harmony* and press *Build*.
-> - **WebConfig 3.45** searches it and adds devices to your remote.
+> - **WebConfig 3.45 or newer** searches it and adds devices to your remote.
 > - **Remote firmware 5.86 or newer** reads it.
 >
 > Older firmware and WebConfig cannot read the new database format, so update
@@ -74,7 +74,7 @@ Studio installs these for you, so you only need them for a manual update.
 |---|---|
 | Remote firmware — ESP32-S3 | [**OpenRemote-Remote-Firmware-6.12.bin**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-Remote-Firmware-6.12.bin) |
 | Dock firmware — ESP32-C3 | [**OpenRemote-Dock-Firmware-1.84.bin**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-Dock-Firmware-1.84.bin) |
-| WebConfig — browser configurator | [**OpenRemote-WebConfig-3.45.html**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-WebConfig-3.45.html) |
+| WebConfig — browser configurator | [**OpenRemote-WebConfig-3.50.html**](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest/download/OpenRemote-WebConfig-3.50.html) |
 
 **[See all downloads and version numbers →](https://github.com/LORDSn1per/OpenRemote-Firmware/releases/latest)**
 
@@ -322,7 +322,7 @@ infrared database. **WebConfig** does everything else, wirelessly. The
 |---|---|---|
 | Remote firmware — ESP32-S3 | 6.12 | [`remote/`](remote/) |
 | Dock firmware — ESP32-C3 | 1.84 | [`dock/`](dock/) |
-| WebConfig | 3.45 | [`webconfig/`](webconfig/) |
+| WebConfig | 3.50 | [`webconfig/`](webconfig/) |
 | OpenRemote Studio | 2.88 | [`studio/`](studio/) |
 
     remote/       ESP32-S3 remote firmware (PlatformIO)

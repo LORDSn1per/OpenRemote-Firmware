@@ -21,7 +21,7 @@
 > giving 271,761 devices in one 129 MB file, and the remote searches it
 > straight from WebConfig.
 >
-> **You need the latest Studio (2.88) and WebConfig (3.45)**, plus remote
+> **You need the latest Studio (2.88) and WebConfig (3.45 or newer)**, plus remote
 > firmware 5.86 or newer. Older versions cannot read the new database format.
 
 ## Download

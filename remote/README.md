@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Remote-v6.12-2f8cff?style=flat-square" alt="Remote firmware v6.12">
   <img src="https://img.shields.io/badge/Dock-v1.84-2f8cff?style=flat-square" alt="Dock firmware v1.84">
   <img src="https://img.shields.io/badge/Studio-v2.88-2f8cff?style=flat-square" alt="Studio v2.88">
-  <img src="https://img.shields.io/badge/WebConfig-v3.45-2f8cff?style=flat-square" alt="WebConfig v3.45">
+  <img src="https://img.shields.io/badge/WebConfig-v3.50-2f8cff?style=flat-square" alt="WebConfig v3.50">
   <img src="https://img.shields.io/badge/100%25-Local-30d158?style=flat-square" alt="100% Local">
   <img src="https://img.shields.io/badge/Cloud-None-30d158?style=flat-square" alt="No Cloud">
 </p>
