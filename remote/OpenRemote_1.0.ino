@@ -1,6 +1,17 @@
 /*
   OpenRemote firmware change log (newest first)
 
+  6.12 - 2026-11-17
+    - Device pages show exactly the screen designer's layout. A button
+      deleted in the designer stayed on the remote after a sync, at its old
+      position and under whatever was placed there - commands not in the
+      layout were never moved off their list position, and every command
+      was drawn. Commands a non-empty layout leaves out are now hidden from
+      the page; they remain usable by activities and the physical buttons.
+      An empty layout still shows every command, as WebConfig does.
+      (Reported by a user on 5.96 / WebConfig 3.45: "doesn't remove buttons
+      I've deleted and buttons I've placed are overlapping".)
+
   6.11 - 2026-10-30
     - Power widget off full screen: the headline is the charge used over the
       range ("29 mAh") rather than the average current. The large tile's
@@ -7717,7 +7728,7 @@
 // reads this marker out of the .bin, which is why a freshly built
 // OpenRemote_2.77.bin still displayed "Firmware 2.57". Deriving both from one
 // macro makes that drift impossible.
-#define OPENREMOTE_VERSION_STRING "6.11"
+#define OPENREMOTE_VERSION_STRING "6.12"
 static constexpr float OPENREMOTE_VERSION = 2.84f;
 static constexpr char OPENREMOTE_VERSION_TEXT[] = OPENREMOTE_VERSION_STRING;
 static constexpr char OPENREMOTE_FIRMWARE_MARKER[] =
@@ -8533,6 +8544,10 @@ struct RuntimeThemeStyle {
   uint8_t glassOpacity;
   bool glassEnabled;
 };
+
+// DeviceCommand.slot for a command its device page's layout leaves off the
+// page. Placed slots are 0-254.
+static const uint8_t DEVICE_COMMAND_NOT_ON_PAGE = 0xFF;
 
 struct DeviceCommand {
   char label[28];
@@ -20536,8 +20551,22 @@ void loadRuntimeModel(JsonDocument &doc) {
       if (powerOff) device->powerOffCommandIndex = (int8_t)(powerOff - device->commands);
       device->powerTrackingEnabled = powerOn || powerOff;
     }
+    /*
+      A designed page shows exactly what is on it. Commands start at their
+      list position, and only the ones the layout places were moved - so a
+      button deleted in the screen designer kept its old slot and was still
+      drawn, under whatever was placed there (6.12; reported on 5.96).
+      WebConfig's own rule (makeDevicePage) is that an empty layout means
+      "every command", so only a non-empty one hides the rest.
+    */
+    JsonArrayConst pageItems = page["items"].as<JsonArrayConst>();
+    if (pageItems.size()) {
+      for (uint8_t i = 0; i < device->commandCount; i++) {
+        device->commands[i].slot = DEVICE_COMMAND_NOT_ON_PAGE;
+      }
+    }
     uint8_t slotCursor = 0;
-    for (JsonObjectConst item : page["items"].as<JsonArrayConst>()) {
+    for (JsonObjectConst item : pageItems) {
       if (strcmp(item["type"] | "", "spacer") == 0) {
         if (slotCursor < 254) slotCursor++;
         continue;
@@ -42705,6 +42734,9 @@ void renderDevicePage() {
 
   uint8_t count = devices[activeDevice].commandCount;
   for (uint8_t i = 0; i < count; i++) {
+    // Still a command - activities and the physical buttons can use it -
+    // just not a button on this page.
+    if (devices[activeDevice].commands[i].slot == DEVICE_COMMAND_NOT_ON_PAGE) continue;
     makeTile(devices[activeDevice].commands[i].slot, devices[activeDevice].commands[i].label,
              devices[activeDevice].commands[i].iconPath ? devices[activeDevice].commands[i].iconPath : "",
              devices[activeDevice].commands[i].showText,
