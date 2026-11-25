@@ -22959,9 +22959,31 @@ bool irdbV3LineMatches(char *fields[10], size_t lengths[10], const IrdbV3Info &i
   }
   haystack[used] = 0;
   uint8_t source = (uint8_t)atoi(fields[1]);
+  // A second, letters-and-digits-only copy, built only if a term
+  // misses, so "avrs920w" or "s920 w" still finds "AVR-S920W".
+  char compactHaystack[IRDB_V3_MAX_LINE + 8];
+  bool compactBuilt = false;
   for (uint8_t t = 0; t < termCount; t++) {
     if (strstr(haystack, terms[t].c_str())) continue;
     if (source < info.sourceCount && info.sourcesLower[source].indexOf(terms[t]) >= 0) continue;
+    char compactTerm[64];
+    size_t termUsed = 0;
+    for (size_t i = 0; i < terms[t].length() && termUsed < sizeof(compactTerm) - 1; i++) {
+      char c = terms[t][i];
+      if (isalnum((unsigned char)c)) compactTerm[termUsed++] = c;
+    }
+    compactTerm[termUsed] = 0;
+    if (termUsed) {
+      if (!compactBuilt) {
+        size_t compactUsed = 0;
+        for (size_t i = 0; i < used; i++) {
+          if (isalnum((unsigned char)haystack[i])) compactHaystack[compactUsed++] = haystack[i];
+        }
+        compactHaystack[compactUsed] = 0;
+        compactBuilt = true;
+      }
+      if (strstr(compactHaystack, compactTerm)) continue;
+    }
     return false;
   }
   return true;
