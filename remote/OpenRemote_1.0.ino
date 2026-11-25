@@ -29149,6 +29149,51 @@ void handleHomeAssistantStatusApi() {
   like from the outside: a list that comes back truncated and reads as
   "some of my devices are missing" rather than as a memory limit.
 */
+/*
+  Home Assistant Discover could reboot the remote with a task-watchdog abort
+  (IDLE0 starved, CPU 0 running openremote_http). The HTTP task runs at
+  priority 1 on core 0, and parsing /api/states straight from the socket keeps
+  it busy - Stream::timedRead() only calls yield(), which never lets the
+  priority-0 idle task run - so a large entity list held core 0 for longer than
+  the watchdog allows. This wrapper sleeps one tick while waiting for data and
+  every 1 KB of parsing, which feeds IDLE0 without slowing the transfer.
+*/
+class WatchdogFriendlyStream : public Stream {
+ public:
+  explicit WatchdogFriendlyStream(Stream &source) : source_(source) {}
+  int available() override { return source_.available(); }
+  int peek() override { return source_.peek(); }
+  size_t write(uint8_t) override { return 0; }
+  void flush() override {}
+  int read() override {
+    char c;
+    return readBytes(&c, 1) == 1 ? (uint8_t)c : -1;
+  }
+  size_t readBytes(char *buffer, size_t length) override {
+    size_t got = 0;
+    unsigned long lastData = millis();
+    while (got < length) {
+      int c = source_.read();
+      if (c < 0) {
+        if (millis() - lastData >= _timeout) break;
+        vTaskDelay(1);
+        continue;
+      }
+      buffer[got++] = (char)c;
+      lastData = millis();
+      if (++sinceYield_ >= 1024) {
+        sinceYield_ = 0;
+        vTaskDelay(1);
+      }
+    }
+    return got;
+  }
+
+ private:
+  Stream &source_;
+  uint16_t sinceYield_ = 0;
+};
+
 void handleHomeAssistantDiscover() {
   if (!requestAuthorized()) {
     sendJson(403, "{\"ok\":false,\"error\":\"Not authorized\"}");
@@ -29205,7 +29250,9 @@ void handleHomeAssistantDiscover() {
   entity["attributes"]["friendly_name"] = true;
 
   JsonDocument source(&psramJsonAllocator);
-  DeserializationError parse = deserializeJson(source, http.getStream(),
+  WatchdogFriendlyStream haStream(http.getStream());
+  haStream.setTimeout(20000);
+  DeserializationError parse = deserializeJson(source, haStream,
                                                DeserializationOption::Filter(filter));
   http.end();
   scheduleNetworkShutdown();
@@ -29226,6 +29273,7 @@ void handleHomeAssistantDiscover() {
   uint16_t skipped = 0;
   for (JsonObjectConst item : source.as<JsonArrayConst>()) {
     total++;
+    if ((total & 63) == 0) vTaskDelay(1);   // keep IDLE0 fed on long entity lists
     const char *entityId = item["entity_id"] | "";
     if (!entityId[0]) continue;
     if (!homeAssistantDomainIsControllable(entityId)) { skipped++; continue; }
