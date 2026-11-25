@@ -12468,9 +12468,19 @@
       return;
     }
 
+    /* Match every word anywhere, ignoring punctuation, so
+       "denon 920", "denon s920w" and "avr s920w" all find "Denon AVR-S920W".
+       The remote already matches word by word; filtering its results again by
+       the whole phrase is what discarded them. */
+    var compactSearch=function(text){ return text.replace(/[^a-z0-9]/g,""); };
+    var qTerms=q.split(/\s+/).filter(function(term){ return term; });
     var matches=irDatabase.filter(function(d){
       var hay=(d.brand+" "+d.model+" "+d.type+" "+d.protocol+" "+d.commands.join(" ")).toLowerCase();
-      return !q || hay.indexOf(q)>-1;
+      var hayCompact=compactSearch(hay);
+      return !qTerms.length || qTerms.every(function(term){
+        var termCompact=compactSearch(term);
+        return hay.indexOf(term)>-1 || (termCompact && hayCompact.indexOf(termCompact)>-1);
+      });
     });
 
     if(count){
